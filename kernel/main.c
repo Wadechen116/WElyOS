@@ -27,7 +27,14 @@ static void serial_puts(const char *s)
         serial_putc(*s++);
 }
 
+/* QEMU isa-debug-exit:寫入 N,QEMU 以 (N<<1)|1 結束。僅用於測試。 */
+static void qemu_exit(uint8_t code)
+{
+    outb(0xF4, code);
+}
+
 void kmain(void)
 {
     serial_puts("Hello WElyOS\r\n");
+    qemu_exit(0);          /* 結束碼 1 = 成功 */
 }
