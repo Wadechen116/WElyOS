@@ -17,10 +17,10 @@
 - [x] 例外處理(三個架構):RISC-V `stvec`、AArch64 向量表、i386 GDT + IDT;印出原因、暫存器與 backtrace,可恢復的例外(中斷點)能繼續執行
 - [x] VGA 文字螢幕(80x25、顏色、硬體游標、自動捲動),`kprintf` 同步輸出到序列埠與螢幕
 - [x] 讀取 multiboot 資訊(開機參數、記憶體大小)
+- [x] 計時器中斷(100Hz tick):RISC-V SBI timer、AArch64 GICv2 + generic timer、i386 PIC + PIT
 
 ## 規劃中
 
-- [ ] 計時器中斷
 - [ ] 實體記憶體管理、heap
 - [ ] 排程器、系統呼叫、使用者模式、shell
 

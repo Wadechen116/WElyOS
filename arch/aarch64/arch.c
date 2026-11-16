@@ -29,8 +29,28 @@ void arch_putc(char c)
 
 void arch_halt(void)
 {
+    arch_irq_disable();
     for (;;)
-        __asm__ volatile("wfe");           /* 等待事件;目前等同閒置 */
+        __asm__ volatile("wfi");           /* 中斷已遮蔽,不會再被處理 */
+}
+
+/*
+ * PSTATE 的 DAIF 四個遮蔽位元:D(除錯)、A(SError)、I(IRQ)、F(FIQ)。
+ * daifclr / daifset 的立即值 #2 對應 I 位元:清除 = 允許 IRQ,設定 = 遮蔽 IRQ。
+ */
+void arch_irq_enable(void)
+{
+    __asm__ volatile("msr daifclr, #2");
+}
+
+void arch_irq_disable(void)
+{
+    __asm__ volatile("msr daifset, #2");
+}
+
+void arch_idle(void)
+{
+    __asm__ volatile("wfi");               /* 休眠到有中斷待處理 */
 }
 
 /*

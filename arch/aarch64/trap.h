@@ -14,4 +14,5 @@ struct trap_frame {
 
 void trap_init(void);                                    /* 設定 VBAR_EL1 */
 void trap_handler(struct trap_frame *tf, uint64_t kind); /* 由 trap.S 呼叫 */
+void irq_handler(void);                                  /* timer.c:處理 IRQ */
 #endif

@@ -60,7 +60,16 @@ void trap_handler(struct trap_frame *tf, uint64_t kind)
 {
     uint64_t ec = ESR_EC(tf->esr);
 
-    /* 非同步例外(IRQ/FIQ/SError):尚未啟用任何中斷,收到就視為錯誤 */
+    /*
+     * IRQ:非同步中斷。ELR 指向被打斷、尚未執行的指令,處理完直接返回即可。
+     * 實際是哪個裝置要問 GIC(見 timer.c)。
+     */
+    if (kind % 4 == 1) {
+        irq_handler();
+        return;
+    }
+
+    /* FIQ / SError:未使用,收到就視為錯誤 */
     if (kind % 4 != 0)
         panic("unexpected %s (vector %llu)", kind_names[kind % 4],
               (unsigned long long)kind);

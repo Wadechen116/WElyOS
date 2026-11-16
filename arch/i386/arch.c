@@ -25,6 +25,22 @@ void arch_halt(void)
         __asm__ volatile("cli; hlt");    /* 中斷關閉時 hlt 會永久停住 */
 }
 
+/* eflags 的 IF 位元:sti 設定(接受中斷),cli 清除 */
+void arch_irq_enable(void)
+{
+    __asm__ volatile("sti");
+}
+
+void arch_irq_disable(void)
+{
+    __asm__ volatile("cli");
+}
+
+void arch_idle(void)
+{
+    __asm__ volatile("hlt");             /* 休眠到下一次中斷 */
+}
+
 /*
  * 通知 QEMU 結束(需 -device isa-debug-exit,iobase=0xf4,iosize=0x04)。
  * 寫入 code 後,QEMU 以結束碼 (code << 1) | 1 離開,所以寫 0 會得到 1

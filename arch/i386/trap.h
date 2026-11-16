@@ -11,4 +11,5 @@ struct trap_frame {
 
 void trap_init(void);                       /* 建立 GDT、IDT */
 void trap_handler(struct trap_frame *tf);   /* 由 trap.S 呼叫 */
+void irq_handler(uint32_t irq);             /* timer.c:處理硬體中斷 IRQ 0~15 */
 #endif

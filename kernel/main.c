@@ -9,6 +9,7 @@
 #include "boot_info.h"
 #include "kprintf.h"
 #include "panic.h"
+#include "timer.h"
 
 /*
  * 開機參數(cmdline)中是否含有指定的「完整單字」(以空白分隔)。
@@ -76,7 +77,19 @@ void kmain(const struct boot_info *bi)
 
     crash_test(bi->cmdline);
 
+    /* 啟動計時器(100Hz)並開啟中斷,示範以 tick 計時 */
+    timer_init(100);
+    arch_irq_enable();
+    kprintf("timer: %u Hz\n", timer_hz());
+    for (unsigned sec = 1; sec <= 2; sec++) {
+        while (timer_ticks() < (uint64_t)sec * timer_hz())
+            arch_idle();                     /* 休眠到下一次中斷,不空轉 */
+        kprintf("uptime: %u s (ticks=%llu)\n", sec,
+                (unsigned long long)timer_ticks());
+    }
+
     if (autoexit)
         arch_exit(0);
-    arch_halt();
+    for (;;)
+        arch_idle();                         /* 閒置;中斷仍持續被處理 */
 }

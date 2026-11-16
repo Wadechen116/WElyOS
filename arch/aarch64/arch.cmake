@@ -1,7 +1,7 @@
 # AArch64:MMU 關閉時需嚴格對齊(-mstrict-align),且不使用浮點/SIMD;
 # -mno-omit-leaf-frame-pointer:葉函式也建立 frame record,backtrace 才不會少一層
 set(ARCH_SOURCES arch/aarch64/boot.S arch/aarch64/trap.S arch/aarch64/start.c
-                 arch/aarch64/arch.c arch/aarch64/trap.c)
+                 arch/aarch64/arch.c arch/aarch64/trap.c arch/aarch64/timer.c)
 set(ARCH_FLAGS -mgeneral-regs-only -mstrict-align -mcmodel=small
                -mno-omit-leaf-frame-pointer
                -fno-pic -fno-pie)

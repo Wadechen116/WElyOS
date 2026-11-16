@@ -15,4 +15,5 @@ struct trap_frame {
 
 void trap_init(void);                       /* 設定 stvec,啟用例外處理 */
 void trap_handler(struct trap_frame *tf);   /* 由 trap.S 呼叫 */
+void timer_interrupt(void);                 /* timer.c:處理計時器中斷 */
 #endif

@@ -659,3 +659,101 @@ x86 把例外分成兩類,由硬體決定存哪個位址:
 | i386 | `int3` 的下一條 | 不用調整 | (硬體已處理) |
 
 RISC-V 與 AArch64 把「要不要跳過」交給軟體決定;x86 由硬體依例外類別決定。同樣的道理日後也適用於系統呼叫:RISC-V 的 `ecall` 返回前要 `sepc += 4`,否則會重複執行系統呼叫(AArch64 的 `svc` 則由硬體存下一條指令的位址)。
+
+---
+
+## 第 8 步:計時器中斷
+
+**目標**:kernel 有時間的概念。硬體計時器每秒產生 100 次中斷,每次累加 tick 計數。這是排程器(定時切換工作)的前置條件。
+
+### 例外與中斷的差別
+
+| | 例外(同步) | 中斷(非同步) |
+|---|---|---|
+| 來源 | 目前執行的指令本身 | 外部裝置(計時器、鍵盤…) |
+| 時機 | 可預期,每次執行到都發生 | 隨時,與正在執行的指令無關 |
+| 返回位址 | 引發例外的指令(中斷點除外,見前一節) | **被打斷、尚未執行的指令** |
+| 處理後 | 視情況調整返回位址 | 直接返回,不用調整 |
+| 可否關閉 | 不可 | 可(全域開關 + 個別遮罩) |
+
+中斷處理共用例外的入口與 trap frame(第 7 步),只是多了「判斷是哪個中斷」這一層。
+
+### 共用層
+
+| 檔案 | 內容 |
+|---|---|
+| `kernel/timer.c`、`include/timer.h` | `timer_init(hz)`、`timer_tick()`(架構層每次中斷呼叫)、`timer_ticks()`、`timer_hz()` |
+| `include/arch.h` | 新增 `arch_timer_init(hz)`、`arch_irq_enable/disable()`、`arch_idle()` |
+
+- `ticks` 宣告為 `volatile`:它在中斷處理程式中被修改,主程式必須每次重新讀取。
+- **32 位元架構的 64 位元讀取**:i386 讀 `uint64_t` 需要兩條指令,中間若發生計時器中斷會讀到高低半不一致的值。`timer_ticks()` 連讀兩次直到相同。
+- `arch_idle()`:讓 CPU 休眠到下一次中斷(`hlt` / `wfi`),等待時不空轉。
+- `arch_halt()`(panic 用)改為**先關中斷**再停住,否則中斷會繼續把 CPU 叫醒。
+
+`kmain` 啟動 100Hz 計時器、開中斷,印出兩次 `uptime`,之後進入 `arch_idle()` 迴圈。
+
+### 三個架構的實作
+
+| | RISC-V | AArch64 | i386 |
+|---|---|---|---|
+| 計時器 | SBI timer(`ecall` 請 OpenSBI 設定) | ARM generic timer(`CNTP_*` 系統暫存器) | PIT 8253(port 0x40/0x43) |
+| 時脈 | 10 MHz(virt 固定) | 讀 `CNTFRQ_EL0` | 1193182 Hz(固定) |
+| 模式 | 單次,每次中斷要重設 | 單次,每次中斷要重設 | **週期性**,設一次即可 |
+| 中斷控制器 | 不需要(CPU 內建) | GICv2(distributor + CPU interface) | PIC 8259 ×2 |
+| 個別開關 | `sie` 的 STIE 位元 | GIC 的 ISENABLER + 計時器 CTL | PIC 遮罩(port 0x21) |
+| 全域開關 | `sstatus.SIE` | `PSTATE.I`(`daifclr #2`) | `eflags.IF`(`sti`) |
+| 識別方式 | `scause` = 中斷 + 碼 5 | 讀 GIC 的 IAR 得中斷號 30 | 向量編號 32(= IRQ 0) |
+| 處理完畢通知 | 重設計時器即清除 | 寫 GIC 的 EOIR | 對 PIC 寫 EOI(0x20) |
+| 檔案 | `arch/riscv64/timer.c` | `arch/aarch64/timer.c` | `arch/i386/timer.c` |
+
+**RISC-V:為什麼要透過 SBI**
+
+計時器(`mtime`/`mtimecmp`)屬於 M-mode,S-mode 的 kernel 不能直接設定。以 `ecall` 請 M-mode 韌體(OpenSBI)代勞,這套介面稱為 SBI:`a7` = 擴充 ID(`0x54494D45`,即 "TIME")、`a6` = 功能 ID、`a0` = 參數。流程是「讀目前時間 → 設定下一次觸發時間 → 中斷時再設下一次」。
+
+**AArch64:為什麼需要 GIC**
+
+ARM 的週邊中斷都要經過中斷控制器才會送到 CPU:
+
+```
+計時器 --(中斷號 30)--> GIC distributor --> GIC CPU interface --> CPU 的 IRQ
+```
+
+- Distributor(`0x08000000`):每個中斷號的開關與優先權。
+- CPU interface(`0x08010000`):讀 `IAR` 認領中斷(得到中斷號),處理完寫 `EOIR`。沒寫 `EOIR`,GIC 不會再送下一個。
+- EL1 實體計時器是中斷號 30(每個 CPU 私有的 PPI)。
+
+**i386:為什麼要重新對映 PIC**
+
+開機時 BIOS 把 IRQ 0~7 對應到向量 8~15,但保護模式下向量 0~31 保留給 CPU 例外(8 是 double fault)。不改的話,計時器中斷會被當成 double fault。所以把 IRQ 0~15 改對應到向量 32~47,並在 IDT 增加這 16 個入口(沿用第 7 步的 `ISR_NOERR` 巨集)。
+
+- 初始化要連續寫入 ICW1~ICW4 四個命令字。
+- 遮罩設為 `0xFE`/`0xFF`:只開 IRQ 0。
+- 中斷閘進入時 CPU 自動清除 IF(關中斷),`iret` 還原 `eflags` 時重新開啟。
+
+### 驗證
+
+三個架構輸出相同:
+
+```
+timer: 100 Hz
+uptime: 1 s (ticks=100)
+uptime: 2 s (ticks=200)
+```
+
+| 架構 | tick 數 | 實測總耗時(含開機) |
+|---|---|---|
+| i386 | 100 / 200 | 2.27 秒 |
+| riscv64 | 100 / 200 | 2.42 秒 |
+| aarch64 | 100 / 200 | 2.40 秒 |
+
+- tick 數精確,總耗時與實際時間吻合(2 秒計時 + 開機),表示頻率設定正確。
+- 兩秒內處理了 200 次中斷,期間主程式的 `kprintf` 與迴圈都正常,顯示中斷的暫存器存檔與還原正確。
+- 第 7 步的 15 個例外測試情境全數通過(回歸)。
+
+### 已知限制
+
+- RISC-V 的 timebase 頻率寫死為 10MHz(QEMU virt);實機應從裝置樹 `/cpus` 的 `timebase-frequency` 讀取。
+- GIC 與 UART 的位址寫死為 QEMU virt 的值;實機應從裝置樹讀取。
+- AArch64 假設為 GICv2(virt 的預設);GICv3 需另外實作。
+- PIT 除數為 16 位元,頻率下限約 19Hz;實際頻率為 1193182/11931 ≈ 100.007Hz,有極小誤差。
+- `kprintf` 不可重入:中斷處理程式與主程式若同時輸出會交錯(目前中斷中不輸出)。

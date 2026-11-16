@@ -34,6 +34,7 @@ add_executable(welyos.elf
     kernel/kprintf.c
     kernel/fdt.c
     kernel/panic.c
+    kernel/timer.c
     lib/string.c)
 target_include_directories(welyos.elf PRIVATE include arch/${ARCH})
 set_target_properties(welyos.elf PROPERTIES LINK_DEPENDS

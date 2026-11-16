@@ -9,9 +9,21 @@
 
 void arch_init(void);                          /* 初始化主控台,之後才能 kprintf */
 void arch_putc(char c);                        /* 輸出一個字元到主控台 */
-void arch_halt(void) __attribute__((noreturn));/* 讓 CPU 永久閒置 */
+void arch_halt(void) __attribute__((noreturn));/* 關閉中斷並永久停住(panic 用) */
 void arch_exit(int code) __attribute__((noreturn)); /* 結束模擬器(僅測試用) */
 const char *arch_name(void);                   /* 架構名稱字串 */
+
+/*
+ * 中斷與計時器。
+ *   arch_timer_init(hz): 設定計時器每秒產生 hz 次中斷(尚未開啟 CPU 中斷)。
+ *                        每次中斷時,架構層須呼叫 timer_tick()(kernel/timer.c)。
+ *   arch_irq_enable/disable: 開啟 / 關閉 CPU 接受中斷。
+ *   arch_idle: 讓 CPU 休眠到下一次中斷再返回(須在中斷開啟時使用)。
+ */
+void arch_timer_init(unsigned hz);
+void arch_irq_enable(void);
+void arch_irq_disable(void);
+void arch_idle(void);
 
 /*
  * 沿著 frame pointer 鏈印出呼叫堆疊(需以 -fno-omit-frame-pointer 編譯)。

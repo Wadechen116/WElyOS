@@ -77,12 +77,13 @@ struct idt_entry {
 static struct idt_entry idt[256];
 static struct desc_ptr idt_ptr;
 
-extern const uint32_t isr_table[32];     /* trap.S:32 個例外入口的位址 */
+#define NUM_VECTORS 48                   /* 0~31 CPU 例外 + 32~47 硬體中斷 */
+extern const uint32_t isr_table[NUM_VECTORS];   /* trap.S:各入口的位址 */
 
 static void idt_init(void)
 {
-    /* 只安裝 CPU 例外(0~31)。32~255 留空;之後的步驟再安裝硬體中斷 */
-    for (int i = 0; i < 32; i++) {
+    /* 安裝 CPU 例外(0~31)與硬體中斷(32~47)。其餘留空 */
+    for (int i = 0; i < NUM_VECTORS; i++) {
         idt[i].offset_low  = (uint16_t)(isr_table[i] & 0xFFFF);
         idt[i].selector    = KERNEL_CS;
         idt[i].zero        = 0;
@@ -129,6 +130,16 @@ static const char *const exc_names[32] = {
 
 void trap_handler(struct trap_frame *tf)
 {
+    /*
+     * 硬體中斷(向量 32~47 = IRQ 0~15):非同步,eip 指向尚未執行的指令,
+     * 處理完直接返回。中斷閘進入時 CPU 已自動關閉中斷(清 IF),
+     * iret 還原 eflags 時會重新開啟。
+     */
+    if (tf->vector >= 32 && tf->vector < 48) {
+        irq_handler(tf->vector - 32);
+        return;
+    }
+
     /*
      * 可恢復的例外:int3。它屬於「trap」類,CPU 存的 eip 已指向下一條指令,
      * 所以直接返回即可(「fault」類如 #UD 的 eip 則指向出錯指令本身)。

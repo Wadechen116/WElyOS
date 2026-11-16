@@ -17,6 +17,7 @@ extern void trap_entry(void);
 
 #define SCAUSE_INTERRUPT (1ULL << 63)   /* scause 最高位元:1 = 中斷,0 = 例外 */
 #define EXC_BREAKPOINT   3
+#define IRQ_S_TIMER      5              /* 中斷碼:S-mode 計時器 */
 
 /* 例外原因表(RISC-V 特權規範,scause 低位元) */
 static const char *const exc_names[] = {
@@ -65,7 +66,14 @@ void trap_handler(struct trap_frame *tf)
     uint64_t cause = tf->scause;
 
     if (cause & SCAUSE_INTERRUPT) {
-        /* 尚未啟用任何中斷(計時器等是之後的步驟),收到就視為錯誤 */
+        /*
+         * 中斷是非同步的:它打斷的指令與中斷無關,sepc 指向「尚未執行的下一條
+         * 指令」,處理完直接返回即可,不需要像例外那樣調整 sepc。
+         */
+        if ((cause & ~SCAUSE_INTERRUPT) == IRQ_S_TIMER) {
+            timer_interrupt();
+            return;
+        }
         panic("unexpected interrupt, scause=0x%llx", (unsigned long long)cause);
     }
 
