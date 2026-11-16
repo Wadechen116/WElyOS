@@ -1,31 +1,7 @@
 #include <stdint.h>
-
-#define COM1 0x3F8
-
-static inline void outb(uint16_t port, uint8_t v)
-{
-    __asm__ volatile("outb %0, %1" : : "a"(v), "Nd"(port));
-}
-
-static inline uint8_t inb(uint16_t port)
-{
-    uint8_t v;
-    __asm__ volatile("inb %1, %0" : "=a"(v) : "Nd"(port));
-    return v;
-}
-
-static void serial_putc(char c)
-{
-    while (!(inb(COM1 + 5) & 0x20))   /* 等待傳送緩衝區空 */
-        ;
-    outb(COM1, (uint8_t)c);
-}
-
-static void serial_puts(const char *s)
-{
-    while (*s)
-        serial_putc(*s++);
-}
+#include "io.h"
+#include "kprintf.h"
+#include "serial.h"
 
 /* QEMU isa-debug-exit:寫入 N,QEMU 以 (N<<1)|1 結束。僅用於測試。 */
 static void qemu_exit(uint8_t code)
@@ -35,6 +11,12 @@ static void qemu_exit(uint8_t code)
 
 void kmain(void)
 {
-    serial_puts("Hello WElyOS\r\n");
-    qemu_exit(0);          /* 結束碼 1 = 成功 */
+    serial_init();
+    kprintf("Hello WElyOS\n");
+    kprintf("char=%c str=%s\n", 'A', "text");
+    kprintf("dec=%d neg=%d uns=%u\n", 42, -42, 4000000000u);
+    kprintf("hex=%x HEX=%X pad=[%08x] w=[%5d] z=[%05d]\n",
+            0xBEEF, 0xBEEF, 0x1234, 7, -7);
+    kprintf("ptr=%p kmain=%p pct=100%%\n", (void *)0, (void *)kmain);
+    qemu_exit(0);
 }

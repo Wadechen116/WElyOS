@@ -62,3 +62,36 @@ cmake --build build --target debug
 ```
 
 **驗證**:`run` 輸出 `Hello WElyOS`,結束碼 0;`debug` 時 1234 埠可連線。
+
+---
+
+## 第 3 步:`kprintf` 格式化輸出
+
+**目標**:kernel 能印出字串、數字、位址,之後除錯與 panic 都靠它。
+
+**重構**
+
+- 序列埠獨立成 `kernel/serial.c` + `include/serial.h`,並新增 `serial_init()`(關中斷、115200 baud、8N1、啟用 FIFO)。
+- I/O port 存取 `outb/inb` 移到 `include/io.h`(inline)。
+- CMake 加入 `include/` 為 include 目錄。
+
+**`kprintf`**(`kernel/kprintf.c`、`include/kprintf.h`)
+
+- 支援 `%c %s %d %i %u %x %X %p %%`,旗標 `0`、寬度(例如 `%08x`、`%5d`)、修飾 `l`。
+- 使用 `<stdarg.h>`:它是編譯器提供的 freestanding 標頭,不需要 libc。
+- `\n` 自動轉成 `\r\n`,序列終端機才會正確換行。
+- 數字以 `out_num()` 統一處理:反向產生位數再倒序輸出;負數取 `0u - v` 以避免 `INT_MIN` 溢位;補零時負號置於零之前(`%05d` 印 -7 得 `-0007`)。
+- `%p` 固定輸出 `0x` + 8 位十六進位(32 位元位址)。
+- 目前不支援浮點、`%ll`(64 位元)、精度(`%.3s`);需要時再擴充。
+
+**驗證**(`run` 的輸出)
+
+```
+Hello WElyOS
+char=A str=text
+dec=42 neg=-42 uns=4000000000
+hex=beef HEX=BEEF pad=[00001234] w=[    7] z=[-0007]
+ptr=0x00000000 kmain=0x0010005a pct=100%
+```
+
+`kmain` 位址 `0x0010005a` 落在 1MB 之後,與 linker script 相符。

@@ -13,7 +13,10 @@ add_link_options(${ARCH_FLAGS} -static -no-pie -Wl,--no-warn-rwx-segments
 
 add_executable(welyos.elf
     arch/i386/boot.S
-    kernel/main.c)
+    kernel/main.c
+    kernel/serial.c
+    kernel/kprintf.c)
+target_include_directories(welyos.elf PRIVATE ${CMAKE_SOURCE_DIR}/include)
 set_target_properties(welyos.elf PROPERTIES LINK_DEPENDS
     ${CMAKE_SOURCE_DIR}/arch/i386/linker.ld)
 

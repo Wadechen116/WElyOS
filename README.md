@@ -10,10 +10,10 @@
 - [x] 序列埠(COM1)輸出
 - [x] CMake 建置,`run` / `debug` target
 - [x] QEMU GDB stub 除錯入口(`-s -S`)
+- [x] `kprintf` 格式化輸出(`%c %s %d %u %x %X %p`,寬度與補零)
 
 ## 規劃中
 
-- [ ] `kprintf` 格式化輸出
 - [ ] VGA 文字螢幕
 - [ ] GDB 除錯流程(`.gdbinit`)
 - [ ] GDT / IDT、例外處理、panic
@@ -39,7 +39,8 @@ cmake --build build --target debug     # 啟動 QEMU 並等待 GDB(tcp::1234)
 
 ```
 arch/i386/    開機程式與 linker script
-kernel/       kernel 主體
+kernel/       kernel 主體(main、serial、kprintf)
+include/      標頭檔(io.h、serial.h、kprintf.h)
 cmake/        toolchain 檔
 scripts/      QEMU 啟動腳本
 docs/         開發紀錄
