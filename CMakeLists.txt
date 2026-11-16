@@ -62,3 +62,7 @@ if(ARCH STREQUAL "i386")
                 bash ${QEMU_SCRIPT} ${ARCH} $<TARGET_FILE:welyos.elf>
         DEPENDS welyos.elf USES_TERMINAL)
 endif()
+# gdb:連到 debug target 啟動的 QEMU(需另一個終端機先執行 debug)
+add_custom_target(gdb
+    COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/gdb.sh ${ARCH} $<TARGET_FILE:welyos.elf>
+    DEPENDS welyos.elf USES_TERMINAL)

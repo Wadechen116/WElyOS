@@ -1,0 +1,20 @@
+# WElyOS 共用的 GDB 設定,由 scripts/gdb.sh 載入
+set pagination off
+set confirm off
+set print pretty on
+set disassemble-next-line off
+
+# 在 kernel 的 C 進入點與例外/panic 處預設中斷點(之後會新增 panic)
+define welyos-start
+  break arch_start
+  break kmain
+  continue
+end
+document welyos-start
+在 arch_start 與 kmain 設中斷點並開始執行。
+end
+
+# 顯示所在函式與原始碼的精簡 backtrace
+define bt-short
+  backtrace 8
+end

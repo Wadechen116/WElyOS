@@ -218,3 +218,129 @@ cmake --preset aarch64 && cmake --build build/aarch64 --target run
 
 - 透過管線(`| grep`)看 QEMU 輸出,若以 timeout 強制結束,最後幾行可能因緩衝而遺失;懷疑時改用 `-serial file:...` 寫到檔案再讀。
 - QEMU monitor(`-monitor stdio`)可用 `xp /4wx <位址>` 檢視實體記憶體、`info registers` 看暫存器。
+
+
+---
+
+## 第 6 步:GDB 除錯
+
+**目標**:用同一個 `gdb-multiarch` 除錯三種架構,在 QEMU 中下中斷點、單步、看暫存器與記憶體。
+
+**需要**:`sudo apt install gdb-multiarch`(Qt 附的 gdb.exe 只支援 x86_64,不能用)。
+
+**元件**
+
+| 檔案 | 作用 |
+|---|---|
+| `scripts/gdb.sh <arch> <elf>` | 選對 `set architecture`(i386 / riscv:rv64 / aarch64)、載入 ELF 符號、連到 QEMU |
+| `scripts/gdbinit` | 共用設定與自訂指令(`welyos-start`、`bt-short`) |
+| CMake `gdb` target | 呼叫 gdb.sh |
+| CMake `debug` target | 啟動 QEMU,帶 `-s -S`(GDB stub 於 tcp::1234,並在第一條指令前暫停) |
+
+**用法(需要兩個終端機)**
+
+```
+# 終端機 A:啟動 QEMU 並暫停等待
+cmake --build build/riscv64 --target debug
+
+# 終端機 B:連上 gdb
+cmake --build build/riscv64 --target gdb
+(gdb) welyos-start        # 在 arch_start、kmain 設中斷點並執行
+(gdb) bt                  # backtrace
+(gdb) info registers
+(gdb) x/5i $pc            # 反組譯
+(gdb) stepi / next / step # 單步
+(gdb) print *bi
+```
+
+**WSL NAT 的連線位址**:QEMU 是 Windows 程式,gdb 在 WSL。NAT 模式下 `127.0.0.1` 連不到,`gdb.sh` 會自動改用 Windows 主機位址(`ip route | awk '/default/{print $3}'`);可用 `GDB_HOST`、`GDB_PORT` 覆寫。
+
+**驗證結果**(三個架構皆以 `-batch` 腳本自動測試)
+
+| 架構 | QEMU 暫停位置 | 中斷點 | backtrace |
+|---|---|---|---|
+| i386 | 0x0000fff0(重設向量) | kmain @0x100625 | kmain → arch_start → _start |
+| riscv64 | 0x00001000(QEMU 內建 ROM) | kmain @0x80200240 | 同上,`dtb=0x87e00000` |
+| aarch64 | 0x40000000 | kmain @0x40080218 | 同上,`dtb=0x44000000` |
+
+三者都能讀取變數(`bi->mem_base`、`bi->cmdline`)與反組譯。
+
+**重點與踩坑**
+
+- **AArch64**:QEMU 載入的是 `welyos.bin`,gdb 讀的是 `welyos.elf` 的符號;兩者位址一致(0x40080000),所以中斷點正常。DTB 位址 `0x44000000` 也證實了:ELF 模式下 QEMU 不載入 DTB。
+- **backtrace 結尾的提示**(`frame did not save the PC` 等):`_start` 沒有呼叫框架資訊(CFI),gdb 無法繼續往上推,屬正常現象。
+- **kmain 不會返回**,所以不能用 `finish`,否則 gdb 會一直等待。
+- **批次模式**結尾要加 `detach` 與 `quit`,否則 gdb 不會結束。
+- **不要用 `pkill -f qemu-...`**:比對字串若出現在自己的指令列,會連目前的 shell 一起殺掉。改用 `taskkill.exe /F /IM qemu-system-xxx.exe`。
+- 暫停在第一條指令時,尚未進入 kernel(位址 `0x...fff0`/`0x1000`/`0x40000000` 是 CPU 重設位置或 QEMU 內建啟動碼),要 `continue` 到中斷點才進入 WElyOS。
+
+---
+
+## 觀念:符號位址如何決定,以及中斷點為何不在函式開頭
+
+以 GDB 看到的 `kmain @ 0x80200240`(RISC-V)、`kmain @ 0x40080218`(AArch64)為例。這兩個數字由**兩層**決定。
+
+### 第一層:函式本身的位址(連結器決定)
+
+| | RISC-V | AArch64 |
+|---|---|---|
+| `linker.ld` 起點 `. = ...` | `0x80200000` | `0x40080000` |
+| `.text` 第一個放 `.text.boot`(`_start`) | `0x80200000` | `0x40080000` |
+| `arch_start` | `0x80200034` | `0x40080044` |
+| `cmdline_has` | `0x8020014a` | `0x400800fc` |
+| **`kmain`** | **`0x80200234`** | **`0x4008020c`** |
+| `kprintf` | `0x80200a48` | `0x40080d2c` |
+
+決定過程:
+
+1. **起點由 `linker.ld` 手動指定**,依硬體與韌體的約定:
+   - RISC-V:OpenSBI 佔用 `0x80000000` 起的空間,約定 S-mode kernel 載入於 `0x80200000`。
+   - AArch64:`virt` 的 RAM 自 `0x40000000` 起,慣例保留前 `0x80000`(給 DTB 等),kernel 放在 `0x40080000`。
+2. **`.text` 內的順序**由 linker script 與連結順序決定:先放 `*(.text.boot)`(`boot.S`,確保 `_start` 在最前),再依 CMake 中列出的檔案順序放 `*(.text*)`:`boot.S` → `start.c` → `arch.c` → `main.c` → `kprintf.c` → `fdt.c` → `string.c`。
+3. **每個函式位址 = 起點 + 它前面所有程式碼的大小**。因此:
+   - 在前面的檔案加幾行程式,`kmain` 的位址就會改變。**不要記位址,要用符號**(`break kmain`、`nm`)。
+   - 同一份 C 程式在不同架構的位址不同,是因為指令長度不同(RISC-V 有 2 位元組壓縮指令,AArch64 固定 4 位元組)。
+
+### 第二層:中斷點位置 = 函式位址 + 序言長度(GDB 決定)
+
+`break kmain` 並不是停在 `kmain` 的第一個位元組,而是**跳過函式序言(prologue)**,停在第一行 C 程式碼。
+
+序言是編譯器在函式開頭產生的固定動作:調整 `sp`、儲存返回位址與框架指標、把傳入參數存到 stack。反組譯如下:
+
+```
+RISC-V                                    AArch64
+80200234 addi sp,sp,-32   ┐               4008020c stp x29,x30,[sp,#-32]!  ┐
+80200236 sd   ra,24(sp)   │ 序言          40080210 mov x29,sp               │ 序言
+80200238 sd   s0,16(sp)   │ (12 位元組)   40080214 str x0,[sp,#24]          ┘ (12 位元組)
+8020023a addi s0,sp,32    │
+8020023c sd   a0,-24(s0)  ┘
+80200240 auipc a0,0x1   ← 第 39 行         40080218 adrp x0,...  ← 第 39 行
+```
+
+- GDB 讀取編譯時由 `-g` 產生的**行號表**(DWARF),找到「第一行原始碼」對應的位址,中斷點下在那裡。所以是 `kmain+12`。
+- 序言執行前,參數與區域變數尚未放入 stack,此時查看會得到不正確的值;停在序言之後才能正確讀取 `bi` 等變數。
+- 想停在函式最前面:`break *kmain` 或 `break *0x80200234`(位址前加 `*` 代表確切位址,不跳過序言)。
+
+### 如何自己驗證
+
+```
+# 列出符號與位址(-n 依位址排序)
+riscv64-unknown-elf-nm -n  build/riscv64/welyos.elf | grep -E " (_start|arch_start|kmain)$"
+aarch64-linux-gnu-nm -n    build/aarch64/welyos.elf | grep -E " (_start|arch_start|kmain)$"
+
+# 查看各區段的起點與大小
+riscv64-unknown-elf-readelf -S build/riscv64/welyos.elf
+
+# 反組譯函式,對照序言與第一行程式碼
+riscv64-unknown-elf-objdump -d --no-show-raw-insn build/riscv64/welyos.elf | less
+```
+
+在程式中也可以直接印出:`kmain` 啟動時會輸出 `kmain=0x...`,應與 `nm` 結果一致(RISC-V 為 `0x80200234`,AArch64 為 `0x4008020c`)。
+
+### 小結
+
+| 問題 | 由誰決定 | 依據 |
+|---|---|---|
+| kernel 載入哪裡 | 我們(`linker.ld`) | 硬體/韌體約定的位址 |
+| 函式放在哪 | 連結器 | 起點 + 檔案順序 + 前面程式碼大小 |
+| 中斷點停在哪 | GDB | 函式位址 + 序言長度(行號表) |

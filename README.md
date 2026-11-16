@@ -10,7 +10,7 @@
 - [x] multiboot 開機(i386,32 位元保護模式);裝置樹(DTB)解析(RISC-V / AArch64)
 - [x] 序列埠(COM1)輸出
 - [x] CMake 建置,`run` / `debug` target
-- [x] QEMU GDB stub 除錯入口(`-s -S`)
+- [x] GDB 除錯:QEMU GDB stub(`-s -S`)加 `gdb-multiarch`,三種架構皆可下中斷點、單步、看暫存器
 - [x] `kprintf` 格式化輸出(`%c %s %d %u %x %X %p`,寬度、補零、`l`/`ll`/`z`)
 - [x] 最小字串函式庫(`memcpy`、`strlen` 等)
 - [x] VGA 文字螢幕(80x25、顏色、硬體游標、自動捲動),`kprintf` 同步輸出到序列埠與螢幕
@@ -18,7 +18,6 @@
 
 ## 規劃中
 
-- [ ] GDB 除錯流程(`.gdbinit`)
 - [ ] GDT / IDT、例外處理、panic
 - [ ] 計時器中斷
 - [ ] 實體記憶體管理、heap
@@ -31,6 +30,7 @@
   - i386:`gcc`(支援 `-m32`)
   - RISC-V 64:`sudo apt install gcc-riscv64-unknown-elf`
   - AArch64:`sudo apt install gcc-aarch64-linux-gnu`
+- 除錯:`sudo apt install gdb-multiarch`
 - QEMU(`qemu-system-i386` / `qemu-system-riscv64` / `qemu-system-aarch64`)。在 WSL 下可使用 Windows 版 QEMU,腳本會自動轉換路徑;也可用環境變數 `QEMU` 指定。
 
 ## 建置與執行
@@ -41,7 +41,8 @@
 cmake --preset riscv64
 cmake --build build/riscv64                    # 只建置
 cmake --build build/riscv64 --target run       # 建置並在 QEMU 執行(序列埠輸出,自動結束)
-cmake --build build/riscv64 --target debug     # 啟動 QEMU 並等待 GDB(tcp::1234)
+cmake --build build/riscv64 --target debug     # 啟動 QEMU 並暫停,等待 GDB(tcp::1234)
+cmake --build build/riscv64 --target gdb       # (另一個終端機)連上 gdb,輸入 welyos-start 開始
 cmake --build build/i386    --target run-gui   # 僅 i386:開啟 QEMU 視窗顯示 VGA 畫面
 ```
 
@@ -53,6 +54,6 @@ include/      與架構無關的標頭(arch.h 為架構介面)
 kernel/       kernel 主體(main、kprintf、fdt)
 lib/          最小字串函式庫
 cmake/        各架構的 toolchain 檔
-scripts/      QEMU 啟動腳本
+scripts/      QEMU 啟動腳本、GDB 腳本與設定
 docs/         開發紀錄
 ```
