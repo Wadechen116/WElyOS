@@ -1,0 +1,46 @@
+/*
+ * boot.S (RISC-V 64) - QEMU virt 機器的啟動程式
+ *
+ * 開機流程:
+ *   1. QEMU 內建的 OpenSBI(M-mode 韌體)先執行,完成基本初始化。
+ *   2. OpenSBI 把 kernel 載入 0x80200000(linker.ld 指定),切到 S-mode 後跳到 _start。
+ *   3. 進入時的暫存器(SBI 規範):
+ *        a0 = hartid(目前 CPU 核心編號)
+ *        a1 = 裝置樹(DTB)的實體位址
+ *      MMU 關閉、中斷關閉,sp 未定義。
+ *   4. 本檔設 stack、清 BSS、呼叫 C 函式 arch_start(hartid, dtb)。
+ */
+    .section .text.boot
+    .global _start
+_start:
+    /* 只讓 hart 0 往下執行;其他核心(若有)在此休眠 */
+    bnez    a0, park
+
+    la      sp, stack_top             /* 設定 stack(RISC-V stack 同樣往低位址成長) */
+
+    /*
+     * 清除 .bss(未初始化全域變數必須為 0)。ELF 載入器不保證替我們清,
+     * 所以自己清。以 8 位元組為單位(linker.ld 保證 __bss_start/end 對齊 8)。
+     * 使用 t0/t1 暫存,不動 a0/a1,它們還要傳給 arch_start。
+     */
+    la      t0, __bss_start
+    la      t1, __bss_end
+1:  bgeu    t0, t1, 2f
+    sd      zero, 0(t0)
+    addi    t0, t0, 8
+    j       1b
+2:
+    call    arch_start                /* a0=hartid, a1=dtb 原樣傳入(C 呼叫慣例) */
+
+park:                                 /* arch_start 不返回;其他核心也停在這裡 */
+    wfi                               /* 等待中斷;中斷關閉時等同閒置 */
+    j       park
+
+    /* 16KB 初始 stack,放在 .bss;RISC-V ABI 要求 16 位元組對齊 */
+    .section .bss
+    .align 4
+    .global stack_bottom
+stack_bottom:
+    .skip 16384
+    .global stack_top
+stack_top:

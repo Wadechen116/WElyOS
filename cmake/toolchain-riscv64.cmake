@@ -1,0 +1,6 @@
+# RISC-V 64 裸機交叉編譯器(apt: gcc-riscv64-unknown-elf)
+set(CMAKE_SYSTEM_NAME Generic)
+set(CMAKE_SYSTEM_PROCESSOR riscv64)
+set(CMAKE_C_COMPILER riscv64-unknown-elf-gcc)
+set(CMAKE_ASM_COMPILER riscv64-unknown-elf-gcc)
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)

@@ -1,0 +1,42 @@
+/*
+ * serial.c - 16550 UART 序列埠驅動(COM1)
+ *
+ * QEMU 以 -serial 把 COM1 接到終端機或檔案,所以這是最早、最可靠的
+ * 除錯輸出管道。
+ */
+#include "io.h"
+#include "serial.h"
+
+#define COM1 0x3F8   /* COM1 的基底 I/O port;其後 +0~+7 為各暫存器 */
+
+/*
+ * 暫存器(相對 COM1):
+ *   +0 資料(DLAB=0)/ 鮑率除數低位元組(DLAB=1)
+ *   +1 中斷致能 / 鮑率除數高位元組(DLAB=1)
+ *   +2 FIFO 控制   +3 線路控制(含 DLAB 位元)
+ *   +4 數據機控制  +5 線路狀態(bit 5 = 傳送緩衝區空)
+ */
+void serial_init(void)
+{
+    outb(COM1 + 1, 0x00);   /* 關閉 UART 中斷(目前採輪詢,不用中斷) */
+    outb(COM1 + 3, 0x80);   /* 開啟 DLAB,以便寫入鮑率除數 */
+    outb(COM1 + 0, 0x01);   /* 除數低位元組 = 1 -> 115200 baud(基頻 / 1) */
+    outb(COM1 + 1, 0x00);   /* 除數高位元組 = 0 */
+    outb(COM1 + 3, 0x03);   /* 關閉 DLAB;格式 8 資料位元、無同位、1 停止位元(8N1) */
+    outb(COM1 + 2, 0xC7);   /* 啟用 FIFO、清空收發緩衝、觸發門檻 14 位元組 */
+    outb(COM1 + 4, 0x03);   /* 拉起 DTR 與 RTS */
+}
+
+void serial_putc(char c)
+{
+    /* 輪詢線路狀態暫存器 bit 5(THRE):為 1 才表示可寫入下一個位元組 */
+    while (!(inb(COM1 + 5) & 0x20))
+        ;
+    outb(COM1, (uint8_t)c);
+}
+
+void serial_puts(const char *s)
+{
+    while (*s)
+        serial_putc(*s++);
+}

@@ -1,0 +1,17 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 20, "patch": 0 },
+  "configurePresets": [
+    { "name": "i386",    "binaryDir": "${sourceDir}/build/i386",
+      "cacheVariables": { "ARCH": "i386" } },
+    { "name": "riscv64", "binaryDir": "${sourceDir}/build/riscv64",
+      "cacheVariables": { "ARCH": "riscv64" } },
+    { "name": "aarch64", "binaryDir": "${sourceDir}/build/aarch64",
+      "cacheVariables": { "ARCH": "aarch64" } }
+  ],
+  "buildPresets": [
+    { "name": "i386",    "configurePreset": "i386" },
+    { "name": "riscv64", "configurePreset": "riscv64" },
+    { "name": "aarch64", "configurePreset": "aarch64" }
+  ]
+}

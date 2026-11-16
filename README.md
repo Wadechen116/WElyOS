@@ -1,20 +1,23 @@
 # WElyOS
 
-以標準 C(C11)從零開發的簡易作業系統,可在 QEMU 上啟動,並可透過 GDB 除錯追蹤。專案從最陽春的階段開始,逐步擴充。
+以標準 C(C11)從零開發的簡易作業系統,支援 **i386、RISC-V 64、AArch64** 三種架構,可在 QEMU 上啟動,並可透過 GDB 除錯追蹤。專案從最陽春的階段開始,逐步擴充。
 
 > 開發過程的逐步紀錄見 [docs/DEVLOG.md](docs/DEVLOG.md)。
 
 ## 目前功能
 
-- [x] multiboot 開機(i386,32 位元保護模式)
+- [x] 多架構:i386、RISC-V 64(QEMU virt)、AArch64(QEMU virt),架構相關程式集中於 `arch/`
+- [x] multiboot 開機(i386,32 位元保護模式);裝置樹(DTB)解析(RISC-V / AArch64)
 - [x] 序列埠(COM1)輸出
 - [x] CMake 建置,`run` / `debug` target
 - [x] QEMU GDB stub 除錯入口(`-s -S`)
-- [x] `kprintf` 格式化輸出(`%c %s %d %u %x %X %p`,寬度與補零)
+- [x] `kprintf` 格式化輸出(`%c %s %d %u %x %X %p`,寬度、補零、`l`/`ll`/`z`)
+- [x] 最小字串函式庫(`memcpy`、`strlen` 等)
+- [x] VGA 文字螢幕(80x25、顏色、硬體游標、自動捲動),`kprintf` 同步輸出到序列埠與螢幕
+- [x] 讀取 multiboot 資訊(開機參數、記憶體大小)
 
 ## 規劃中
 
-- [ ] VGA 文字螢幕
 - [ ] GDB 除錯流程(`.gdbinit`)
 - [ ] GDT / IDT、例外處理、panic
 - [ ] 計時器中斷
@@ -23,25 +26,33 @@
 
 ## 需求
 
-- gcc(支援 `-m32`)、binutils、CMake ≥ 3.20、make
-- QEMU(`qemu-system-i386`)。在 WSL 下可使用 Windows 版 QEMU,腳本會自動轉換路徑;也可用環境變數 `QEMU` 指定。
+- CMake ≥ 3.20、make
+- 各架構的編譯器(WSL/Ubuntu):
+  - i386:`gcc`(支援 `-m32`)
+  - RISC-V 64:`sudo apt install gcc-riscv64-unknown-elf`
+  - AArch64:`sudo apt install gcc-aarch64-linux-gnu`
+- QEMU(`qemu-system-i386` / `qemu-system-riscv64` / `qemu-system-aarch64`)。在 WSL 下可使用 Windows 版 QEMU,腳本會自動轉換路徑;也可用環境變數 `QEMU` 指定。
 
 ## 建置與執行
 
+以 preset 選擇架構(`i386`、`riscv64`、`aarch64`),各自輸出到 `build/<架構>/`:
+
 ```
-cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-i386.cmake
-cmake --build build                    # 只建置
-cmake --build build --target run       # 建置並在 QEMU 執行
-cmake --build build --target debug     # 啟動 QEMU 並等待 GDB(tcp::1234)
+cmake --preset riscv64
+cmake --build build/riscv64                    # 只建置
+cmake --build build/riscv64 --target run       # 建置並在 QEMU 執行(序列埠輸出,自動結束)
+cmake --build build/riscv64 --target debug     # 啟動 QEMU 並等待 GDB(tcp::1234)
+cmake --build build/i386    --target run-gui   # 僅 i386:開啟 QEMU 視窗顯示 VGA 畫面
 ```
 
 ## 專案結構
 
 ```
-arch/i386/    開機程式與 linker script
-kernel/       kernel 主體(main、serial、kprintf)
-include/      標頭檔(io.h、serial.h、kprintf.h)
-cmake/        toolchain 檔
+arch/<名稱>/  各架構的開機程式、linker script、驅動(i386 / riscv64 / aarch64)
+include/      與架構無關的標頭(arch.h 為架構介面)
+kernel/       kernel 主體(main、kprintf、fdt)
+lib/          最小字串函式庫
+cmake/        各架構的 toolchain 檔
 scripts/      QEMU 啟動腳本
 docs/         開發紀錄
 ```
