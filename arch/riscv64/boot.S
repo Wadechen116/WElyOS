@@ -17,6 +17,7 @@ _start:
     bnez    a0, park
 
     la      sp, stack_top             /* 設定 stack(RISC-V stack 同樣往低位址成長) */
+    li      s0, 0                     /* frame pointer 歸零:backtrace 以 0 判斷鏈的終點 */
 
     /*
      * 清除 .bss(未初始化全域變數必須為 0)。ELF 載入器不保證替我們清,

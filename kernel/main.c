@@ -8,6 +8,7 @@
 #include "arch.h"
 #include "boot_info.h"
 #include "kprintf.h"
+#include "panic.h"
 
 /*
  * 開機參數(cmdline)中是否含有指定的「完整單字」(以空白分隔)。
@@ -33,6 +34,31 @@ static int cmdline_has(const char *cmd, const char *word)
     return 0;
 }
 
+/*
+ * 測試用:由開機參數 crash=<種類> 故意觸發錯誤,驗證例外與 panic 處理。
+ *   crash=panic    直接呼叫 panic()
+ *   crash=fault    觸發記憶體/保護錯誤(方式依架構而定,見 arch_test_fault)
+ *   crash=illegal  執行非法指令
+ *   crash=break    執行軟體中斷點指令(可恢復的例外,處理後會繼續往下)
+ */
+static void crash_test(const char *cmd)
+{
+    if (cmdline_has(cmd, "crash=panic")) {
+        panic("test panic, value=%d", 42);
+    } else if (cmdline_has(cmd, "crash=fault")) {
+        kprintf("triggering fault...\n");
+        arch_test_fault();
+        kprintf("fault did not trap!\n");       /* 不應到達這裡 */
+    } else if (cmdline_has(cmd, "crash=illegal")) {
+        kprintf("executing illegal instruction...\n");
+        arch_test_illegal();
+    } else if (cmdline_has(cmd, "crash=break")) {
+        kprintf("executing breakpoint instruction...\n");
+        arch_test_breakpoint();
+        kprintf("survived breakpoint\n");
+    }
+}
+
 /* kernel 主函式。主控台此時已可使用。此函式不會返回。 */
 void kmain(const struct boot_info *bi)
 {
@@ -44,8 +70,13 @@ void kmain(const struct boot_info *bi)
             (unsigned long long)(bi->mem_size >> 10));
     kprintf("kmain=%p\n", (void *)kmain);
 
-    /* 帶 autoexit 參數時(make run)自動結束模擬器,否則留在閒置迴圈 */
-    if (cmdline_has(bi->cmdline, "autoexit"))
+    /* autoexit:自動結束模擬器;並讓 panic 也結束模擬器(回傳失敗碼) */
+    int autoexit = cmdline_has(bi->cmdline, "autoexit");
+    panic_set_exit(autoexit);
+
+    crash_test(bi->cmdline);
+
+    if (autoexit)
         arch_exit(0);
     arch_halt();
 }

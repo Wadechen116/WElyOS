@@ -7,6 +7,7 @@
 #include "boot_info.h"
 #include "multiboot.h"
 #include "kprintf.h"
+#include "trap.h"
 
 /*
  * boot.S 依 multiboot 規範傳入:
@@ -18,6 +19,7 @@ void arch_start(uint32_t magic, uint32_t mbi_addr)
     static struct boot_info bi;
 
     arch_init();                         /* 先初始化輸出裝置,才能印訊息 */
+    trap_init();                         /* 建立 GDT、IDT;之後的例外都會進入 trap_handler */
 
     /* 魔術數不符代表不是由 multiboot 載入,info 結構不可信,直接停機 */
     if (magic != MULTIBOOT_BOOTLOADER_MAGIC) {

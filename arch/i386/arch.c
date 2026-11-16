@@ -3,6 +3,7 @@
  */
 #include "arch.h"
 #include "io.h"
+#include "kprintf.h"
 #include "serial.h"
 #include "vga.h"
 
@@ -38,4 +39,55 @@ void arch_exit(int code)
 const char *arch_name(void)
 {
     return "i386";
+}
+
+/* boot.S 定義的 stack 範圍,用來驗證 frame pointer 是否合理 */
+extern char stack_bottom[], stack_top[];
+
+/*
+ * i386 的 frame 版面(使用 -fno-omit-frame-pointer,ebp 為 frame pointer):
+ *   *(ebp)     = 上一層的 ebp
+ *   *(ebp + 4) = 返回位址
+ * 每一步都檢查 ebp 在 stack 內、對齊、且往高位址前進。
+ */
+void arch_backtrace(uintptr_t pc, uintptr_t fp)
+{
+    int n = 0;
+
+    kprintf("backtrace:\n");
+    if (pc)
+        kprintf("  #%d pc=%p\n", n++, (void *)pc);
+
+    while (n < 16) {
+        if (fp & 3 || fp < (uintptr_t)stack_bottom || fp + 8 > (uintptr_t)stack_top)
+            break;
+        uintptr_t prev = ((uintptr_t *)fp)[0];
+        uintptr_t ra   = ((uintptr_t *)fp)[1];
+        if (!ra)
+            break;
+        kprintf("  #%d ra=%p\n", n++, (void *)ra);
+        if (prev <= fp)
+            break;
+        fp = prev;
+    }
+}
+
+void arch_test_illegal(void)
+{
+    __asm__ volatile("ud2");                 /* 未定義指令,觸發 #UD */
+}
+
+void arch_test_breakpoint(void)
+{
+    __asm__ volatile("int3");
+}
+
+void arch_test_fault(void)
+{
+    /*
+     * 未開啟分頁時,讀寫任何 4GB 內的位址都不會產生例外,所以改用
+     * 保護錯誤:載入一個超出 GDT 範圍的區段選擇子 -> #GP,錯誤碼為該選擇子。
+     */
+    __asm__ volatile("mov $0x38, %%ax\n"
+                     "mov %%ax, %%fs" : : : "eax");
 }

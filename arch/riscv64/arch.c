@@ -6,6 +6,7 @@
  */
 #include <stdint.h>
 #include "arch.h"
+#include "kprintf.h"
 
 /* virt 機器的 NS16550A 序列埠,基底 0x10000000 */
 #define UART0_BASE  0x10000000UL
@@ -47,4 +48,52 @@ void arch_exit(int code)
 const char *arch_name(void)
 {
     return "riscv64";
+}
+
+/* boot.S 定義的 stack 範圍,用來驗證 frame pointer 是否合理 */
+extern char stack_bottom[], stack_top[];
+
+/*
+ * RISC-V 的 frame 版面(使用 -fno-omit-frame-pointer):s0 = fp 指向 frame 頂端,
+ *   *(fp - 8)  = 返回位址 ra
+ *   *(fp - 16) = 上一層的 fp
+ * 沿著這條鏈往回走。每一步都檢查 fp 在 stack 內、對齊、且往高位址前進,
+ * 避免遇到損壞的鏈而再次出錯。
+ */
+void arch_backtrace(uintptr_t pc, uintptr_t fp)
+{
+    int n = 0;
+
+    kprintf("backtrace:\n");
+    if (pc)
+        kprintf("  #%d pc=%p\n", n++, (void *)pc);
+
+    while (n < 16) {
+        if (fp & 7 || fp < (uintptr_t)stack_bottom + 16 || fp > (uintptr_t)stack_top)
+            break;
+        uintptr_t ra   = ((uintptr_t *)fp)[-1];
+        uintptr_t prev = ((uintptr_t *)fp)[-2];
+        if (!ra)
+            break;
+        kprintf("  #%d ra=%p\n", n++, (void *)ra);
+        if (prev <= fp)
+            break;
+        fp = prev;
+    }
+}
+
+void arch_test_illegal(void)
+{
+    __asm__ volatile(".4byte 0xffffffff");   /* 全 1 不是合法指令編碼 */
+}
+
+void arch_test_breakpoint(void)
+{
+    __asm__ volatile("ebreak");
+}
+
+void arch_test_fault(void)
+{
+    volatile int *p = (volatile int *)0;     /* virt 機器的位址 0 沒有裝置 */
+    (void)*p;
 }

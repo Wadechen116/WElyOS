@@ -21,8 +21,9 @@ set(CMAKE_C_EXTENSIONS OFF)
 
 # freestanding:不假設有 OS 或 libc。
 # -fno-tree-loop-distribute-patterns:避免 lib/string.c 的迴圈被改寫成自我呼叫
+# -fno-omit-frame-pointer:保留 frame pointer 鏈,backtrace 才能回溯
 add_compile_options(${ARCH_FLAGS} -ffreestanding -fno-stack-protector -fno-builtin
-                    -fno-tree-loop-distribute-patterns -nostdlib -Wall -Wextra -g)
+                    -fno-tree-loop-distribute-patterns -fno-omit-frame-pointer -nostdlib -Wall -Wextra -g)
 add_link_options(${ARCH_LINK_FLAGS} -ffreestanding -nostdlib -static -no-pie
                  -Wl,--no-warn-rwx-segments
                  -T ${CMAKE_SOURCE_DIR}/arch/${ARCH}/linker.ld)
@@ -32,6 +33,7 @@ add_executable(welyos.elf
     kernel/main.c
     kernel/kprintf.c
     kernel/fdt.c
+    kernel/panic.c
     lib/string.c)
 target_include_directories(welyos.elf PRIVATE include arch/${ARCH})
 set_target_properties(welyos.elf PROPERTIES LINK_DEPENDS

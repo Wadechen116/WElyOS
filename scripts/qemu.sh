@@ -17,10 +17,10 @@ case "$ARCH" in
     MACHINE=(-machine virt -smp 1 -m 128M -bios default) ;;
   aarch64)
     BIN=qemu-system-aarch64
-    # 結束由 PSCI SYSTEM_OFF 處理。
+    # 成功結束由 PSCI SYSTEM_OFF 處理;失敗碼靠 semihosting 回報(需 -semihosting)。
     # 載入原始二進位(.bin)而非 ELF:QEMU 才會把 DTB 位址放進 x0
     ELF="${ELF%.elf}.bin"
-    MACHINE=(-machine virt -cpu cortex-a57 -smp 1 -m 128M) ;;
+    MACHINE=(-machine virt -cpu cortex-a57 -smp 1 -m 128M -semihosting) ;;
   *) echo "未知架構: $ARCH" >&2; exit 1 ;;
 esac
 

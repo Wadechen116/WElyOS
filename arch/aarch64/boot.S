@@ -24,6 +24,7 @@ _start:
     adrp    x1, stack_top
     add     x1, x1, :lo12:stack_top
     mov     sp, x1                    /* AArch64 要求 sp 16 位元組對齊 */
+    mov     x29, xzr                  /* frame pointer 歸零:backtrace 以 0 判斷鏈的終點 */
 
     /* 清除 .bss,以 8 位元組為單位;x0(dtb)保持不動 */
     adrp    x1, __bss_start

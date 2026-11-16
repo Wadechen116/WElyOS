@@ -35,14 +35,17 @@
  */
 .section .bss
 .align 16
+.global stack_bottom
 stack_bottom:
 .skip 16384
+.global stack_top
 stack_top:
 
 .section .text
 .global _start                /* linker.ld 的 ENTRY(_start) 指向此處 */
 _start:
     mov $stack_top, %esp      /* 設定 stack,C 程式才能運作 */
+    xor %ebp, %ebp            /* frame pointer 歸零:backtrace 以 0 判斷鏈的終點 */
 
     /*
      * 依 cdecl 呼叫慣例,參數由右到左推入 stack:

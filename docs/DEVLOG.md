@@ -344,3 +344,318 @@ riscv64-unknown-elf-objdump -d --no-show-raw-insn build/riscv64/welyos.elf | les
 | kernel 載入哪裡 | 我們(`linker.ld`) | 硬體/韌體約定的位址 |
 | 函式放在哪 | 連結器 | 起點 + 檔案順序 + 前面程式碼大小 |
 | 中斷點停在哪 | GDB | 函式位址 + 序言長度(行號表) |
+
+---
+
+## 第 7 步(RISC-V):例外處理與 panic
+
+**目標**:kernel 出錯時不再無聲卡住,而是印出原因、暫存器與呼叫堆疊;並驗證「例外 → 處理 → 返回」這條路是對的。
+
+### 什麼是 trap
+
+CPU 遇到例外(非法指令、存取錯誤、`ebreak`…)或中斷時,**硬體**自動:
+
+1. 把當時的 pc 存進 `sepc`,原因存進 `scause`,附加資訊(出錯位址、非法指令內容)存進 `stval`
+2. 關閉中斷(`sstatus.SIE` 清 0),舊狀態記在 `sstatus.SPIE`
+3. 跳到 `stvec` 指向的位址
+
+硬體**不會**替我們存任何一般暫存器,所以入口程式必須先全部存起來,否則被打斷的程式會被破壞。
+
+### 元件
+
+| 檔案 | 作用 |
+|---|---|
+| `arch/riscv64/trap.S` | `trap_entry`:挖出 trap frame、存 x1~x31 與 4 個 CSR、呼叫 C、還原、`sret` |
+| `arch/riscv64/trap.c` | `trap_init()` 設定 `stvec`;`trap_handler()` 判斷原因並處理 |
+| `arch/riscv64/trap.h` | `struct trap_frame`(版面須與 `trap.S` 一致) |
+| `kernel/panic.c`、`include/panic.h` | 與架構無關的 `panic()` |
+| `arch_backtrace()` | 三個架構各自實作,沿 frame pointer 鏈回溯 |
+| `scripts/backtrace.sh` | 把 backtrace 位址轉成「函式 at 檔案:行號」 |
+
+### trap frame 版面
+
+`trap.S` 把暫存器依編號存在 stack 上,`trap.c` 的 `struct trap_frame` 欄位順序必須完全一致,並以 `_Static_assert` 在編譯期檢查:
+
+| slot | 內容 | offset |
+|---|---|---|
+| 0~30 | x1~x31(slot = 暫存器編號 − 1;x0 恆為 0 不存) | 0~240 |
+| 31 | sepc | 248 |
+| 32 | sstatus | 256 |
+| 33 | scause | 264 |
+| 34 | stval | 272 |
+
+共 35 slot = 280 位元組,補到 288 以維持 16 位元組對齊。`x2`(sp)存的是被打斷時的值(目前 sp + 288),不是 trap 當下的 sp。
+
+### 處理流程
+
+```
+例外發生 → 硬體存 sepc/scause/stval,跳到 stvec
+  → trap_entry:存暫存器 → 呼叫 trap_handler(frame)
+      ├ 中斷:目前尚未啟用,視為錯誤 → panic
+      ├ breakpoint(可恢復):印訊息、sepc += 指令長度、return
+      └ 其他例外:印 scause/sepc/stval/暫存器/backtrace → panic_halt
+  → 還原 CSR 與暫存器 → sret(回到 sepc)
+```
+
+- **跳過 ebreak**:`sepc` 指向 `ebreak` 本身,不調整會無限重複。指令長度看低 2 位元:`11` 為 4 位元組,否則為 2 位元組壓縮指令(`ebreak` 有 2 位元組的 `c.ebreak` 版本)。
+- `handler` 修改 frame 內的 `sepc`,`trap.S` 返回前才寫回 CSR,所以可以改變返回位置。
+
+### 常見 scause 值
+
+| scause | 意義 | 範例 |
+|---|---|---|
+| 2 | 非法指令 | `stval` 為該指令的編碼 |
+| 3 | 中斷點 | `ebreak` |
+| 5 | 讀取存取錯誤 | `stval` 為出錯位址 |
+| 7 | 寫入存取錯誤 | 同上 |
+| 12/13/15 | 指令/讀取/寫入 page fault | 啟用分頁後才會出現 |
+| 最高位元為 1 | 中斷(非例外) | 如計時器 |
+
+### panic 與測試用開機參數
+
+`panic()` 印出訊息與 backtrace。行為由 `panic_set_exit()` 決定:帶 `autoexit` 時結束 QEMU 並回傳**失敗碼**(讓腳本與 CI 能判斷),否則永久閒置(方便用 GDB 檢查現場)。
+
+測試以開機參數觸發:
+
+```
+bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit crash=fault"
+```
+
+| 參數 | 行為 | RISC-V 結果 |
+|---|---|---|
+| `crash=panic` | 直接呼叫 `panic()` | KERNEL PANIC,rc=1 |
+| `crash=fault` | 讀取位址 0(原名 `crash=null`,見下方「跨架構」一節) | Load access fault(scause=5, stval=0),rc=1 |
+| `crash=illegal` | 執行非法指令 | Illegal instruction(scause=2, stval=0xffffffff),rc=1 |
+| `crash=break` | 執行軟體中斷點(`ebreak`) | 印出 resuming、繼續執行、印出 survived,rc=0 |
+
+`crash=break` 驗證了整條「存檔 → 處理 → 還原 → sret」路徑:若任何暫存器還原錯誤,後面的程式就會壞掉。
+
+### backtrace
+
+使用 `-fno-omit-frame-pointer` 保留 frame pointer 鏈。各架構的 frame 版面不同:
+
+| 架構 | fp 暫存器 | 上一層 fp | 返回位址 |
+|---|---|---|---|
+| RISC-V | s0 | `*(fp − 16)` | `*(fp − 8)` |
+| i386 | ebp | `*(ebp)` | `*(ebp + 4)` |
+| AArch64 | x29 | `*(fp)` | `*(fp + 8)` |
+
+回溯時每一步都檢查:fp 在 stack 範圍內、對齊、且往高位址前進,避免遇到損壞的鏈時再次出錯。`boot.S` 把 fp 歸零,作為鏈的終點。
+
+**用工具解析**(自動處理下面的 `−1`):
+
+```
+bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit crash=fault" > log.txt
+bash scripts/backtrace.sh riscv64 build/riscv64/welyos.elf < log.txt
+  #0 crash_test at kernel/main.c:51
+  #1 kmain at kernel/main.c:77
+  #2 arch_start at arch/riscv64/start.c:21
+  #3 _start at arch/riscv64/boot.S:34
+```
+
+**為什麼 `ra` 要減 1 才能查**:`ra` 是返回位址,即呼叫指令的**下一條**。若被呼叫的是不會返回的函式(如 `kmain`),呼叫指令是呼叫者的最後一條,返回位址就剛好落在**下一個函式**的開頭,直接查會得到錯誤的函式(實測曾把 `arch_start` 誤判成 `arch_init`)。減 1 後必定落在呼叫那一行。`pc`(出錯指令位址)則不用減。
+
+**限制**:葉函式(leaf)若沒有建立 frame,則該層會被略過;沒有符號表在 kernel 內,故只印位址,靠 `addr2line` 還原。
+
+### 踩坑
+
+- **把架構專屬指令寫進共用程式碼**:一度在 `kernel/main.c` 直接寫 RISC-V 的 `ebreak`,i386 組譯失敗。改成 `arch_test_breakpoint()`、`arch_test_illegal()`,由各架構實作。
+- **檢查建置結果要看結束碼**:我的 `grep error` 只比對小寫,漏掉組譯器的 `Error:`,導致 i386 / AArch64 用舊的執行檔測試,看起來「沒有 panic」。教訓:以 `cmake --build ...; echo rc=$?` 確認建置成功,且比對 `kmain=` 位址是否變動。
+- **AArch64 失敗碼**:PSCI `SYSTEM_OFF` 無法帶結束碼,panic 會被誤判為成功(rc=0)。失敗時改用 semihosting `SYS_EXIT`(`hlt #0xf000`,`qemu.sh` 為 aarch64 加 `-semihosting`),成功仍用 PSCI。
+- **i386 的結束碼**:`isa-debug-exit` 寫入 N 得到 `(N<<1)|1`,成功為 1(腳本轉成 0)、panic 為 3。
+
+---
+
+## 第 7 步(AArch64):例外向量表
+
+### 機制
+
+例外發生時硬體自動:返回位址存入 `ELR_EL1`、處理器狀態存入 `SPSR_EL1`、原因存入 `ESR_EL1`、出錯位址存入 `FAR_EL1`,然後跳到 **`VBAR_EL1` + 偏移**。
+
+與 RISC-V「單一入口、再看 scause」不同,AArch64 用**向量表**:16 個入口,每個固定 0x80 位元組,整張表須 2KB 對齊。
+
+| 偏移 | 來源 | 四個入口(各 0x80) |
+|---|---|---|
+| 0x000 | 目前 EL,使用 SP_EL0 | sync / IRQ / FIQ / SError |
+| 0x200 | 目前 EL,使用 SP_ELx(**kernel 平常的狀態**) | 同上 |
+| 0x400 | 較低 EL,AArch64(未來的使用者程式) | 同上 |
+| 0x600 | 較低 EL,AArch32 | 同上 |
+
+- **sync**:由指令本身引發(未定義指令、存取錯誤、`brk`、`svc`)。原因細分看 `ESR_EL1` 的 EC 欄位(bit 31:26)。
+- **IRQ / FIQ / SError**:非同步;目前尚未啟用,收到即 panic。
+
+### 實作
+
+- `trap.S`:`VENTRY` 巨集產生 16 個入口,每個只做「挖 frame、存 x0/x1、帶種類編號跳到 `trap_common`」(入口空間只有 32 條指令)。`trap_common` 存其餘暫存器與 4 個系統暫存器,呼叫 `trap_handler(frame, kind)`,還原後 `eret`。
+- trap frame:x0~x30、sp、elr、spsr、esr、far,共 36 slot = 288 位元組。
+- `trap_init()`:`msr vbar_el1` 後加 `isb`,確保設定在後續指令前生效。
+- `brk` 的 `ELR` 指向 `brk` 本身,處理時 `elr += 4`(AArch64 指令固定 4 位元組)。
+
+### 常見 EC 值
+
+| EC | 意義 |
+|---|---|
+| 0x00 | 未知原因(通常是未定義指令) |
+| 0x15 | SVC(系統呼叫) |
+| 0x21 / 0x20 | Instruction abort(同 EL / 較低 EL) |
+| 0x25 / 0x24 | Data abort(同 EL / 較低 EL),`FAR` 為出錯位址 |
+| 0x22 / 0x26 | PC / SP 對齊錯誤 |
+| 0x3C | BRK 中斷點 |
+
+### 踩坑
+
+- **backtrace 少一層**:`arch_test_fault → kmain`,中間的 `crash_test` 不見。AArch64 的 GCC 預設不替**葉函式**建立 frame record(返回位址只留在 `x30`),即使有 `-fno-omit-frame-pointer`。加上 `-mno-omit-leaf-frame-pointer` 後完整。
+- **位址 0 不會出錯**:virt 機器的位址 0 是 flash,讀得到。改讀超出 CPU 實體位址範圍的位址(`0x0010000000000000`),MMU 關閉時產生 address size fault(Data abort,`FAR` 即該位址)。
+
+---
+
+## 第 7 步(i386):GDT、IDT 與例外入口
+
+### 為什麼 x86 多了 GDT
+
+保護模式下,`cs`/`ds` 等區段暫存器存的是**選擇子**,指向 GDT(全域描述符表)的一項,描述區段的基底、長度、權限。multiboot 進入時區段可用,但 bootloader 的 GDT 位置不保證保留,而 IDT 的每一項都要參照程式碼區段選擇子,所以必須先建立自己的 GDT。
+
+採**平坦模型**:基底 0、長度 4GB,等於不使用分段(位址保護之後交給分頁)。
+
+| 索引 | 選擇子 | 內容 | access |
+|---|---|---|---|
+| 0 | 0x00 | 空描述符(規定) | — |
+| 1 | 0x08 | kernel 程式碼 | 0x9A |
+| 2 | 0x10 | kernel 資料 | 0x92 |
+
+載入:`lgdt` 後,資料區段可直接 `mov`;**`cs` 不能 `mov`,必須用遠跳躍(`ljmp $0x08, $1f`)** 才會重新載入。
+
+### IDT 與例外入口
+
+CPU 以向量編號(0~255)查 IDT,在 stack 推入 `eflags`、`cs`、`eip`(部分例外再推**錯誤碼**),然後跳到入口。
+
+兩個麻煩,以巨集解決:
+
+1. **CPU 不告訴入口自己是第幾號**:每個向量各有一個小入口,把編號推上 stack 再跳到共用的 `isr_common`。
+2. **有的例外有錯誤碼(8、10~14、17、21、29、30),有的沒有**:沒有的自己補推一個 0,讓 stack 版面統一。
+
+統一後的 trap frame(低位址在前):`pusha` 的 8 個暫存器 → `vector`、`err` → CPU 推入的 `eip`、`cs`、`eflags`。
+
+- 閘類型 `0x8E`:存在、ring 0、32 位元中斷閘。
+- 目前只安裝 0~31(CPU 例外);32~255 留待硬體中斷步驟。
+- 同權限等級發生例外時 CPU **不推入** `esp`/`ss`,出錯當下的 esp 以「`eflags` 之後的位址」推算。
+
+### trap 與 fault 的差別
+
+| 類別 | 存入的 eip | 範例 | 返回後 |
+|---|---|---|---|
+| fault | 指向**出錯指令本身** | #UD、#GP、#PF | 重新執行該指令(修好原因才有意義) |
+| trap | 指向**下一條指令** | #BP(`int3`) | 繼續往下 |
+
+所以 `int3` 處理後直接返回即可,不用像 RISC-V(`sepc += 長度`)、AArch64(`elr += 4`)那樣手動跳過。
+
+### 踩坑與注意
+
+- **未開分頁時沒有記憶體存取例外**:讀寫任何 4GB 內的位址都不會出錯。測試改用保護錯誤:載入超出 GDT 範圍的選擇子(`0x38`)→ #GP,錯誤碼即該選擇子。真正的 page fault 要等分頁步驟。
+- **`-mgeneral-regs-only`**:kernel 不使用 x87/SSE(尚未初始化 FPU,也免得例外入口要存浮點狀態)。
+- **`cld`**:呼叫 C 之前清除方向旗標,這是 C 呼叫慣例的要求。
+
+---
+
+## 第 7 步總結:三個架構的例外處理對照
+
+| | RISC-V | AArch64 | i386 |
+|---|---|---|---|
+| 入口設定 | `stvec` | `VBAR_EL1` | IDT(`lidt`),需先有 GDT |
+| 入口數量 | 1 個 | 16 個(向量表) | 每個向量 1 個(256) |
+| 原因 | `scause` | `ESR_EL1` 的 EC | 向量編號 + 錯誤碼 |
+| 返回位址 | `sepc` | `ELR_EL1` | stack 上的 `eip` |
+| 出錯位址 | `stval` | `FAR_EL1` | `CR2`(僅 page fault) |
+| 狀態 | `sstatus` | `SPSR_EL1` | stack 上的 `eflags` |
+| 返回指令 | `sret` | `eret` | `iret` |
+| 硬體自動存 | 只存到 CSR | 只存到系統暫存器 | 推入 stack |
+| 中斷點 | `ebreak`,要 `sepc += 2或4` | `brk`,要 `elr += 4` | `int3`,不用調整 |
+| 檔案 | `trap.S`/`trap.c`/`trap.h` | 同左 | 同左(含 GDT/IDT) |
+
+三者的 C 介面一致:`trap_init()` 由各自的 `arch_start()` 呼叫;錯誤最後都走 `arch_backtrace()` 與 `panic_halt()`。
+
+### 跨架構的測試(`crash=` 開機參數)
+
+原本的 `crash=null`(讀位址 0)只在 RISC-V 會出錯,因此改為 `crash=fault`,由 `arch_test_fault()` 以各架構可行的方式觸發:
+
+| 架構 | `crash=fault` 的做法 | 得到的例外 |
+|---|---|---|
+| riscv64 | 讀位址 0 | Load access fault |
+| aarch64 | 讀超出實體位址範圍的位址 | Data abort |
+| i386 | 載入無效的區段選擇子 | General protection fault (#GP) |
+
+同理 `arch_test_illegal()`、`arch_test_breakpoint()` 也由各架構實作。
+
+### 驗證矩陣(QEMU 結束碼)
+
+| | 無 | break | panic | illegal | fault |
+|---|---|---|---|---|---|
+| i386 | 0 | 0 | 3 | 3 | 3 |
+| riscv64 | 0 | 0 | 1 | 1 | 1 |
+| aarch64 | 0 | 0 | 1 | 1 | 1 |
+
+- 0 = 成功;非 0 = 失敗(i386 為 3 是因為 `isa-debug-exit` 的結束碼為 `(N<<1)|1`)。
+- `break` 三者都印出 `resuming` 與 `survived breakpoint`,證明「存檔 → 處理 → 還原 → 返回」正確。
+- 三個架構的 backtrace 經 `scripts/backtrace.sh` 解析後完全一致:`arch_test_xxx → crash_test → kmain → arch_start → _start`。
+
+測試方式:
+
+```
+for c in break panic illegal fault; do
+  bash scripts/qemu.sh aarch64 build/aarch64/welyos.elf -append "autoexit crash=$c"; echo "rc=$?"
+done
+```
+
+---
+
+## 觀念:中斷點為何要調整返回位址(sepc += 2 或 4、elr += 4)
+
+關鍵問題:**例外發生時,CPU 存下來的返回位址指向哪裡?**
+
+### RISC-V、AArch64:存的是「引發例外的指令本身」
+
+同步例外一律把引發例外的那條指令位址存進 `sepc` / `ELR_EL1`。這是為了「修好原因再重試」:例如 page fault,kernel 補上缺的分頁後返回,CPU 重新執行同一條指令就會成功。
+
+但中斷點不是可以修好的錯誤,`ebreak` / `brk` 指令本身就是原因:
+
+```
+sepc / elr → ebreak / brk     ← 返回位址指向這裡
+              下一條指令
+```
+
+處理完若直接返回,CPU 會再執行一次同一條指令 → 再進例外 → 再返回,形成**無限迴圈**。所以處理程式必須自己把返回位址往後推,跳過這條指令。
+
+### 為什麼 RISC-V 是 2 或 4,AArch64 固定是 4
+
+要跳過一條指令,必須知道它的長度:
+
+- **AArch64**:所有指令固定 4 位元組 → `elr += 4`。
+- **RISC-V**:有壓縮指令擴充(C extension;我們以 `rv64imac` 編譯,其中的 `c`)。常用指令有 2 位元組的短版本,`ebreak` 也有(`c.ebreak`),組譯器會自動選用。因此要先判斷長度:**指令最低 2 位元為 `11` 表示 4 位元組,否則為 2 位元組**。
+
+  ```c
+  uint16_t first = *(volatile uint16_t *)tf->sepc;
+  tf->sepc += ((first & 3) == 3) ? 4 : 2;
+  ```
+
+  若固定加 4 而實際是 2 位元組的 `c.ebreak`,返回位址會落在下一條指令的中間,CPU 會把錯位的位元組當成指令執行。
+
+### 為什麼 i386 不用調整
+
+x86 把例外分成兩類,由硬體決定存哪個位址:
+
+| 類別 | 存入的 eip | 例子 | 返回後 |
+|---|---|---|---|
+| fault | 出錯指令本身 | #PF、#GP、#UD | 重新執行(修好原因才有意義) |
+| trap | **下一條指令** | #BP(`int3`) | 繼續往下 |
+
+`int3` 屬於 trap,CPU 已存好下一條指令的位址,直接 `iret` 即可。
+
+### 小結
+
+| 架構 | 中斷點返回位址指向 | 處理方式 | 指令長度 |
+|---|---|---|---|
+| RISC-V | `ebreak` 本身 | `sepc += 2 或 4` | 2(壓縮)或 4 |
+| AArch64 | `brk` 本身 | `elr += 4` | 固定 4 |
+| i386 | `int3` 的下一條 | 不用調整 | (硬體已處理) |
+
+RISC-V 與 AArch64 把「要不要跳過」交給軟體決定;x86 由硬體依例外類別決定。同樣的道理日後也適用於系統呼叫:RISC-V 的 `ecall` 返回前要 `sepc += 4`,否則會重複執行系統呼叫(AArch64 的 `svc` 則由硬體存下一條指令的位址)。
