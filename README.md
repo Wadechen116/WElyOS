@@ -19,9 +19,10 @@
 - [x] 讀取 multiboot 資訊(開機參數、記憶體大小)
 - [x] 計時器中斷(1000Hz tick):RISC-V SBI timer、AArch64 GICv2 + generic timer、i386 PIC + PIT(以 TSC 校正);中斷延遲時會補記遺失的 tick,不累積誤差
 - [x] 實體記憶體管理(位元圖頁面配置器,`pmm_alloc`)與 kernel heap(`kmalloc` / `kfree`,first-fit 加相鄰合併,可偵測重複釋放)
-- [x] 核心執行緒與排程器:三個架構的 context switch、round-robin、計時器搶佔(時間片 10ms)、`thread_yield` / `thread_sleep`、stack 溢位偵測
+- [x] 核心執行緒與排程器:三個架構的 context switch、round-robin、計時器搶佔(時間片 10ms)、`thread_yield` / `thread_sleep`
 - [x] 同步機制:等待佇列、semaphore、mutex(偵測重複上鎖與非擁有者解鎖)、`thread_join`
 - [x] 分頁(MMU):i386 2 層、RISC-V Sv39、AArch64 4KB/39 位元;恆等對映、大分頁(2MB / 4MB)與自動拆分、W^X(程式碼唯讀、資料不可執行)、NULL 指標偵測
+- [x] kernel stack 保護頁與獨立的例外 stack:溢位在發生當下被攔下並回報(i386 以 TSS 加 double fault 工作閘);閒置 stack 快取重複使用
 
 ## 規劃中
 
@@ -47,7 +48,7 @@ cmake --build build/riscv64                    # 只建置
 cmake --build build/riscv64 --target run       # 建置並在 QEMU 執行(序列埠輸出,自動結束)
 cmake --build build/riscv64 --target debug     # 啟動 QEMU 並暫停,等待 GDB(tcp::1234)
 cmake --build build/riscv64 --target gdb       # (另一個終端機)連上 gdb,輸入 welyos-start 開始
-bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit crash=fault"  # 故意觸發錯誤(crash=panic|fault|illegal|break|dfree|stack|thread|relock|null|wtext|exec)
+bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit crash=fault"  # 故意觸發錯誤(crash=panic|fault|illegal|break|dfree|stack|thread|relock|null|wtext|exec|mainstack)
 bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit memtest"      # 完整記憶體測試:寫入並驗證每一個空閒頁
 bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit stress"       # 排程器壓力測試:建立 1000 條執行緒
 cmake --build build/i386    --target run-gui   # 僅 i386:開啟 QEMU 視窗顯示 VGA 畫面

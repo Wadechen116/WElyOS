@@ -224,7 +224,8 @@ static void sleep_worker(void *arg)
 
 static void sched_demo(void)
 {
-    size_t free0 = pmm_free_count();
+    sched_trim();                            /* 基準:快取中不留閒置的 stack */
+    size_t free0 = pmm_free_count() + vm_table_pages();
     struct kheap_stats h0, h1;
     int t[3];
     kheap_stats(&h0);
@@ -254,9 +255,11 @@ static void sched_demo(void)
     join_all(t, 3);
 
     /* 所有示範執行緒都結束後,它們的 stack 與結構都應該已歸還 */
+    sched_trim();                            /* 快取中閒置的 stack 也要還回去才能核對 */
     kheap_stats(&h1);
     KASSERT(sched_thread_count() == 1);
-    KASSERT(pmm_free_count() == free0);
+    /* 保護頁會把所在的大分頁拆開,多出來的頁表不會歸還,所以一併計入 */
+    KASSERT(pmm_free_count() + vm_table_pages() == free0);
     KASSERT(h1.free_bytes == h0.free_bytes);
     kprintf("sched: all threads exited, memory reclaimed\n");
 }
@@ -425,9 +428,16 @@ static void stress_worker(void *arg)
     sem_post(&stress_sem);
 }
 
+static void churn_worker(void *arg)
+{
+    (void)arg;
+}
+
 static void sched_stress(void)
 {
-    size_t free0 = pmm_free_count();
+    sched_trim();                            /* 先清掉前面示範留在快取裡的 stack,基準才準 */
+    size_t free0 = pmm_free_count() + vm_table_pages();
+    size_t used0 = pmm_free_count();
     unsigned long sw0 = sched_switch_count();
     uint64_t t0 = timer_ticks();
     unsigned created = 0;
@@ -440,26 +450,38 @@ static void sched_stress(void)
         created++;
     }
     kprintf("stress: created %u threads, %zu KB used (stacks + thread structs)\n", created,
-            (free0 - pmm_free_count()) * (PAGE_SIZE / 1024));
+            (used0 - pmm_free_count()) * (PAGE_SIZE / 1024));
     for (unsigned i = 0; i < created; i++)
         sem_wait(&stress_sem);               /* 每等到一次代表一條完成 */
     thread_sleep(10);                        /* post 之後它們還要一點時間真正結束並被回收 */
     kprintf("stress: all finished in %llu ticks, %lu context switches\n",
             (unsigned long long)(timer_ticks() - t0), sched_switch_count() - sw0);
     KASSERT(created == STRESS_THREADS && sched_thread_count() == 1);
+
+    /* 第二階段:一條接一條地建立並等待結束(同時只有一條存活)。
+       這是 stack 快取發揮作用的情況:每次都重複使用同一條 stack,
+       不必重新配置頁面、移除保護頁的對映、清 TLB */
+    t0 = timer_ticks();
+    for (unsigned i = 0; i < STRESS_THREADS; i++) {
+        int tid = thread_create("churn", churn_worker, NULL);
+        KASSERT(tid > 0);
+        thread_join(tid);
+    }
+    kprintf("stress: %u sequential create+join in %llu ticks\n", STRESS_THREADS,
+            (unsigned long long)(timer_ticks() - t0));
     /* stack 必須全部歸還。heap 為了放 1000 個 struct thread 而向 pmm 多要的頁
        不會歸還(kmalloc 的已知限制),所以要扣掉;但那些空間在 heap 內必須都已空閒 */
     kheap_stats(&h1);
     size_t heap_grow = h1.heap_bytes - h0.heap_bytes;
-    KASSERT(pmm_free_count() == free0 - heap_grow / PAGE_SIZE);
+    sched_trim();
+    KASSERT(pmm_free_count() + vm_table_pages() == free0 - heap_grow / PAGE_SIZE);
     KASSERT(h1.free_bytes == h0.free_bytes + heap_grow);
     kprintf("stress: ok (stacks reclaimed, heap grew by %zu KB)\n", heap_grow / 1024);
 }
 
 /*
- * crash=stack:遞迴到超出 16KB 的 stack,排程器應在下次切換時發現。
- * 每層都把區域陣列整個寫滿:記號只有 stack 最底端的 4 個位元組,
- * 如果只寫陣列的一小部分,可能剛好「跨過」記號而沒有蓋到它,就偵測不到。
+ * crash=stack:遞迴到超出 16KB 的 stack。stack 下方的保護頁沒有對映,
+ * 一碰到就觸發例外,應在溢位的當下被攔下並回報為 KERNEL STACK OVERFLOW。
  */
 static int overflow_recurse(int depth)
 {
@@ -467,7 +489,7 @@ static int overflow_recurse(int depth)
     for (unsigned i = 0; i < sizeof(pad); i++)
         pad[i] = (char)depth;
     if (depth == 0) {
-        thread_yield();                      /* 在最深處讓出 -> schedule() 檢查記號 */
+        thread_yield();                      /* 不應到達:途中就該碰到保護頁 */
         return pad[0];
     }
     return overflow_recurse(depth - 1) + pad[0];
@@ -492,6 +514,10 @@ static void sched_crash_test(const char *cmd)
         kprintf("overflowing a thread stack...\n");
         thread_create("overflow", overflow_worker, NULL);
         thread_sleep(100);
+    } else if (cmdline_has(cmd, "crash=mainstack")) {
+        /* 同樣的溢位,但發生在 main 執行緒使用的開機 stack(它也有保護頁) */
+        kprintf("overflowing the boot stack...\n");
+        overflow_recurse(40);
     } else if (cmdline_has(cmd, "crash=thread")) {
         thread_create("faulty", fault_worker, NULL);
         thread_sleep(100);

@@ -6,6 +6,7 @@
 #include "arch.h"
 #include "kprintf.h"
 #include "panic.h"
+#include "sched.h"
 #include "trap.h"
 
 /* 編譯期檢查:C 結構必須與 trap.S 的版面一致 */
@@ -92,6 +93,7 @@ void trap_handler(struct trap_frame *tf)
     if (cause < sizeof(exc_names) / sizeof(exc_names[0]) && exc_names[cause])
         name = exc_names[cause];
 
+    sched_report_overflow(tf->sp, tf->stval);    /* 若是 stack 溢位,先指出來 */
     kprintf("\n*** EXCEPTION: %s ***\n", name);
     kprintf("  scause =0x%llx\n", (unsigned long long)cause);
     kprintf("  sepc   =0x%llx   (發生例外的指令位址)\n", (unsigned long long)tf->sepc);

@@ -20,16 +20,39 @@
     .align 4                          /* stvec 要求位址 4 位元組對齊(直接模式) */
     .global trap_entry
 trap_entry:
-    addi    sp, sp, -FRAME_SIZE       /* 在目前 stack 上挖出 trap frame */
+    /*
+     * 第一件事:檢查 stack 還放不放得下 trap frame。
+     * 如果例外的原因正是 stack 溢位,sp 此刻指著保護頁(沒有對映),
+     * 直接往下存暫存器會再次觸發例外,又進到這裡,無窮迴圈。
+     * 所以先比較 sp 與目前執行緒的 stack 下限(kstack_limit,排程器維護);
+     * 不夠就改用專用的例外 stack(exc_stack),讓處理程式能正常執行並回報。
+     *
+     * 做比較需要一個暫存器,但此刻所有暫存器都還是被打斷程式的值,
+     * 不能直接拿來用。sscratch 是專為這種情況設計的 CSR:先把 t0 暫放進去。
+     */
+    csrw    sscratch, t0
+    la      t0, kstack_limit
+    ld      t0, 0(t0)
+    addi    t0, t0, FRAME_SIZE        /* sp 至少要比下限高出一個 frame */
+    bgeu    sp, t0, 1f
 
-    /* 存 x1 與 x3~x31。x2 是 sp,稍後處理;t0(x5)先存下才能拿來當暫存 */
+    /* 溢位:改用例外 stack;原本的 sp 記進 frame 供回報 */
+    mv      t0, sp
+    la      sp, exc_stack_top
+    addi    sp, sp, -FRAME_SIZE
+    sd      t0, 8(sp)                 /* x2 的 slot = 被打斷時的 sp */
+    j       2f
+
+1:  addi    sp, sp, -FRAME_SIZE       /* 正常:在目前 stack 上挖出 trap frame */
+    addi    t0, sp, FRAME_SIZE
+    sd      t0, 8(sp)                 /* x2 的 slot = 被打斷時的 sp */
+
+2:  csrr    t0, sscratch              /* 取回 t0 原本的值 */
+
+    /* 存 x1 與 x3~x31(x2 即 sp,上面已存) */
     .irp    n, 1,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
     sd      x\n, (\n-1)*8(sp)
     .endr
-
-    /* 被打斷時的 sp = 目前 sp + FRAME_SIZE,存進 x2 的 slot */
-    addi    t0, sp, FRAME_SIZE
-    sd      t0, 8(sp)
 
     /* 存 CSR */
     csrr    t0, sepc
@@ -57,3 +80,14 @@ trap_entry:
 
     addi    sp, sp, FRAME_SIZE        /* 釋放 trap frame,sp 回到被打斷時的值 */
     sret                              /* 回到 sepc,並依 sstatus.SPIE 還原中斷狀態 */
+
+/*
+ * 例外專用 stack(8KB):只在偵測到 kernel stack 溢位時使用。
+ * 那種情況必定以 panic 收場,不會返回,所以全系統共用一條即可。
+ */
+    .section .bss
+    .balign 16
+exc_stack:
+    .skip 8192
+    .global exc_stack_top
+exc_stack_top:

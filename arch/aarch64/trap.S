@@ -18,10 +18,34 @@
  */
 #define FRAME_SIZE 288
 
-/* 每個向量入口空間有限(0x80),只做最少的事:挖 frame、存 x0/x1、帶著種類編號跳走 */
+/*
+ * 每個向量入口空間有限(0x80 = 32 條指令)。
+ *
+ * 第一件事:檢查 stack 還放不放得下 trap frame。如果例外的原因正是 stack 溢位,
+ * sp 此刻指著保護頁(沒有對映),直接存暫存器會再次觸發例外、無窮迴圈。
+ * 所以先比較 sp 與目前執行緒的 stack 下限(kstack_limit,排程器維護),
+ * 不夠就改用專用的例外 stack(exc_stack)。
+ *
+ * 比較需要兩個暫存器,但此刻所有暫存器都還是被打斷程式的值。
+ * 借用兩個 kernel 沒有其他用途的系統暫存器 TPIDR_EL1、TPIDRRO_EL0 暫放 x0、x1。
+ */
 .macro VENTRY kind
     .align  7                         /* 每個入口對齊到 0x80 */
-    sub     sp, sp, #FRAME_SIZE
+    msr     tpidr_el1, x0
+    msr     tpidrro_el0, x1
+    adrp    x0, kstack_limit
+    ldr     x0, [x0, :lo12:kstack_limit]
+    add     x0, x0, #FRAME_SIZE       /* sp 至少要比下限高出一個 frame */
+    mov     x1, sp                    /* x1 = 被打斷時的 sp */
+    cmp     x1, x0
+    b.hs    1f
+    adrp    x0, exc_stack_top         /* 溢位:改用例外 stack */
+    add     x0, x0, :lo12:exc_stack_top
+    mov     sp, x0
+1:  sub     sp, sp, #FRAME_SIZE       /* 挖出 trap frame */
+    str     x1, [sp, #248]            /* slot 31 = 被打斷時的 sp */
+    mrs     x0, tpidr_el1             /* 取回 x0、x1 原本的值 */
+    mrs     x1, tpidrro_el0
     stp     x0, x1, [sp, #0]
     mov     x0, #\kind                /* 0~15:第幾個向量,供 C 判斷來源與種類 */
     b       trap_common
@@ -69,8 +93,7 @@ trap_common:
     stp     x26, x27, [sp, #208]
     stp     x28, x29, [sp, #224]
 
-    add     x2, sp, #FRAME_SIZE       /* 被打斷時的 sp */
-    stp     x30, x2, [sp, #240]
+    str     x30, [sp, #240]           /* slot 31(被打斷時的 sp)已在入口存好 */
 
     mrs     x2, elr_el1
     mrs     x3, spsr_el1
@@ -106,3 +129,14 @@ trap_common:
     ldr     x30, [sp, #240]
     add     sp, sp, #FRAME_SIZE
     eret                              /* 回到 ELR_EL1,並以 SPSR_EL1 還原狀態 */
+
+/*
+ * 例外專用 stack(8KB):只在偵測到 kernel stack 溢位時使用。
+ * 那種情況必定以 panic 收場,不會返回,所以全系統共用一條即可。
+ */
+    .section .bss
+    .balign 16
+exc_stack:
+    .skip 8192
+    .global exc_stack_top
+exc_stack_top:

@@ -27,11 +27,12 @@
 #include "pmm.h"
 #include "sched.h"
 #include "timer.h"
+#include "vm.h"
 
 #define STACK_PAGES   4u                     /* 每條執行緒的 stack:16KB */
 #define STACK_SIZE    (STACK_PAGES * PAGE_SIZE)
 #define TIME_SLICE_MS 10u                    /* 時間片長度(毫秒) */
-#define STACK_CANARY  0x57454C59u            /* "WELY":放在 stack 最底端的記號 */
+#define STACK_CACHE_MAX 32u                  /* 最多保留幾條閒置的 stack 供重複使用 */
 
 enum thread_state {
     T_READY,       /* 在執行佇列中等待輪到 */
@@ -46,7 +47,7 @@ struct thread {
     int id;
     const char *name;
     enum thread_state state;
-    char *stack;               /* stack 的最低位址;開機 stack 與此不同來源,為 NULL */
+    char *stack;               /* 配置區塊的起點(= 保護頁);開機 stack 不是配置來的,為 NULL */
     uintptr_t stack_lo, stack_hi;
     void (*fn)(void *);        /* 進入點與參數 */
     void *arg;
@@ -57,8 +58,10 @@ struct thread {
     struct wait_queue joiners; /* 正在 thread_join 等我結束的執行緒 */
 };
 
-/* 開機時 boot.S 設定的 stack,main 執行緒繼續使用它 */
-extern char stack_bottom[], stack_top[];
+/* 開機時 boot.S 設定的 stack,main 執行緒繼續使用它;stack_guard 是它下方的保護頁 */
+extern char stack_guard[], stack_bottom[], stack_top[];
+
+uintptr_t kstack_limit;                      /* 見 sched.h */
 
 static struct thread main_thread;            /* 開機流程本身 */
 static struct thread *current;               /* 正在執行的執行緒;NULL = 排程器未啟動 */
@@ -145,13 +148,91 @@ int wq_wake_all(struct wait_queue *wq)
  * 回收已結束的執行緒。執行緒不能釋放自己正踩著的 stack,
  * 所以由「切換過去的下一條執行緒」代為釋放。
  */
+static void stack_free(char *stack);
+
 static void reap(void)
 {
     struct thread *z = zombie;
     if (z && z != current) {
         zombie = NULL;
-        pmm_free_pages(z->stack, STACK_PAGES);
+        stack_free(z->stack);
         kfree(z);
+    }
+}
+
+/*
+ * 執行緒的 stack:配置 STACK_PAGES + 1 頁,最低的一頁是「保護頁」(guard page),
+ * 把它從頁表移除。stack 往低位址成長,用過頭就會碰到保護頁,立刻觸發 page fault,
+ * 不會悄悄寫壞相鄰的記憶體。
+ *
+ *     低位址                                              高位址
+ *     | 保護頁(不對映) |        可用的 stack(16KB)        |
+ *     ^ stack           ^ stack_lo                          ^ stack_hi
+ *
+ * 快取:結束的執行緒把 stack 放進 stack_cache,下次建立直接取用。
+ * 省下的不只是頁面配置,還有「移除保護頁對映 + 清 TLB」與結束時的「對映回來 + 清 TLB」,
+ * 這兩個才是比較貴的操作。閒置的 stack 用它自己的第一個可用位元組串成串列。
+ */
+static char *stack_cache;                    /* 閒置 stack 的串列(存的是配置區塊起點) */
+static unsigned stack_cached;
+
+static char *stack_alloc(void)
+{
+    unsigned long flags = arch_irq_save();
+    char *st = stack_cache;
+    if (st) {
+        stack_cache = *(char **)(st + PAGE_SIZE);
+        stack_cached--;
+    }
+    arch_irq_restore(flags);
+    if (st)
+        return st;
+
+    st = pmm_alloc_pages(STACK_PAGES + 1);
+    if (!st)
+        return NULL;
+    if (vm_unmap((uintptr_t)st) != 0) {      /* 移除保護頁的對映 */
+        pmm_free_pages(st, STACK_PAGES + 1);
+        return NULL;
+    }
+    return st;
+}
+
+/* 把一條 stack 真正還給 pmm:保護頁要先對映回來,否則下一個拿到這頁的人無法使用 */
+static void stack_release(char *st)
+{
+    if (vm_map((uintptr_t)st, (uintptr_t)st, VM_READ | VM_WRITE) != 0)
+        panic("sched: cannot remap guard page %p", (void *)st);
+    pmm_free_pages(st, STACK_PAGES + 1);
+}
+
+static void stack_free(char *st)
+{
+    unsigned long flags = arch_irq_save();
+    if (stack_cached < STACK_CACHE_MAX) {
+        *(char **)(st + PAGE_SIZE) = stack_cache;
+        stack_cache = st;
+        stack_cached++;
+        st = NULL;
+    }
+    arch_irq_restore(flags);
+    if (st)
+        stack_release(st);
+}
+
+void sched_trim(void)
+{
+    for (;;) {
+        unsigned long flags = arch_irq_save();
+        char *st = stack_cache;
+        if (st) {
+            stack_cache = *(char **)(st + PAGE_SIZE);
+            stack_cached--;
+        }
+        arch_irq_restore(flags);
+        if (!st)
+            break;
+        stack_release(st);
     }
 }
 
@@ -164,10 +245,6 @@ static void schedule(void)
     struct thread *prev = current;
 
     need_resched = 0;
-
-    /* stack 往低位址成長,用過頭會先蓋掉最底端的記號 */
-    if (prev->stack && *(uint32_t *)prev->stack != STACK_CANARY)
-        panic("stack overflow in thread %d (%s)", prev->id, prev->name);
 
     if (prev->state == T_RUNNING && prev != idle_thread)
         rq_push(prev);
@@ -182,6 +259,7 @@ static void schedule(void)
         return;                              /* 只有自己可跑,不必切換 */
 
     current = next;
+    kstack_limit = next->stack_lo;           /* 例外入口用它檢查 stack 是否溢位 */
     nswitches++;
     arch_switch(&prev->sp, next->sp);
 
@@ -210,13 +288,12 @@ static struct thread *thread_alloc(const char *name, void (*fn)(void *), void *a
     struct thread *t = kzalloc(sizeof(*t));
     if (!t)
         return NULL;
-    t->stack = pmm_alloc_pages(STACK_PAGES);
+    t->stack = stack_alloc();
     if (!t->stack) {
         kfree(t);
         return NULL;
     }
-    *(uint32_t *)t->stack = STACK_CANARY;
-    t->stack_lo = (uintptr_t)t->stack;
+    t->stack_lo = (uintptr_t)t->stack + PAGE_SIZE;       /* 最低一頁是保護頁 */
     t->stack_hi = t->stack_lo + STACK_SIZE;
     t->name = name;
     t->fn = fn;
@@ -242,6 +319,11 @@ void sched_init(void)
     main_thread.stack_lo = (uintptr_t)stack_bottom;
     main_thread.stack_hi = (uintptr_t)stack_top;
     nthreads = 1;
+
+    /* 開機 stack 下方由 boot.S 預留了一頁,同樣移除對映當作保護頁 */
+    if (vm_unmap((uintptr_t)stack_guard) != 0)
+        panic("sched: cannot unmap boot stack guard page");
+    kstack_limit = main_thread.stack_lo;
 
     idle_thread = thread_alloc("idle", idle_main, NULL);
     if (!idle_thread)
@@ -372,6 +454,24 @@ const char *thread_name(void)  { return current ? current->name : "boot"; }
 int thread_id(void)            { return current ? current->id : 0; }
 unsigned sched_thread_count(void)      { return nthreads; }
 unsigned long sched_switch_count(void) { return nswitches; }
+
+int sched_report_overflow(uintptr_t sp, uintptr_t fault_addr)
+{
+    uintptr_t lo, hi;
+
+    sched_stack_bounds(&lo, &hi);
+    /* 兩種跡象:stack pointer 已經低於可用範圍,或出錯位址落在保護頁內 */
+    int sp_out = sp < lo && sp >= lo - STACK_SIZE;
+    int in_guard = fault_addr >= lo - PAGE_SIZE && fault_addr < lo;
+    if (!sp_out && !in_guard)
+        return 0;
+
+    kprintf("\n*** KERNEL STACK OVERFLOW in thread %d (%s) ***\n",
+            thread_id(), thread_name());
+    kprintf("  stack %p-%p, guard page %p, sp=%p\n", (void *)lo, (void *)hi,
+            (void *)(lo - PAGE_SIZE), (void *)sp);
+    return 1;
+}
 
 void sched_stack_bounds(uintptr_t *lo, uintptr_t *hi)
 {

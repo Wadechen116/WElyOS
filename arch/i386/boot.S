@@ -34,7 +34,10 @@
  * 16 位元組對齊是 System V i386 ABI 對呼叫時 stack 的要求。
  */
 .section .bss
-.align 16
+.balign 4096
+.global stack_guard           /* 保護頁:排程器啟動時移除對映,stack 用過頭會立刻出錯 */
+stack_guard:
+.skip 4096
 .global stack_bottom
 stack_bottom:
 .skip 16384

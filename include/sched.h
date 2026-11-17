@@ -71,4 +71,20 @@ void sched_irq_exit(void);
 
 /* 目前執行緒的 stack 範圍 [lo, hi),backtrace 用來驗證 frame pointer */
 void sched_stack_bounds(uintptr_t *lo, uintptr_t *hi);
+
+/*
+ * 目前執行緒 stack 的最低可用位址。RISC-V 與 AArch64 的例外入口(組合語言)
+ * 會讀這個變數,在存暫存器之前先檢查 stack pointer 是否已經超出範圍。
+ * 排程器在每次切換時更新。0 表示尚未啟用檢查。
+ */
+extern uintptr_t kstack_limit;
+
+/*
+ * 例外處理程式在致命錯誤時呼叫:依出錯當下的 stack pointer 與出錯位址,
+ * 判斷是否為 kernel stack 溢位,是的話印出說明並回傳 1。
+ */
+int sched_report_overflow(uintptr_t sp, uintptr_t fault_addr);
+
+/* 釋放快取中閒置的執行緒 stack(記憶體不足時,或測試要核對記憶體用量時呼叫) */
+void sched_trim(void);
 #endif

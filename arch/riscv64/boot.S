@@ -39,7 +39,10 @@ park:                                 /* arch_start 不返回;其他核心也停
 
     /* 16KB 初始 stack,放在 .bss;RISC-V ABI 要求 16 位元組對齊 */
     .section .bss
-    .align 4
+    .balign 4096
+    .global stack_guard               /* 保護頁:排程器啟動時移除對映,stack 用過頭會立刻出錯 */
+stack_guard:
+    .skip 4096
     .global stack_bottom
 stack_bottom:
     .skip 16384

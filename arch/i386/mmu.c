@@ -18,6 +18,7 @@
  *   CR2          發生 page fault 時,CPU 把出錯的位址放在這裡
  */
 #include "mmu.h"
+#include "trap.h"
 #include "vm.h"
 
 #define PTE_P   0x001u
@@ -62,6 +63,8 @@ unsigned arch_pte_flags(pte_t e)
 void arch_mmu_enable(pte_t *root)
 {
     uint32_t cr0, cr4;
+
+    trap_set_page_table((uint32_t)root);     /* double fault 的工作切換會載入它 */
 
     __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
     cr4 |= 0x10u;                            /* PSE:必須在開啟分頁之前設定 */
