@@ -26,5 +26,6 @@ void pmm_free(void *page);
 void pmm_free_pages(void *page, size_t n);
 
 size_t pmm_total_pages(void);   /* 管理的總頁數 */
+uintptr_t pmm_mem_start(void);  /* 第 0 頁的實體位址(管理範圍的起點) */
 size_t pmm_free_count(void);    /* 目前可用的頁數 */
 #endif

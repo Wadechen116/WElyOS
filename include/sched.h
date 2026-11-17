@@ -12,7 +12,8 @@
 struct thread;
 
 /* 初始化排程器:把目前正在跑的開機流程登記為第一條執行緒(main)。
-   需先完成 pmm_init();之後才能呼叫本檔其他函式 */
+   需先完成 pmm_init() 與 timer_init()(時間片要依 tick 頻率換算);
+   之後才能呼叫本檔其他函式 */
 void sched_init(void);
 
 /* 建立一條執行緒,從 fn(arg) 開始執行;fn 返回即結束。

@@ -11,10 +11,11 @@
  *
  * ARM generic timer 是 CPU 內建的計時器,以系統暫存器操作:
  *   CNTFRQ_EL0    計數頻率(Hz)
- *   CNTP_TVAL_EL0 倒數值:寫入 N 表示 N 個計數後觸發
+ *   CNTPCT_EL0    目前的計數值(只會遞增)
+ *   CNTP_CVAL_EL0 比較值:計數值到達這個絕對時間就觸發
  *   CNTP_CTL_EL0  控制:bit 0 啟用,bit 1 遮蔽輸出
  * EL1 實體計時器的中斷號是 30(屬於每個 CPU 私有的 PPI)。
- * 同樣是「單次鬧鐘」,中斷處理程式中要重新寫入倒數值。
+ * 同樣是「單次鬧鐘」,中斷處理程式中要寫入下一次的比較值。
  */
 #include <stdint.h>
 #include "arch.h"
@@ -50,6 +51,16 @@ static inline uint32_t mmio_r32(uintptr_t addr)
 }
 
 static uint64_t interval;          /* 每個 tick 的計數值 */
+static uint64_t deadline;          /* 下一個 tick 應該發生的絕對時間 */
+
+#define MAX_CATCHUP 100            /* 一次中斷最多補記幾個 tick */
+
+static uint64_t read_counter(void)
+{
+    uint64_t t;
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t));
+    return t;
+}
 
 void arch_timer_init(unsigned hz)
 {
@@ -65,7 +76,8 @@ void arch_timer_init(unsigned hz)
     /* 計時器:依頻率算出每個 tick 的計數,寫入倒數值並啟用 */
     __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
     interval = freq / hz;
-    __asm__ volatile("msr cntp_tval_el0, %0" : : "r"(interval));
+    deadline = read_counter() + interval;
+    __asm__ volatile("msr cntp_cval_el0, %0" : : "r"(deadline));
     __asm__ volatile("msr cntp_ctl_el0, %0" : : "r"(1UL));
 }
 
@@ -79,9 +91,22 @@ void irq_handler(void)
         return;
 
     if (id == IRQ_TIMER) {
-        /* 重新寫入倒數值:同時讓計時器的中斷訊號消失 */
-        __asm__ volatile("msr cntp_tval_el0, %0" : : "r"(interval));
-        timer_tick();
+        /*
+         * 下一次的時間以「上一次的預定時間 + 間隔」計算,不以「現在」為基準,
+         * 中斷送達的延遲才不會累積成時鐘變慢。若晚了不只一個間隔,
+         * 把錯過的 tick 補記回來(說明見 arch/riscv64/timer.c)。
+         */
+        uint64_t now = read_counter();
+        int n = 0;
+        while (deadline <= now && n < MAX_CATCHUP) {
+            timer_tick();
+            deadline += interval;
+            n++;
+        }
+        if (deadline <= now)                 /* 落後太多:放棄補記,重新對時 */
+            deadline = now + interval;
+        /* 寫入新的比較值:同時讓計時器的中斷訊號消失 */
+        __asm__ volatile("msr cntp_cval_el0, %0" : : "r"(deadline));
     } else {
         kprintf("[irq] unexpected interrupt %u\n", id);
     }

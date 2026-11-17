@@ -30,7 +30,7 @@
 
 #define STACK_PAGES   4u                     /* 每條執行緒的 stack:16KB */
 #define STACK_SIZE    (STACK_PAGES * PAGE_SIZE)
-#define TIME_SLICE    5u                     /* 時間片:5 個 tick(100Hz 時為 50ms) */
+#define TIME_SLICE_MS 10u                    /* 時間片長度(毫秒) */
 #define STACK_CANARY  0x57454C59u            /* "WELY":放在 stack 最底端的記號 */
 
 enum thread_state {
@@ -71,6 +71,7 @@ static volatile int need_resched;            /* 中斷中設定:返回前要重�
 static unsigned nthreads;                    /* 存活數(不含 idle) */
 static unsigned long nswitches;
 static int next_id;
+static unsigned time_slice = 1;              /* 時間片換算成 tick 數,sched_init 依計時器頻率設定 */
 
 static void schedule(void);
 
@@ -176,7 +177,7 @@ static void schedule(void)
         next = idle_thread;                  /* 所有人都在睡:跑 idle 等中斷 */
 
     next->state = T_RUNNING;
-    next->slice = TIME_SLICE;
+    next->slice = time_slice;
     if (next == prev)
         return;                              /* 只有自己可跑,不必切換 */
 
@@ -228,10 +229,16 @@ static struct thread *thread_alloc(const char *name, void (*fn)(void *), void *a
 
 void sched_init(void)
 {
+    /* 時間片以毫秒定義,再依實際的 tick 頻率換算,所以改頻率不必改這裡。
+       時間片越短反應越快,但切換次數越多、花在切換上的比例越高 */
+    time_slice = timer_hz() * TIME_SLICE_MS / 1000;
+    if (time_slice == 0)
+        time_slice = 1;
+
     main_thread.id = next_id++;
     main_thread.name = "main";
     main_thread.state = T_RUNNING;
-    main_thread.slice = TIME_SLICE;
+    main_thread.slice = time_slice;
     main_thread.stack_lo = (uintptr_t)stack_bottom;
     main_thread.stack_hi = (uintptr_t)stack_top;
     nthreads = 1;
@@ -350,7 +357,7 @@ void sched_tick(void)
         if (rq_head)
             need_resched = 1;
         else
-            current->slice = TIME_SLICE;
+            current->slice = time_slice;
     }
 }
 

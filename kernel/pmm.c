@@ -130,11 +130,19 @@ static void *alloc_pages_locked(size_t n)
 
     /* first-fit:從 hint 往後找第一段連續 n 個 0 */
     size_t run = 0;                        /* 目前連續空閒的頁數 */
+    size_t first_free = npages;            /* 這次掃描遇到的第一個空閒頁 */
     for (size_t i = hint; i < npages; i++) {
+        /* 加速:位於位元組邊界且整個位元組都是 1(8 頁全在使用中),一次跳過 */
+        if (run == 0 && (i & 7) == 0 && bitmap[i / 8] == 0xFF) {
+            i += 7;
+            continue;
+        }
         if (bit_test(i)) {
             run = 0;
             continue;
         }
+        if (first_free == npages)
+            first_free = i;
         if (++run < n)
             continue;
 
@@ -142,8 +150,16 @@ static void *alloc_pages_locked(size_t n)
         for (size_t j = first; j <= i; j++)
             bit_set(j);
         nfree -= n;
-        if (first == hint)                 /* 最低的空閒頁被拿走,提示往後移 */
-            hint = i + 1;
+        /*
+         * 更新 hint,維持「比 hint 小的頁都不是空閒的」:
+         *   - 配置到的就是掃描中遇到的第一個空閒頁:它之前全是使用中,
+         *     所以下次可以直接從這段之後開始找
+         *   - 否則(前面有不夠長的空洞被跳過):hint 移到那個空洞
+         * 重點是 hint 一定要跨過「已使用」的區段往前推進。若只在
+         * first == hint 時才更新,hint 一旦停在使用中的頁上就永遠不動,
+         * 之後每次配置都重掃同一段,配置 n 頁變成 O(n^2)(見 DEVLOG 第 12 步)。
+         */
+        hint = (first_free == first) ? i + 1 : first_free;
         return (void *)(mem_start + ((uintptr_t)first << PAGE_SHIFT));
     }
     return NULL;                           /* 總數夠但沒有夠長的連續區段 */
@@ -183,4 +199,5 @@ void pmm_free(void *page)
 }
 
 size_t pmm_total_pages(void) { return npages; }
+uintptr_t pmm_mem_start(void) { return mem_start; }
 size_t pmm_free_count(void)  { return nfree; }

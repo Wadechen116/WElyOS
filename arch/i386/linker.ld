@@ -10,7 +10,13 @@ SECTIONS
     /* 程式碼。.multiboot 必須最先放,bootloader 才能在檔案開頭找到 header */
     .text   : { *(.multiboot) *(.text*) }
 
+    /* 各區段對齊到頁(4KB):分頁的權限以頁為單位,
+       程式碼、唯讀資料、可寫資料不能共用同一頁 */
+    . = ALIGN(4096);
+    __text_end = .;
     .rodata : { *(.rodata*) } /* 唯讀資料(字串常數等) */
+    . = ALIGN(4096);
+    __rodata_end = .;
     .data   : { *(.data*) }   /* 已初始化的全域變數 */
     .bss    : {                /* 未初始化的全域變數與 stack;載入時為 0 */
         __bss_start = .;

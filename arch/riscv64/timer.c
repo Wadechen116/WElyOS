@@ -28,6 +28,9 @@
 #define SIE_STIE (1UL << 5)            /* sie 的 bit 5:允許 S-mode 計時器中斷 */
 
 static uint64_t interval;              /* 每個 tick 相當於多少 timebase 單位 */
+static uint64_t deadline;              /* 下一個 tick 應該發生的絕對時間 */
+
+#define MAX_CATCHUP 100                /* 一次中斷最多補記幾個 tick */
 
 static uint64_t read_time(void)
 {
@@ -48,14 +51,34 @@ static void sbi_set_timer(uint64_t when)
 void arch_timer_init(unsigned hz)
 {
     interval = TIMEBASE_HZ / hz;
-    sbi_set_timer(read_time() + interval);
+    deadline = read_time() + interval;
+    sbi_set_timer(deadline);
     __asm__ volatile("csrs sie, %0" : : "r"(SIE_STIE));
 }
 
-/* 由 trap_handler 在收到 S-mode 計時器中斷時呼叫 */
+/*
+ * 由 trap_handler 在收到 S-mode 計時器中斷時呼叫。
+ *
+ * 下一次的時間用「上一次的預定時間 + 間隔」計算,而不是「現在 + 間隔」。
+ * 中斷實際送達的時間總會比預定晚一點;若每次都以「現在」為基準,
+ * 這些延遲會一直累加,時鐘越走越慢。以預定時間為基準就不會累積誤差。
+ *
+ * 如果晚了不只一個間隔(中斷被關閉太久,或模擬器的主機排程延遲),
+ * 就把錯過的 tick 一次補記回來,系統時間才不會落後。
+ */
 void timer_interrupt(void)
 {
-    sbi_set_timer(read_time() + interval);   /* 設定下一次,並清除本次的待處理狀態 */
-    timer_tick();
+    uint64_t now = read_time();
+    int n = 0;
+
+    while (deadline <= now && n < MAX_CATCHUP) {
+        timer_tick();
+        deadline += interval;
+        n++;
+    }
+    if (deadline <= now)                     /* 落後太多(例如被除錯器暫停):放棄補記,重新對時 */
+        deadline = now + interval;
+
+    sbi_set_timer(deadline);                 /* 設定下一次,並清除本次的待處理狀態 */
     sched_irq_exit();                        /* 時間片用完就在這裡換人(下一次鬧鐘已設好) */
 }

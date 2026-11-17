@@ -15,6 +15,8 @@
 #include "sched.h"
 #include "sync.h"
 #include "timer.h"
+#include "vm.h"
+#include "mmu.h"
 
 /*
  * 開機參數(cmdline)中是否含有指定的「完整單字」(以空白分隔)。
@@ -47,6 +49,9 @@ static int cmdline_has(const char *cmd, const char *word)
  *   crash=illegal  執行非法指令
  *   crash=break    執行軟體中斷點指令(可恢復的例外,處理後會繼續往下)
  *   crash=dfree    同一塊記憶體釋放兩次(驗證 kfree 的檢查)
+ *   crash=null     讀取 NULL 指標(位址 0 沒有對映 -> page fault)
+ *   crash=wtext    寫入 kernel 程式碼(唯讀頁 -> page fault)
+ *   crash=exec     跳到資料頁執行(不可執行頁 -> page fault;i386 無此保護)
  * (crash=stack、crash=thread、crash=relock 需要排程器,在 sched_demo 之前另外處理)
  */
 static void crash_test(const char *cmd)
@@ -69,7 +74,110 @@ static void crash_test(const char *cmd)
         kprintf("freeing %p twice...\n", p);
         kfree(p);
         kfree(p);
+    } else if (cmdline_has(cmd, "crash=null")) {
+        volatile int *p = NULL;
+        kprintf("reading from NULL...\n");
+        kprintf("read %d?!\n", *p);               /* 不應到達 */
+    } else if (cmdline_has(cmd, "crash=wtext")) {
+        volatile char *p = (volatile char *)(uintptr_t)kmain;
+        kprintf("writing to kernel text at %p...\n", (void *)(uintptr_t)kmain);
+        *p = 0;
+        kprintf("write succeeded?!\n");           /* 不應到達 */
+    } else if (cmdline_has(cmd, "crash=exec")) {
+        if (!MMU_HAS_NX) {
+            kprintf("crash=exec: this page-table format has no NX bit, skipped\n");
+            return;
+        }
+        void *page = pmm_alloc();                 /* 一般的資料頁:可讀寫、不可執行 */
+        memset(page, 0, PAGE_SIZE);
+        kprintf("jumping to data page %p...\n", page);
+        ((void (*)(void))(uintptr_t)page)();
+        kprintf("execution returned?!\n");        /* 不應到達 */
     }
+}
+
+/*
+ * 分頁示範:查詢權限、把一個實體頁對映到兩個不同的虛擬位址(別名)。
+ */
+static const char *perm_str(unsigned f, char buf[4])
+{
+    buf[0] = (f & VM_READ) ? 'r' : '-';
+    buf[1] = (f & VM_WRITE) ? 'w' : '-';
+    buf[2] = (f & VM_EXEC) ? 'x' : '-';
+    buf[3] = '\0';
+    return buf;
+}
+
+static void vm_demo(void)
+{
+    static int data_var = 1;
+    static const int ro_var = 2;
+    uintptr_t pa;
+    unsigned f1, f2, f3;
+    char b1[4], b2[4], b3[4];
+
+    /* 1. 各區段的權限 */
+    KASSERT(vm_query((uintptr_t)kmain, &pa, &f1) == 0 && pa == (uintptr_t)kmain);
+    KASSERT(vm_query((uintptr_t)&ro_var, NULL, &f2) == 0);
+    KASSERT(vm_query((uintptr_t)&data_var, NULL, &f3) == 0);
+    kprintf("vm: kmain %s, rodata %s, data %s\n",
+            perm_str(f1, b1), perm_str(f2, b2), perm_str(f3, b3));
+    KASSERT(!(f1 & VM_WRITE) && !(f2 & VM_WRITE) && (f3 & VM_WRITE));
+    KASSERT(vm_query(0, NULL, NULL) != 0);             /* NULL 頁沒有對映 */
+
+    /* 2. 別名:兩個虛擬位址指向同一個實體頁。這兩個位址都在 RAM 之外,
+          原本沒有任何東西;對映之後才變得可以存取 */
+    const uintptr_t va1 = 0xC0000000u, va2 = 0xC0001000u;
+    unsigned long tables0 = vm_table_pages();
+    volatile uint32_t *phys = pmm_alloc();
+    KASSERT(phys != NULL);
+    KASSERT(vm_query(va1, NULL, NULL) != 0);
+    KASSERT(vm_map(va1, (uintptr_t)phys, VM_READ | VM_WRITE) == 0);
+    KASSERT(vm_map(va2, (uintptr_t)phys, VM_READ) == 0);
+
+    volatile uint32_t *v1 = (volatile uint32_t *)va1;
+    volatile uint32_t *v2 = (volatile uint32_t *)va2;
+    *v1 = 0x12345678;                        /* 從第一個虛擬位址寫入 */
+    KASSERT(*v2 == 0x12345678);              /* 從第二個虛擬位址讀到 */
+    KASSERT(*phys == 0x12345678);            /* 從實體位址(恆等對映)也讀到 */
+    *phys = 0xCAFEF00D;
+    KASSERT(*v1 == 0xCAFEF00D && *v2 == 0xCAFEF00D);
+    KASSERT(vm_query(va2 + 0x10, &pa, &f1) == 0 && pa == (uintptr_t)phys + 0x10);
+    kprintf("vm: %p and %p both map to physical %p (%lu new table pages)\n",
+            (void *)va1, (void *)va2, (void *)(uintptr_t)phys,
+            vm_table_pages() - tables0);
+
+    /* 安全檢查:同時可寫又可執行的對映必須被拒絕 */
+    KASSERT(vm_map(va2, (uintptr_t)phys, VM_READ | VM_WRITE | VM_EXEC) != 0);
+
+    KASSERT(vm_unmap(va1) == 0 && vm_unmap(va2) == 0);
+    KASSERT(vm_query(va1, NULL, NULL) != 0);
+    KASSERT(vm_unmap(va1) != 0);             /* 已移除:再移除要回報失敗 */
+
+    pmm_free((void *)(uintptr_t)phys);
+
+    /* 3. 拆開大分頁:取主記憶體 1/4 處、對齊到大分頁邊界之後的第 2 頁,
+          這個位置確定是以大分頁對映的。把它單獨改成唯讀,vm 必須自動把
+          那一大塊拆成 4KB 頁(多用 1 頁表格),而且只影響這一頁,鄰居維持可寫 */
+    uintptr_t large = (uintptr_t)PAGE_SIZE << (MMU_LARGE_LEVEL * MMU_BITS);
+    uintptr_t tgt = ((pmm_mem_start() + pmm_total_pages() / 4 * PAGE_SIZE) & ~(large - 1))
+                    + PAGE_SIZE;
+    volatile uint32_t *tp = (volatile uint32_t *)tgt;
+    volatile uint32_t *nb = (volatile uint32_t *)(tgt + PAGE_SIZE);
+    uint32_t tp_old = *tp, nb_old = *nb;
+    *tp = 0x600DF00D;
+    tables0 = vm_table_pages();
+    KASSERT(vm_map(tgt, tgt, VM_READ) == 0);
+    KASSERT(vm_table_pages() - tables0 == 1);            /* 拆分用掉剛好 1 頁表格 */
+    KASSERT(vm_query(tgt + 4, &pa, &f1) == 0 && pa == tgt + 4 && !(f1 & VM_WRITE));
+    KASSERT(vm_query(tgt + PAGE_SIZE, &pa, &f2) == 0 && pa == tgt + PAGE_SIZE);
+    KASSERT(f2 & VM_WRITE);
+    KASSERT(*tp == 0x600DF00D);              /* 內容不受拆分影響 */
+    *nb = nb_old;                            /* 鄰居仍可寫入 */
+    kprintf("vm: split a %lu MB page to write-protect %p (1 new table page)\n",
+            (unsigned long)(large >> 20), (void *)tgt);
+    KASSERT(vm_map(tgt, tgt, VM_READ | VM_WRITE) == 0);
+    *tp = tp_old;
 }
 
 /* ------------------------------------------------------------------ */
@@ -130,7 +238,7 @@ static void sched_demo(void)
     kprintf("sched: preemptive (busy loops, no yield)\n");
     static volatile unsigned long c1, c2;
     unsigned long sw0 = sched_switch_count();
-    spin_deadline = timer_ticks() + 50;      /* 兩條各自空轉到 0.5 秒後 */
+    spin_deadline = timer_ticks() + timer_hz() * 60 / 1000;   /* 各自空轉 60ms = 6 個時間片 */
     t[0] = thread_create("spin1", spin_worker, (void *)&c1);
     t[1] = thread_create("spin2", spin_worker, (void *)&c2);
     join_all(t, 2);
@@ -140,9 +248,9 @@ static void sched_demo(void)
     KASSERT(c1 > 0 && c2 > 0 && c1 < c2 * 3 && c2 < c1 * 3);
 
     kprintf("sched: sleep\n");
-    t[0] = thread_create("s300", sleep_worker, (void *)300);
-    t[1] = thread_create("s100", sleep_worker, (void *)100);
-    t[2] = thread_create("s200", sleep_worker, (void *)200);
+    t[0] = thread_create("s30", sleep_worker, (void *)30);
+    t[1] = thread_create("s10", sleep_worker, (void *)10);
+    t[2] = thread_create("s20", sleep_worker, (void *)20);
     join_all(t, 3);
 
     /* 所有示範執行緒都結束後,它們的 stack 與結構都應該已歸還 */
@@ -258,7 +366,7 @@ static void consumer(void *arg)
 static void join_sleeper(void *arg)
 {
     (void)arg;
-    thread_sleep(100);
+    thread_sleep(20);
 }
 
 static void sync_demo(void)
@@ -288,7 +396,7 @@ static void sync_demo(void)
     KASSERT(pc_sum == PC_ITEMS * (PC_ITEMS + 1) / 2);
     KASSERT(pc_count[0] > 0 && pc_count[1] > 0);
 
-    /* join:對方睡 100ms,join 應該在它結束的那一刻返回,而不是輪詢的整數倍 */
+    /* join:對方睡 20ms,join 應該在它結束的那一刻返回,而不是輪詢的整數倍 */
     uint64_t t0 = timer_ticks();
     unsigned long sw0 = sched_switch_count();
     int tid = thread_create("sleeper", join_sleeper, NULL);
@@ -408,12 +516,12 @@ static void mem_selftest(void)
     char *a = pmm_alloc();
     char *b = pmm_alloc();
     KASSERT(a && b);
-    KASSERT(b == a + PAGE_SIZE);             /* first-fit:依序拿到相鄰的兩頁 */
+    KASSERT(b > a);                          /* first-fit:由低位址往高位址配置 */
     KASSERT((uintptr_t)a % PAGE_SIZE == 0);
     pmm_free(a);
     KASSERT(pmm_alloc() == (void *)a);       /* 釋放後最低的空閒頁會被重複使用 */
     char *c = pmm_alloc_pages(8);            /* 連續 8 頁 */
-    KASSERT(c == b + PAGE_SIZE);
+    KASSERT(c > b);                          /* 不與前面配置的頁重疊 */
     memset(c, 0xA5, 8 * PAGE_SIZE);          /* 整段都要能寫 */
     KASSERT(pmm_free_count() == free0 - 10);
     pmm_free_pages(c, 8);
@@ -509,16 +617,19 @@ void kmain(const struct boot_info *bi)
 
     /* 記憶體管理:先建立頁面配置器,之後才能用 kmalloc */
     pmm_init(bi);
+    vm_init(bi);                             /* 開啟分頁;之後的存取都經過頁表 */
+    vm_demo();
     mem_selftest();
     if (cmdline_has(bi->cmdline, "memtest"))
         mem_fulltest();
 
     crash_test(bi->cmdline);
 
-    /* 排程器:把目前的流程登記為 main 執行緒,再啟動計時器(100Hz)與中斷。
+    /* 啟動計時器(1000Hz,一個 tick 1ms)與排程器,再開中斷。
+       timer_init 只是設定硬體,中斷要到 arch_irq_enable 才會真的進來。
        從開中斷那一刻起,main 也會和其他執行緒一樣被搶佔 */
+    timer_init(1000);
     sched_init();
-    timer_init(100);
     arch_irq_enable();
     kprintf("timer: %u Hz\n", timer_hz());
 
