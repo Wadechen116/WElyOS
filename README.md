@@ -33,11 +33,13 @@
 - [x] 可替換的執行佇列(`include/runq.h`):`ring` 每顆 CPU 一組無鎖(lock-free)環狀佇列加工作竊取(預設)、`list` 全系統一組有鎖的串列,以 `-DWELYOS_RUNQ=` 選擇;主機端多執行緒測試(含 ThreadSanitizer)
 - [x] 多核心第二段:啟動其他 CPU(最多 8 顆)— RISC-V 以 SBI HSM(Hart State Management)、AArch64 以 PSCI(Power State Coordination Interface)、i386 以 ACPI(Advanced Configuration and Power Interface)找出 CPU 並用 LAPIC(Local Advanced Programmable Interrupt Controller)的 INIT / SIPI(Startup Inter-Processor Interrupt)加真實模式跳板啟動;各 CPU 完成初始化與並行測試後待命
 - [x] 多核心第三段:其他 CPU 參與排程 — 每顆 CPU 自己的計時器(i386 用 LAPIC 計時器)、處理器間中斷(Inter-Processor Interrupt,IPI)、跨 CPU 呼叫與 TLB shootdown、panic 時停止其他 CPU;執行緒與行程真正同時在多顆 CPU 上執行
+- [x] 檔案系統:VFS(Virtual File System)介面、記憶體檔案系統(ramfs)、開機檔案包(tar 嵌入 kernel,開機時解開)、裝置檔案 `/dev/console`;系統呼叫 `open` / `close` / `read` / `write` / `readdir` / `mkdir` / `unlink` / `stat` 與每個行程的檔案描述符表;使用者程式改由 `/bin/init` 載入
+- [x] 行程:多個使用者程式(`/bin/init`、`echo`、`cat`、`ls`)、`main(argc, argv)` 參數、`spawn` / `wait` / `exec` 系統呼叫、建立行程時繼承檔案描述符(可重新導向輸出);相同程式的行程共用程式碼頁,正在執行的程式檔不可修改
 
 ## 規劃中
 
 - [ ] 多核心(Symmetric Multiprocessing,SMP)效能:縮小排程器的大鎖、喚醒時考慮上次執行的 CPU、mutex 先自旋再睡
-- [ ] 檔案系統、從檔案載入程式(`exec`)、`fork`、shell
+- [ ] 主控台輸入與 shell;`fork`(需要寫入時複製);磁碟驅動與磁碟上的檔案系統
 
 ## 需求
 
@@ -75,10 +77,11 @@ QEMU_SMP=8 bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoex
 ```
 arch/<名稱>/  各架構的開機程式、linker script、驅動(i386 / riscv64 / aarch64)
 include/      與架構無關的標頭(arch.h 為架構介面)
-kernel/       kernel 主體(main、kprintf、fdt、panic、timer、pmm、kmalloc、sched、runq_ring / runq_list、spinlock、smp、sync、vm、proc)
+kernel/       kernel 主體(main、kprintf、fdt、panic、timer、pmm、kmalloc、sched、runq_ring / runq_list、spinlock、smp、sync、vm、proc、vfs、ramfs、initrd)
 lib/          最小字串函式庫
 cmake/        各架構的 toolchain 檔
-user/         使用者程式(在使用者模式執行,獨立連結後嵌入 kernel)
+user/         使用者程式(各自獨立連結後放進開機檔案包的 /bin/):init(測試)、echo、cat、ls;crt0.c 為共用的啟動程式,ulib.h 為共用的小工具
+rootfs/       開機檔案包的內容(建置時打包成 tar 嵌入 kernel,開機時解開到檔案系統)
 tests/host/   在主機上執行的測試(執行佇列的並行測試)
 scripts/      QEMU 啟動腳本、GDB 腳本與設定、主機測試腳本
 docs/         開發紀錄

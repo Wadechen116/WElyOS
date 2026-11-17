@@ -18,7 +18,28 @@
 enum {
     SYS_write = 1, SYS_exit, SYS_getpid, SYS_yield, SYS_sleep,
     SYS_thread_create, SYS_thread_exit, SYS_gettid, SYS_futex_wait, SYS_futex_wake,
+    SYS_open, SYS_close, SYS_read, SYS_readdir, SYS_mkdir, SYS_unlink, SYS_stat,
+    SYS_spawn, SYS_exec, SYS_wait,
 };
+
+/* 檔案相關的定義,必須與 kernel 的 include/fs.h 一致 */
+#define O_RDONLY  0x000
+#define O_WRONLY  0x001
+#define O_RDWR    0x002
+#define O_CREAT   0x040
+#define O_TRUNC   0x200
+#define O_APPEND  0x400
+#define E_NOENT   2
+#define E_NOEXEC  8
+#define E_BADF    9
+#define E_FAULT   14
+#define E_BUSY    16
+#define E_EXIST   17
+#define E_TXTBSY  26
+#define E_NOTEMPTY 39
+enum { I_FILE = 1, I_DIR, I_DEV };
+struct dirent { char name[60]; unsigned int type; };
+struct stat { unsigned int type; unsigned int nlink; unsigned long long size; };
 
 static inline long syscall3(long num, long a0, long a1, long a2)
 {
@@ -48,9 +69,29 @@ static inline long syscall3(long num, long a0, long a1, long a2)
 #endif
 }
 
-static inline long sys_write(const char *buf, unsigned long len)
+/* 檔案描述符:0 = 標準輸入,1 = 標準輸出,2 = 標準錯誤(行程建立時都指向主控台) */
+static inline long sys_write(long fd, const void *buf, unsigned long len)
 {
-    return syscall3(SYS_write, (long)buf, (long)len, 0);
+    return syscall3(SYS_write, fd, (long)buf, (long)len);
+}
+static inline long sys_read(long fd, void *buf, unsigned long len)
+{
+    return syscall3(SYS_read, fd, (long)buf, (long)len);
+}
+static inline long sys_open(const char *path, long flags)
+{
+    return syscall3(SYS_open, (long)path, flags, 0);
+}
+static inline long sys_close(long fd)             { return syscall3(SYS_close, fd, 0, 0); }
+static inline long sys_readdir(long fd, struct dirent *d)
+{
+    return syscall3(SYS_readdir, fd, (long)d, 0);
+}
+static inline long sys_mkdir(const char *path)    { return syscall3(SYS_mkdir, (long)path, 0, 0); }
+static inline long sys_unlink(const char *path)   { return syscall3(SYS_unlink, (long)path, 0, 0); }
+static inline long sys_stat(const char *path, struct stat *st)
+{
+    return syscall3(SYS_stat, (long)path, (long)st, 0);
 }
 __attribute__((noreturn))
 static inline void sys_exit(int code)      { syscall3(SYS_exit, code, 0, 0); for (;;) ; }
@@ -64,6 +105,16 @@ static inline long sys_thread_create(void (*entry)(long), long arg)
 {
     return syscall3(SYS_thread_create, (long)entry, arg, 0);
 }
+/* 行程:argv 是以 NULL 結尾的字串陣列,argv[0] 依慣例是程式名稱 */
+static inline long sys_spawn(const char *path, char **argv)
+{
+    return syscall3(SYS_spawn, (long)path, (long)argv, 0);
+}
+static inline long sys_exec(const char *path, char **argv)
+{
+    return syscall3(SYS_exec, (long)path, (long)argv, 0);
+}
+static inline long sys_wait(long pid)             { return syscall3(SYS_wait, pid, 0, 0); }
 static inline long sys_futex_wait(volatile int *addr, int val)
 {
     return syscall3(SYS_futex_wait, (long)addr, val, 0);

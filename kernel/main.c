@@ -8,6 +8,7 @@
 #include "arch.h"
 #include "boot_info.h"
 #include "cpu.h"
+#include "fs.h"
 #include "kmalloc.h"
 #include "kprintf.h"
 #include "kstring.h"
@@ -658,17 +659,210 @@ static void prio_demo(void)
 /* 使用者模式示範                                                      */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* 檔案系統的示範與測試(kernel 內部直接呼叫 VFS)                        */
+/* ------------------------------------------------------------------ */
+
+/* 遞迴列出目錄的內容(印在同一行) */
+static void fs_list(const char *path, int depth)
+{
+    struct file *d;
+    struct dirent e;
+
+    if (depth > 4 || vfs_open(path, O_RDONLY, &d) != 0)
+        return;
+    while (vfs_readdir(d, &e) == 0) {
+        char sub[FS_PATH_MAX + 1];
+        size_t n = 0;
+        for (const char *p = path; *p && n < FS_PATH_MAX; p++)
+            sub[n++] = *p;
+        if (n > 1 && n < FS_PATH_MAX)
+            sub[n++] = '/';
+        for (const char *p = e.name; *p && n < FS_PATH_MAX; p++)
+            sub[n++] = *p;
+        sub[n] = '\0';
+        kprintf(" %s%s", sub, e.type == I_DIR ? "/" : "");
+        if (e.type == I_DIR)
+            fs_list(sub, depth + 1);
+    }
+    vfs_close(d);
+}
+
+#define FS_WORKERS 4
+#define FS_FILES   25
+#define FS_RECORD  32u                       /* 共用紀錄檔中每一筆的長度 */
+
+/* 多條執行緒同時在同一個目錄建立、寫入、讀回、刪除各自的檔案,
+   並各自往同一個紀錄檔附加固定長度的紀錄 */
+static void fs_worker(void *arg)
+{
+    int id = (int)(uintptr_t)arg;
+    char path[32] = "/t/w0-00", rec[FS_RECORD], back[600], data[600];
+    struct file *f, *log;
+
+    KASSERT(vfs_open("/t/log", O_WRONLY | O_APPEND, &log) == 0);
+    for (unsigned i = 0; i < sizeof(data); i++)
+        data[i] = (char)(id * 31 + i);
+    for (int n = 0; n < FS_FILES; n++) {
+        path[4] = (char)('0' + id);
+        path[6] = (char)('0' + n / 10);
+        path[7] = (char)('0' + n % 10);
+        KASSERT(vfs_open(path, O_CREAT | O_RDWR, &f) == 0);
+        KASSERT(vfs_write(f, data, sizeof(data)) == (long)sizeof(data));
+        KASSERT(vfs_pread(f, back, sizeof(back), 0) == (long)sizeof(back));
+        KASSERT(memcmp(data, back, sizeof(data)) == 0);
+        vfs_close(f);
+        KASSERT(vfs_unlink(path) == 0);
+
+        /* 一筆紀錄全部是同一個字元:之後檢查時,混到別人的內容就看得出來 */
+        memset(rec, 'A' + id, sizeof(rec));
+        KASSERT(vfs_write(log, rec, sizeof(rec)) == (long)sizeof(rec));
+    }
+    vfs_close(log);
+}
+
+static void fs_demo(void)
+{
+    struct file *f;
+    struct stat st;
+    static char buf[10000], back[10000];
+    unsigned long pages0 = ramfs_pages();
+    struct kheap_stats h0, h1;
+
+    sched_trim();
+    kheap_stats(&h0);
+    size_t pool0 = sched_pool_bytes();
+
+    kprintf("fs: tree:");
+    fs_list("/", 0);
+    kprintf("\n");
+
+    /* 1. 讀取開機檔案包帶來的檔案 */
+    KASSERT(vfs_open("/etc/motd", O_RDONLY, &f) == 0);
+    long n = vfs_read(f, buf, 80);
+    KASSERT(n > 0);
+    for (long i = 0; i < n; i++)
+        if (buf[i] == '\n')
+            buf[i] = '\0';
+    buf[n] = '\0';
+    kprintf("fs: /etc/motd: \"%s\"\n", buf);
+    KASSERT(vfs_write(f, "x", 1) == -E_BADF);         /* 唯讀開啟 */
+    vfs_close(f);
+
+    /* 2. 建立、寫入超過兩頁的資料、讀回比對 */
+    KASSERT(vfs_mkdir("/t") == 0);
+    KASSERT(vfs_mkdir("/t") == -E_EXIST);
+    for (unsigned i = 0; i < sizeof(buf); i++)
+        buf[i] = (char)(i * 13 + 1);
+    KASSERT(vfs_open("/t/a", O_CREAT | O_RDWR, &f) == 0);
+    KASSERT(vfs_write(f, buf, sizeof(buf)) == (long)sizeof(buf));
+    KASSERT(vfs_pread(f, back, sizeof(back), 0) == (long)sizeof(back));
+    KASSERT(memcmp(buf, back, sizeof(buf)) == 0);
+    KASSERT(vfs_read(f, back, 10) == 0);              /* 寫完後位置在結尾:讀不到東西 */
+    KASSERT(vfs_stat("/t/a", &st) == 0 && st.type == I_FILE && st.size == sizeof(buf));
+    KASSERT(ramfs_pages() == pages0 + 3);             /* 10000 位元組 = 3 頁 */
+    vfs_close(f);
+
+    /* 3. 附加:以 O_APPEND 開啟時,每次寫入都接在檔案最後 */
+    KASSERT(vfs_open("/t/b", O_CREAT | O_WRONLY | O_APPEND, &f) == 0);
+    KASSERT(vfs_write(f, "head", 4) == 4);
+    vfs_close(f);
+    KASSERT(vfs_open("/t/b", O_RDWR | O_APPEND, &f) == 0);
+    KASSERT(vfs_write(f, "tail", 4) == 4);
+    KASSERT(vfs_pread(f, back, 16, 0) == 8 && memcmp(back, "headtail", 8) == 0);
+    vfs_close(f);
+
+    /* 4. 開著的時候被刪除:名稱立刻消失,內容留到關閉為止 */
+    KASSERT(vfs_open("/t/a", O_RDONLY, &f) == 0);
+    KASSERT(vfs_unlink("/t/a") == 0);
+    KASSERT(vfs_stat("/t/a", &st) == -E_NOENT);
+    KASSERT(vfs_pread(f, back, 100, 5000) == 100 && memcmp(back, buf + 5000, 100) == 0);
+    KASSERT(ramfs_pages() == pages0 + 4);             /* a 的 3 頁還在,加上 b 的 1 頁 */
+    vfs_close(f);
+    KASSERT(ramfs_pages() == pages0 + 1);             /* 關閉後才真的釋放 */
+
+    /* 5. O_TRUNC:重新開啟並清空 */
+    KASSERT(vfs_open("/t/b", O_WRONLY | O_TRUNC, &f) == 0);
+    KASSERT(vfs_size(f) == 0 && ramfs_pages() == pages0);
+    vfs_close(f);
+
+    /* 6. 錯誤情況 */
+    KASSERT(vfs_open("/nope", O_RDONLY, &f) == -E_NOENT);
+    KASSERT(vfs_open("/etc/motd/x", O_RDONLY, &f) == -E_NOTDIR);
+    KASSERT(vfs_open("/t", O_WRONLY, &f) == -E_ISDIR);
+    KASSERT(vfs_unlink("/t") == -E_NOTEMPTY);
+    KASSERT(vfs_unlink("/") == -E_INVAL);
+    KASSERT(vfs_mkdir("/t/..") == -E_EXIST);
+    KASSERT(vfs_stat("/t/../etc/./motd", &st) == 0);  /* "." 與 ".." */
+    {
+        char longname[FS_NAME_MAX + 8];
+        longname[0] = '/';
+        memset(longname + 1, 'x', sizeof(longname) - 2);
+        longname[sizeof(longname) - 1] = '\0';
+        KASSERT(vfs_mkdir(longname) == -E_NAMETOOLONG);
+    }
+
+    /* 7. 多條執行緒(在多顆 CPU 上)同時操作同一個目錄與同一個紀錄檔 */
+    int tid[FS_WORKERS];
+    KASSERT(vfs_open("/t/log", O_CREAT | O_WRONLY, &f) == 0);
+    vfs_close(f);
+    uint64_t t0 = timer_ticks();
+    for (int i = 0; i < FS_WORKERS; i++)
+        tid[i] = thread_create("fs-worker", fs_worker, (void *)(uintptr_t)i);
+    for (int i = 0; i < FS_WORKERS; i++)
+        thread_join(tid[i]);
+    /* 紀錄檔:總長度正確,每一筆都完整(32 個相同的字元),每條執行緒的筆數正確 */
+    unsigned count[FS_WORKERS] = { 0 };
+    KASSERT(vfs_open("/t/log", O_RDONLY, &f) == 0);
+    KASSERT(vfs_size(f) == (uint64_t)FS_WORKERS * FS_FILES * FS_RECORD);
+    char rec[FS_RECORD];
+    while (vfs_read(f, rec, sizeof(rec)) == (long)sizeof(rec)) {
+        for (unsigned i = 1; i < sizeof(rec); i++)
+            KASSERT(rec[i] == rec[0]);
+        KASSERT(rec[0] >= 'A' && rec[0] < 'A' + FS_WORKERS);
+        count[rec[0] - 'A']++;
+    }
+    vfs_close(f);
+    for (int i = 0; i < FS_WORKERS; i++)
+        KASSERT(count[i] == FS_FILES);
+    kprintf("fs: %d threads x %d files (create, write, read back, delete) plus a shared "
+            "append-only log: all intact, %llu ticks\n", FS_WORKERS, FS_FILES,
+            (unsigned long long)(timer_ticks() - t0));
+
+    /* 8. 全部刪掉之後,佔用的記憶體要回到原本的樣子 */
+    KASSERT(vfs_unlink("/t/log") == 0 && vfs_unlink("/t/b") == 0 && vfs_unlink("/t") == 0);
+    sched_trim();
+    kheap_stats(&h1);
+    KASSERT(ramfs_pages() == pages0);
+    KASSERT(h1.free_bytes + (sched_pool_bytes() - pool0) == h0.free_bytes + (h1.heap_bytes - h0.heap_bytes));
+    kprintf("fs: selftest ok (all files removed, memory returned)\n");
+}
+
 /* 傳給使用者程式的 mode;數值必須與 user/init.c 一致 */
 enum {
     UMODE_HELLO = 0, UMODE_READ_KERNEL, UMODE_WRITE_TEXT, UMODE_PRIVILEGED, UMODE_NULL,
     UMODE_BAD_POINTER, UMODE_SPIN, UMODE_STACK, UMODE_ISOLATION, UMODE_BAD_SYSCALL,
-    UMODE_FUTEX,
+    UMODE_FUTEX, UMODE_FS, UMODE_PROC, UMODE_EXEC, UMODE_EXEC_THREADS,
 };
+
+/* 以測試編號 mode 啟動 /bin/init:編號轉成字串,當作 argv[1] 傳給它 */
+static int spawn_init(long mode)
+{
+    char num[12];
+    int n = 0;
+    const char *argv[] = { "init", num, NULL };
+
+    if (mode >= 10)
+        num[n++] = (char)('0' + mode / 10);
+    num[n++] = (char)('0' + mode % 10);
+    num[n] = '\0';
+    return proc_spawn("/bin/init", argv);
+}
 
 /* 啟動一個行程、等它結束,確認結束碼符合預期 */
 static void run_user(const char *what, long mode, int expect)
 {
-    int pid = proc_spawn("init", mode);
+    int pid = spawn_init(mode);
     KASSERT(pid > 0);
     int code = proc_wait(pid);
     kprintf("user: %s -> exit code %d\n", what, code);
@@ -687,6 +881,24 @@ static void user_demo(void)
     kprintf("user: running a program in user mode\n");
     run_user("hello, 2 threads, exit(42)", UMODE_HELLO, 42);
 
+    /* 檔案系統呼叫:建立、讀寫、列目錄、刪除,以及位址與權限的檢查 */
+    run_user("file system calls", UMODE_FS, 9);
+    /* 程式檔不存在、或內容不是合法的程式:建立行程要失敗,而不是執行到一半出事 */
+    KASSERT(proc_spawn("/bin/nope", NULL) == -1);
+    KASSERT(proc_spawn("/etc/motd", NULL) == -1);
+
+    /* 參數傳遞:kernel 直接啟動 /bin/echo,它的結束碼是收到的參數個數 */
+    {
+        const char *argv[] = { "echo", "  [user] /bin/echo started by the kernel with", "3 arguments", NULL };
+        int pid = proc_spawn("/bin/echo", argv);
+        KASSERT(pid > 0 && proc_wait(pid) == 3);
+    }
+    /* 使用者程式自己建立行程、等待、重新導向輸出;以及各種應該被拒絕的情況 */
+    run_user("spawn, wait, arguments, redirection", UMODE_PROC, 12);
+    /* exec:行程把自己換成 /bin/echo。結束碼來自 echo(3 個參數),不是原本的程式 */
+    run_user("exec replaces the program", UMODE_EXEC, 3);
+    run_user("exec with a second thread is refused", UMODE_EXEC_THREADS, 13);
+
     /* 使用者模式的 mutex(futex):3 條執行緒搶同一把鎖,總和必須正確 */
     run_user("user-mode mutex (futex), 3 threads", UMODE_FUTEX, 11);
 
@@ -704,7 +916,7 @@ static void user_demo(void)
 
     /* 搶佔與強制終止:行程陷入無窮迴圈、從不呼叫 kernel。
        計時器中斷仍會把 CPU 拿回來,main 才有機會執行並終止它 */
-    int pid = proc_spawn("init", UMODE_SPIN);
+    int pid = spawn_init(UMODE_SPIN);
     KASSERT(pid > 0);
     thread_sleep(20);
     KASSERT(proc_kill(pid, 99) == 0);
@@ -716,7 +928,7 @@ static void user_demo(void)
        它們的頁表把這個位址對映到不同的實體頁,所以互不影響 */
     int p[3];
     for (int i = 0; i < 3; i++) {
-        p[i] = proc_spawn("init", UMODE_ISOLATION);
+        p[i] = spawn_init(UMODE_ISOLATION);
         KASSERT(p[i] > 0);
     }
     for (int i = 0; i < 3; i++)
@@ -799,7 +1011,7 @@ static void sched_stress(void)
        所以一定會重複使用;每個行程都必須正常執行,不受前一個使用同編號者的殘留影響 */
     t0 = timer_ticks();
     for (int i = 0; i < 300; i++) {
-        int pid = proc_spawn("init", UMODE_BAD_SYSCALL);
+        int pid = spawn_init(UMODE_BAD_SYSCALL);
         KASSERT(pid > 0 && proc_wait(pid) == 9);
     }
     kprintf("stress: 300 sequential processes in %llu ticks\n",
@@ -1139,6 +1351,18 @@ void kmain(const struct boot_info *bi)
     arch_irq_enable();
     kprintf("timer: %u Hz\n", timer_hz());
 
+    /* 檔案系統:建立根目錄,把嵌在 kernel 裡的開機檔案包解開進去。
+       要在排程器之後:檔案系統用 mutex 上鎖,而 mutex 需要知道「目前的執行緒」 */
+    {
+        extern const uint8_t rootfs_start[], rootfs_end[];
+        vfs_init();
+        int nfiles = initrd_unpack(rootfs_start, (size_t)(rootfs_end - rootfs_start));
+        if (nfiles < 0)
+            panic("fs: cannot unpack the boot archive (error %d)", nfiles);
+        kprintf("fs: root file system ready: %d files unpacked from a %zu KB boot archive\n",
+                nfiles, (size_t)(rootfs_end - rootfs_start) / 1024);
+    }
+
     /* 啟動其他 CPU。selftest 時所有 CPU 一起跑一輪並行測試 */
     smp_init(bi, cmdline_has(bi->cmdline, "selftest"));
 
@@ -1162,6 +1386,7 @@ void kmain(const struct boot_info *bi)
     }
     if (selftest) {
         smp_sched_demo();
+        fs_demo();
         user_demo();
     }
     if (cmdline_has(bi->cmdline, "stress"))

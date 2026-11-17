@@ -43,18 +43,41 @@ set(COMMON_LINK_FLAGS ${ARCH_LINK_FLAGS} -ffreestanding -nostdlib -static -no-pi
                       -Wl,--no-warn-rwx-segments -Wl,--build-id=none)
 
 # ---- 使用者程式 ----
-# 獨立連結在 USER_BASE(各架構的使用者位址範圍起點),再轉成原始二進位,
-# 由 kernel/userimg.S 以 .incbin 嵌入 kernel。
-add_executable(init.elf user/init.c)
-target_link_options(init.elf PRIVATE ${COMMON_LINK_FLAGS}
-    -T ${CMAKE_SOURCE_DIR}/user/user.ld -Wl,--defsym=USER_BASE=${ARCH_USER_BASE})
-set_target_properties(init.elf PROPERTIES LINK_DEPENDS ${CMAKE_SOURCE_DIR}/user/user.ld)
-set(USER_IMG ${CMAKE_BINARY_DIR}/init.bin)
-add_custom_command(OUTPUT ${USER_IMG}
-    COMMAND ${CMAKE_OBJCOPY} -O binary $<TARGET_FILE:init.elf> ${USER_IMG}
-    DEPENDS init.elf
-    COMMENT "產生使用者程式映像 init.bin")
-add_custom_target(user_image DEPENDS ${USER_IMG})
+# 每個程式(user/<名稱>.c)與共用的啟動程式 crt0.c 一起,獨立連結在 USER_BASE
+# (各架構的使用者位址範圍起點),再轉成原始二進位,放進開機檔案包的 /bin/<名稱>。
+set(USER_PROGRAMS init echo cat ls)
+set(USER_BINS "")
+foreach(prog ${USER_PROGRAMS})
+    add_executable(${prog}.elf user/${prog}.c user/crt0.c)
+    target_include_directories(${prog}.elf PRIVATE user)
+    target_link_options(${prog}.elf PRIVATE ${COMMON_LINK_FLAGS}
+        -T ${CMAKE_SOURCE_DIR}/user/user.ld -Wl,--defsym=USER_BASE=${ARCH_USER_BASE})
+    set_target_properties(${prog}.elf PROPERTIES LINK_DEPENDS ${CMAKE_SOURCE_DIR}/user/user.ld)
+    set(bin ${CMAKE_BINARY_DIR}/userbin/${prog})
+    add_custom_command(OUTPUT ${bin}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/userbin
+        COMMAND ${CMAKE_OBJCOPY} -O binary $<TARGET_FILE:${prog}.elf> ${bin}
+        DEPENDS ${prog}.elf
+        COMMENT "產生使用者程式 /bin/${prog}")
+    list(APPEND USER_BINS ${bin})
+endforeach()
+
+# ---- 開機檔案包 ----
+# 把原始碼的 rootfs/ 目錄與編譯好的使用者程式集中到暫存目錄,打包成 tar(ustar 格式),
+# 再由 kernel/rootfs.S 以 .incbin 嵌入 kernel。開機時 kernel 把它解開到記憶體檔案系統。
+# --sort / --mtime / --owner 讓同樣的內容每次都打包出完全相同的檔案(可重現的建置)。
+set(ROOTFS_STAGE ${CMAKE_BINARY_DIR}/rootfs)
+set(ROOTFS_TAR ${CMAKE_BINARY_DIR}/rootfs.tar)
+file(GLOB_RECURSE ROOTFS_FILES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/rootfs/*)
+add_custom_command(OUTPUT ${ROOTFS_TAR}
+    COMMAND ${CMAKE_COMMAND} -E rm -rf ${ROOTFS_STAGE}
+    COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/rootfs ${ROOTFS_STAGE}
+    COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_BINARY_DIR}/userbin ${ROOTFS_STAGE}/bin
+    COMMAND tar --format=ustar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner
+            -cf ${ROOTFS_TAR} -C ${ROOTFS_STAGE} .
+    DEPENDS ${USER_BINS} ${ROOTFS_FILES}
+    COMMENT "打包開機檔案包 rootfs.tar")
+add_custom_target(rootfs_image DEPENDS ${ROOTFS_TAR})
 
 add_executable(welyos.elf
     ${ARCH_SOURCES}
@@ -72,15 +95,18 @@ add_executable(welyos.elf
     kernel/sync.c
     kernel/vm.c
     kernel/proc.c
-    kernel/userimg.S
+    kernel/vfs.c
+    kernel/ramfs.c
+    kernel/initrd.c
+    kernel/rootfs.S
     lib/string.c)
 target_link_options(welyos.elf PRIVATE ${COMMON_LINK_FLAGS}
     -T ${CMAKE_SOURCE_DIR}/arch/${ARCH}/linker.ld)
-# userimg.S 內嵌 init.bin:映像改變時要重新組譯
-add_dependencies(welyos.elf user_image)
-set_source_files_properties(kernel/userimg.S PROPERTIES
-    COMPILE_DEFINITIONS "USER_IMG_PATH=\"${USER_IMG}\""
-    OBJECT_DEPENDS ${USER_IMG})
+# rootfs.S 內嵌 rootfs.tar:內容改變時要重新組譯
+add_dependencies(welyos.elf rootfs_image)
+set_source_files_properties(kernel/rootfs.S PROPERTIES
+    COMPILE_DEFINITIONS "ROOTFS_PATH=\"${ROOTFS_TAR}\""
+    OBJECT_DEPENDS ${ROOTFS_TAR})
 target_include_directories(welyos.elf PRIVATE include arch/${ARCH})
 set_target_properties(welyos.elf PROPERTIES LINK_DEPENDS
     ${CMAKE_SOURCE_DIR}/arch/${ARCH}/linker.ld)

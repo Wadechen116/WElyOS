@@ -12,9 +12,10 @@
  * kernel 與其他行程不受影響。
  */
 
-/* 建立行程,執行內建的使用者程式(user/init.c),arg 傳給它的 main。
-   回傳行程編號(pid);失敗回傳 -1 */
-int proc_spawn(const char *name, long arg);
+/* 建立行程,執行檔案系統中 path 指到的程式(例如 "/bin/init")。
+   argv 是傳給程式 main 的參數:以 NULL 結尾的字串陣列;傳 NULL 表示只有程式名稱。
+   回傳行程編號(pid);失敗(檔案不存在、不是合法的程式、記憶體不足)回傳 -1 */
+int proc_spawn(const char *path, const char *const argv[]);
 
 /* 等待行程結束並取得它的結束碼,同時釋放行程的紀錄。pid 不存在回傳 -1。
    因例外被終止的行程,結束碼為 PROC_KILLED_FAULT;被 proc_kill 終止的為指定的值 */
@@ -38,7 +39,7 @@ void user_return_check(void);
 
 /* 系統呼叫編號(使用者端的對應定義在 user/usys.h,兩邊必須一致) */
 enum {
-    SYS_write = 1,          /* (buf, len)      輸出字串;回傳寫出的長度 */
+    SYS_write = 1,          /* (fd, buf, len)  寫入檔案描述符;回傳寫入的長度。1 = 標準輸出 */
     SYS_exit,               /* (code)          結束整個行程 */
     SYS_getpid,             /* ()              行程編號 */
     SYS_yield,              /* ()              讓出 CPU */
@@ -48,5 +49,17 @@ enum {
     SYS_gettid,             /* ()              執行緒編號 */
     SYS_futex_wait,         /* (addr, val)     若 *addr == val 就睡到被喚醒;否則立刻返回 1 */
     SYS_futex_wake,         /* (addr)          喚醒所有睡在 addr 上的執行緒;回傳喚醒的數量 */
+    /* ---- 檔案(失敗時回傳負的錯誤碼,見 include/fs.h 的 E_*) ---- */
+    SYS_open,               /* (path, flags)   開啟檔案;回傳檔案描述符 */
+    SYS_close,              /* (fd) */
+    SYS_read,               /* (fd, buf, len)  讀取;回傳讀到的長度,0 = 檔案結尾 */
+    SYS_readdir,            /* (fd, dirent)    讀取目錄的下一筆;0 = 取得,1 = 沒有了 */
+    SYS_mkdir,              /* (path) */
+    SYS_unlink,             /* (path)          刪除檔案或空的目錄 */
+    SYS_stat,               /* (path, stat)    查詢類型與大小 */
+    /* ---- 行程 ---- */
+    SYS_spawn,              /* (path, argv)    建立新行程執行 path;回傳 pid。新行程繼承開啟中的檔案 */
+    SYS_exec,               /* (path, argv)    目前的行程改為執行 path;成功則不返回 */
+    SYS_wait,               /* (pid)           等待行程結束,回傳它的結束碼 */
 };
 #endif

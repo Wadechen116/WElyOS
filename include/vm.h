@@ -22,6 +22,9 @@
 #define VM_EXEC    0x04u       /* 可執行(i386 未使用 PAE,無法禁止執行,此旗標無作用) */
 #define VM_DEVICE  0x08u       /* 裝置暫存器(MMIO):AArch64 需要不同的記憶體屬性 */
 #define VM_USER    0x10u       /* 使用者模式可存取;沒有這個旗標的頁只有 kernel 能碰 */
+#define VM_SHARED  0x20u       /* 這一頁不屬於這個位址空間(例如和檔案共用的程式碼頁):
+                                  位址空間釋放時只移除對映,不釋放實體頁。
+                                  記在頁表項目中保留給軟體使用的位元裡,硬體會忽略它 */
 
 /* 建立 kernel 頁表並開啟分頁。需先完成 pmm_init() */
 void vm_init(const struct boot_info *bi);

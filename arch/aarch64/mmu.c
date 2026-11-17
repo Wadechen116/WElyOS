@@ -46,6 +46,7 @@
 #define PTE_NG        (1UL << 11)
 #define PTE_PXN       (1UL << 53)
 #define PTE_UXN       (1UL << 54)
+#define PTE_SW_SHARED (1UL << 55)            /* bit 55~58 保留給軟體使用,硬體忽略 */
 #define PTE_ADDR_MASK 0x0000FFFFFFFFF000UL
 
 #define ATTR_NORMAL   0                      /* MAIR 位元組 0:一般記憶體 */
@@ -75,6 +76,8 @@ pte_t arch_pte_leaf(uintptr_t pa, unsigned flags, int level)
         e |= PTE_ATTR(ATTR_NORMAL) | PTE_SH_INNER;
     if (!(flags & VM_WRITE))
         e |= PTE_AP_RO;
+    if (flags & VM_SHARED)
+        e |= PTE_SW_SHARED;
     return e;
 }
 
@@ -115,6 +118,8 @@ unsigned arch_pte_flags(pte_t e)
     }
     if (((e >> 2) & 7) == ATTR_DEVICE)
         f |= VM_DEVICE;
+    if (e & PTE_SW_SHARED)
+        f |= VM_SHARED;
     return f;
 }
 

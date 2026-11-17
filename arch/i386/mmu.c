@@ -40,6 +40,7 @@
 #define PTE_US  0x004ULL
 #define PTE_PS  0x080ULL
 #define PTE_G   0x100ULL
+#define PTE_SW_SHARED 0x200ULL            /* bit 9~11 保留給軟體使用,硬體忽略 */
 #define PTE_NX  (1ULL << 63)
 #define PTE_ADDR_MASK 0x000FFFFFFFFFF000ULL
 
@@ -102,6 +103,8 @@ pte_t arch_pte_leaf(uintptr_t pa, unsigned flags, int level)
         e |= PTE_NX;
     if (level > 0)
         e |= PTE_PS;
+    if (flags & VM_SHARED)
+        e |= PTE_SW_SHARED;
     return e;
 }
 
@@ -139,6 +142,8 @@ unsigned arch_pte_flags(pte_t e)
         f |= VM_USER;
     if (!has_nx || !(e & PTE_NX))
         f |= VM_EXEC;                        /* 沒有 NX 的 CPU:有對映就可執行 */
+    if (e & PTE_SW_SHARED)
+        f |= VM_SHARED;
     return f;
 }
 

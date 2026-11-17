@@ -326,8 +326,8 @@ static void free_table(pte_t *t, int level)
             continue;
         if (level > 0)
             free_table((pte_t *)arch_pte_addr(t[i]), level - 1);
-        else
-            pmm_free((void *)arch_pte_addr(t[i]));       /* 行程擁有的實體頁 */
+        else if (!(arch_pte_flags(t[i]) & VM_SHARED))
+            pmm_free((void *)arch_pte_addr(t[i]));       /* 行程擁有的實體頁;共用的頁不歸它釋放 */
     }
     pmm_free(t);
     table_pages--;

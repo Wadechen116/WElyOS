@@ -9,6 +9,7 @@
  * mode 的數值必須與 kernel/main.c 的 UMODE_* 一致。
  */
 #include "usys.h"
+#include "ulib.h"
 
 enum {
     UMODE_HELLO = 0,     /* 正常執行:輸出、多執行緒、結束碼 */
@@ -22,6 +23,10 @@ enum {
     UMODE_ISOLATION,     /* 檢查自己的資料不受其他行程影響 */
     UMODE_BAD_SYSCALL,   /* 不存在的系統呼叫編號 */
     UMODE_FUTEX,         /* 多執行緒以使用者模式的 mutex 保護共用資料 */
+    UMODE_FS,            /* 檔案:建立、寫入、讀回、列出目錄、刪除,以及各種錯誤情況 */
+    UMODE_PROC,          /* 建立其他行程並等待、參數傳遞、exec 失敗時原程式不受影響 */
+    UMODE_EXEC,          /* 以 exec 把自己換成另一個程式 */
+    UMODE_EXEC_THREADS,  /* 還有其他執行緒時呼叫 exec:應被拒絕 */
 };
 
 /* 各架構 kernel 映像所在的位址(使用者模式不應該讀得到) */
@@ -32,76 +37,6 @@ enum {
 #else
 #define KERNEL_ADDR 0x40080000UL
 #endif
-
-/*
- * 編譯器在最佳化時可能自行產生對 memset / memcpy 的呼叫(例如把結構清為 0)。
- * 使用者程式沒有連結任何函式庫,也不能用 kernel 裡的那一份,所以要自己提供。
- */
-void *memset(void *dst, int c, unsigned long n)
-{
-    unsigned char *d = dst;
-    while (n--)
-        *d++ = (unsigned char)c;
-    return dst;
-}
-
-void *memcpy(void *dst, const void *src, unsigned long n)
-{
-    unsigned char *d = dst;
-    const unsigned char *s = src;
-    while (n--)
-        *d++ = *s++;
-    return dst;
-}
-
-/* ---- 極簡的輸出函式:使用者程式沒有 C 函式庫,一切自己來 ---- */
-
-static unsigned long ustrlen(const char *s)
-{
-    unsigned long n = 0;
-    while (s[n])
-        n++;
-    return n;
-}
-
-static void puts_(const char *s)
-{
-    sys_write(s, ustrlen(s));
-}
-
-/* 把字串與十進位數字組進緩衝區,最後一次輸出,避免多條執行緒的輸出互相穿插 */
-struct line {
-    char buf[96];
-    unsigned len;
-};
-
-static void line_str(struct line *l, const char *s)
-{
-    while (*s && l->len < sizeof(l->buf) - 1)
-        l->buf[l->len++] = *s++;
-}
-
-static void line_num(struct line *l, long v)
-{
-    char tmp[24];
-    int n = 0;
-    unsigned long u = v < 0 ? -(unsigned long)v : (unsigned long)v;
-
-    if (v < 0)
-        line_str(l, "-");
-    do {
-        tmp[n++] = (char)('0' + u % 10);
-        u /= 10;
-    } while (u);
-    while (n > 0 && l->len < sizeof(l->buf) - 1)
-        l->buf[l->len++] = tmp[--n];
-}
-
-static void line_out(struct line *l)
-{
-    sys_write(l->buf, l->len);
-    l->len = 0;
-}
 
 /* ---- UMODE_HELLO ---- */
 
@@ -220,7 +155,223 @@ static int mode_isolation(void)
     return 0;
 }
 
-void _start(long mode);
+/* ---- UMODE_PROC ---- */
+
+static void idle_worker(long arg)
+{
+    (void)arg;
+    /* 每次只睡一下:行程結束時,睡在 kernel 裡的執行緒要等醒來才會結束,
+       睡太久會讓整個行程的結束跟著拖延 */
+    for (;;)
+        sys_sleep(2);
+}
+
+/* 從使用者程式建立行程、傳參數、等它結束;以及各種應該失敗的情況 */
+static int mode_proc(void)
+{
+    struct line l = { .len = 0 };
+    char *echo_argv[] = { "echo", "  [user] hello from a spawned /bin/echo:", "one", "two", 0 };
+    char *cat_argv[] = { "cat", "/etc/motd", 0 };
+    char *ls_argv[] = { "ls", "/bin", 0 };
+    long pid, code;
+
+    /* 1. 建立行程並等待。echo 的結束碼是它收到的參數個數 */
+    pid = sys_spawn("/bin/echo", echo_argv);
+    if (pid <= 0)
+        return 201;
+    code = sys_wait(pid);
+    if (code != 4)
+        return 202;
+    line_str(&l, "  [user] spawned pid ");
+    line_num(&l, pid);
+    line_str(&l, " exited with ");
+    line_num(&l, code);
+    line_str(&l, " (my pid is ");
+    line_num(&l, sys_getpid());
+    line_str(&l, ")\n");
+    line_out(&l);
+
+    /* 2. 其他小工具:顯示檔案內容、列出目錄 */
+    puts_("  [user] running: cat /etc/motd\n");
+    if (sys_wait(sys_spawn("/bin/cat", cat_argv)) != 0)
+        return 203;
+    puts_("  [user] running: ls /bin\n");
+    if (sys_wait(sys_spawn("/bin/ls", ls_argv)) != 0)
+        return 204;
+
+    /* 3. 新行程繼承開啟中的檔案:先把自己的標準輸出換成一個檔案,
+          再建立 echo。echo 照常寫入 1 號描述符,結果進了檔案 */
+    long saved = sys_open("/dev/console", O_WRONLY);     /* 留一份主控台,等一下換回來 */
+    sys_close(1);
+    if (sys_open("/out.txt", O_CREAT | O_WRONLY | O_TRUNC) != 1)   /* 最小的空位就是 1 */
+        return 210;
+    char *redir_argv[] = { "echo", "captured", "output", 0 };
+    pid = sys_spawn("/bin/echo", redir_argv);
+    code = sys_wait(pid);
+    sys_close(1);
+    if (sys_open("/dev/console", O_WRONLY) != 1)         /* 換回主控台 */
+        return 211;
+    sys_close(saved);
+    if (code != 3)
+        return 212;
+    char buf[64];
+    long fd = sys_open("/out.txt", O_RDONLY);
+    long n = sys_read(fd, buf, sizeof(buf) - 1);
+    sys_close(fd);
+    sys_unlink("/out.txt");
+    buf[n > 0 ? n : 0] = 0;
+    if (!streq(buf, "captured output\n"))
+        return 213;
+    puts_("  [user] output of a child process was redirected into a file and read back\n");
+
+    /* 4. 應該失敗的情況:每一種都只是回傳錯誤,自己照常繼續執行 */
+    if (sys_spawn("/bin/nope", echo_argv) != -E_NOENT)
+        return 220;
+    if (sys_spawn("/etc/motd", echo_argv) != -E_NOEXEC)              /* 不是程式 */
+        return 221;
+    if (sys_exec("/bin/nope", echo_argv) != -E_NOENT)                /* exec 失敗:原程式不受影響 */
+        return 222;
+    if (sys_exec("/etc/motd", echo_argv) != -E_NOEXEC)
+        return 223;
+    if (sys_spawn((const char *)KERNEL_ADDR, echo_argv) != -E_FAULT) /* 路徑指向 kernel */
+        return 224;
+    if (sys_spawn("/bin/echo", (char **)KERNEL_ADDR) != -E_FAULT)    /* 參數陣列指向 kernel */
+        return 225;
+    char *bad_argv[] = { "echo", (char *)KERNEL_ADDR, 0 };           /* 其中一個參數指向 kernel */
+    if (sys_spawn("/bin/echo", bad_argv) != -E_FAULT)
+        return 226;
+    if (sys_wait(sys_getpid()) >= 0)                                 /* 等自己 */
+        return 227;
+
+    /* 5. 正在執行的程式檔不可以被修改(它的頁正對映在行程裡) */
+    fd = sys_open("/bin/init", O_WRONLY);
+    if (fd < 0)
+        return 230;
+    if (sys_write(fd, "x", 1) != -E_TXTBSY)
+        return 231;
+    sys_close(fd);
+    if (sys_open("/bin/init", O_WRONLY | O_TRUNC) != -E_TXTBSY)
+        return 232;
+
+    puts_("  [user] process calls work as expected\n");
+    return 12;
+}
+
+/* ---- UMODE_FS ---- */
+
+/* 每一項檢查失敗就回傳一個不同的數字,從結束碼可以看出是哪一步出錯 */
+static int mode_fs(void)
+{
+    /* 超過一頁:跨頁的讀寫也要正確。放在 stack 上而不是全域:全域變數會讓「每一個」
+       行程載入時都多配置這些頁,即使它根本不跑這個測試 */
+    char big[4500], back[4500];
+    char buf[160];
+    struct line l = { .len = 0 };
+    struct stat st;
+    struct dirent d;
+    long fd, n;
+
+    /* 1. 讀取開機檔案包裡的檔案 */
+    fd = sys_open("/etc/motd", O_RDONLY);
+    if (fd < 0)
+        return 101;
+    n = sys_read(fd, buf, sizeof(buf) - 1);
+    if (n <= 0)
+        return 102;
+    buf[n] = 0;
+    for (long i = 0; i < n; i++)                 /* 只印第一行 */
+        if (buf[i] == '\n')
+            buf[i] = 0;
+    line_str(&l, "  [user] /etc/motd says: ");
+    line_str(&l, buf);
+    line_str(&l, "\n");
+    line_out(&l);
+    if (sys_write(fd, "x", 1) != -E_BADF)        /* 唯讀開啟的檔案不能寫 */
+        return 103;
+    sys_close(fd);
+    if (sys_read(fd, buf, 1) != -E_BADF)         /* 關閉之後描述符就失效了 */
+        return 104;
+
+    /* 2. 建立目錄與檔案,寫入、讀回、比對 */
+    if (sys_mkdir("/tmp") != 0 && sys_mkdir("/tmp") != -E_EXIST)
+        return 110;
+    for (unsigned i = 0; i < sizeof(big); i++)
+        big[i] = (char)(i * 7 + 3);
+    fd = sys_open("/tmp/data", O_CREAT | O_RDWR | O_TRUNC);
+    if (fd < 0)
+        return 111;
+    if (sys_write(fd, big, sizeof(big)) != (long)sizeof(big))
+        return 112;
+    sys_close(fd);
+    if (sys_stat("/tmp/data", &st) != 0 || st.type != I_FILE || st.size != sizeof(big))
+        return 113;
+    fd = sys_open("/tmp/data", O_RDONLY);
+    if (sys_read(fd, back, sizeof(back)) != (long)sizeof(back))
+        return 114;
+    for (unsigned i = 0; i < sizeof(big); i++)
+        if (back[i] != big[i])
+            return 115;
+    if (sys_read(fd, back, 16) != 0)             /* 已經到結尾:回傳 0 */
+        return 116;
+    sys_close(fd);
+
+    /* 3. 附加:每次寫入都接在最後 */
+    fd = sys_open("/tmp/log", O_CREAT | O_WRONLY | O_APPEND);
+    sys_write(fd, "one ", 4);
+    sys_write(fd, "two", 3);
+    sys_close(fd);
+    fd = sys_open("/tmp/log", O_RDONLY);
+    n = sys_read(fd, buf, sizeof(buf) - 1);
+    sys_close(fd);
+    buf[n > 0 ? n : 0] = 0;
+    if (!streq(buf, "one two"))
+        return 120;
+
+    /* 4. 列出目錄 */
+    fd = sys_open("/tmp", O_RDONLY);
+    if (fd < 0)
+        return 130;
+    int seen = 0;
+    line_str(&l, "  [user] /tmp contains:");
+    while (sys_readdir(fd, &d) == 0) {
+        line_str(&l, " ");
+        line_str(&l, d.name);
+        seen += streq(d.name, "data") + streq(d.name, "log");
+    }
+    line_str(&l, "\n");
+    line_out(&l);
+    sys_close(fd);
+    if (seen != 2)
+        return 131;
+
+    /* 5. 錯誤情況:每一種都應該被拒絕,而不是悄悄成功 */
+    if (sys_open("/no/such/file", O_RDONLY) != -E_NOENT)
+        return 140;
+    if (sys_unlink("/tmp") != -E_NOTEMPTY)       /* 目錄不是空的 */
+        return 141;
+    if (sys_open((const char *)KERNEL_ADDR, O_RDONLY) != -E_FAULT)   /* 路徑指向 kernel 的記憶體 */
+        return 142;
+    fd = sys_open("/etc/motd", O_RDONLY);
+    if (sys_read(fd, (void *)KERNEL_ADDR, 16) != -E_FAULT)          /* 請 kernel 寫入 kernel 的記憶體 */
+        return 143;
+    if (sys_read(fd, (void *)mode_fs, 16) != -E_FAULT)              /* 請 kernel 寫入自己的程式碼(唯讀頁) */
+        return 144;
+    sys_close(fd);
+    if (sys_close(99) != -E_BADF || sys_close(-1) != -E_BADF)
+        return 145;
+
+    /* 6. 刪除 */
+    if (sys_unlink("/tmp/data") != 0 || sys_unlink("/tmp/log") != 0 || sys_unlink("/tmp") != 0)
+        return 150;
+    if (sys_stat("/tmp", &st) != -E_NOENT)
+        return 151;
+
+    puts_("  [user] file system calls work as expected\n");
+    return 9;
+}
+
+
+int main(int argc, char **argv);
 
 static int umain(long mode)
 {
@@ -234,7 +385,7 @@ static int umain(long mode)
 
     case UMODE_WRITE_TEXT:
         puts_("  [user] writing to my own code...\n");
-        *(volatile char *)(unsigned long)_start = 0;     /* 程式碼頁是唯讀的 */
+        *(volatile char *)(unsigned long)main = 0;       /* 程式碼頁是唯讀的 */
         return 1;
 
     case UMODE_PRIVILEGED:
@@ -255,7 +406,7 @@ static int umain(long mode)
     case UMODE_BAD_POINTER: {
         /* 請 kernel 把「kernel 自己的記憶體」印出來。kernel 必須拒絕,
            否則使用者就能藉由系統呼叫讀到任何東西 */
-        long r = sys_write((const char *)KERNEL_ADDR, 16);
+        long r = sys_write(1, (const char *)KERNEL_ADDR, 16);
         puts_(r < 0 ? "  [user] write(kernel address) was rejected\n"
                     : "  [user] write(kernel address) SUCCEEDED?!\n");
         return r < 0 ? 7 : 1;
@@ -273,6 +424,27 @@ static int umain(long mode)
     case UMODE_ISOLATION:
         return mode_isolation();
 
+    case UMODE_FS:
+        return mode_fs();
+
+    case UMODE_PROC:
+        return mode_proc();
+
+    case UMODE_EXEC: {
+        /* 成功的話不會返回:這個行程接下來執行的是 /bin/echo,
+           結束碼也由它決定(echo 回傳它收到的參數個數) */
+        char *argv[] = { "echo", "  [user] this line is printed by /bin/echo after exec,", "same pid", 0 };
+        sys_exec("/bin/echo", argv);
+        return 1;                                        /* 走到這裡表示 exec 失敗 */
+    }
+
+    case UMODE_EXEC_THREADS: {
+        sys_thread_create(idle_worker, 0);
+        char *argv[] = { "echo", 0 };
+        long r = sys_exec("/bin/echo", argv);
+        return r == -E_BUSY ? 13 : 1;
+    }
+
     case UMODE_FUTEX:
         return mode_futex();
 
@@ -282,13 +454,8 @@ static int umain(long mode)
     return 3;
 }
 
-/*
- * 進入點。kernel 把 CPU 降到使用者模式後從這裡開始執行,mode 是第一個參數。
- * 放在 .text.start 區段,linker script 會把它排在程式碼的最前面。
- * umain 返回後必須呼叫 sys_exit:使用者程式沒有「上一層」可以返回。
- */
-__attribute__((section(".text.start"), noreturn))
-void _start(long mode)
+/* 第一個參數(argv[1])是要執行的測試編號;沒有給就是 0 */
+int main(int argc, char **argv)
 {
-    sys_exit(umain(mode));
+    return umain(argc > 1 ? uatoi(argv[1]) : 0);
 }
