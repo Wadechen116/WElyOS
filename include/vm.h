@@ -73,4 +73,11 @@ int vm_space_query(struct vm_space *vs, uintptr_t va, uintptr_t *pa, unsigned *f
 
 /* 讓 CPU 改用這個位址空間;傳 NULL 表示回到 kernel 自己的頁表 */
 void vm_space_switch(struct vm_space *vs);
+
+/* 其他 CPU 啟動時呼叫:在「目前這顆 CPU」上載入 kernel 頁表並開啟分頁。
+   頁表本身全系統共用,但開啟分頁、功能位元這些設定是每顆 CPU 各自的 */
+void vm_enable_secondary(void);
+
+/* kernel 頁表根表格的實體位址(i386 的啟動程式要在開啟分頁前把它載入 CR3) */
+uintptr_t vm_kernel_root(void);
 #endif

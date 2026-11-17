@@ -30,7 +30,9 @@ struct cpu {
     uintptr_t kstack_top;        /* 目前執行緒 kernel stack 的頂端(從使用者模式進入時使用) */
     uintptr_t scratch[2];        /* 例外入口暫放暫存器的空間 */
 
-    int id;                      /* CPU 編號(cpus[] 的索引) */
+    int id;                      /* CPU 編號(cpus[] 的索引);開機的那一顆固定是 0 */
+    uint64_t arch_id;            /* 硬體上的編號:RISC-V hartid、AArch64 MPIDR、i386 LAPIC ID */
+    volatile int started;        /* 已經啟動並回報(見 smp.c) */
     int online;                  /* 已啟動並參與排程 */
     int in_irq;                  /* 正在中斷處理程式中 */
     volatile int need_resched;   /* 需要重新排程(可由別顆 CPU 設定) */
@@ -46,7 +48,7 @@ _Static_assert(offsetof(struct cpu, kstack_top) == sizeof(uintptr_t), "cpu.kstac
 _Static_assert(offsetof(struct cpu, scratch) == 2 * sizeof(uintptr_t), "cpu.scratch");
 
 extern struct cpu cpus[MAX_CPUS];
-extern int cpu_count;            /* 已啟動的 CPU 數(目前固定為 1) */
+extern int cpu_count;            /* 參與排程的 CPU 數(目前固定為 1:其他 CPU 啟動後先待命) */
 
 #include "cpu_arch.h"            /* arch_this_cpu()、arch_cpu_relax() */
 

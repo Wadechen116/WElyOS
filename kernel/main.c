@@ -15,6 +15,7 @@
 #include "pmm.h"
 #include "proc.h"
 #include "sched.h"
+#include "smp.h"
 #include "spinlock.h"
 #include "sync.h"
 #include "timer.h"
@@ -1063,6 +1064,9 @@ void kmain(const struct boot_info *bi)
     sched_init();
     arch_irq_enable();
     kprintf("timer: %u Hz\n", timer_hz());
+
+    /* 啟動其他 CPU。selftest 時所有 CPU 一起跑一輪並行測試 */
+    smp_init(bi, cmdline_has(bi->cmdline, "selftest"));
 
     sched_crash_test(bi->cmdline);
     if (selftest) {

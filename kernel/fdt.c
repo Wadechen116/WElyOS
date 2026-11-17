@@ -43,6 +43,7 @@ int fdt_parse(const void *fdt, struct boot_info *bi)
     bi->mem_base = 0;
     bi->mem_size = 0;
     bi->n_reserved = 0;
+    bi->ncpus = 0;
     if (!base || be32(base) != FDT_MAGIC)
         return -1;
 
@@ -66,6 +67,9 @@ int fdt_parse(const void *fdt, struct boot_info *bi)
     int depth = 0;             /* 根節點內為 1,根的子節點為 2 */
     enum { NONE, CHOSEN, MEMORY } cur = NONE;   /* 目前所在的深度 2 節點種類 */
     int got_mem = 0;
+    /* CPU 清單:/cpus 底下每個名為 cpu@N 的節點,其 reg 屬性就是該 CPU 的硬體編號 */
+    int in_cpus = 0, in_cpu = 0;
+    uint32_t cpu_ac = 1;       /* /cpus 節點的 #address-cells:reg 由幾個 cell 組成 */
 
     for (;;) {
         uint32_t tok = be32(p);
@@ -80,9 +84,16 @@ int fdt_parse(const void *fdt, struct boot_info *bi)
                     cur = CHOSEN;
                 else if (!strncmp(name, "memory", 6))
                     cur = MEMORY;
+                in_cpus = !strcmp(name, "cpus");
+            } else if (depth == 3 && in_cpus) {
+                in_cpu = !strncmp(name, "cpu@", 4);
             }
             p += (strlen(name) + 1 + 3) & ~3u;           /* 名稱以 4 位元組對齊 */
         } else if (tok == FDT_END_NODE) {
+            if (depth == 3)
+                in_cpu = 0;
+            else if (depth == 2)
+                in_cpus = 0;
             depth--;
             cur = NONE;
         } else if (tok == FDT_PROP) {
@@ -103,6 +114,11 @@ int fdt_parse(const void *fdt, struct boot_info *bi)
                 bi->mem_base = be_cells(data, ac);
                 bi->mem_size = be_cells(data + 4 * ac, sc);
                 got_mem = 1;
+            } else if (depth == 2 && in_cpus && !strcmp(pname, "#address-cells")) {
+                cpu_ac = be32(data);
+            } else if (depth == 3 && in_cpu && !strcmp(pname, "reg") &&
+                       len >= 4 * cpu_ac && bi->ncpus < BOOT_MAX_CPUS) {
+                bi->cpu_ids[bi->ncpus++] = be_cells(data, cpu_ac);
             }
         } else if (tok != FDT_NOP) {
             break;                                       /* FDT_END 或無法辨識 */

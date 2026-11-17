@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include "arch.h"
 #include "boot_info.h"
+#include "cpu.h"
 #include "fdt.h"
 #include "kprintf.h"
 #include "trap.h"
@@ -12,7 +13,7 @@
 void arch_start(uint64_t hartid, const void *dtb)
 {
     static struct boot_info bi;
-    (void)hartid;
+    cpus[0].arch_id = hartid;            /* 開機的這顆 hart;之後啟動其他 hart 時要跳過它 */
 
     arch_init();
     trap_init();                         /* 之後的例外都會進入 trap_handler */

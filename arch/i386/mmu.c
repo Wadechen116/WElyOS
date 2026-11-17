@@ -28,6 +28,7 @@
  * SMEP / SMAP 的用意:kernel 若因為程式錯誤而解參考了使用者提供的指標,
  * 或跳到使用者控制的位址,硬體會直接擋下。這類錯誤是提權攻擊最常利用的途徑。
  */
+#include "cpu.h"
 #include "mmu.h"
 #include "kprintf.h"
 #include "panic.h"
@@ -162,6 +163,8 @@ void arch_mmu_enable(pte_t *root)
     cr0 |= 0x80000000u | 0x00010000u;        /* PG | WP */
     __asm__ volatile("mov %0, %%cr0" : : "r"(cr0));
 
+    if (this_cpu()->id != 0)                 /* 其他 CPU 啟動時也會執行這裡,不必重複印 */
+        return;
     kprintf("vm: cpu features: NX %s, global pages %s, SMEP %s, SMAP %s\n",
             has_nx ? "on" : "unavailable", has_pge ? "on" : "unavailable",
             has_smep ? "on" : "unavailable", smap_enabled ? "on" : "unavailable");

@@ -10,8 +10,11 @@
 
 | 縮寫 | 英文全名 | 中文 |
 |---|---|---|
+| ACPI | Advanced Configuration and Power Interface | 進階組態與電源介面:BIOS 描述硬體的一組表格 |
+| AP | Application Processor | 應用處理器:開機後才被叫醒的其他 CPU |
 | ASID | Address Space Identifier | 位址空間編號 |
 | BSS | Block Started by Symbol | 未初始化資料區段 |
+| BSP | Bootstrap Processor | 開機處理器:開機時唯一在執行的那顆 CPU |
 | CAS | Compare-And-Swap | 比較並交換:「值仍是我看到的那個才改」的原子操作 |
 | CFS | Completely Fair Scheduler | 完全公平排程器 |
 | CSR | Control and Status Register | 控制與狀態暫存器 |
@@ -25,14 +28,17 @@
 | GDT | Global Descriptor Table | 全域描述符表 |
 | GIC | Generic Interrupt Controller | 通用中斷控制器 |
 | HSM | Hart State Management | hart 狀態管理(SBI 用來啟動、停止 CPU 的擴充) |
+| ICR | Interrupt Command Register | 中斷命令暫存器:LAPIC 中用來發出 IPI 的暫存器 |
 | IDT | Interrupt Descriptor Table | 中斷描述符表 |
 | IPI | Inter-Processor Interrupt | 處理器間中斷 |
 | IRQ | Interrupt Request | 中斷請求 |
 | ISR | Interrupt Service Routine | 中斷服務常式 |
 | LAPIC | Local Advanced Programmable Interrupt Controller | 本地進階可程式化中斷控制器 |
+| MADT | Multiple APIC Description Table | 多重 APIC 描述表:ACPI 中列出各 CPU 的表格 |
 | MLFQ | Multi-Level Feedback Queue | 多層回饋佇列 |
 | MMIO | Memory-Mapped I/O | 記憶體對映輸入輸出 |
 | MMU | Memory Management Unit | 記憶體管理單元 |
+| MPIDR | Multiprocessor Affinity Register | 多處理器親和暫存器:AArch64 每顆 CPU 的硬體編號 |
 | MSR | Model-Specific Register | 型號特定暫存器 |
 | NX | No-eXecute | 禁止執行位元 |
 | OpenSBI | Open Source Supervisor Binary Interface | RISC-V 的開源 SBI 韌體 |
@@ -48,7 +54,10 @@
 | PTE | Page Table Entry | 頁表項目 |
 | PXN | Privileged eXecute Never | 特權不可執行 |
 | QEMU | Quick Emulator | 快速模擬器 |
+| RSDP | Root System Description Pointer | 根系統描述指標:找到 ACPI 表格的起點 |
+| RSDT | Root System Description Table | 根系統描述表:列出其他 ACPI 表格的位址 |
 | SBI | Supervisor Binary Interface | 管理者二進位介面 |
+| SIPI | Startup Inter-Processor Interrupt | 啟動用處理器間中斷:讓 x86 的 AP 開始執行 |
 | SMAP | Supervisor Mode Access Prevention | 管理者模式存取保護 |
 | SMEP | Supervisor Mode Execution Prevention | 管理者模式執行保護 |
 | SMP | Symmetric Multiprocessing | 對稱多處理 |
@@ -102,6 +111,7 @@
 | priority inheritance | priority inheritance | 優先權繼承 |
 | priority inversion | priority inversion | 優先權反轉 |
 | race condition | race condition | 競爭條件:結果取決於執行順序 |
+| real mode | real mode | 真實模式:x86 開機時的 16 位元模式,沒有保護與分頁 |
 | round-robin | round-robin | 輪流排程 |
 | semaphore | semaphore | 號誌 |
 | semihosting | semihosting | 半主機:由模擬器或除錯器代為執行 I/O |
@@ -114,6 +124,7 @@
 | TLB shootdown | TLB shootdown | 通知其他 CPU 讓 TLB 紀錄失效 |
 | trap | trap | 例外與中斷的統稱(RISC-V 用語) |
 | trap frame | trap frame | 進入例外時存放暫存器的結構 |
+| trampoline | trampoline | 跳板:把 CPU 從一種執行環境帶到另一種的一小段程式 |
 | type-stable memory | type-stable memory | 型別穩定的記憶體:釋放後只會再被當成同一種結構使用 |
 | wait queue | wait queue | 等待佇列 |
 | work stealing | work stealing | 工作竊取:閒置的 CPU 到別顆 CPU 的佇列拿工作 |
@@ -2675,4 +2686,144 @@ kernel(單一 CPU,ring):只開機 0.22~0.31 秒,`selftest` 0.68~0.86 秒,全部�
 - **竊取一次只拿一個**。Go 的做法是一次拿走一半,可以減少竊取的次數,之後量測有需要再改。
 - **`struct thread` 的記憶體不歸還 heap**。同時存在過的執行緒數量上限決定了佔用量(1000 條約 200KB)。
 - **溢出串列「串入後再檢查」的競爭沒有被測試涵蓋**,如上所述。
+
+---
+
+## 第 17 步:多核心第二段 — 啟動其他 CPU
+
+這一步讓其他 CPU 真的開始執行 kernel 的程式。三個架構都能啟動到 8 顆(`MAX_CPUS`),每顆完成自己的初始化、通過並行測試,然後**待命**。讓它們參與排程是第三段的工作,因為那需要每顆 CPU 自己的計時器與處理器間中斷(IPI)。
+
+為什麼不一次做到底:排程需要搶佔,搶佔需要計時器中斷,而其他 CPU 的計時器在三個架構上是三套不同的東西(尤其 i386 要改用 LAPIC 的計時器)。先確認「啟動」本身正確,下一段出問題時範圍才小。
+
+### 名詞:BSP 與 AP
+
+開機時只有一顆 CPU 在執行,稱為 BSP(Bootstrap Processor);其他的稱為 AP(Application Processor),停在韌體裡等 kernel 叫醒。
+
+### 共用的流程:`kernel/smp.c`
+
+```
+smp_init()
+  1. arch_smp_discover()   問架構層:除了自己還有哪些 CPU(硬體編號)
+  2. 對每一顆:
+       配置它的 struct cpu 與自己的 stack(16KB)
+       arch_smp_start()    叫醒它
+       等它回報(逾時 200ms 就放棄這一顆,繼續下一顆)
+  3. arch_smp_done()       收拾啟動用的暫時資源
+  4. selftest 時:所有 CPU 一起跑並行測試;否則直接待命
+```
+
+AP 醒來後由架構層的組合語言設定好 stack 與「自己的 `struct cpu`」,再依序做三件每顆 CPU 都要各自做一次的事:安裝例外入口、開啟分頁、呼叫 `smp_ap_main()` 回報。
+
+兩個設計上的選擇:
+
+- **一次只啟動一顆**,等它回報才啟動下一顆。啟動過程中有些資料是所有 AP 共用的(例如 i386 跳板要讀的 stack 位址),同時啟動會互相覆蓋。代價是啟動時間與 CPU 數成正比,但每顆只需不到 1ms。
+- **頁表共用、設定各自做**。kernel 的頁表全系統只有一份,但「開啟分頁」與 NX、SMEP、PAN 這些功能位元存在每顆 CPU 自己的控制暫存器裡,每顆都要設定一次(`vm_enable_secondary()`)。漏掉的話那顆 CPU 就沒有這些保護。
+
+### 三個架構怎麼找到、怎麼叫醒其他 CPU
+
+| | RISC-V | AArch64 | i386 |
+|---|---|---|---|
+| 有哪些 CPU | 裝置樹 `/cpus/cpu@N` 的 `reg`(hartid) | 裝置樹 `/cpus/cpu@N` 的 `reg`(MPIDR) | ACPI 的 MADT(LAPIC ID) |
+| 叫醒的方法 | SBI 的 HSM 擴充 `hart_start` | PSCI 的 `CPU_ON`(以 `hvc` 呼叫) | LAPIC 送出 INIT 與 SIPI |
+| AP 醒來時的狀態 | S-mode、分頁關閉 | EL1、分頁關閉 | **真實模式**(16 位元) |
+| 能否傳參數給 AP | 可以(`a1`) | 可以(`x0`) | 不行 |
+
+RISC-V 與 AArch64 很直接:韌體提供一個呼叫,指定「哪一顆、從哪裡開始、帶什麼參數」。參數就傳那顆 CPU 的 `struct cpu` 位址,AP 的入口(`boot.S` 的 `ap_entry`)只有四五條指令:把它放進 `tp` / `TPIDR_EL1`、從裡面取出 stack、跳進 C。
+
+裝置樹的解析(`kernel/fdt.c`)加了 CPU 清單:`/cpus` 底下名稱以 `cpu@` 開頭的節點,其 `reg` 屬性就是硬體編號,長度由 `/cpus` 的 `#address-cells` 決定。
+
+#### 踩坑(預先避開):RISC-V 開機的不一定是 0 號 hart
+
+原本的 `boot.S` 寫著「只讓 hart 0 往下執行,其他休眠」。單核心時沒問題,但多核心時 OpenSBI **隨機挑一顆** hart 進入 kernel,實測 4 顆時是 2 號、8 顆時是 5 號。照原本的寫法,那顆 hart 會直接休眠,整台機器開不了機。
+
+改為「第一顆到達的 hart 繼續」:用一條原子交換指令搶一個旗標,搶到的往下走。正常情況下只有一顆會到達(其他停在韌體裡),這個旗標只是防範舊版韌體讓所有 hart 同時進來。旗標放在 `.data` 而不是 `.bss`,否則會被開機流程自己清掉。
+
+由此也確立一個原則:**kernel 內的 CPU 編號(`cpu->id`)和硬體編號(`cpu->arch_id`)是兩回事**。開機的那顆永遠是 0 號,不論它在硬體上是幾號。
+
+#### i386:三個額外的麻煩
+
+**1. 沒有裝置樹,要讀 ACPI。** 在 `0xE0000`~`0xFFFFF` 之間找 `"RSD PTR "` 開頭的 RSDP → 它指向 RSDT → RSDT 列出其他表格的位址 → 找到簽章為 `"APIC"` 的 MADT → 裡面類型 0 的紀錄各代表一顆 CPU。每張表都有檢查碼(所有位元組相加為 0),長度也設了上限,不合格就放棄並維持單核心。這些表格位在 BIOS 保留的區域,不屬於 kernel 管理的記憶體,平常沒有對映,讀之前先以**唯讀**對映。
+
+**2. AP 醒來時是 16 位元的真實模式**,只能執行 1MB 以下的程式,而 kernel 在 1MB 以上、是 32 位元的。所以需要一段跳板(trampoline,`arch/i386/ap_tramp.S`):
+
+```
+kernel 把跳板複製到 0x8000
+AP 從 0x8000 開始(真實模式)
+  → 載入臨時的 GDT,設定 CR0.PE,遠跳躍       進入 32 位元保護模式
+  → 載入與 BSP 相同的 CR4、EFER、CR3、CR0     開啟分頁(含 NX、SMEP、SMAP)
+  → 換到 kernel 準備的 stack,跳進 arch_ap_start()
+```
+
+幾個細節:
+
+- 跳板被組譯時在 kernel 映像裡,執行時卻在 `0x8000`,所以它引用自己內部的位址時要手動換算。
+- 開啟分頁後的下一條指令仍在 `0x8000`,所以這一頁必須在頁表中對映為可執行。做法是先對映成可寫、複製完改成唯讀可執行(維持 W^X),所有 AP 啟動後**移除對映**,不在低位址留下一頁可執行的程式。
+- CR3 用的是 kernel 的頁表,不是 BSP 當下的 CR3:後者可能是某個行程的頁表(第 15 步的延遲切換)。
+- 放跳板前先確認 `0x8000` 沒有和 bootloader 留下的資料重疊(QEMU 把 multiboot 資訊放在 `0x9500`,很近)。
+
+**3. 每顆 CPU 要有自己的 TSS。** 第 16 步選擇用工作暫存器 TR 來辨識 CPU,這裡補上對應的實作:GDT 擴充到 21 項,第 7 項起每兩項屬於一顆 AP。AP 進入 C 之後第一件事是載入 kernel 的 GDT、IDT 與**自己的** TSS(`trap_init_ap`),在那之前 `this_cpu()` 還不能用。TSS 裡的 `esp0`(從使用者模式進入 kernel 時用的 stack)也因此變成每顆 CPU 各自一份。
+
+INIT 與 SIPI 的時序依規範:INIT 之後等 10ms 再送 SIPI,SIPI 送兩次。
+
+### 效能:開機時間
+
+使用者在意開機耗時,所以特別量了這一步的影響(`autoexit`,5 次取最快):
+
+| | 1 顆 CPU | 4 顆 CPU | 8 顆 CPU |
+|---|---|---|---|
+| i386(第一版) | 0.30 秒 | **0.46 秒** | — |
+| i386(調整後) | 0.30 秒 | 0.31 秒 | 0.34 秒 |
+| riscv64 | 0.31 秒 | 0.32 秒 | — |
+| aarch64 | 0.24 秒 | 0.24 秒 | — |
+
+i386 第一版多出的 0.16 秒幾乎全部來自那 10ms 的等待(模擬器裡閒置等待的實際耗時遠大於 10ms)。兩個調整:
+
+1. **INIT 用「除了自己以外的所有 CPU」一次送出**,只等一次,而不是每顆各等 10ms。
+2. **在模擬器 / 虛擬機裡把等待縮短為 1ms**。10ms 是給實體 CPU 完成重設用的,模擬的 CPU 重設是瞬間完成的。判斷依據是 CPUID 的 hypervisor 位元(ECX bit 31),它由虛擬機管理程式設定,實體 CPU 上恆為 0,所以在實機上仍會等足 10ms。
+
+`selftest` 與全部測試在 4 顆 CPU 時比 1 顆慢約 0.05~0.15 秒,來自並行測試本身與模擬器多開的執行緒。
+
+QEMU 的 CPU 數由環境變數 `QEMU_SMP` 控制,預設 4。要最快的開機可用 `QEMU_SMP=1`。
+
+### 驗證
+
+`selftest` 時所有 CPU 同時執行一份並行測試。這是 kernel 裡**第一次有真正同時執行的程式**,所以也順便驗證前兩步只能靠推導的東西:
+
+| 項目 | 做法 | 結果 |
+|---|---|---|
+| 例外處理 | 每顆 AP 各自觸發一次中斷點例外並返回 | 三個架構每顆 AP 都印出 `[trap] breakpoint ... resuming` |
+| `this_cpu()` | 每顆 CPU 反覆確認拿到的是自己的 `struct cpu`(共 2 萬次) | 0 次錯誤 |
+| spinlock | 所有 CPU 同時對同一個計數器加一,各 2 萬次 | 總和完全正確(例:8 顆 = 160000) |
+| 對照組 | 同樣的遞增但不上鎖 | 偶爾少掉(見下) |
+| 無鎖環狀佇列 | BSP 放入 63 個項目,所有 CPU 同時取出 | 每個項目恰好被取走一次,總和正確 |
+
+不上鎖的對照組在不同次執行中少了 0、1、2、20 次不等。少掉代表兩顆 CPU 讀到同一個舊值、各自加一後寫回,只算了一次 — 這正是需要鎖的原因,也證明這些 CPU 確實是同時在執行。偶爾為 0 是因為測試很短,碰巧沒有撞上。
+
+實際啟動的情況:
+
+```
+riscv64, 8 顆:  smp: 8 cpus started (hardware ids: 5 0 1 2 3 4 6 7)
+aarch64, 8 顆:  smp: 8 cpus started (hardware ids: 0 1 2 3 4 5 6 7)
+i386,    8 顆:  smp: 8 cpus started (hardware ids: 0 1 2 3 4 5 6 7)
+```
+
+回歸測試(預設 4 顆 CPU):
+
+- 三個架構各 19 個情境,共 57 個,結束碼全部符合預期。
+- `autoexit selftest stress memtest`:三個架構 × 2、4、8 顆 CPU 各 7 次,加上稍早 4、8 顆各 10 次,共 123 次全部通過。
+- `QEMU_SMP=1`(三個架構)與 `QEMU_CPU=qemu32`(i386 沒有 NX、SMEP、SMAP 的退回路徑,4 顆 CPU)都通過。
+
+這一步三個架構都是第一次執行就成功,沒有踩到坑;RISC-V 開機 hart 的問題是事先讀規範發現的。
+
+### 已知限制
+
+- **AP 啟動後只是待命**(關著中斷休眠),還沒有執行任何執行緒。`cpu_count`(參與排程的 CPU 數)仍是 1。
+- **AP 沒有計時器、也收不到中斷**。第三段要加上每顆 CPU 的計時器(i386 要改用 LAPIC 的計時器)與 IPI。
+- **panic 時其他 CPU 不會停下來**。目前它們都在休眠所以沒有影響;參與排程之後需要用 IPI 讓它們停止。
+- **AP 的 stack 沒有保護頁**,溢位不會被立刻發現(BSP 與所有執行緒的 stack 都有)。
+- **i386 的 double fault 處理全系統只有一份**(TSS 與 stack),兩顆 CPU 同時發生時會互相干擾。處理程式已改為從 `link` 欄位找出是哪顆 CPU 出事。
+- **i386 找 CPU 只支援 ACPI 1.0 的 RSDT**,不讀 64 位元的 XSDT,也不搜尋 EBDA(延伸 BIOS 資料區);找不到時維持單核心。只認 8 位元的 LAPIC ID(255 顆以下)。
+- **「在虛擬機裡縮短 INIT 等待」依賴 CPUID 的 hypervisor 位元**。若某個虛擬機管理程式設了這個位元、卻需要較長的重設時間,AP 會啟動失敗(會印出訊息並繼續以較少的 CPU 執行,不會當機)。
+- **啟動失敗的 CPU 不會重試**,它的 stack 也不回收(那顆 CPU 也許只是慢了)。
+- 第 16 步列出的多核心限制(TLB 失效只作用在自己這顆、kernel 執行緒沿用上一個行程的頁表、i386 的 PAE 項目分兩次寫入)仍然存在,在 AP 參與排程之前必須處理。
 

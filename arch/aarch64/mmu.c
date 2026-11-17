@@ -31,6 +31,7 @@
  * kernel 若因為程式錯誤而解參考了使用者提供的指標,硬體會直接擋下。
  * 需要 ARMv8.1 以上的 CPU;kernel 讀寫使用者資料一律走恆等對映的實體位址,不受影響。
  */
+#include "cpu.h"
 #include "mmu.h"
 #include "kprintf.h"
 #include "vm.h"
@@ -157,7 +158,8 @@ void arch_mmu_enable(pte_t *root)
            避免要求組譯器以 ARMv8.1 的指令集編譯整個檔案 */
         __asm__ volatile(".inst 0xD500419F");
     }
-    kprintf("vm: cpu features: PAN %s\n", has_pan ? "on" : "unavailable");
+    if (this_cpu()->id == 0)                 /* 其他 CPU 啟動時也會執行這裡,不必重複印 */
+        kprintf("vm: cpu features: PAN %s\n", has_pan ? "on" : "unavailable");
 }
 
 void arch_mmu_switch(pte_t *root, unsigned asid, int flush)

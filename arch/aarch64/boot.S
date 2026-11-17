@@ -47,6 +47,21 @@ park:                                 /* arch_start 不返回;其他核心也停
     wfe
     b       park
 
+/*
+ * 其他 CPU 的起點(由 PSCI 的 CPU_ON 指定):x0 = 它的 struct cpu。
+ * 和 _start 的差別:BSS 已經清過,stack 用的是 kernel 替它配置的那一條。
+ */
+    .section .text
+    .global ap_entry
+ap_entry:
+    msr     tpidr_el1, x0             /* TPIDR_EL1 = 自己的 struct cpu */
+    ldr     x1, [x0, #8]              /* struct cpu 的 kstack_top */
+    mov     sp, x1
+    mov     x29, xzr
+    bl      arch_ap_start             /* 不會返回 */
+1:  wfe
+    b       1b
+
     /* 16KB 初始 stack,放在 .bss */
     .section .bss
     .balign 4096

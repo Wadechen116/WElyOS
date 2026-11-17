@@ -365,6 +365,16 @@ void vm_space_switch(struct vm_space *vs)
     arch_mmu_switch(vs->root, vs->asid, vs->asid == MMU_ASID_MAX);
 }
 
+void vm_enable_secondary(void)
+{
+    arch_mmu_enable(root);
+}
+
+uintptr_t vm_kernel_root(void)
+{
+    return (uintptr_t)root;
+}
+
 unsigned long vm_table_pages(void)
 {
     return table_pages;

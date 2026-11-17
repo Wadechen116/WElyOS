@@ -13,8 +13,16 @@
     .section .text.boot
     .global _start
 _start:
-    /* 只讓 hart 0 往下執行;其他核心(若有)在此休眠 */
-    bnez    a0, park
+    /*
+     * 只讓「第一顆到達這裡的 hart」往下執行。哪一顆 hart 負責開機由 OpenSBI 決定,
+     * 不一定是 0 號;其他 hart 正常情況下停在韌體裡,等 kernel 之後用 SBI 叫醒
+     * (見 smp.c 與下面的 ap_entry)。保險起見,萬一韌體讓多顆同時進來,
+     * 用一個原子交換搶旗標:搶到的繼續,其餘休眠。
+     */
+    la      t0, boot_lottery
+    li      t1, 1
+    amoswap.w t1, t1, (t0)
+    bnez    t1, park
 
     la      sp, stack_top             /* 設定 stack(RISC-V stack 同樣往低位址成長) */
     la      tp, cpus                  /* tp = 第 0 顆 CPU 的 struct cpu(kernel 中固定如此,見 cpu_arch.h) */
@@ -37,6 +45,25 @@ _start:
 park:                                 /* arch_start 不返回;其他核心也停在這裡 */
     wfi                               /* 等待中斷;中斷關閉時等同閒置 */
     j       park
+
+/*
+ * 其他 hart 的起點(由 SBI 的 hart_start 指定):a0 = hartid,a1 = 它的 struct cpu。
+ * 和 _start 的差別:BSS 已經清過,stack 用的是 kernel 替它配置的那一條。
+ */
+    .global ap_entry
+ap_entry:
+    mv      tp, a1                    /* tp = 自己的 struct cpu */
+    ld      sp, 8(tp)                 /* struct cpu 的 kstack_top */
+    li      s0, 0
+    csrw    sscratch, zero            /* 約定:在 kernel 中 sscratch 為 0(見 trap.S) */
+    call    arch_ap_start             /* 不會返回 */
+1:  wfi
+    j       1b
+
+    .section .data
+    .balign 4
+boot_lottery:                         /* 0 = 還沒有 hart 開機;放在 .data,不受清 BSS 影響 */
+    .word   0
 
     /* 16KB 初始 stack,放在 .bss;RISC-V ABI 要求 16 位元組對齊 */
     .section .bss

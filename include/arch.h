@@ -59,6 +59,23 @@ void arch_set_kstack(uintptr_t top);
 void arch_enter_user(uintptr_t entry, uintptr_t usp, uintptr_t arg) __attribute__((noreturn));
 
 /*
+ * 多核心:啟動其他 CPU(實作在 arch/<名稱>/smp.c)。
+ *   arch_smp_discover(bi, ids, max):找出「開機這顆以外」的 CPU,把它們硬體上的編號
+ *       填入 ids(最多 max 個),回傳個數。同時完成啟動前的一次性準備。
+ *   arch_smp_start(c):讓 c 代表的那顆 CPU 開始執行。呼叫前 c->id、c->arch_id、
+ *       c->kstack_top 已設定好。那顆 CPU 會在自己的 stack 上、以 this_cpu() == c
+ *       的狀態呼叫 smp_ap_main()。回傳 0 表示啟動要求已送出(不代表已經啟動)。
+ *   arch_smp_done():所有 CPU 都啟動(或放棄)之後呼叫,收拾啟動用的暫時資源。
+ *   arch_smp_park():讓目前這顆 CPU 永久休眠(關著中斷)。
+ */
+struct boot_info;
+struct cpu;
+int  arch_smp_discover(const struct boot_info *bi, uint64_t *ids, int max);
+int  arch_smp_start(struct cpu *c);
+void arch_smp_done(void);
+void arch_smp_park(void) __attribute__((noreturn));
+
+/*
  * 沿著 frame pointer 鏈印出呼叫堆疊(需以 -fno-omit-frame-pointer 編譯)。
  *   pc: 發生例外的位址,非 0 時當作第 0 層印出;傳 0 則略過
  *   fp: 起始的 frame pointer

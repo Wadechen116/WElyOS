@@ -31,11 +31,11 @@
 - [x] 以 `-O2` 編譯(`-DWELYOS_OPT=-O0` 可改回,方便 GDB 逐行追蹤)
 - [x] 多核心第一段:spinlock(偵測重複上鎖、錯誤解鎖、持有時切換執行緒)、每顆 CPU 的狀態(`struct cpu`,RISC-V 用 `tp`、AArch64 用 `TPIDR_EL1`、i386 用工作暫存器 TR(Task Register) 取得)、所有共用資料改以鎖保護;目前仍只啟動一顆 CPU
 - [x] 可替換的執行佇列(`include/runq.h`):`ring` 每顆 CPU 一組無鎖(lock-free)環狀佇列加工作竊取(預設)、`list` 全系統一組有鎖的串列,以 `-DWELYOS_RUNQ=` 選擇;主機端多執行緒測試(含 ThreadSanitizer)
+- [x] 多核心第二段:啟動其他 CPU(最多 8 顆)— RISC-V 以 SBI HSM(Hart State Management)、AArch64 以 PSCI(Power State Coordination Interface)、i386 以 ACPI(Advanced Configuration and Power Interface)找出 CPU 並用 LAPIC(Local Advanced Programmable Interrupt Controller)的 INIT / SIPI(Startup Inter-Processor Interrupt)加真實模式跳板啟動;各 CPU 完成初始化與並行測試後待命
 
 ## 規劃中
 
-- [ ] 多核心(Symmetric Multiprocessing,SMP)第二段:啟動其他 CPU(RISC-V SBI HSM(Hart State Management)、AArch64 PSCI(Power State Coordination Interface)、i386 LAPIC(Local Advanced Programmable Interrupt Controller) INIT-SIPI)
-- [ ] 多核心第三段:每顆 CPU 的計時器、處理器間中斷(Inter-Processor Interrupt,IPI)、TLB shootdown
+- [ ] 多核心(Symmetric Multiprocessing,SMP)第三段:每顆 CPU 的計時器、處理器間中斷(Inter-Processor Interrupt,IPI)、TLB shootdown,讓其他 CPU 參與排程
 - [ ] 檔案系統、從檔案載入程式(`exec`)、`fork`、shell
 
 ## 需求
@@ -66,6 +66,7 @@ bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit stress" 
 cmake --build build/i386    --target run-gui   # 僅 i386:開啟 QEMU 視窗顯示 VGA 畫面
 cmake --preset riscv64 -DWELYOS_RUNQ=list      # 換用另一種執行佇列的實作(預設 ring)
 bash scripts/host-test.sh                      # 在主機上以多條執行緒測試執行佇列(不需要 QEMU)
+QEMU_SMP=8 bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit selftest"   # 指定 CPU 數(預設 4,最多 8;1 = 單核心)
 ```
 
 ## 專案結構
@@ -73,7 +74,7 @@ bash scripts/host-test.sh                      # 在主機上以多條執行緒�
 ```
 arch/<名稱>/  各架構的開機程式、linker script、驅動(i386 / riscv64 / aarch64)
 include/      與架構無關的標頭(arch.h 為架構介面)
-kernel/       kernel 主體(main、kprintf、fdt、panic、timer、pmm、kmalloc、sched、runq_ring / runq_list、spinlock、sync、vm、proc)
+kernel/       kernel 主體(main、kprintf、fdt、panic、timer、pmm、kmalloc、sched、runq_ring / runq_list、spinlock、smp、sync、vm、proc)
 lib/          最小字串函式庫
 cmake/        各架構的 toolchain 檔
 user/         使用者程式(在使用者模式執行,獨立連結後嵌入 kernel)

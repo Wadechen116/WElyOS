@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "arch.h"
+#include "cpu.h"
 #include "kprintf.h"
 #include "panic.h"
 #include "proc.h"
@@ -46,7 +47,11 @@ struct desc_ptr {
 #define USER_CS   0x2B     /* GDT 第 5 項 | RPL 3:使用者程式碼區段 */
 #define USER_DS   0x33     /* GDT 第 6 項 | RPL 3:使用者資料區段 */
 
-static struct gdt_entry gdt[7];
+/* 第 0~6 項如上;第 7 項起每兩項留給第 1 顆、第 2 顆…CPU 的 TSS(見 cpu_arch.h)。
+   每顆 CPU 要有自己的 TSS:裡面的 esp0 是「這顆 CPU 上正在執行的執行緒」的 kernel stack */
+#define GDT_ENTRIES (7 + 2 * (MAX_CPUS - 1))
+#define AP_TSS_INDEX(id) (7 + 2 * ((id) - 1))        /* 第 id 顆 CPU(id >= 1)的 TSS 在第幾項 */
+static struct gdt_entry gdt[GDT_ENTRIES];
 static struct desc_ptr gdt_ptr;
 
 extern void gdt_flush(const struct desc_ptr *p);
@@ -91,7 +96,8 @@ struct tss {
 
 _Static_assert(sizeof(struct tss) == 104, "tss size");
 
-static struct tss main_tss;          /* 平常的 TSS:#DF 時 CPU 把出錯當下的狀態存在這裡 */
+static struct tss main_tss;          /* 第 0 顆 CPU 平常的 TSS:#DF 時 CPU 把出錯當下的狀態存在這裡 */
+static struct tss ap_tss[MAX_CPUS - 1];  /* 其他 CPU 平常的 TSS */
 static struct tss df_tss;            /* #DF 時載入的狀態 */
 static uint8_t df_stack[8192] __attribute__((aligned(16)));
 
@@ -125,12 +131,24 @@ static void tss_init(void)
 
     gdt_set_tss(3, &main_tss);
     gdt_set_tss(4, &df_tss);
+    for (int id = 1; id < MAX_CPUS; id++) {
+        ap_tss[id - 1].ss0 = KERNEL_DS;
+        ap_tss[id - 1].iomap_base = sizeof(struct tss);
+        gdt_set_tss(AP_TSS_INDEX(id), &ap_tss[id - 1]);
+    }
+}
+
+/* 目前這顆 CPU 平常使用的 TSS */
+static struct tss *cpu_tss(void)
+{
+    int id = this_cpu()->id;
+    return id == 0 ? &main_tss : &ap_tss[id - 1];
 }
 
 /* 由使用者模式進入 kernel 時,CPU 從 TSS 的 esp0 取得 kernel stack 的位置 */
 void arch_set_kstack(uintptr_t top)
 {
-    main_tss.esp0 = (uint32_t)top;
+    cpu_tss()->esp0 = (uint32_t)top;
 }
 
 /* 工作切換時 CPU 也會載入 TSS 裡的 CR3;必須是有效的頁表,否則立刻 triple fault */
@@ -138,6 +156,8 @@ void trap_set_page_table(uint32_t cr3)
 {
     main_tss.cr3 = cr3;
     df_tss.cr3 = cr3;
+    for (int i = 0; i < MAX_CPUS - 1; i++)
+        ap_tss[i].cr3 = cr3;
 }
 
 static void gdt_init(void)
@@ -215,6 +235,15 @@ void trap_init(void)
     idt_init();
 }
 
+/* 其他 CPU 啟動時呼叫:GDT 與 IDT 的內容全系統共用,但「載入」是每顆 CPU 各自的事,
+   TR 則要指向自己的 TSS。這一步之後 this_cpu() 才會回傳正確的結果 */
+void trap_init_ap(int id)
+{
+    gdt_flush(&gdt_ptr);
+    __asm__ volatile("ltr %%ax" : : "a"((uint16_t)(AP_TSS_INDEX(id) * 8)));
+    __asm__ volatile("lidt %0" : : "m"(idt_ptr));
+}
+
 /* ------------------------------------------------------------------ */
 /* 例外處理                                                            */
 /* ------------------------------------------------------------------ */
@@ -244,21 +273,26 @@ static const char *const exc_names[32] = {
 
 /*
  * double fault 的處理:此時已在 df_stack 上,中斷關閉。
- * 出錯當下的 eip、esp、ebp 由 CPU 存進了 main_tss。不會返回。
+ * 出錯當下的 eip、esp、ebp 由 CPU 存進了「出錯的那顆 CPU 平常使用的 TSS」;
+ * 是哪一個,看 df_tss.link:工作切換時 CPU 會把切換前的 TSS 選擇子記在這裡。
+ * 不會返回。
+ * (限制:#DF 用的 TSS 與 stack 全系統只有一份,兩顆 CPU 同時發生時會互相干擾)
  */
 static void double_fault_handler(void)
 {
     uint32_t cr2;
+    unsigned idx = (df_tss.link & 0xFFFF) >> 3;
+    struct tss *t = idx < 7 ? &main_tss : &ap_tss[(idx - 7) >> 1];
 
     __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
     panic_begin();                               /* 致命錯誤:關中斷、讓 spinlock 放行 */
-    if (!sched_report_overflow(main_tss.esp, cr2))
+    if (!sched_report_overflow(t->esp, cr2))
         kprintf("\n(double fault not caused by a stack overflow)\n");
     kprintf("\n*** EXCEPTION: Double fault (#DF) ***\n");
-    kprintf("  eip   =0x%08x   (發生例外的指令位址)\n", main_tss.eip);
-    kprintf("  esp   =0x%08x  ebp=0x%08x\n", main_tss.esp, main_tss.ebp);
+    kprintf("  eip   =0x%08x   (發生例外的指令位址)\n", t->eip);
+    kprintf("  esp   =0x%08x  ebp=0x%08x\n", t->esp, t->ebp);
     kprintf("  cr2   =0x%08x   (出錯的記憶體位址)\n", cr2);
-    arch_backtrace(main_tss.eip, main_tss.ebp);
+    arch_backtrace(t->eip, t->ebp);
     panic_halt();
 }
 

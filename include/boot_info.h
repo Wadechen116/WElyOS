@@ -7,6 +7,7 @@
  * (i386: multiboot info;RISC-V/AArch64: 裝置樹 DTB)轉成此結構。
  */
 #define BOOT_MAX_RESERVED 8
+#define BOOT_MAX_CPUS     8
 
 /* 一段實體記憶體範圍:[base, base + size) */
 struct mem_region {
@@ -26,6 +27,12 @@ struct boot_info {
      */
     struct mem_region reserved[BOOT_MAX_RESERVED];
     unsigned n_reserved;
+    /*
+     * 裝置樹列出的 CPU(RISC-V 的 hartid、AArch64 的 MPIDR 親和值),含開機的那一顆。
+     * i386 沒有裝置樹,CPU 清單另外從 ACPI 取得,這裡為 0。
+     */
+    uint64_t cpu_ids[BOOT_MAX_CPUS];
+    unsigned ncpus;
 };
 
 /* 登記一段保留範圍;size 為 0 或表格已滿時忽略 */
