@@ -27,6 +27,7 @@
 #include "panic.h"
 #include "pmm.h"
 #include "vm.h"
+#include "cpu.h"
 #include "sched.h"
 #include "smp.h"
 #include "spinlock.h"
@@ -46,6 +47,13 @@ static pte_t *root;                          /* kernel 頁表的根表格 */
 struct vm_space {
     pte_t *root;                             /* 這個位址空間的根表格 */
     unsigned asid;                           /* 位址空間編號(見 mmu.h);不支援的架構恆為 0 */
+    /*
+     * 這個位址空間曾經在哪些 CPU 上被載入過(bit n = 第 n 顆)。只增不減。
+     * 用途:要讓它的 TLB 紀錄失效、或釋放它之前要確認沒有人還載入著時,
+     * 只需要通知這些 CPU。其他 CPU 從來沒碰過它,不可能留有它的任何東西。
+     * 大多數行程只在一兩顆 CPU 上執行過,所以通常只需要通知很少的 CPU,甚至不必通知。
+     */
+    volatile unsigned used_cpus;
 };
 
 #if MMU_ASID_MAX > 0
@@ -187,17 +195,39 @@ static pte_t *walk(pte_t *t, uintptr_t va, int target, int create, int split,
  * CPU 不會把「無效」這件事存進 TLB,其他 CPU 第一次用到時自然會查到新的內容。
  */
 #if !MMU_TLB_BROADCAST
+/* 跨 CPU 呼叫用:在被通知的那顆 CPU 上清掉 va 的紀錄 */
 static void flush_one_fn(void *arg)
 {
     arch_tlb_flush((uintptr_t)arg);
 }
 #endif
 
+/* kernel 的對映:每一顆 CPU 都可能用過,全部都要通知 */
 static void tlb_shootdown(uintptr_t va)
 {
+#if MMU_TLB_BROADCAST
+    arch_tlb_flush_broadcast(va);
+#else
     arch_tlb_flush(va);
-#if !MMU_TLB_BROADCAST
     smp_call_others(flush_one_fn, (void *)va);
+#endif
+}
+
+/* 某個位址空間裡的對映:只有載入過它的 CPU 才可能留有舊紀錄。
+   如果除了自己以外沒有別人,清自己的就夠了(最常見的情況) */
+static void tlb_shootdown_space(struct vm_space *vs, uintptr_t va)
+{
+    unsigned others = __atomic_load_n(&vs->used_cpus, __ATOMIC_SEQ_CST) & ~(1u << this_cpu()->id);
+
+    if (!others) {
+        arch_tlb_flush(va);
+        return;
+    }
+#if MMU_TLB_BROADCAST
+    arch_tlb_flush_broadcast(va);
+#else
+    arch_tlb_flush(va);
+    smp_call_mask(others, flush_one_fn, (void *)va);
 #endif
 }
 
@@ -308,6 +338,7 @@ struct vm_space *vm_space_create(void)
            在既有範圍內的修改(例如拆開大分頁、移除保護頁)所有位址空間都看得到 */
         memcpy(vs->root, root, PAGE_SIZE);
         vs->asid = asid_alloc();
+        vs->used_cpus = 0;                   /* 還沒有任何 CPU 載入過 */
     }
     spin_unlock_irqrestore(&vm_lk, irq);
 
@@ -354,7 +385,7 @@ void vm_space_destroy(struct vm_space *vs)
     unsigned long f = arch_irq_save();
     space_gone_fn(vs);
     arch_irq_restore(f);
-    smp_call_others(space_gone_fn, vs);
+    smp_call_mask(vs->used_cpus, space_gone_fn, vs);   /* 只有載入過它的 CPU 需要知道 */
 
     unsigned long irq = spin_lock_irqsave(&vm_lk);
     int top = MMU_LEVELS - 1;
@@ -385,7 +416,7 @@ int vm_space_map(struct vm_space *vs, uintptr_t va, uintptr_t pa, unsigned flags
         *e = arch_pte_leaf(pa, flags, 0);
         if (enabled) {
             if (was_valid)
-                tlb_shootdown(va);           /* 同一行程的其他執行緒可能正在別顆 CPU 上執行 */
+                tlb_shootdown_space(vs, va); /* 同一行程的其他執行緒可能正在別顆 CPU 上執行 */
             else
                 arch_tlb_flush(va);
         }
@@ -512,7 +543,7 @@ struct vm_space *vm_space_fork(struct vm_space *parent)
     unsigned long f = arch_irq_save();
     space_flush_fn(parent);
     arch_irq_restore(f);
-    smp_call_others(space_flush_fn, parent);
+    smp_call_mask(parent->used_cpus, space_flush_fn, parent);
 
     if (rc != 0) {
         vm_space_destroy(child);             /* 已經對映的部分會各自歸還它們的參考 */
@@ -562,7 +593,7 @@ int vm_space_fault(struct vm_space *vs, uintptr_t va, int write)
                 /* 配置失敗:回傳 -1,這個行程會被終止 */
             }
             if (rc == 0)
-                tlb_shootdown(va);           /* 同一行程的其他執行緒可能在別顆 CPU 上 */
+                tlb_shootdown_space(vs, va); /* 同一行程的其他執行緒可能在別顆 CPU 上 */
         }
     }
     spin_unlock_irqrestore(&vm_lk, irq);
@@ -571,6 +602,7 @@ int vm_space_fault(struct vm_space *vs, uintptr_t va, int write)
 
 void vm_space_switch_flush(struct vm_space *vs)
 {
+    __atomic_fetch_or(&vs->used_cpus, 1u << this_cpu()->id, __ATOMIC_SEQ_CST);
     arch_mmu_switch(vs->root, vs->asid, 1);
 }
 
@@ -580,6 +612,9 @@ void vm_space_switch(struct vm_space *vs)
         arch_mmu_switch(root, 0, 0);         /* kernel 頁表:編號 0,裡面沒有使用者的頁 */
         return;
     }
+    /* 記下「這顆 CPU 載入過它」。要在真正載入之前記:之後任何人看到這一位是 0,
+       就能確定這顆 CPU 沒有、也不曾有過它的任何 TLB 紀錄 */
+    __atomic_fetch_or(&vs->used_cpus, 1u << this_cpu()->id, __ATOMIC_SEQ_CST);
     /* 有自己編號的位址空間不必清空 TLB;共用編號的(或不支援 ASID 的架構)才要 */
     arch_mmu_switch(vs->root, vs->asid, vs->asid == MMU_ASID_MAX);
 }

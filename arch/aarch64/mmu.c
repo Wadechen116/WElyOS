@@ -183,15 +183,25 @@ void arch_mmu_switch(pte_t *root, unsigned asid, int flush)
 
 void arch_asid_flush(unsigned asid)
 {
-    /* tlbi aside1is:清掉這個 ASID 的所有紀錄;參數的 bit 63~48 為 ASID。
-       結尾的 is(inner shareable)表示廣播給所有 CPU;dsb ish 等大家都完成 */
-    __asm__ volatile("tlbi aside1is, %0\n dsb ish\n isb" : : "r"((uint64_t)asid << 48));
+    /* tlbi aside1:清掉「這顆 CPU」上這個 ASID 的所有紀錄;參數的 bit 63~48 為 ASID */
+    __asm__ volatile("tlbi aside1, %0\n dsb nsh\n isb" : : "r"((uint64_t)asid << 48));
 }
 
 void arch_tlb_flush(uintptr_t va)
 {
-    /* tlbi vaae1is 的參數是頁號;is 表示廣播給所有 CPU(每顆 CPU 的 TLB 都清)。
-       dsb ish 等所有 CPU 完成,isb 讓後續指令看到結果 */
+    /* tlbi vaae1 的參數是頁號。只清「這顆 CPU」的 TLB;
+       dsb 等待失效完成,isb 讓後續指令看到結果 */
+    __asm__ volatile("tlbi vaae1, %0\n dsb nsh\n isb" : : "r"((uint64_t)va >> 12));
+}
+
+/*
+ * 同上,但結尾的 is(inner shareable)表示「廣播」:硬體會讓每一顆 CPU 的 TLB 都失效,
+ * dsb ish 等所有 CPU 完成。不需要處理器間中斷。
+ * 廣播比本機的版本貴(模擬器上尤其明顯:要讓所有 CPU 都停下來配合),
+ * 所以只在其他 CPU 真的可能留有舊紀錄時才用;新增對映這類只影響自己的情況用上面的版本。
+ */
+void arch_tlb_flush_broadcast(uintptr_t va)
+{
     __asm__ volatile("tlbi vaae1is, %0\n dsb ish\n isb" : : "r"((uint64_t)va >> 12));
 }
 

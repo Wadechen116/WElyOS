@@ -61,10 +61,20 @@ void smp_ipi_handler(void)
 
 void smp_call_others(void (*fn)(void *), void *arg)
 {
+    smp_call_mask(~0u, fn, arg);
+}
+
+void smp_call_mask(unsigned mask, void (*fn)(void *), void *arg)
+{
     if (cpu_count == 1)
         return;
 
     unsigned long flags = arch_irq_save();
+    unsigned all = cpu_count >= 32 ? ~0u : (1u << cpu_count) - 1;
+    if (!(mask & all & ~(1u << this_cpu()->id))) {
+        arch_irq_restore(flags);             /* 除了自己以外沒有對象:什麼都不必做 */
+        return;
+    }
     /* 別人也可能正要發起呼叫,而且正在等我們回應:搶不到鎖時要一邊處理它的要求 */
     while (!spin_trylock(&call_lk)) {
         smp_poll();
@@ -76,7 +86,7 @@ void smp_call_others(void (*fn)(void *), void *arg)
     call_arg = arg;
     __atomic_store_n(&call_acks, 0, __ATOMIC_SEQ_CST);
     for (int i = 0; i < cpu_count; i++) {
-        if (i == me)
+        if (i == me || !(mask & (1u << i)))
             continue;
         smp_send(&cpus[i], IPI_CALL);
         n++;

@@ -58,6 +58,10 @@ void smp_poll(void);
  */
 void smp_call_others(void (*fn)(void *), void *arg);
 
+/* 同上,但只呼叫 mask 指定的 CPU(bit n = 第 n 顆);自己那一位會被忽略。
+   通知的對象越少越好:每一次通知都要打斷對方,對方若在休眠還得先被叫醒 */
+void smp_call_mask(unsigned mask, void (*fn)(void *), void *arg);
+
 /* panic 時呼叫:要求其他所有 CPU 停止(不等它們回應) */
 void smp_stop_others(void);
 #endif

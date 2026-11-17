@@ -9,7 +9,7 @@
 typedef uint64_t pte_t;
 #define MMU_NAME    "AArch64 4K/39-bit"
 /* 有廣播式的 TLB 失效指令(tlbi ...is):硬體會通知所有 CPU,不需要跨 CPU 呼叫 */
-#define MMU_TLB_BROADCAST 1
+#define MMU_TLB_BROADCAST 1                    /* 提供 arch_tlb_flush_broadcast() */
 #define MMU_LEVELS  3
 #define MMU_BITS    9
 #define MMU_VA_BITS 39
@@ -43,6 +43,7 @@ void      arch_mmu_switch(pte_t *root, unsigned asid, int flush);
 void      arch_asid_flush(unsigned asid);                /* 讓某個位址空間編號的 TLB 紀錄全部失效 */
 static inline void arch_mmu_init(void) {}                /* 本架構不需要事先偵測 */
 static inline void arch_mmu_root_changed(pte_t *root) { (void)root; }
-void      arch_tlb_flush(uintptr_t va);                  /* 讓一頁的 TLB 快取失效 */
+void      arch_tlb_flush(uintptr_t va);                  /* 讓一頁的 TLB 快取失效(僅這顆 CPU) */
+void      arch_tlb_flush_broadcast(uintptr_t va);        /* 同上,但由硬體通知所有 CPU */
 void      arch_mmu_map_devices(void);                    /* 對映本架構的裝置 */
 #endif
