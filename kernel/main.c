@@ -13,6 +13,7 @@
 #include "panic.h"
 #include "pmm.h"
 #include "sched.h"
+#include "sync.h"
 #include "timer.h"
 
 /*
@@ -46,7 +47,7 @@ static int cmdline_has(const char *cmd, const char *word)
  *   crash=illegal  執行非法指令
  *   crash=break    執行軟體中斷點指令(可恢復的例外,處理後會繼續往下)
  *   crash=dfree    同一塊記憶體釋放兩次(驗證 kfree 的檢查)
- * (crash=stack 與 crash=thread 需要排程器,在 sched_demo 之前另外處理)
+ * (crash=stack、crash=thread、crash=relock 需要排程器,在 sched_demo 之前另外處理)
  */
 static void crash_test(const char *cmd)
 {
@@ -75,15 +76,13 @@ static void crash_test(const char *cmd)
 /* 排程器示範與測試                                                    */
 /* ------------------------------------------------------------------ */
 
-static volatile int demo_done;               /* 已結束的示範執行緒數 */
-
-/* 等到 n 條示範執行緒都結束。main 用 sleep 等待,不佔 CPU */
-static void wait_done(int n)
+/* 等待一組執行緒全部結束。thread_join 會睡到對方結束時被直接喚醒,不必輪詢 */
+static void join_all(const int *tids, int n)
 {
-    while (demo_done < n)
-        thread_sleep(10);
-    demo_done = 0;
-    thread_sleep(10);                        /* 讓最後結束的那條被回收 */
+    for (int i = 0; i < n; i++) {
+        KASSERT(tids[i] > 0);                /* 建立必須成功 */
+        thread_join(tids[i]);
+    }
 }
 
 /* 示範 1:主動讓出。每印一行就 yield,三條執行緒應該整齊地輪流 */
@@ -94,7 +93,6 @@ static void coop_worker(void *arg)
         thread_yield();
     }
     (void)arg;
-    demo_done++;
 }
 
 /* 示範 2:搶佔。完全不讓出 CPU 的忙碌迴圈,只能靠計時器中斷換人 */
@@ -105,7 +103,6 @@ static void spin_worker(void *arg)
     volatile unsigned long *counter = arg;
     while (timer_ticks() < spin_deadline)
         (*counter)++;
-    demo_done++;
 }
 
 /* 示範 3:休眠。各自睡不同長度,醒來的順序應該依時間而不是建立順序 */
@@ -115,38 +112,38 @@ static void sleep_worker(void *arg)
     thread_sleep(ms);
     kprintf("  [%s] woke after %u ms (tick %llu)\n", thread_name(), ms,
             (unsigned long long)timer_ticks());
-    demo_done++;
 }
 
 static void sched_demo(void)
 {
     size_t free0 = pmm_free_count();
     struct kheap_stats h0, h1;
+    int t[3];
     kheap_stats(&h0);
 
     kprintf("sched: cooperative (yield)\n");
-    thread_create("A", coop_worker, NULL);
-    thread_create("B", coop_worker, NULL);
-    thread_create("C", coop_worker, NULL);
-    wait_done(3);
+    t[0] = thread_create("A", coop_worker, NULL);
+    t[1] = thread_create("B", coop_worker, NULL);
+    t[2] = thread_create("C", coop_worker, NULL);
+    join_all(t, 3);
 
     kprintf("sched: preemptive (busy loops, no yield)\n");
     static volatile unsigned long c1, c2;
     unsigned long sw0 = sched_switch_count();
     spin_deadline = timer_ticks() + 50;      /* 兩條各自空轉到 0.5 秒後 */
-    thread_create("spin1", spin_worker, (void *)&c1);
-    thread_create("spin2", spin_worker, (void *)&c2);
-    wait_done(2);
+    t[0] = thread_create("spin1", spin_worker, (void *)&c1);
+    t[1] = thread_create("spin2", spin_worker, (void *)&c2);
+    join_all(t, 2);
     kprintf("  spin1=%lu spin2=%lu, %lu context switches\n",
             (unsigned long)c1, (unsigned long)c2, sched_switch_count() - sw0);
     /* 兩條都要跑到,而且沒有一條被餓死(差距在 3 倍以內) */
     KASSERT(c1 > 0 && c2 > 0 && c1 < c2 * 3 && c2 < c1 * 3);
 
     kprintf("sched: sleep\n");
-    thread_create("s300", sleep_worker, (void *)300);
-    thread_create("s100", sleep_worker, (void *)100);
-    thread_create("s200", sleep_worker, (void *)200);
-    wait_done(3);
+    t[0] = thread_create("s300", sleep_worker, (void *)300);
+    t[1] = thread_create("s100", sleep_worker, (void *)100);
+    t[2] = thread_create("s200", sleep_worker, (void *)200);
+    join_all(t, 3);
 
     /* 所有示範執行緒都結束後,它們的 stack 與結構都應該已歸還 */
     kheap_stats(&h1);
@@ -156,22 +153,168 @@ static void sched_demo(void)
     kprintf("sched: all threads exited, memory reclaimed\n");
 }
 
+/* ------------------------------------------------------------------ */
+/* 同步機制示範                                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 示範 1:競爭條件(race condition)與 mutex。
+ * 「讀出 -> 加 1 -> 寫回」如果中途被別的執行緒插入,更新就會遺失。
+ * 這裡在讀與寫之間刻意 thread_yield(),讓問題每次都必然發生,方便觀察;
+ * 實際程式中它是由搶佔偶爾造成的,所以更難發現。
+ */
+#define RACE_THREADS 3
+#define RACE_ROUNDS  100
+
+static volatile int race_counter;
+static struct mutex race_mutex = MUTEX_INIT;
+
+static void race_worker(void *arg)
+{
+    int use_mutex = (int)(uintptr_t)arg;
+
+    for (int i = 0; i < RACE_ROUNDS; i++) {
+        if (use_mutex)
+            mutex_lock(&race_mutex);
+        int tmp = race_counter;              /* 讀出 */
+        thread_yield();                      /* 這時別人可能也讀到同一個舊值 */
+        race_counter = tmp + 1;              /* 寫回:蓋掉別人在這期間的更新 */
+        if (use_mutex)
+            mutex_unlock(&race_mutex);
+    }
+}
+
+static int race_run(int use_mutex)
+{
+    int t[RACE_THREADS];
+
+    race_counter = 0;
+    for (int i = 0; i < RACE_THREADS; i++)
+        t[i] = thread_create("race", race_worker, (void *)(uintptr_t)use_mutex);
+    join_all(t, RACE_THREADS);
+    return race_counter;
+}
+
+/*
+ * 示範 2:生產者 / 消費者(bounded buffer),號誌的經典用法。
+ *   slots:緩衝區還有幾個空位。生產者放入前 wait,滿了就睡
+ *   items:緩衝區有幾個項目。  消費者取出前 wait,空了就睡
+ *   mutex:保護緩衝區本身的索引
+ * 緩衝區只有 4 格,生產者要放 20 個,所以一定會多次因為滿而睡著,
+ * 由消費者取走後喚醒。
+ */
+#define PC_SLOTS     4
+#define PC_ITEMS     20
+#define PC_CONSUMERS 2
+
+static int pc_buf[PC_SLOTS];
+static unsigned pc_head, pc_tail;
+static struct semaphore pc_slots, pc_items;
+static struct mutex pc_mutex = MUTEX_INIT;
+static int pc_sum, pc_count[PC_CONSUMERS];
+
+static void pc_put(int v)
+{
+    sem_wait(&pc_slots);                     /* 等到有空位 */
+    mutex_lock(&pc_mutex);
+    pc_buf[pc_tail++ % PC_SLOTS] = v;
+    mutex_unlock(&pc_mutex);
+    sem_post(&pc_items);                     /* 通知:多了一個項目 */
+}
+
+static int pc_get(void)
+{
+    sem_wait(&pc_items);                     /* 等到有項目 */
+    mutex_lock(&pc_mutex);
+    int v = pc_buf[pc_head++ % PC_SLOTS];
+    mutex_unlock(&pc_mutex);
+    sem_post(&pc_slots);                     /* 通知:多了一個空位 */
+    return v;
+}
+
+static void producer(void *arg)
+{
+    (void)arg;
+    for (int i = 1; i <= PC_ITEMS; i++)
+        pc_put(i);
+    for (int i = 0; i < PC_CONSUMERS; i++)
+        pc_put(-1);                          /* 每個消費者一個結束記號 */
+}
+
+static void consumer(void *arg)
+{
+    int id = (int)(uintptr_t)arg;
+    int v;
+
+    while ((v = pc_get()) != -1) {
+        mutex_lock(&pc_mutex);
+        pc_sum += v;
+        pc_count[id]++;
+        mutex_unlock(&pc_mutex);
+        thread_yield();                      /* 讓另一個消費者也有機會拿到 */
+    }
+}
+
+static void join_sleeper(void *arg)
+{
+    (void)arg;
+    thread_sleep(100);
+}
+
+static void sync_demo(void)
+{
+    int t[1 + PC_CONSUMERS];
+
+    kprintf("sync: race condition, %d threads x %d increments\n",
+            RACE_THREADS, RACE_ROUNDS);
+    int unsafe = race_run(0);
+    int safe = race_run(1);
+    kprintf("  without mutex: %d    with mutex: %d    (expected %d)\n",
+            unsafe, safe, RACE_THREADS * RACE_ROUNDS);
+    KASSERT(unsafe < RACE_THREADS * RACE_ROUNDS);    /* 沒保護:一定有遺失 */
+    KASSERT(safe == RACE_THREADS * RACE_ROUNDS);     /* 有保護:一個都不能少 */
+
+    kprintf("sync: producer/consumer, %d items through a %d-slot buffer\n",
+            PC_ITEMS, PC_SLOTS);
+    sem_init(&pc_slots, PC_SLOTS);
+    sem_init(&pc_items, 0);
+    t[0] = thread_create("producer", producer, NULL);
+    t[1] = thread_create("consumer0", consumer, (void *)0);
+    t[2] = thread_create("consumer1", consumer, (void *)1);
+    join_all(t, 3);
+    kprintf("  consumed %d + %d items, sum=%d (expected %d)\n",
+            pc_count[0], pc_count[1], pc_sum, PC_ITEMS * (PC_ITEMS + 1) / 2);
+    KASSERT(pc_count[0] + pc_count[1] == PC_ITEMS);
+    KASSERT(pc_sum == PC_ITEMS * (PC_ITEMS + 1) / 2);
+    KASSERT(pc_count[0] > 0 && pc_count[1] > 0);
+
+    /* join:對方睡 100ms,join 應該在它結束的那一刻返回,而不是輪詢的整數倍 */
+    uint64_t t0 = timer_ticks();
+    unsigned long sw0 = sched_switch_count();
+    int tid = thread_create("sleeper", join_sleeper, NULL);
+    thread_join(tid);
+    kprintf("sync: join returned after %llu ticks, %lu context switches\n",
+            (unsigned long long)(timer_ticks() - t0), sched_switch_count() - sw0);
+    thread_join(tid);                        /* 已結束的 tid:必須立即返回 */
+    thread_join(99999);                      /* 不存在的 tid:同樣立即返回 */
+    KASSERT(sem_trywait(&pc_items) == 0);    /* 沒有項目:trywait 不等待,回傳 0 */
+}
+
 /*
  * 開機參數 stress:建立大量執行緒,確認數量只受記憶體限制。
  * 每條執行緒讓出 CPU 數次後結束;全部結束後記憶體必須完全歸還。
  */
 #define STRESS_THREADS 1000
 
-static volatile unsigned stress_done;
+/* 號誌當作「完成通知」:每條結束前 post 一次,main 就 wait 相同次數 */
+static struct semaphore stress_sem = SEMAPHORE_INIT(0);
 
 static void stress_worker(void *arg)
 {
     (void)arg;
     for (int i = 0; i < 3; i++)
         thread_yield();
-    unsigned long flags = arch_irq_save();   /* 「讀-加-寫」不可被搶佔打斷 */
-    stress_done++;
-    arch_irq_restore(flags);
+    sem_post(&stress_sem);
 }
 
 static void sched_stress(void)
@@ -184,15 +327,15 @@ static void sched_stress(void)
     kheap_stats(&h0);
 
     for (unsigned i = 0; i < STRESS_THREADS; i++) {
-        if (!thread_create("stress", stress_worker, NULL))
+        if (thread_create("stress", stress_worker, NULL) < 0)
             break;
         created++;
     }
     kprintf("stress: created %u threads, %zu KB used (stacks + thread structs)\n", created,
             (free0 - pmm_free_count()) * (PAGE_SIZE / 1024));
-    while (stress_done < created)
-        thread_sleep(10);
-    thread_sleep(10);
+    for (unsigned i = 0; i < created; i++)
+        sem_wait(&stress_sem);               /* 每等到一次代表一條完成 */
+    thread_sleep(10);                        /* post 之後它們還要一點時間真正結束並被回收 */
     kprintf("stress: all finished in %llu ticks, %lu context switches\n",
             (unsigned long long)(timer_ticks() - t0), sched_switch_count() - sw0);
     KASSERT(created == STRESS_THREADS && sched_thread_count() == 1);
@@ -244,6 +387,12 @@ static void sched_crash_test(const char *cmd)
     } else if (cmdline_has(cmd, "crash=thread")) {
         thread_create("faulty", fault_worker, NULL);
         thread_sleep(100);
+    } else if (cmdline_has(cmd, "crash=relock")) {
+        /* 同一條執行緒對同一個 mutex 上鎖兩次:不偵測的話會自己等自己 */
+        static struct mutex m = MUTEX_INIT;
+        kprintf("locking a mutex twice...\n");
+        mutex_lock(&m);
+        mutex_lock(&m);
     }
 }
 
@@ -375,6 +524,7 @@ void kmain(const struct boot_info *bi)
 
     sched_crash_test(bi->cmdline);
     sched_demo();
+    sync_demo();
     if (cmdline_has(bi->cmdline, "stress"))
         sched_stress();
 

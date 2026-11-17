@@ -38,6 +38,7 @@ add_executable(welyos.elf
     kernel/pmm.c
     kernel/kmalloc.c
     kernel/sched.c
+    kernel/sync.c
     lib/string.c)
 target_include_directories(welyos.elf PRIVATE include arch/${ARCH})
 set_target_properties(welyos.elf PROPERTIES LINK_DEPENDS

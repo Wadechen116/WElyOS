@@ -37,6 +37,7 @@ enum thread_state {
     T_READY,       /* 在執行佇列中等待輪到 */
     T_RUNNING,     /* 正在使用 CPU */
     T_SLEEPING,    /* 等待時間到 */
+    T_BLOCKED,     /* 在某個等待佇列上,等別人喚醒 */
     T_ZOMBIE       /* 已結束,等待別人回收它的 stack */
 };
 
@@ -51,7 +52,9 @@ struct thread {
     void *arg;
     unsigned slice;            /* 剩餘的時間片(tick 數) */
     uint64_t wake_tick;        /* T_SLEEPING:到這個 tick 就喚醒 */
-    struct thread *next;       /* 串在執行佇列或休眠串列中 */
+    struct thread *next;       /* 串在執行佇列、休眠串列或某個等待佇列中(同時只會在一個) */
+    struct thread *all_next;   /* 串在「所有執行緒」串列中,供 thread_join 以編號尋找 */
+    struct wait_queue joiners; /* 正在 thread_join 等我結束的執行緒 */
 };
 
 /* 開機時 boot.S 設定的 stack,main 執行緒繼續使用它 */
@@ -61,12 +64,15 @@ static struct thread main_thread;            /* 開機流程本身 */
 static struct thread *current;               /* 正在執行的執行緒;NULL = 排程器未啟動 */
 static struct thread *idle_thread;           /* 沒人可跑時執行,不進執行佇列 */
 static struct thread *rq_head, *rq_tail;     /* 執行佇列(FIFO):READY 的執行緒 */
-static struct thread *sleepers;              /* 休眠中的執行緒(無順序) */
+static struct thread *sleepers;              /* 休眠中的執行緒,依喚醒時間由早到晚排序 */
+static struct thread *all_threads;           /* 所有存活的執行緒(不含 main 與 idle) */
 static struct thread *zombie;                /* 剛結束、等待回收的執行緒(最多一條) */
 static volatile int need_resched;            /* 中斷中設定:返回前要重新排程 */
 static unsigned nthreads;                    /* 存活數(不含 idle) */
 static unsigned long nswitches;
 static int next_id;
+
+static void schedule(void);
 
 /* ---- 執行佇列:尾端加入、頭端取出,所以大家輪流 ---- */
 
@@ -91,6 +97,47 @@ static struct thread *rq_pop(void)
         t->next = NULL;
     }
     return t;
+}
+
+/* ---- 等待佇列 ---- */
+
+void wq_sleep(struct wait_queue *wq)
+{
+    struct thread *t = current;
+
+    t->state = T_BLOCKED;                    /* 不是 RUNNING,schedule() 就不會把它排回去 */
+    t->next = NULL;
+    if (wq->tail)
+        wq->tail->next = t;
+    else
+        wq->head = t;
+    wq->tail = t;
+    schedule();                              /* 被喚醒、再次輪到時才從這裡返回 */
+}
+
+int wq_wake_one(struct wait_queue *wq)
+{
+    unsigned long flags = arch_irq_save();
+    struct thread *t = wq->head;
+
+    if (t) {
+        wq->head = t->next;
+        if (!wq->head)
+            wq->tail = NULL;
+        rq_push(t);                          /* 排到執行佇列尾端,等輪到 */
+        if (current == idle_thread)
+            need_resched = 1;                /* 在中斷中喚醒且 CPU 閒著:返回前就換人 */
+    }
+    arch_irq_restore(flags);
+    return t != NULL;
+}
+
+int wq_wake_all(struct wait_queue *wq)
+{
+    int n = 0;
+    while (wq_wake_one(wq))
+        n++;
+    return n;
 }
 
 /*
@@ -197,18 +244,36 @@ void sched_init(void)
     current = &main_thread;                  /* 從這一刻起排程器算是啟動了 */
 }
 
-struct thread *thread_create(const char *name, void (*fn)(void *), void *arg)
+int thread_create(const char *name, void (*fn)(void *), void *arg)
 {
     struct thread *t = thread_alloc(name, fn, arg);
     if (!t)
-        return NULL;
+        return -1;
 
     unsigned long flags = arch_irq_save();   /* 佇列也會被中斷路徑修改 */
-    t->id = next_id++;
+    int id = t->id = next_id++;
     nthreads++;
+    t->all_next = all_threads;
+    all_threads = t;
     rq_push(t);
     arch_irq_restore(flags);
-    return t;
+    /* 注意:開中斷之後 t 隨時可能已經跑完並被釋放,所以回傳先記下的 id,不再碰 t */
+    return id;
+}
+
+void thread_join(int tid)
+{
+    unsigned long flags = arch_irq_save();
+
+    /* 「尋找」與「睡下去」之間中斷一直是關的,對方不可能剛好在中間結束 */
+    for (struct thread *t = all_threads; t; t = t->all_next) {
+        if (t->id == tid) {
+            KASSERT(t != current);           /* 等自己結束會永遠等下去 */
+            wq_sleep(&t->joiners);
+            break;                           /* 被喚醒時 t 已結束,不可再存取 */
+        }
+    }
+    arch_irq_restore(flags);
 }
 
 void thread_yield(void)
@@ -228,8 +293,15 @@ void thread_sleep(unsigned ms)
     unsigned long flags = arch_irq_save();
     current->wake_tick = timer_ticks() + n;
     current->state = T_SLEEPING;
-    current->next = sleepers;
-    sleepers = current;
+
+    /* 依喚醒時間插入到正確位置:每個 tick 只需檢查串列的第一個。
+       用 <= 讓同一時間到期的維持先來後到的順序 */
+    struct thread **pp = &sleepers;
+    while (*pp && (*pp)->wake_tick <= current->wake_tick)
+        pp = &(*pp)->next;
+    current->next = *pp;
+    *pp = current;
+
     schedule();                              /* 醒來後才會從這裡返回 */
     arch_irq_restore(flags);
 }
@@ -239,6 +311,15 @@ void thread_exit(void)
     arch_irq_disable();
     if (current == &main_thread || current == idle_thread)
         panic("thread_exit: %s thread must not exit", current->name);
+    /* 從「所有執行緒」串列移除:之後的 thread_join 找不到它,會立即返回 */
+    for (struct thread **pp = &all_threads; *pp; pp = &(*pp)->all_next) {
+        if (*pp == current) {
+            *pp = current->all_next;
+            break;
+        }
+    }
+    wq_wake_all(&current->joiners);          /* 叫醒所有在等我結束的執行緒 */
+
     current->state = T_ZOMBIE;
     zombie = current;                        /* 由下一條執行緒 reap() */
     nthreads--;
@@ -251,21 +332,17 @@ void sched_tick(void)
     if (!current)
         return;                              /* 排程器尚未啟動 */
 
-    /* 喚醒時間到的休眠者:從串列移除、放回執行佇列 */
+    /* 喚醒時間到的休眠者。串列已依喚醒時間排序,所以只看最前面的;
+       第一個還沒到期,後面的一定也還沒,可以直接結束 */
     uint64_t now = timer_ticks();
-    struct thread **pp = &sleepers;
-    while (*pp) {
-        struct thread *t = *pp;
-        if (now >= t->wake_tick) {
-            *pp = t->next;
-            rq_push(t);
-            /* 剛醒的人排到隊尾等待輪到,不插隊;只有 CPU 正閒著才立刻換人。
-               (若一醒來就強制換人,正在跑的執行緒會被提早中斷而吃虧,見 DEVLOG) */
-            if (current == idle_thread)
-                need_resched = 1;
-        } else {
-            pp = &t->next;
-        }
+    while (sleepers && now >= sleepers->wake_tick) {
+        struct thread *t = sleepers;
+        sleepers = t->next;
+        rq_push(t);
+        /* 剛醒的人排到隊尾等待輪到,不插隊;只有 CPU 正閒著才立刻換人。
+           (若一醒來就強制換人,正在跑的執行緒會被提早中斷而吃虧,見 DEVLOG) */
+        if (current == idle_thread)
+            need_resched = 1;
     }
 
     /* 時間片用完且有人在等,才需要換人 */
@@ -283,6 +360,7 @@ void sched_irq_exit(void)
         schedule();
 }
 
+struct thread *thread_current(void) { return current; }
 const char *thread_name(void)  { return current ? current->name : "boot"; }
 int thread_id(void)            { return current ? current->id : 0; }
 unsigned sched_thread_count(void)      { return nthreads; }
