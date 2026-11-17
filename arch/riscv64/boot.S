@@ -17,6 +17,7 @@ _start:
     bnez    a0, park
 
     la      sp, stack_top             /* 設定 stack(RISC-V stack 同樣往低位址成長) */
+    la      tp, cpus                  /* tp = 第 0 顆 CPU 的 struct cpu(kernel 中固定如此,見 cpu_arch.h) */
     li      s0, 0                     /* frame pointer 歸零:backtrace 以 0 判斷鏈的終點 */
 
     /*

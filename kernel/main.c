@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include "arch.h"
 #include "boot_info.h"
+#include "cpu.h"
 #include "kmalloc.h"
 #include "kprintf.h"
 #include "kstring.h"
@@ -14,6 +15,7 @@
 #include "pmm.h"
 #include "proc.h"
 #include "sched.h"
+#include "spinlock.h"
 #include "sync.h"
 #include "timer.h"
 #include "vm.h"
@@ -53,7 +55,9 @@ static int cmdline_has(const char *cmd, const char *word)
  *   crash=null     讀取 NULL 指標(位址 0 沒有對映 -> page fault)
  *   crash=wtext    寫入 kernel 程式碼(唯讀頁 -> page fault)
  *   crash=exec     跳到資料頁執行(不可執行頁 -> page fault;i386 無此保護)
- * (crash=stack、crash=thread、crash=relock 需要排程器,在 sched_demo 之前另外處理)
+ *   crash=spin     同一顆 CPU 對同一把 spinlock 上鎖兩次(不偵測的話會永遠卡住)
+ *   crash=spinsleep 持有 spinlock 時讓出 CPU(規則禁止;排程器應該擋下)
+ * (crash=stack、crash=thread、crash=relock、crash=spin* 需要排程器,在 sched_demo 之前另外處理)
  */
 static void crash_test(const char *cmd)
 {
@@ -230,6 +234,7 @@ static void sched_demo(void)
     struct kheap_stats h0, h1;
     int t[3];
     kheap_stats(&h0);
+    size_t pool0 = sched_pool_bytes();       /* 執行緒結構留在池子裡不歸還,核對時要扣掉 */
 
     kprintf("sched: cooperative (yield)\n");
     t[0] = thread_create("A", coop_worker, NULL);
@@ -261,7 +266,7 @@ static void sched_demo(void)
     KASSERT(sched_thread_count() == 1);
     /* 保護頁會把所在的大分頁拆開,多出來的頁表不會歸還,所以一併計入 */
     KASSERT(pmm_free_count() + vm_table_pages() == free0);
-    KASSERT(h1.free_bytes == h0.free_bytes);
+    KASSERT(h1.free_bytes + (sched_pool_bytes() - pool0) == h0.free_bytes);
     kprintf("sched: all threads exited, memory reclaimed\n");
 }
 
@@ -675,6 +680,7 @@ static void user_demo(void)
     size_t free0 = pmm_free_count() + vm_table_pages();
     struct kheap_stats h0, h1;
     kheap_stats(&h0);
+    size_t pool0 = sched_pool_bytes();       /* 執行緒結構留在池子裡不歸還,核對時要扣掉 */
 
     kprintf("user: running a program in user mode\n");
     run_user("hello, 2 threads, exit(42)", UMODE_HELLO, 42);
@@ -723,7 +729,7 @@ static void user_demo(void)
     kheap_stats(&h1);
     KASSERT(sched_thread_count() == 1);
     KASSERT(pmm_free_count() + vm_table_pages() == free0);
-    KASSERT(h1.free_bytes == h0.free_bytes);
+    KASSERT(h1.free_bytes + (sched_pool_bytes() - pool0) == h0.free_bytes);
     kprintf("user: all processes exited, memory reclaimed\n");
 }
 
@@ -759,6 +765,7 @@ static void sched_stress(void)
     unsigned created = 0;
     struct kheap_stats h0, h1;
     kheap_stats(&h0);
+    size_t pool0 = sched_pool_bytes();       /* 執行緒結構留在池子裡不歸還,核對時要扣掉 */
 
     for (unsigned i = 0; i < STRESS_THREADS; i++) {
         if (thread_create("stress", stress_worker, NULL) < 0)
@@ -802,7 +809,7 @@ static void sched_stress(void)
     size_t heap_grow = h1.heap_bytes - h0.heap_bytes;
     sched_trim();
     KASSERT(pmm_free_count() + vm_table_pages() == free0 - heap_grow / PAGE_SIZE);
-    KASSERT(h1.free_bytes == h0.free_bytes + heap_grow);
+    KASSERT(h1.free_bytes + (sched_pool_bytes() - pool0) == h0.free_bytes + heap_grow);
     kprintf("stress: ok (stacks reclaimed, heap grew by %zu KB)\n", heap_grow / 1024);
 }
 
@@ -879,7 +886,48 @@ static void sched_crash_test(const char *cmd)
         kprintf("locking a mutex twice...\n");
         mutex_lock(&m);
         mutex_lock(&m);
+    } else if (cmdline_has(cmd, "crash=spinsleep")) {
+        /* 持有 spinlock 時切換執行緒:別人會關著中斷一直等這把鎖,所以禁止 */
+        static struct spinlock l = SPINLOCK_INIT("test");
+        kprintf("yielding the CPU while holding a spinlock...\n");
+        unsigned long flags = spin_lock_irqsave(&l);
+        thread_yield();
+        spin_unlock_irqrestore(&l, flags);
+    } else if (cmdline_has(cmd, "crash=spin")) {
+        /* 同一顆 CPU 對同一把 spinlock 上鎖兩次:不偵測的話會自己等自己,而且中斷是關的 */
+        static struct spinlock l = SPINLOCK_INIT("test");
+        kprintf("acquiring a spinlock twice...\n");
+        unsigned long flags = spin_lock_irqsave(&l);
+        (void)spin_lock_irqsave(&l);
+        spin_unlock_irqrestore(&l, flags);
     }
+}
+
+/*
+ * spinlock 與每顆 CPU 狀態的自我測試(目前只有一顆 CPU,檢查的是基本行為與記帳):
+ *   - 上鎖後 spin_held 為真、這顆 CPU 的持有數加一;解鎖後恢復
+ *   - 巢狀持有兩把「不同的」鎖是允許的
+ *   - 解鎖後中斷狀態回到上鎖之前的樣子
+ */
+static void spin_selftest(void)
+{
+    static struct spinlock a = SPINLOCK_INIT("test-a"), b = SPINLOCK_INIT("test-b");
+
+    unsigned long fa = spin_lock_irqsave(&a);
+    struct cpu *c = this_cpu();              /* 中斷已關閉,可以安全使用 */
+    int base = c->nlocks;
+    KASSERT(spin_held(&a) && !spin_held(&b) && base >= 1);
+    unsigned long fb = spin_lock_irqsave(&b);
+    KASSERT(spin_held(&b) && c->nlocks == base + 1);
+    spin_unlock_irqrestore(&b, fb);
+    KASSERT(!spin_held(&b) && c->nlocks == base);
+    int id = c->id;
+    spin_unlock_irqrestore(&a, fa);
+    KASSERT(!a.locked && a.cpu == -1);
+
+    /* 中斷有恢復:睡一下還醒得來就代表計時器中斷仍在進來 */
+    thread_sleep(2);
+    kprintf("spinlock: selftest ok (cpu %d of %d online, max %d)\n", id, cpu_count, MAX_CPUS);
 }
 
 /*
@@ -1018,6 +1066,7 @@ void kmain(const struct boot_info *bi)
 
     sched_crash_test(bi->cmdline);
     if (selftest) {
+        spin_selftest();
         sched_demo();
         sync_demo();
         prio_demo();

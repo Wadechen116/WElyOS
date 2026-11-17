@@ -251,6 +251,7 @@ static void double_fault_handler(void)
     uint32_t cr2;
 
     __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+    panic_begin();                               /* 致命錯誤:關中斷、讓 spinlock 放行 */
     if (!sched_report_overflow(main_tss.esp, cr2))
         kprintf("\n(double fault not caused by a stack overflow)\n");
     kprintf("\n*** EXCEPTION: Double fault (#DF) ***\n");
@@ -306,6 +307,7 @@ void trap_handler(struct trap_frame *tf)
         user_fault(name, tf->eip, addr);
     }
 
+    panic_begin();                               /* 致命錯誤:關中斷、讓 spinlock 放行 */
     if (tf->vector == VEC_PAGE_FAULT) {
         /* esp 還在有效範圍、但存取落到保護頁的情況(例如超大的區域陣列) */
         uint32_t fault;

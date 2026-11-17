@@ -27,6 +27,15 @@ set(CMAKE_C_EXTENSIONS OFF)
 set(WELYOS_OPT "-O2" CACHE STRING "編譯器最佳化等級,例如 -O2、-Og、-O0")
 add_compile_options(${WELYOS_OPT})
 
+# 執行佇列的實作(見 include/runq.h):
+#   ring  每顆 CPU 一組無鎖環狀佇列,加上工作竊取(預設)
+#   list  全系統共用一組串列,以一把鎖保護
+# 可改用:cmake --preset <架構> -DWELYOS_RUNQ=list
+set(WELYOS_RUNQ "ring" CACHE STRING "執行佇列的實作:ring 或 list")
+if(NOT EXISTS ${CMAKE_SOURCE_DIR}/kernel/runq_${WELYOS_RUNQ}.c)
+    message(FATAL_ERROR "未知的 WELYOS_RUNQ: ${WELYOS_RUNQ}(kernel/runq_${WELYOS_RUNQ}.c 不存在)")
+endif()
+
 add_compile_options(${ARCH_FLAGS} -ffreestanding -fno-stack-protector -fno-builtin
                     -fno-tree-loop-distribute-patterns -fno-omit-frame-pointer -nostdlib -Wall -Wextra -g)
 # 連結選項分成共用的部分與各自的 linker script:kernel 與使用者程式是兩個獨立的執行檔
@@ -57,6 +66,8 @@ add_executable(welyos.elf
     kernel/pmm.c
     kernel/kmalloc.c
     kernel/sched.c
+    kernel/runq_${WELYOS_RUNQ}.c
+    kernel/spinlock.c
     kernel/sync.c
     kernel/vm.c
     kernel/proc.c

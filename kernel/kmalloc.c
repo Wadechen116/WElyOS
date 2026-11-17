@@ -16,15 +16,19 @@
  * 配置:從頭找第一個夠大的空閒區塊(first-fit),太大就切成兩塊。
  * 不夠:向 pmm 要幾頁,當成一個新的空閒區塊加進串列。
  *
- * 空閒串列以「關中斷」保護,所以可被多條執行緒(以及排程器在中斷中)使用。
+ * 空閒串列以一把 spinlock 保護,所以可被多條執行緒、多顆 CPU 以及中斷處理程式使用。
  * 限制:取得的頁不會還給 pmm。
  */
 #include <stdint.h>
 #include "kmalloc.h"
+#include "spinlock.h"
 #include "arch.h"
 #include "kstring.h"
 #include "panic.h"
 #include "pmm.h"
+
+/* 保護空閒串列。持有期間可能再取得 pmm 的鎖(heap 擴充時),順序固定為 heap -> pmm */
+static struct spinlock heap_lk = SPINLOCK_INIT("heap");
 
 #define KM_ALIGN       16u            /* 回傳位址與區塊大小的對齊單位 */
 #define KM_GROW_PAGES  4u             /* 每次至少向 pmm 要幾頁(16KB) */
@@ -134,9 +138,9 @@ static void *kmalloc_locked(size_t size)
 
 void *kmalloc(size_t size)
 {
-    unsigned long flags = arch_irq_save();
+    unsigned long flags = spin_lock_irqsave(&heap_lk);
     void *p = kmalloc_locked(size);
-    arch_irq_restore(flags);
+    spin_unlock_irqrestore(&heap_lk, flags);
     return p;
 }
 
@@ -159,9 +163,18 @@ void kfree(void *ptr)
     if (b->magic != KM_MAGIC_USED)
         panic("kfree: invalid pointer or double free: %p", ptr);
 
-    unsigned long flags = arch_irq_save();
+    unsigned long flags = spin_lock_irqsave(&heap_lk);
     insert_free(b);
-    arch_irq_restore(flags);
+    spin_unlock_irqrestore(&heap_lk, flags);
+}
+
+size_t kmalloc_size(void *ptr)
+{
+    struct block *b = (struct block *)((char *)ptr - HDR);
+
+    if (b->magic != KM_MAGIC_USED)
+        panic("kmalloc_size: invalid pointer %p", ptr);
+    return b->size;
 }
 
 void kheap_stats(struct kheap_stats *st)
@@ -170,10 +183,10 @@ void kheap_stats(struct kheap_stats *st)
     st->free_bytes = 0;
     st->free_blocks = 0;
 
-    unsigned long flags = arch_irq_save();
+    unsigned long flags = spin_lock_irqsave(&heap_lk);
     for (struct block *b = free_list; b; b = b->next) {
         st->free_bytes += b->size;
         st->free_blocks++;
     }
-    arch_irq_restore(flags);
+    spin_unlock_irqrestore(&heap_lk, flags);
 }

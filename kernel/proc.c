@@ -52,6 +52,12 @@ struct proc {
     struct proc *next;
 };
 
+/*
+ * 上鎖:行程的串列與每個行程的狀態(nthreads、exiting、zombie、等待佇列)
+ * 都由排程器的鎖保護(sched_lock,見 sched.h),因為「等待行程結束」「futex」
+ * 需要把「檢查狀態」與「睡下去」做成不可分割的一步。
+ * 會花時間或需要其他鎖的工作(配置記憶體、建立執行緒、釋放位址空間)一律放在鎖外。
+ */
 static struct proc *procs;           /* 所有行程(含 zombie) */
 static int next_pid = 1;
 
@@ -126,20 +132,28 @@ static void proc_thread_exit(void)
 {
     struct proc *p = thread_data();
 
-    arch_irq_disable();
-    if (--p->nthreads == 0) {
-        /* 先換回 kernel 頁表,才能釋放自己正在使用的那一份 */
+    unsigned long flags = sched_lock();
+    int last = --p->nthreads == 0;
+    sched_unlock(flags);
+
+    if (last) {
+        /* 自己是最後一條:已經沒有別人在使用這個位址空間,可以在鎖外慢慢釋放。
+           先換回 kernel 頁表,才能釋放自己正在使用的那一份 */
         thread_set_space(NULL);
         vm_space_destroy(p->space);
+
+        flags = sched_lock();
         p->space = NULL;
         p->zombie = 1;
         wq_wake_all(&p->waiters);
+        sched_unlock(flags);
+        /* 解鎖之後 proc_wait 隨時可能把 p 釋放,不可再存取 */
     }
     thread_set_data(NULL);
     thread_exit();
 }
 
-/* 開始結束行程:記下結束碼,要求所有執行緒結束。呼叫時中斷已關閉 */
+/* 開始結束行程:記下結束碼,要求所有執行緒結束。呼叫時必須持有排程器的鎖 */
 static void proc_begin_exit(struct proc *p, int code)
 {
     if (p->exiting)
@@ -157,8 +171,9 @@ static void proc_exit(int code)
 {
     struct proc *p = thread_data();
 
-    arch_irq_disable();
+    unsigned long flags = sched_lock();
     proc_begin_exit(p, code);
+    sched_unlock(flags);
     proc_thread_exit();
 }
 
@@ -190,14 +205,17 @@ static int proc_add_thread(struct proc *p, uintptr_t entry, uintptr_t arg)
         return -1;
     }
 
-    unsigned long flags = arch_irq_save();
+    unsigned long flags = sched_lock();
     p->nthreads++;                   /* 先算進去:新執行緒可能立刻開始跑甚至結束 */
+    sched_unlock(flags);
+
     int tid = thread_create(p->name, user_thread_main, st);
     if (tid < 0) {
+        flags = sched_lock();
         p->nthreads--;
+        sched_unlock(flags);
         kfree(st);
     }
-    arch_irq_restore(flags);
     return tid;
 }
 
@@ -218,33 +236,36 @@ int proc_spawn(const char *name, long arg)
         return -1;
     }
 
-    unsigned long flags = arch_irq_save();
+    unsigned long flags = sched_lock();
     int pid = p->pid = next_pid++;
     p->next = procs;
     procs = p;
-    arch_irq_restore(flags);
+    sched_unlock(flags);
 
     if (proc_add_thread(p, p->entry, (uintptr_t)arg) < 0) {
         /* 沒有任何執行緒:直接當作已結束,讓 proc_wait 回收 */
-        flags = arch_irq_save();
         vm_space_destroy(p->space);
+        flags = sched_lock();
         p->space = NULL;
         p->exit_code = PROC_KILLED_FAULT;
         p->zombie = 1;
-        arch_irq_restore(flags);
+        wq_wake_all(&p->waiters);
+        sched_unlock(flags);
     }
     return pid;
 }
 
 int proc_wait(int pid)
 {
-    unsigned long flags = arch_irq_save();
-    struct proc *p = proc_find(pid);
+    unsigned long flags = sched_lock();
+    struct proc *p;
     int code = -1;
 
+    /* 每次醒來都重新以編號尋找:如果有另一條執行緒也在等同一個行程,
+       它可能先一步把行程回收並釋放了,不能沿用睡前拿到的指標(pid 不會重複使用) */
+    while ((p = proc_find(pid)) != NULL && !p->zombie)
+        wq_sleep(&p->waiters);
     if (p) {
-        while (!p->zombie)
-            wq_sleep(&p->waiters);
         code = p->exit_code;
         for (struct proc **pp = &procs; *pp; pp = &(*pp)->next) {
             if (*pp == p) {
@@ -252,15 +273,15 @@ int proc_wait(int pid)
                 break;
             }
         }
-        kfree(p);
     }
-    arch_irq_restore(flags);
+    sched_unlock(flags);
+    kfree(p);                        /* 已從串列移除,別人找不到它了;在鎖外釋放(NULL 無作用) */
     return code;
 }
 
 int proc_kill(int pid, int code)
 {
-    unsigned long flags = arch_irq_save();
+    unsigned long flags = sched_lock();
     struct proc *p = proc_find(pid);
     int rc = -1;
 
@@ -268,7 +289,7 @@ int proc_kill(int pid, int code)
         proc_begin_exit(p, code);
         rc = 0;
     }
-    arch_irq_restore(flags);
+    sched_unlock(flags);
     return rc;
 }
 
@@ -351,8 +372,8 @@ static long sys_write(struct proc *p, uintptr_t ubuf, size_t len)
  * futex_wait(addr, val):「如果 *addr 仍然等於 val,就讓我睡」。
  *   檢查與睡下去必須不可分割,否則會發生 lost wakeup(見 DEVLOG 第 11 步):
  *   使用者程式剛看到鎖被佔用、還沒睡下去,對方就解鎖並喚醒(此時沒人在睡),
- *   之後才睡下去就再也沒人叫了。把「再確認一次數值」交給 kernel 在關中斷下做,
- *   就不會有這個空檔:數值若已經變了,代表情況已改變,直接返回讓它重試。
+ *   之後才睡下去就再也沒人叫了。把「再確認一次數值」交給 kernel 在持有排程器的鎖時做,
+ *   而喚醒的一方也要先拿到同一把鎖才能叫人,就不會有這個空檔:數值若已經變了,代表情況已改變,直接返回讓它重試。
  */
 static struct wait_queue *futex_bucket(struct proc *p, uintptr_t uaddr)
 {
@@ -366,26 +387,29 @@ static long sys_futex_wait(struct proc *p, uintptr_t uaddr, int val)
 
     if (uaddr & 3)
         return -1;
-    unsigned long flags = arch_irq_save();
-    if (vm_space_query(p->space, uaddr, &pa, NULL) != 0) {
-        rc = -1;                             /* 不是使用者可存取的位址 */
-    } else if (*(volatile int *)pa != val || p->exiting) {
+    /* 位址轉換在鎖外做(它要用頁表的鎖)。行程的頁在行程結束前不會被移除,
+       而呼叫者正是這個行程的執行緒,所以查到的實體位址在下面使用時仍然有效 */
+    if (vm_space_query(p->space, uaddr, &pa, NULL) != 0)
+        return -1;                           /* 不是使用者可存取的位址 */
+
+    unsigned long flags = sched_lock();
+    if (*(volatile int *)pa != val || p->exiting) {
         rc = 1;                              /* 數值已經變了:不睡,讓使用者程式重新判斷 */
     } else {
         wq_sleep(futex_bucket(p, uaddr));
         rc = 0;
     }
-    arch_irq_restore(flags);
+    sched_unlock(flags);
     return rc;
 }
 
 static long sys_futex_wake(struct proc *p, uintptr_t uaddr)
 {
     /* 同一桶裡可能有等別的位址的人,一併被叫醒也無妨:它們會重新檢查自己的條件 */
-    unsigned long flags = arch_irq_save();
+    unsigned long flags = sched_lock();
     long n = wq_wake_all(futex_bucket(p, uaddr));
     sched_preempt_point();
-    arch_irq_restore(flags);
+    sched_unlock(flags);
     return n;
 }
 

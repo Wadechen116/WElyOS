@@ -27,6 +27,11 @@
 #include "panic.h"
 #include "pmm.h"
 #include "vm.h"
+#include "spinlock.h"
+
+/* 保護 kernel 頁表、所有位址空間的頁表與 ASID 的分配。
+   持有期間可能再取得 pmm 的鎖(配置表格時),順序固定為 vm -> pmm */
+static struct spinlock vm_lk = SPINLOCK_INIT("vm");
 
 #define ENTRIES   (1u << MMU_BITS)           /* 每個表格的項目數 */
 #define IDX_MASK  (ENTRIES - 1)
@@ -177,7 +182,7 @@ int vm_map(uintptr_t va, uintptr_t pa, unsigned flags)
     if (((va | pa) & (PAGE_SIZE - 1)) || !flags_ok(flags))
         return -1;
 
-    unsigned long irq = arch_irq_save();
+    unsigned long irq = spin_lock_irqsave(&vm_lk);
     pte_t *e = walk(root, va, 0, 1, 1, 0, NULL);
     int rc = -1;
     if (e) {
@@ -188,7 +193,7 @@ int vm_map(uintptr_t va, uintptr_t pa, unsigned flags)
             arch_tlb_flush(va);
         rc = 0;
     }
-    arch_irq_restore(irq);
+    spin_unlock_irqrestore(&vm_lk, irq);
     return rc;
 }
 
@@ -215,7 +220,7 @@ int vm_unmap(uintptr_t va)
 {
     va &= ~(uintptr_t)(PAGE_SIZE - 1);
 
-    unsigned long irq = arch_irq_save();
+    unsigned long irq = spin_lock_irqsave(&vm_lk);
     pte_t *e = walk(root, va, 0, 0, 1, 0, NULL);   /* 落在大分頁裡就先拆開,只移除這一頁 */
     int rc = -1;
     if (e && arch_pte_valid(*e)) {
@@ -224,13 +229,13 @@ int vm_unmap(uintptr_t va)
             arch_tlb_flush(va);
         rc = 0;
     }
-    arch_irq_restore(irq);
+    spin_unlock_irqrestore(&vm_lk, irq);
     return rc;
 }
 
 int vm_query(uintptr_t va, uintptr_t *pa, unsigned *flags)
 {
-    unsigned long irq = arch_irq_save();
+    unsigned long irq = spin_lock_irqsave(&vm_lk);
     int level = 0;
     pte_t *e = walk(root, va, 0, 0, 0, 0, &level);
     int rc = -1;
@@ -243,7 +248,7 @@ int vm_query(uintptr_t va, uintptr_t *pa, unsigned *flags)
             *flags = arch_pte_flags(*e);
         rc = 0;
     }
-    arch_irq_restore(irq);
+    spin_unlock_irqrestore(&vm_lk, irq);
     return rc;
 }
 
@@ -262,7 +267,7 @@ struct vm_space *vm_space_create(void)
     if (!vs)
         return NULL;
 
-    unsigned long irq = arch_irq_save();
+    unsigned long irq = spin_lock_irqsave(&vm_lk);
     vs->root = table_alloc();
     if (vs->root) {
         /* 複製 kernel 頁表最上層的所有項目。下層表格因此是共用的:之後 kernel
@@ -270,7 +275,7 @@ struct vm_space *vm_space_create(void)
         memcpy(vs->root, root, PAGE_SIZE);
         vs->asid = asid_alloc();
     }
-    arch_irq_restore(irq);
+    spin_unlock_irqrestore(&vm_lk, irq);
 
     if (!vs->root) {
         kfree(vs);
@@ -296,7 +301,7 @@ static void free_table(pte_t *t, int level)
 
 void vm_space_destroy(struct vm_space *vs)
 {
-    unsigned long irq = arch_irq_save();
+    unsigned long irq = spin_lock_irqsave(&vm_lk);
     int top = MMU_LEVELS - 1;
 
     /* 只處理最上層中屬於使用者範圍的項目;其餘是和 kernel 共用的,不能動 */
@@ -307,7 +312,7 @@ void vm_space_destroy(struct vm_space *vs)
     pmm_free(vs->root);
     table_pages--;
     asid_free(vs->asid);
-    arch_irq_restore(irq);
+    spin_unlock_irqrestore(&vm_lk, irq);
     kfree(vs);
 }
 
@@ -317,7 +322,7 @@ int vm_space_map(struct vm_space *vs, uintptr_t va, uintptr_t pa, unsigned flags
     if (((va | pa) & (PAGE_SIZE - 1)) || !flags_ok(flags) || !user_range(va))
         return -1;
 
-    unsigned long irq = arch_irq_save();
+    unsigned long irq = spin_lock_irqsave(&vm_lk);
     pte_t *e = walk(vs->root, va, 0, 1, 0, 1, NULL);
     int rc = -1;
     if (e) {
@@ -326,7 +331,7 @@ int vm_space_map(struct vm_space *vs, uintptr_t va, uintptr_t pa, unsigned flags
             arch_tlb_flush(va);
         rc = 0;
     }
-    arch_irq_restore(irq);
+    spin_unlock_irqrestore(&vm_lk, irq);
     return rc;
 }
 
@@ -335,7 +340,7 @@ int vm_space_query(struct vm_space *vs, uintptr_t va, uintptr_t *pa, unsigned *f
     if (!user_range(va))
         return -1;
 
-    unsigned long irq = arch_irq_save();
+    unsigned long irq = spin_lock_irqsave(&vm_lk);
     int level = 0;
     pte_t *e = walk(vs->root, va, 0, 0, 0, 0, &level);
     int rc = -1;
@@ -346,7 +351,7 @@ int vm_space_query(struct vm_space *vs, uintptr_t va, uintptr_t *pa, unsigned *f
             *flags = arch_pte_flags(*e);
         rc = 0;
     }
-    arch_irq_restore(irq);
+    spin_unlock_irqrestore(&vm_lk, irq);
     return rc;
 }
 

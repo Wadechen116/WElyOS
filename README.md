@@ -29,10 +29,13 @@
 - [x] 記憶體保護補強:i386 改用 PAE(Physical Address Extension) 分頁取得 NX(No-eXecute);SMEP(Supervisor Mode Execution Prevention) / SMAP(Supervisor Mode Access Prevention,i386)與 PAN(Privileged Access Never,AArch64)禁止 kernel 存取或執行使用者的頁;ASID(Address Space Identifier) 與全域頁避免切換行程時清空 TLB(Translation Lookaside Buffer)
 - [x] futex 與使用者模式的 mutex
 - [x] 以 `-O2` 編譯(`-DWELYOS_OPT=-O0` 可改回,方便 GDB 逐行追蹤)
+- [x] 多核心第一段:spinlock(偵測重複上鎖、錯誤解鎖、持有時切換執行緒)、每顆 CPU 的狀態(`struct cpu`,RISC-V 用 `tp`、AArch64 用 `TPIDR_EL1`、i386 用工作暫存器 TR(Task Register) 取得)、所有共用資料改以鎖保護;目前仍只啟動一顆 CPU
+- [x] 可替換的執行佇列(`include/runq.h`):`ring` 每顆 CPU 一組無鎖(lock-free)環狀佇列加工作竊取(預設)、`list` 全系統一組有鎖的串列,以 `-DWELYOS_RUNQ=` 選擇;主機端多執行緒測試(含 ThreadSanitizer)
 
 ## 規劃中
 
-- [ ] 多核心(Symmetric Multiprocessing,SMP):spinlock、每顆 CPU 的排程狀態、TLB shootdown
+- [ ] 多核心(Symmetric Multiprocessing,SMP)第二段:啟動其他 CPU(RISC-V SBI HSM(Hart State Management)、AArch64 PSCI(Power State Coordination Interface)、i386 LAPIC(Local Advanced Programmable Interrupt Controller) INIT-SIPI)
+- [ ] 多核心第三段:每顆 CPU 的計時器、處理器間中斷(Inter-Processor Interrupt,IPI)、TLB shootdown
 - [ ] 檔案系統、從檔案載入程式(`exec`)、`fork`、shell
 
 ## 需求
@@ -57,10 +60,12 @@ cmake --build build/riscv64 --target debug     # 啟動 QEMU 並暫停,等待 GD
 cmake --build build/riscv64 --target gdb       # (另一個終端機)連上 gdb,輸入 welyos-start 開始
 bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit"              # 只開機,不跑測試(最快)
 bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit selftest"     # 開機並執行各子系統的自我測試與示範
-bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit crash=fault"  # 故意觸發錯誤(crash=panic|fault|illegal|break|dfree|stack|mainstack|thread|relock|null|wtext|exec|uaccess|uexec)
+bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit crash=fault"  # 故意觸發錯誤(crash=panic|fault|illegal|break|dfree|stack|mainstack|thread|relock|null|wtext|exec|uaccess|uexec|spin|spinsleep)
 bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit memtest"      # 完整記憶體測試:寫入並驗證每一個空閒頁
 bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit stress"       # 排程器壓力測試:建立 1000 條執行緒
 cmake --build build/i386    --target run-gui   # 僅 i386:開啟 QEMU 視窗顯示 VGA 畫面
+cmake --preset riscv64 -DWELYOS_RUNQ=list      # 換用另一種執行佇列的實作(預設 ring)
+bash scripts/host-test.sh                      # 在主機上以多條執行緒測試執行佇列(不需要 QEMU)
 ```
 
 ## 專案結構
@@ -68,10 +73,11 @@ cmake --build build/i386    --target run-gui   # 僅 i386:開啟 QEMU 視窗顯�
 ```
 arch/<名稱>/  各架構的開機程式、linker script、驅動(i386 / riscv64 / aarch64)
 include/      與架構無關的標頭(arch.h 為架構介面)
-kernel/       kernel 主體(main、kprintf、fdt、panic、timer、pmm、kmalloc、sched、sync、vm、proc)
+kernel/       kernel 主體(main、kprintf、fdt、panic、timer、pmm、kmalloc、sched、runq_ring / runq_list、spinlock、sync、vm、proc)
 lib/          最小字串函式庫
 cmake/        各架構的 toolchain 檔
 user/         使用者程式(在使用者模式執行,獨立連結後嵌入 kernel)
-scripts/      QEMU 啟動腳本、GDB 腳本與設定
+tests/host/   在主機上執行的測試(執行佇列的並行測試)
+scripts/      QEMU 啟動腳本、GDB 腳本與設定、主機測試腳本
 docs/         開發紀錄
 ```

@@ -32,15 +32,21 @@
  * 所以先比較 sp 與目前執行緒的 stack 下限(kstack_limit,排程器維護),
  * 不夠就改用專用的例外 stack(exc_stack)。
  *
- * 比較需要兩個暫存器,但此刻所有暫存器都還是被打斷程式的值。
- * 借用兩個 kernel 沒有其他用途的系統暫存器 TPIDR_EL1、TPIDRRO_EL0 暫放 x0、x1。
+ * 比較需要兩個暫存器,但此刻所有暫存器都還是被打斷程式的值:
+ *   x0 暫放在系統暫存器 TPIDRRO_EL0(kernel 沒有其他用途)
+ *   x1 暫放在這顆 CPU 的 struct cpu 裡的空位
+ * struct cpu 的位址固定存在 TPIDR_EL1(見 cpu_arch.h),每顆 CPU 各自一份,
+ * 所以多核心時各自檢查的是自己正在執行的那條執行緒的 stack。
  */
+#define CPU_KLIMIT   0                /* struct cpu 的 kstack_limit */
+#define CPU_SCRATCH  16               /* struct cpu 的 scratch[0] */
+
 .macro VENTRY kind
     .align  7                         /* 每個入口對齊到 0x80 */
-    msr     tpidr_el1, x0
-    msr     tpidrro_el0, x1
-    adrp    x0, kstack_limit
-    ldr     x0, [x0, :lo12:kstack_limit]
+    msr     tpidrro_el0, x0
+    mrs     x0, tpidr_el1             /* x0 = struct cpu */
+    str     x1, [x0, #CPU_SCRATCH]
+    ldr     x0, [x0, #CPU_KLIMIT]
     add     x0, x0, #FRAME_SIZE       /* sp 至少要比下限高出一個 frame */
     mov     x1, sp                    /* x1 = 被打斷時的 sp */
     cmp     x1, x0
@@ -51,7 +57,8 @@
 1:  sub     sp, sp, #FRAME_SIZE       /* 挖出 trap frame */
     str     x1, [sp, #248]            /* slot 31 = 被打斷時的 sp */
     mrs     x0, tpidr_el1             /* 取回 x0、x1 原本的值 */
-    mrs     x1, tpidrro_el0
+    ldr     x1, [x0, #CPU_SCRATCH]
+    mrs     x0, tpidrro_el0
     stp     x0, x1, [sp, #0]
     mov     x0, #\kind                /* 0~15:第幾個向量,供 C 判斷來源與種類 */
     b       trap_common
@@ -120,7 +127,7 @@ trap_common:
     msr     spsr_el1, x3
     ldr     x2, [sp, #288]
     msr     sp_el0, x2
-    /* TPIDRRO_EL0 被入口借來暫放 x1,而它在 EL0 是可讀的。
+    /* TPIDRRO_EL0 被入口借來暫放 x0,而它在 EL0 是可讀的。
        清掉它,避免把上一次例外時的暫存器內容洩漏給使用者程式 */
     msr     tpidrro_el0, xzr
 
@@ -145,7 +152,8 @@ trap_common:
 
 /*
  * 例外專用 stack(8KB):只在偵測到 kernel stack 溢位時使用。
- * 那種情況必定以 panic 收場,不會返回,所以全系統共用一條即可。
+ * 那種情況必定以 panic 收場,不會返回,所以全系統共用一條即可
+ * (兩顆 CPU 同時溢位的機率極低;真的發生時訊息可能交錯,但同樣會停機)。
  */
     .section .bss
     .balign 16

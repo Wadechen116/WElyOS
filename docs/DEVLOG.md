@@ -12,6 +12,7 @@
 |---|---|---|
 | ASID | Address Space Identifier | 位址空間編號 |
 | BSS | Block Started by Symbol | 未初始化資料區段 |
+| CAS | Compare-And-Swap | 比較並交換:「值仍是我看到的那個才改」的原子操作 |
 | CFS | Completely Fair Scheduler | 完全公平排程器 |
 | CSR | Control and Status Register | 控制與狀態暫存器 |
 | DTB | Device Tree Blob | 裝置樹二進位檔 |
@@ -23,6 +24,7 @@
 | GDB | GNU Debugger | GNU 除錯器 |
 | GDT | Global Descriptor Table | 全域描述符表 |
 | GIC | Generic Interrupt Controller | 通用中斷控制器 |
+| HSM | Hart State Management | hart 狀態管理(SBI 用來啟動、停止 CPU 的擴充) |
 | IDT | Interrupt Descriptor Table | 中斷描述符表 |
 | IPI | Inter-Processor Interrupt | 處理器間中斷 |
 | IRQ | Interrupt Request | 中斷請求 |
@@ -50,9 +52,13 @@
 | SMAP | Supervisor Mode Access Prevention | 管理者模式存取保護 |
 | SMEP | Supervisor Mode Execution Prevention | 管理者模式執行保護 |
 | SMP | Symmetric Multiprocessing | 對稱多處理 |
+| SPMC | Single Producer Multiple Consumer | 單一放入者、多個取出者 |
 | TLB | Translation Lookaside Buffer | 轉譯後備緩衝區 |
+| TR | Task Register | 工作暫存器:x86 中指向目前 TSS 的暫存器 |
+| TSan | ThreadSanitizer | 執行緒消毒器:偵測資料競爭的編譯器工具 |
 | TSC | Time Stamp Counter | 時間戳計數器 |
 | TSS | Task State Segment | 工作狀態區段 |
+| TTAS | Test and Test-And-Set | 先測試再做原子交換的 spinlock 寫法 |
 | UART | Universal Asynchronous Receiver-Transmitter | 通用非同步收發器 |
 | UXN | Unprivileged eXecute Never | 非特權不可執行 |
 | VGA | Video Graphics Array | 視訊圖形陣列 |
@@ -63,12 +69,17 @@
 | 用語 | 英文 | 說明 |
 |---|---|---|
 | aging | aging | 老化:等越久優先權越高,用來防止飢餓 |
+| ABA problem | ABA problem | ABA 問題:值由 A 變 B 又變回 A,CAS 誤以為沒變過 |
+| atomic | atomic operation | 原子操作:不會被其他 CPU 或中斷從中間插入的操作 |
 | backtrace | backtrace | 呼叫堆疊回溯 |
 | bitmap | bitmap | 位元圖 |
 | break-before-make | break-before-make | ARM 修改頁表的規定:先失效再寫入 |
 | callee-saved | callee-saved registers | 被呼叫者保存的暫存器 |
+| cache line | cache line | 快取線:CPU 快取存取記憶體的最小單位(通常 64 位元組) |
 | coalescing | coalescing | 合併相鄰的空閒區塊 |
 | context switch | context switch | 上下文切換:換到另一條執行緒執行 |
+| circular queue | circular queue / ring buffer | 環狀佇列:固定大小的陣列,用到尾端繞回開頭 |
+| data race | data race | 資料競爭:多方同時存取同一記憶體且至少一方寫入,又沒有同步 |
 | deadlock | deadlock | 死結:互相等待而永遠無法前進 |
 | double fault | double fault | 雙重錯誤:處理例外的過程中又發生例外 |
 | first-fit | first-fit | 最先適合:取第一個夠大的空閒區塊 |
@@ -76,14 +87,18 @@
 | freestanding | freestanding | 獨立環境:不依賴作業系統與標準函式庫 |
 | futex | Fast Userspace Mutex | 快速使用者空間互斥鎖 |
 | guard page | guard page | 保護頁:刻意不對映、用來偵測越界的頁 |
+| hart | hardware thread | RISC-V 對一顆 CPU 核心(硬體執行緒)的稱呼 |
 | heap | heap | 堆積:動態配置記憶體的區域 |
 | identity mapping | identity mapping | 恆等對映:虛擬位址等於實體位址 |
 | large page | large page / huge page | 大分頁:一個項目對映 2MB 或 4MB |
+| lock-free | lock-free | 無鎖:不靠鎖、以原子操作協調多方存取 |
+| lock ordering | lock ordering | 鎖的順序:多把鎖一律依固定順序取得,以避免死結 |
 | linker script | linker script | 連結器腳本:決定各區段的位址 |
 | lost wakeup | lost wakeup | 遺失的喚醒:喚醒發生在睡下去之前 |
 | multiboot | Multiboot Specification | x86 的開機載入規範 |
 | mutex | mutual exclusion lock | 互斥鎖 |
 | page fault | page fault | 分頁錯誤:存取的頁沒有對映或權限不符 |
+| per-CPU | per-CPU data | 每顆 CPU 各自一份的資料 |
 | priority inheritance | priority inheritance | 優先權繼承 |
 | priority inversion | priority inversion | 優先權反轉 |
 | race condition | race condition | 競爭條件:結果取決於執行順序 |
@@ -99,7 +114,9 @@
 | TLB shootdown | TLB shootdown | 通知其他 CPU 讓 TLB 紀錄失效 |
 | trap | trap | 例外與中斷的統稱(RISC-V 用語) |
 | trap frame | trap frame | 進入例外時存放暫存器的結構 |
+| type-stable memory | type-stable memory | 型別穩定的記憶體:釋放後只會再被當成同一種結構使用 |
 | wait queue | wait queue | 等待佇列 |
+| work stealing | work stealing | 工作竊取:閒置的 CPU 到別顆 CPU 的佇列拿工作 |
 
 ---
 
@@ -2277,3 +2294,385 @@ kernel 本身在 `-O2` 下沒有出現任何問題,51 個回歸情境與 60 次�
 - **PAE 的 64 位元項目在 32 位元 CPU 上要分兩次寫入**,不是不可分割的。單一 CPU 且關中斷時沒有問題,多核心下需要注意寫入順序。
 - **i386 沒有啟用 PAE 之外的 36 位元實體位址**,仍只使用 4GB 以下的記憶體。
 - 還沒有檔案系統、`exec`、`fork`,使用者程式仍只有內建的一個。這些是尚未實作的功能,列在後續步驟。
+
+---
+
+## 第 16 步:多核心第一段 — spinlock 與每顆 CPU 的狀態
+
+多核心(Symmetric Multiprocessing,SMP)是一大步,分三段做,每一段都能獨立驗證:
+
+| 段 | 內容 | 狀態 |
+|---|---|---|
+| 一 | spinlock、每顆 CPU 的狀態、把所有「關中斷就安全」的地方改成真正的鎖 | **本步** |
+| 二 | 找出並啟動其他 CPU(RISC-V 用 SBI 的 HSM(Hart State Management) 擴充、AArch64 用 PSCI(Power State Coordination Interface)、i386 用 LAPIC(Local Advanced Programmable Interrupt Controller) 的 INIT-SIPI),讓它們進入排程器 | 下一步 |
+| 三 | 每顆 CPU 的計時器、處理器間中斷(Inter-Processor Interrupt,IPI)、TLB shootdown | 之後 |
+
+這一段**仍然只有一顆 CPU 在跑**。目的是先把 kernel 改成「就算有多顆 CPU 同時執行也正確」的寫法,並確認在單一 CPU 上行為完全不變。這樣第二段真的啟動其他 CPU 時,出問題的範圍只剩「啟動」本身,不會和上鎖的錯誤混在一起。
+
+### 為什麼「關中斷」不夠了
+
+到第 15.5 步為止,所有共用資料(執行佇列、位元圖、heap 的空閒串列、頁表)都靠同一招保護:
+
+```c
+unsigned long flags = arch_irq_save();      // 關中斷
+... 修改共用資料 ...
+arch_irq_restore(flags);
+```
+
+單一 CPU 上這是對的:唯一會打斷這段程式的就是中斷,關掉就沒有人能插進來。多顆 CPU 時,關中斷只管得到**自己這一顆**,別顆 CPU 同一時間可能正在修改同一份資料。
+
+### spinlock(自旋鎖)
+
+`include/spinlock.h`、`kernel/spinlock.c`。鎖是一個整數:0 = 沒人持有,1 = 有人持有。
+
+上鎖用一條**原子**(atomic)指令「把 1 寫進去並取回舊值」:舊值是 0 代表搶到了;是 1 代表別人持有,就原地反覆重試(自旋)。各架構對應的指令由編譯器的 `__atomic_exchange_n` 產生:i386 是 `xchg`,RISC-V 是 `amoswap.w`,AArch64 是 `ldxr` / `stxr` 這一對。
+
+```c
+while (__atomic_exchange_n(&l->locked, 1u, __ATOMIC_ACQUIRE)) {
+    while (l->locked)            // 搶不到:先用一般的讀取等它變空
+        arch_cpu_relax();
+}
+```
+
+內層多一個迴圈是 **TTAS**(Test and Test-And-Set)寫法:原子交換每次都要獨佔那條快取線(cache line),多顆 CPU 一起反覆交換會互相拖慢;單純讀取可以共享,等待的成本低得多。`arch_cpu_relax()` 是給 CPU 的提示(i386 `pause`、AArch64 `yield`),表示現在只是在空等。
+
+使用時幾乎都用關中斷的版本:
+
+```c
+unsigned long flags = spin_lock_irqsave(&lock);     // 先關中斷,再上鎖
+...
+spin_unlock_irqrestore(&lock, flags);
+```
+
+**上鎖的同時必須關中斷**。否則持有鎖的時候進來一個中斷,而中斷處理程式也要拿同一把鎖,它就會永遠等待被它自己打斷的那段程式。
+
+### 安全:把「永遠卡住」變成「立刻回報」
+
+spinlock 用錯的典型後果是整台機器靜靜地卡死,而且中斷是關的,連計時器都進不來,非常難查。所以每把鎖多記兩樣東西(持有者的 CPU 編號、名稱),每顆 CPU 記自己持有幾把鎖,用來在出錯的當下直接 panic:
+
+| 錯誤 | 不檢查的後果 | 現在 |
+|---|---|---|
+| 同一顆 CPU 對同一把鎖上鎖兩次 | 自己等自己,永遠卡住 | `spinlock "名稱": recursive acquire on cpu N` |
+| 解開不是自己持有的鎖 | 別人的臨界區失去保護,資料悄悄損壞 | `spinlock "名稱": released on cpu N but not held by it` |
+| 持有 spinlock 時切換執行緒 | 別顆 CPU 關著中斷一直等這把鎖,系統卡住 | `schedule: cpu N would switch threads while holding K spinlock(s)` |
+| 沒持有排程器的鎖就操作等待佇列 | 佇列損壞 | `KASSERT(spin_held(&sched_lk))` |
+
+檢查的成本是每次上鎖、解鎖多幾條指令,換來的是這類錯誤在第一次發生時就被指出來。
+
+還有一個細節:**panic 本身也要印訊息**,而出事的當下可能正持有主控台的鎖(例如在 `kprintf` 裡面出錯)。所以 panic 一開始就呼叫 `spin_panic_mode()`,之後所有 spinlock 操作直接放行。各架構的致命例外路徑(印 `*** EXCEPTION ***` 的地方)也改為先呼叫 `panic_begin()`。
+
+### 每顆 CPU 的狀態(per-CPU)
+
+「目前正在執行的執行緒」「是否在中斷中」「需不需要重新排程」「載入的是哪個位址空間」這些資訊每顆 CPU 都不同,不能再是單一個全域變數。它們集中到 `struct cpu`(`include/cpu.h`),每顆 CPU 一份:
+
+```c
+struct cpu {
+    uintptr_t kstack_limit;      // 以下三項由例外入口(組合語言)以固定位移存取
+    uintptr_t kstack_top;
+    uintptr_t scratch[2];
+    int id, online, in_irq;
+    volatile int need_resched;
+    int nlocks;                  // 持有幾把 spinlock
+    struct thread *current, *idle, *zombie;
+    struct vm_space *loaded_space;
+};
+extern struct cpu cpus[MAX_CPUS];   // MAX_CPUS = 8
+```
+
+問題是:一段程式怎麼知道「我在哪一顆 CPU 上」?三個架構的做法不同:
+
+| 架構 | `this_cpu()` 的來源 | 進出使用者模式時 |
+|---|---|---|
+| RISC-V | `tp` 暫存器固定指向自己的 `struct cpu` | 使用者可以任意改 `tp`,所以入口要換回來(見下) |
+| AArch64 | 系統暫存器 `TPIDR_EL1` | 不必處理:使用者模式碰不到這個暫存器 |
+| i386 | 讀工作暫存器 TR(Task Register),換算成編號 | 不必處理:TR 不受使用者模式影響 |
+
+**RISC-V**:`sscratch` 的約定跟著改。之前它在使用者模式期間存放 kernel stack 的頂端;現在存放 `struct cpu` 的位址(kernel 中仍為 0)。入口把 `tp` 與 `sscratch` 交換,非 0 就是從使用者模式來,此時 `tp` 已經是 `struct cpu`,再從裡面讀出 `kstack_top` 換 stack。每顆 CPU 有自己的 `sscratch`,所以各自拿到的是自己那一份。
+
+**AArch64**:`TPIDR_EL1` 原本被例外入口借來暫放 `x0`,現在要讓出來。入口改成:`x0` 暫放在 `TPIDRRO_EL0`,`x1` 暫放在 `struct cpu` 裡的空位。整個入口 19 條指令,仍在每個向量 32 條的限制內。
+
+**i386**:沒有多餘的暫存器。常見做法是用 `fs` / `gs` 區段指向每顆 CPU 的資料,但那樣每次進出使用者模式都要保存、切換區段暫存器,多一個容易出錯的地方。這裡利用一個現成的事實:**每顆 CPU 本來就必須有自己的 TSS**(裡面記錄該 CPU 的 kernel stack),所以 TR 的值每顆 CPU 都不同。用 `str` 指令讀出 TR 就能換算出編號,不需要動到區段暫存器,也不需要更改例外入口。代價是 `str` 比讀一個區段暫存器慢幾個週期。
+
+### 一個只有多核心才會出現的陷阱:`this_cpu()` 的結果會過期
+
+```c
+struct cpu *c = this_cpu();
+// <-- 如果這裡被搶佔,之後在「另一顆 CPU」上被切回來
+c->current ...                 // 讀到的是原本那顆 CPU 的資料
+```
+
+規則:**`this_cpu()` 的結果只能在中斷關閉時使用**。受影響的地方有三處,都已處理:
+
+1. `thread_current()`、`thread_id()` 這類在中斷開著時呼叫的函式,改為先關中斷再讀。
+2. `schedule()` 切換回來之後,不可再使用切換前取得的 `c`(那時可能已經換了 CPU)。
+3. **RISC-V 的例外返回路徑不還原 `tp`**。例外入口會把所有暫存器存進 trap frame、返回前還原;但被打斷的 kernel 執行緒可能在這次中斷裡被搶佔,之後在另一顆 CPU 上被切回來,若把 `tp` 還原成當初存的值,它就指向原本那顆 CPU 了。`tp` 在 kernel 中代表「現在這顆 CPU」,不屬於被打斷程式的狀態,所以返回 kernel 時跳過它(返回使用者模式時才還原使用者的 `tp`)。
+
+這三處在單一 CPU 上都測不出問題,是讀程式推導出來的,第二段啟動多顆 CPU 後才會真正被考驗。
+
+### 排程器:一把鎖,而且鎖要「跨過切換」
+
+排程器的所有資料(執行佇列、休眠串列、所有等待佇列、每條執行緒的狀態與優先權)由**同一把鎖** `sched_lk` 保護;semaphore、mutex、futex、行程的結束狀態也共用它:
+
+```c
+unsigned long flags = sched_lock();
+while (條件不成立)
+    wq_sleep(&佇列);
+...
+sched_unlock(flags);
+```
+
+和之前「關中斷」的寫法一一對應,所以 `sync.c` 的邏輯完全沒變,只是換了保護的方式。
+
+關鍵在 `schedule()`:**鎖在切換前由舊執行緒取得,切換後由新執行緒釋放**。
+
+```
+舊執行緒:sched_lock() → schedule() → 把自己放回執行佇列 → arch_switch ─┐
+新執行緒:                                    ┌──────────────────────────┘
+                                             └→ 從它上次的 arch_switch 返回 → sched_unlock()
+```
+
+為什麼不能在切換前就解鎖:舊執行緒在切換完成前就已經被放回執行佇列。如果這時鎖已釋放,別顆 CPU 可能立刻把它取出來執行,而原本的 CPU 還沒離開它的 stack,**兩顆 CPU 同時踩在同一條 stack 上**。鎖一直持有到切換完成,別顆 CPU 在那之前拿不到佇列裡的任何東西。新建立的執行緒第一次執行時沒有「上次的 `sched_unlock`」可以返回,所以 `thread_entry()` 開頭要自己解鎖。
+
+其他配合的修改:
+
+- **回收已結束的執行緒**移到解鎖之後。它要釋放 stack 與結構,會用到 heap、頁表、頁面配置器的鎖,不該被排程器的鎖包住。每顆 CPU 有自己的 `zombie` 欄位:執行緒結束時把自己記在上面,由同一顆 CPU 上切換過去的下一條執行緒在 `sched_unlock()` 時釋放。
+- **喚醒時要挑一顆 CPU**(`kick()`):找「正在執行的優先權最低、且低於被喚醒者」的 CPU(閒置的最優先),設定它的 `need_resched`。已經被要求重新排程的 CPU 略過,讓同時被喚醒的多條執行緒分散到不同的 CPU。只有一顆 CPU 時,結果和原本的判斷相同。
+- **每顆 CPU 一條 idle 執行緒**:一條執行緒不能同時在兩顆 CPU 上執行。
+- **計時器 tick**:每顆 CPU 都會有自己的計時器中斷,但系統時間只由第 0 顆 CPU 推進(否則 N 顆 CPU 時間會走快 N 倍),喚醒休眠者與防飢餓檢查也只由它負責;時間片則各算各的。
+
+### 決策:為什麼是一把大鎖,而不是每顆 CPU 一條佇列
+
+第 10 步的紀錄提過,要讓排程器隨 CPU 數量擴展,需要每顆 CPU 自己的執行佇列加上 work stealing。這裡刻意先不做:
+
+| | 一把鎖、一組佇列(本步) | 每顆 CPU 一組佇列 |
+|---|---|---|
+| 正確性 | 所有狀態在同一把鎖下,容易確認 | 喚醒、搬移、優先權繼承都會跨佇列,要同時持有多把鎖並注意順序 |
+| 優先權語意 | 天然滿足「N 顆 CPU 執行優先權最高的 N 條」 | 各佇列各自排序,要另外平衡才能接近 |
+| 效能 | 排程操作互相等待;CPU 越多越明顯 | 平常互不干擾 |
+
+以目前的規模(模擬器上最多幾顆 CPU、臨界區只有幾十條指令),鎖的競爭不是瓶頸;先求正確,等第二、三段完成、能實際量測之後,再決定值不值得換。這個取捨列在已知限制。
+
+### 其他子系統的鎖與順序
+
+| 鎖 | 保護的資料 | 持有時可以再拿 |
+|---|---|---|
+| `sched_lk` | 排程器、等待佇列、semaphore / mutex / futex、行程狀態 | `console` |
+| `vm_lk` | kernel 頁表、所有位址空間的頁表、ASID 的分配 | `pmm`、`console` |
+| `heap_lk` | kernel heap 的空閒串列 | `pmm`、`console` |
+| `pmm_lk` | 頁面位元圖 | `console` |
+| `stack_lk` | 閒置 stack 的快取 | `console` |
+| `console_lk` | 主控台輸出(一次 `kprintf` 不被插入) | 無(最內層) |
+
+需要同時持有兩把鎖時,只會依表中的方向取得(例如 heap 擴充時 `heap_lk` → `pmm_lk`,從不反過來),所以不會出現兩顆 CPU 以相反順序各拿一把而互相等待的死結。`sched_lk` 持有期間刻意不呼叫任何會配置或釋放記憶體的函式。
+
+`proc.c` 原本大量依賴「關著中斷一路做完」(例如行程結束時遞減計數、釋放位址空間、喚醒等待者是同一段)。現在拆成:需要不可分割的狀態變更在 `sched_lk` 下做,花時間的工作(建立執行緒、釋放位址空間、`kfree`)移到鎖外。
+
+### 順帶修正:`proc_wait` 的懸空指標
+
+改寫 `proc_wait` 時發現一個既有的錯誤(單一 CPU 也會發生):兩條執行緒同時等同一個行程時,兩者都被喚醒,第一條回收並釋放了 `struct proc`,第二條醒來後仍用睡前拿到的指標讀 `p->zombie`,讀的是已釋放的記憶體。改為每次醒來都以 pid 重新尋找(pid 不會重複使用),找不到就代表已被別人回收。
+
+### 驗證
+
+行為應與上一步完全相同,所以主要的驗證是回歸測試;另外加了三項針對這一步的測試:
+
+| 測試 | 內容 | 結果(三個架構相同) |
+|---|---|---|
+| `selftest` 中的 spinlock 自我測試 | 上鎖 / 解鎖的記帳、巢狀持有兩把不同的鎖、解鎖後中斷恢復 | `spinlock: selftest ok (cpu 0 of 1 online, max 8)` |
+| `crash=spin` | 同一把 spinlock 上鎖兩次 | `KERNEL PANIC: spinlock "test": recursive acquire on cpu 0` |
+| `crash=spinsleep` | 持有 spinlock 時呼叫 `thread_yield()` | `KERNEL PANIC: schedule: cpu 0 would switch threads while holding 1 spinlock(s)` |
+
+回歸矩陣:三個架構各 19 個情境(上一步的 17 個加上面兩個),共 57 個,結束碼全部符合預期(成功為 0;故意出錯的情境 i386 為 3、其餘為 1)。三個架構各連續執行 20 次 `autoexit selftest stress memtest`,60 次全部通過。`QEMU_CPU=qemu32` 的退回路徑也通過。
+
+第一次建置後就全部通過,過程中沒有踩到坑;因為每一處修改都對應到原本的一個關中斷區段,邏輯沒有變。
+
+耗時與上一步相比沒有可辨識的差異(單一 CPU 上鎖永遠一次就拿到):
+
+| | 只開機 | `selftest` | 全部測試(20 次的範圍) |
+|---|---|---|---|
+| i386 | 0.30 秒 | 0.86 秒 | 1.00~1.09 秒 |
+| riscv64 | 0.23 秒 | 0.75 秒 | 0.90~0.98 秒 |
+| aarch64 | 0.19 秒 | 0.70 秒 | 0.83~0.93 秒 |
+
+壓力測試的數字也相近:1000 條執行緒 23~65 tick,300 個循序行程 60~89 tick。
+
+### 已知限制(這一段刻意留下,由後兩段處理)
+
+- **還沒有第二顆 CPU**。上面所有「多核心下才會出錯」的推論(鎖跨過切換、`tp` 不還原、`this_cpu()` 過期)都還沒有被真正的並行執行驗證過,只確認了單一 CPU 上沒有退步。
+- **沒有 IPI**。`kick()` 選到別顆 CPU 時只設定旗標,對方要到自己的下一個計時器 tick 才會發現(最多 1ms)。panic 時也還不會讓其他 CPU 停下來。
+- **TLB 失效只作用在自己這顆 CPU**。多核心下修改頁表後要通知其他 CPU(TLB shootdown);ASID 的回收也有同樣的問題。
+- **kernel 執行緒沿用上一個行程的頁表**(第 15 步的最佳化)在多核心下不安全:某顆 CPU 的 idle 執行緒可能還載入著一個已經在別顆 CPU 上被釋放的位址空間。第二段要先處理這一點。
+- **i386 的 PAE 項目分兩次寫入**(第 15.5 步列過)在多核心下需要注意順序。
+- **例外專用的 stack 全系統只有一條**。兩顆 CPU 同時發生 kernel stack 溢位時會互相覆蓋;結果仍是停機,但訊息可能交錯。
+- **i386 的 TSS 與 double fault stack 還是只有一份**,GDT 也只配置了第 0 顆 CPU 的項目;`this_cpu()` 的換算方式已經為多顆預留。
+- **spinlock 不保證公平**:TTAS 寫法下,等最久的不一定先拿到。CPU 很多、競爭激烈時應改用排隊式的鎖(ticket lock)。
+- **一把排程鎖**的擴展性限制,如上面的決策所述。
+
+---
+
+## 第 16.1 步:可替換的執行佇列,與無鎖環狀佇列
+
+這一步做兩件事:把執行佇列從排程器裡抽出來,變成一個可以整個換掉的元件;然後照這個介面寫出第二種做法 — 每顆 CPU 一組無鎖(lock-free)環狀佇列(circular queue)加上工作竊取(work stealing)。
+
+先講結論,免得誤會:**目前只有一顆 CPU,而且排程器的大鎖(第 16 步的 `sched_lk`)還在**,所以無鎖佇列現在帶不來任何加速,單一 CPU 上反而每次操作多做一點事。這一步的價值是把結構擺好、把演算法在真正的並行下驗證過;效益要等多顆 CPU 啟動、並把大鎖的範圍縮小之後才看得到。
+
+### 介面:`include/runq.h`
+
+```c
+void            runq_init(void);
+const char     *runq_name(void);
+void            runq_push(struct rq_node *n, int prio, int front);   // 放入
+struct rq_node *runq_pop(void);                                      // 取出優先權最高的
+void            runq_reprio(struct rq_node *n, int prio);            // 佇列中的節點改優先權
+int             runq_highest(void);                                  // 目前最高的優先權(參考值)
+int             runq_peek(int prio, struct rq_node **out, int max);  // 等最久的候選者(防飢餓用)
+```
+
+為了讓實作真的能換,定了三條界線:
+
+1. **介面只認得 `struct rq_node`**(嵌在 `struct thread` 裡的一小塊),不認得 `struct thread`。實作因此不依賴排程器的內部結構,也可以單獨拿出來測試。
+2. **上鎖由實作自己負責**。所有函式都可以由任何 CPU 同時呼叫,呼叫者不必持有任何鎖。串列版自己帶一把鎖,環狀版幾乎不用鎖,排程器不需要知道差別。
+3. **策略留在排程器**。優先權怎麼算、何時搶佔、防飢餓的門檻都在 `sched.c`;執行佇列只負責存放與取出。
+
+選擇實作是建置時的選項,排程器的程式一行都不用改:
+
+```
+cmake --preset riscv64 -DWELYOS_RUNQ=ring     # 預設
+cmake --preset riscv64 -DWELYOS_RUNQ=list
+```
+
+要嘗試第三種做法(例如每顆 CPU 一把鎖的串列),只要新增 `kernel/runq_<名稱>.c` 實作這七個函式。開機時會印出目前用的是哪一個(`sched: run queue = ...`)。
+
+### 實作一:`runq_list.c`(對照與退路)
+
+就是第 14 步的做法搬出來:每個優先權一條串列加一個位元圖,全系統共用,以一把鎖保護。順便改成雙向串列,「從中間移除」(改優先權時需要)由走訪整條變成固定成本。順序最嚴格,但所有 CPU 搶同一把鎖。
+
+### 實作二:`runq_ring.c`
+
+#### 無鎖環狀佇列(`include/ring.h`)
+
+一個固定大小(64 格)的陣列,加上兩個只增不減的計數器:
+
+```
+       head                 tail
+        v                    v
+  [ ][ ][A][B][C][D][ ][ ][ ]        索引 = 計數器 % 大小,用到尾端就繞回開頭
+```
+
+- `tail`:下一個要放入的位置。**只有擁有這條佇列的 CPU 會放入**。
+- `head`:下一個要取出的位置。擁有者取自己的工作、別顆 CPU 來竊取,走同一個函式,用 CAS(Compare-And-Swap)競爭:「如果 `head` 還是我剛才看到的值,就把它加一」。成功的人拿走那一格,失敗的重來。
+
+這種「單一放入者、多個取出者」的組合稱為 SPMC(Single Producer Multiple Consumer),Go 語言排程器每顆 CPU 的本地佇列就是這個結構。不需要鎖的理由:
+
+- 放入者只寫 `tail` 和 `tail` 指到的那一格,而那一格在 `tail` 前進之前沒有人會讀。
+- 取出者先讀格子的內容、再用 CAS 確認 `head` 沒變。那一格要被新資料覆蓋,`head` 必須先越過它;所以 CAS 成功就保證剛才讀到的內容有效,失敗時讀到的東西直接丟掉。
+- 計數器只增不減(32 位元,繞一圈要 40 億次操作),不會遇到 ABA 問題。
+
+為了維持「只有擁有者放入」,**被喚醒的執行緒放進「喚醒者」這顆 CPU 的佇列**,再由 `kick()` 通知該讓出的 CPU 來取(竊取)。
+
+#### 每顆 CPU 的結構與取出順序
+
+| 每顆 CPU | 用途 |
+|---|---|
+| `ring[p]` | 每個優先權一個環 |
+| `front[p]` | 每個優先權一格「插隊位」:被搶佔、時間片還沒用完的工作放這裡,最先取出 |
+| `mask` | 哪些優先權可能有工作,給別顆 CPU 看的提示 |
+
+全系統另有一組**溢出串列**(有鎖):環放不下時進這裡,也是各 CPU 之間自然的平衡點。
+
+取出時由高優先權到低,同一優先權內依序找:自己的插隊位 → 自己的環 → 溢出串列 → 別顆 CPU 的插隊位與環。**先把同一優先權在所有地方找過,才往下一級**,所以取到的幾乎一定是全系統優先權最高的,只差在別顆 CPU 同時放入的那一瞬間。這比常見的「自己的佇列空了才去偷」更接近嚴格的優先權排程,代價是每次取出要多看幾個提示。
+
+#### 難題:無鎖結構不能從中間移除
+
+優先權繼承與防飢餓都需要把一條**已經在排隊**的執行緒換到別的優先權。環狀佇列做不到「從中間拿掉」。解法是改變格子的意義:
+
+> 環裡的每一格不是「這個工作在這裡」,而是一張**號碼牌**:「這個工作可能可以執行」。
+> 真正決定誰能執行它的,是節點上的旗標 `queued`。
+
+- **放入**:`queued = 1`,然後放一張號碼牌。
+- **取出**:拿到一張牌之後,用 CAS 把 `queued` 從 1 改成 0。成功才算拿到;失敗表示這張牌已經**作廢**(工作早被別人經由另一張牌取走),丟掉再拿下一張。
+
+於是同一個工作可以有好幾張牌,只有第一個兌換的人成功:
+
+| 動作 | 做法 |
+|---|---|
+| 提高優先權 | 不動舊的牌,在新優先權的環再放一張。舊的那張之後被拿到時作廢 |
+| 降低優先權 | 什麼都不做。之後從舊的(較高的)環被拿到時,發現優先權不符,重新放到正確的環 |
+
+這帶出兩個必須處理的後果:
+
+**1. 作廢的牌可能指向已經結束的執行緒。** 拿到牌之後要去讀它的 `queued`,如果那塊記憶體已經還給 heap、被拿去做別的用途,就是讀寫不該碰的記憶體。所以 `struct thread` 改由排程器自己的池子管理:結束後放回池子重複使用,**永遠不還給 heap**(type-stable memory)。如果那塊記憶體已經被新的執行緒使用,而新執行緒正好也在排隊,經由舊牌把它取走也是正確的 — 它本來就該被執行,只是提早了一點。順帶的好處是建立執行緒不必每次配置與釋放結構。
+
+**2. 作廢的牌會擋住防飢餓的檢查。** 防飢餓只看每條佇列的頭(等最久的)。如果頭是一張作廢的牌,而這條低優先權的環又一直輪不到(這正是飢餓的情況),後面真正在等的執行緒就永遠不會被發現。所以 `runq_peek` 看到頭是作廢的牌時會順手把它清掉。
+
+#### 溢出串列與號碼牌的配合
+
+溢出串列用節點自己的指標串起來,所以「已經被取走執行的節點還留在串列上」是不允許的。但節點可能同時有一張環裡的牌,被別顆 CPU 經由那張牌取走。兩邊用對稱的順序配合:
+
+```
+串入的一方:(持有鎖)串入並標記「在串列上」 → 再讀 queued,若已是 0 就自己拆下來
+兌換的一方:CAS 把 queued 改成 0             → 再讀標記,若在串列上就(持有鎖)拆下來
+```
+
+兩邊都是「先寫自己的、再讀對方的」,並使用最嚴格的記憶體順序,所以不可能兩邊都沒看到對方,至少有一邊會負責拆下來。
+
+### 順帶修正:防飢餓提升後不肯下來
+
+換成環狀版後,`selftest` 在防飢餓測試卡住。原因是一個既有的規則漏洞,只是之前被巧合遮住:
+
+- 被提升的執行緒此刻是最高優先權;時間片用完時的規則是「有優先權不低於自己的人在等才換人」,而沒有人比它高,所以它**一直執行下去**,反過來霸佔 CPU。
+- 之前沒出事,是因為同時在等的 main 執行緒過了 100ms 也被提升到最高,才把它換下來。環狀版裡 main 在插隊位上,防飢餓檢查沒看那裡,巧合就消失了。
+
+兩處都修了:靠提升上來的執行緒時間片用完時**無條件**讓出(這才符合「只給一個時間片」的原意);`runq_peek` 也把插隊位列為候選。這是「換實作」帶來的額外收穫:兩個實作行為不一致的地方,往往就是原本靠運氣的地方。
+
+### 驗證
+
+**(一)主機上的並行測試**(`tests/host/runq_test.c`,以 `bash scripts/host-test.sh` 執行)
+
+kernel 裡只有一顆 CPU,測不到無鎖結構最容易出錯的「多方同時操作」。因為介面不依賴 kernel,同一份 `runq_ring.c` / `runq_list.c` 可以直接編譯成一般的 Linux 程式,讓 4 條 pthread 各扮演一顆 CPU,同時隨機地取出、放回(隨機優先權與插隊)、暫時留在手上(模擬睡著)、更改任意節點的優先權。檢查:
+
+- **互斥**:同一個節點不會同時交給兩條執行緒(在 kernel 裡就是同一條執行緒同時在兩顆 CPU 上執行)
+- **不遺失**:結束後把佇列取空,每個節點恰好出現一次,而且由高優先權到低
+
+| 實作 | 3000 個節點(大量使用溢出串列) | 200 個節點(幾乎只用環與竊取) | ThreadSanitizer |
+|---|---|---|---|
+| ring | 通過(每條 300 萬次操作,共約 720 萬次取出) | 通過 | 沒有回報資料競爭 |
+| list | 通過 | 通過 | 沒有回報資料競爭 |
+
+以上連續執行三輪結果相同。ThreadSanitizer(TSan)是編譯器的工具,會檢查每一次記憶體存取有沒有資料競爭。
+
+也確認了測試本身有效:把「兌換號碼牌」的 CAS 故意拿掉後,測試立刻回報大量「同一節點交給兩顆 CPU」。但另一處故意改壞(拿掉溢出串列「串入後再檢查一次」)即使跑 2000 萬次也**沒有**被測到 — 那個時間窗極小。所以那段邏輯的正確性目前靠的是推導,不是測試。
+
+**(二)kernel 回歸測試**
+
+| | ring(預設) | list |
+|---|---|---|
+| 57 個情境(三個架構各 19 個)的結束碼 | 全部符合預期 | 全部符合預期 |
+| `autoexit selftest stress memtest` 每個架構 20 次 | 60 次全部通過 | (未重複執行) |
+| `QEMU_CPU=qemu32` 退回路徑 | 通過 | (未執行) |
+
+**(三)耗時**
+
+kernel(單一 CPU,ring):只開機 0.22~0.31 秒,`selftest` 0.68~0.86 秒,全部測試 0.87~1.40 秒。和第 16 步相比最小值相近,最大值偏高(riscv64 有一次 1.40 秒);單次量測的雜訊不小,無法斷言是環狀版造成的,但也沒有變快的理由。
+
+主機上 4 條執行緒各做 500 萬次操作的總耗時(僅供參考,測試程式的鎖在搶不到時會讓出 CPU,和 kernel 裡的行為不同):
+
+| 節點數 | ring | list |
+|---|---|---|
+| 3000 | 1.37 秒 | 1.39 秒 |
+| 200 | 1.44 秒 | 1.57 秒 |
+| 60 | 1.34 秒 | 1.67 秒 |
+
+節點多時兩者沒有差別:環只有 64 格,多數工作其實是經由有鎖的溢出串列進出。節點少時環狀版快一到兩成。這個差距不大,而且測試裡有 15% 的操作是隨機改優先權(會產生大量作廢的牌),比實際的排程負載不利得多;真正的評估要等多核心啟動後,在 kernel 裡量。
+
+### 已知限制
+
+- **目前沒有效益**。排程器仍在 `sched_lk` 之下呼叫執行佇列,環狀版「不用鎖」的特性被外層的鎖蓋住了。要讓它發揮,得先縮小 `sched_lk` 的範圍,而那需要處理另一個問題:執行緒被放回佇列時還踩在自己的 stack 上,必須等切換完成才能讓別顆 CPU 執行它(目前靠大鎖跨過切換來保證,縮小鎖之後要改用每條執行緒的「仍在 CPU 上」旗標)。這是多核心啟動之後的工作。
+- **真正的並行只在主機測試中驗證過**,kernel 裡還沒有第二顆 CPU。
+- **環的容量固定為 64**。同一優先權、同一顆 CPU 上超過 64 個可執行的工作時走溢出串列,那時的行為和串列版相同(有鎖)。壓力測試的 1000 條執行緒就是這種情況。
+- **多顆 CPU 之間不保證嚴格的先進先出**:同優先權的工作分散在各自的環與溢出串列裡。
+- **作廢的號碼牌會佔用環的空間**,直到被取出時丟掉。優先權頻繁變動時,有效容量會變小。
+- **`runq_highest()` 是參考值**:別顆 CPU 的提示可能過期(它下次取出時才更新),偶爾會造成一次不必要的重新排程,不影響正確性。
+- **竊取一次只拿一個**。Go 的做法是一次拿走一半,可以減少竊取的次數,之後量測有需要再改。
+- **`struct thread` 的記憶體不歸還 heap**。同時存在過的執行緒數量上限決定了佔用量(1000 條約 200KB)。
+- **溢出串列「串入後再檢查」的競爭沒有被測試涵蓋**,如上所述。
+

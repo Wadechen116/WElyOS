@@ -11,6 +11,7 @@
 #include <stddef.h>
 #include "arch.h"
 #include "kprintf.h"
+#include "spinlock.h"
 
 /* 輸出單一字元。回傳 1(輸出字元數) */
 static int out_char(char c)
@@ -166,16 +167,20 @@ int kvprintf(const char *fmt, va_list ap)
 
 /*
  * 可變參數版本:包裝 kvprintf。
- * 整個輸出期間關閉中斷,所以一次 kprintf 的內容不會被其他執行緒
- * 或中斷處理程式的輸出從中間插入(單一 CPU 上關中斷即不會被搶佔)。
+ * 整個輸出期間持有主控台的鎖(同時關中斷),所以一次 kprintf 的內容不會被
+ * 其他執行緒、其他 CPU 或中斷處理程式的輸出從中間插入。
+ * 這把鎖是「最內層」的鎖:持有它的期間不會再去拿別的鎖,
+ * 所以在任何地方(包括持有其他鎖時)都可以安全地呼叫 kprintf。
  */
+static struct spinlock console_lk = SPINLOCK_INIT("console");
+
 int kprintf(const char *fmt, ...)
 {
     va_list ap;
-    unsigned long flags = arch_irq_save();
+    unsigned long flags = spin_lock_irqsave(&console_lk);
     va_start(ap, fmt);
     int n = kvprintf(fmt, ap);
     va_end(ap);
-    arch_irq_restore(flags);
+    spin_unlock_irqrestore(&console_lk, flags);
     return n;
 }

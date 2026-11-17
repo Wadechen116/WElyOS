@@ -26,6 +26,11 @@ _start:
     mov     sp, x1                    /* AArch64 要求 sp 16 位元組對齊 */
     mov     x29, xzr                  /* frame pointer 歸零:backtrace 以 0 判斷鏈的終點 */
 
+    /* TPIDR_EL1 = 第 0 顆 CPU 的 struct cpu(kernel 中固定如此,見 cpu_arch.h) */
+    adrp    x1, cpus
+    add     x1, x1, :lo12:cpus
+    msr     tpidr_el1, x1
+
     /* 清除 .bss,以 8 位元組為單位;x0(dtb)保持不動 */
     adrp    x1, __bss_start
     add     x1, x1, :lo12:__bss_start

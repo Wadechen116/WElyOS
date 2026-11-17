@@ -117,6 +117,7 @@ void trap_handler(struct trap_frame *tf)
     if (cause < sizeof(exc_names) / sizeof(exc_names[0]) && exc_names[cause])
         name = exc_names[cause];
 
+    panic_begin();                               /* 致命錯誤:關中斷、讓 spinlock 放行 */
     sched_report_overflow(tf->sp, tf->stval);    /* 若是 stack 溢位,先指出來 */
     kprintf("\n*** EXCEPTION: %s ***\n", name);
     kprintf("  scause =0x%llx\n", (unsigned long long)cause);

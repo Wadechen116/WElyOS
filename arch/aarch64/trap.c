@@ -103,6 +103,7 @@ void trap_handler(struct trap_frame *tf, uint64_t kind)
         return;                                  /* trap.S 會 eret 回到 elr */
     }
 
+    panic_begin();                               /* 致命錯誤:關中斷、讓 spinlock 放行 */
     sched_report_overflow(tf->sp, tf->far);      /* 若是 stack 溢位,先指出來 */
     kprintf("\n*** EXCEPTION: %s ***\n", ec_name(ec));
     kprintf("  esr =0x%llx   (EC=0x%llx)\n", (unsigned long long)tf->esr,

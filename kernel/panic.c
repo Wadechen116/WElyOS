@@ -5,12 +5,19 @@
 #include "arch.h"
 #include "kprintf.h"
 #include "panic.h"
+#include "spinlock.h"
 
 static int exit_on_panic;
 
 void panic_set_exit(int on)
 {
     exit_on_panic = on;
+}
+
+void panic_begin(void)
+{
+    arch_irq_disable();        /* 從此不再被搶佔 */
+    spin_panic_mode();         /* 出事當下可能正持有某些鎖:之後一律放行,訊息才印得出來 */
 }
 
 void panic_halt(void)
@@ -24,7 +31,7 @@ void panic(const char *fmt, ...)
 {
     va_list ap;
 
-    arch_irq_disable();        /* 從此不再被搶佔,其他執行緒也不會繼續跑 */
+    panic_begin();
     kprintf("\n*** KERNEL PANIC: ");
     va_start(ap, fmt);
     kvprintf(fmt, ap);

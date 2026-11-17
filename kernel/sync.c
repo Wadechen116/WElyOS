@@ -3,16 +3,19 @@
  *
  * 兩者的寫法都是同一個模式:
  *
- *     關中斷
+ *     flags = sched_lock()          取得排程器的鎖(同時關中斷)
  *     while (條件不成立)
  *         wq_sleep(&等待佇列);
  *     取得資源
- *     恢復中斷
+ *     sched_unlock(flags)
+ *
+ * semaphore 與 mutex 的內部狀態(計數、擁有者、等待佇列)和排程器共用同一把鎖。
+ * 多核心之下只關中斷是不夠的:別顆 CPU 可能同時在操作同一個 semaphore。
  *
  * 兩個重點:
  *
- * 1. 「檢查條件」和「睡下去」必須在同一段關中斷的區間內。
- *    如果中間開了中斷,可能剛檢查完(資源沒有)就被切走,對方釋放資源並
+ * 1. 「檢查條件」和「睡下去」必須在同一段持有鎖的區間內。
+ *    如果中間解了鎖,可能剛檢查完(資源沒有)就被切走,對方釋放資源並
  *    發出喚醒(此時佇列是空的,沒人可叫),然後自己才睡下去,
  *    從此再也沒人來叫醒。這種錯誤稱為 lost wakeup。
  *
@@ -33,30 +36,30 @@ void sem_init(struct semaphore *s, int count)
 
 void sem_wait(struct semaphore *s)
 {
-    unsigned long flags = arch_irq_save();
+    unsigned long flags = sched_lock();
     while (s->count == 0)
         wq_sleep(&s->wq);
     s->count--;
-    arch_irq_restore(flags);
+    sched_unlock(flags);
 }
 
 int sem_trywait(struct semaphore *s)
 {
-    unsigned long flags = arch_irq_save();
+    unsigned long flags = sched_lock();
     int ok = s->count > 0;
     if (ok)
         s->count--;
-    arch_irq_restore(flags);
+    sched_unlock(flags);
     return ok;
 }
 
 void sem_post(struct semaphore *s)
 {
-    unsigned long flags = arch_irq_save();
+    unsigned long flags = sched_lock();
     s->count++;
     wq_wake_one(&s->wq);
     sched_preempt_point();                   /* 被喚醒者比自己優先:立刻讓它跑 */
-    arch_irq_restore(flags);
+    sched_unlock(flags);
 }
 
 /* ------------------------------------------------------------------ */
@@ -111,7 +114,7 @@ void mutex_init(struct mutex *m)
 void mutex_lock(struct mutex *m)
 {
     struct thread *self = thread_current();
-    unsigned long flags = arch_irq_save();
+    unsigned long flags = sched_lock();
 
     if (m->owner == self)
         panic("mutex: recursive lock by thread %d (%s)", thread_id(), thread_name());
@@ -134,13 +137,13 @@ void mutex_lock(struct mutex *m)
     m->next_held = *held;
     *held = m;
     recompute_inherit(self);
-    arch_irq_restore(flags);
+    sched_unlock(flags);
 }
 
 void mutex_unlock(struct mutex *m)
 {
     struct thread *self = thread_current();
-    unsigned long flags = arch_irq_save();
+    unsigned long flags = sched_lock();
 
     if (m->owner != self)
         panic("mutex: unlock by non-owner thread %d (%s)", thread_id(), thread_name());
@@ -157,5 +160,5 @@ void mutex_unlock(struct mutex *m)
     recompute_inherit(self);                 /* 只交還這把鎖帶來的提升,其餘的保留 */
     wq_wake_one(&m->wq);
     sched_preempt_point();                   /* 等鎖的人比自己優先:立刻讓它跑 */
-    arch_irq_restore(flags);
+    sched_unlock(flags);
 }

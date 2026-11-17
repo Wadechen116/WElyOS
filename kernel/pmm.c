@@ -10,15 +10,19 @@
  *   - 管理資料不放在被管理的頁面裡,頁面內容被寫壞也不影響管理
  * 代價是配置要掃描位元圖,為 O(頁數);以「最低空閒頁提示」減少掃描。
  *
- * 配置與釋放以「關中斷」保護(arch_irq_save / restore):單一 CPU 上,
- * 關了中斷就不會被搶佔,也不會被中斷處理程式插入,位元圖因此不會被同時修改。
+ * 配置與釋放以一把 spinlock 保護(見 spinlock.h):多顆 CPU 可能同時配置,
+ * 也可能在中斷處理程式中配置,所以上鎖的同時也關中斷。
  */
 #include <stdint.h>
 #include "pmm.h"
+#include "spinlock.h"
 #include "arch.h"
 #include "kprintf.h"
 #include "kstring.h"
 #include "panic.h"
+
+/* 保護位元圖與相關計數。多顆 CPU 可能同時配置,只關中斷已經不夠 */
+static struct spinlock pmm_lk = SPINLOCK_INIT("pmm");
 
 /* linker script 定義的符號:kernel 映像的範圍。只取位址,不讀內容 */
 extern char __kernel_start[], __kernel_end[];
@@ -116,13 +120,13 @@ void pmm_init(const struct boot_info *bi)
 
 void *pmm_alloc_pages(size_t n)
 {
-    unsigned long flags = arch_irq_save();
+    unsigned long flags = spin_lock_irqsave(&pmm_lk);
     void *p = alloc_pages_locked(n);
-    arch_irq_restore(flags);
+    spin_unlock_irqrestore(&pmm_lk, flags);
     return p;
 }
 
-/* 實際的配置邏輯;呼叫時中斷已關閉 */
+/* 實際的配置邏輯;呼叫時已持有 pmm_lk */
 static void *alloc_pages_locked(size_t n)
 {
     if (n == 0 || n > nfree)
@@ -173,7 +177,7 @@ void *pmm_alloc(void)
 void pmm_free_pages(void *page, size_t n)
 {
     uintptr_t addr = (uintptr_t)page;
-    unsigned long flags = arch_irq_save();
+    unsigned long flags = spin_lock_irqsave(&pmm_lk);
 
     if (addr % PAGE_SIZE != 0 || addr < mem_start)
         panic("pmm: free of invalid address %p", page);
@@ -190,7 +194,7 @@ void pmm_free_pages(void *page, size_t n)
     nfree += n;
     if (first < hint)
         hint = first;
-    arch_irq_restore(flags);
+    spin_unlock_irqrestore(&pmm_lk, flags);
 }
 
 void pmm_free(void *page)

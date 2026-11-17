@@ -16,16 +16,31 @@
  * 兩種走的是同一個 schedule()。搶佔時,被打斷的暫存器已由中斷入口存在
  * 該執行緒自己的 stack 上(trap frame),所以之後切回來、從中斷返回就能繼續。
  *
- * 規則:schedule() 一律在「中斷關閉」的狀態下執行;切回來的執行緒
- * 各自負責還原自己的中斷狀態(主動的由 arch_irq_restore,搶佔的由中斷返回指令)。
+ * 上鎖規則(多核心):
+ *   排程器的所有資料(執行佇列、休眠串列、所有等待佇列、每條執行緒的狀態與優先權)
+ *   由同一把 spinlock「sched_lk」保護,以 sched_lock() / sched_unlock() 取得與釋放。
+ *   semaphore、mutex、futex 的內部狀態也由它保護(見 sync.c、proc.c)。
+ *
+ *   schedule() 一律在持有這把鎖(因此中斷也關閉)的狀態下呼叫,而且鎖會
+ *   「跟著 CPU 跨過切換」:舊執行緒上鎖 -> 切換 -> 由新執行緒解鎖。
+ *   這是必要的:舊執行緒在切換完成前就已經被放回執行佇列,如果這時鎖已釋放,
+ *   別顆 CPU 可能立刻把它取出來執行,兩顆 CPU 就會同時踩在同一條 stack 上。
+ *   鎖一直持有到切換完成,別顆 CPU 在那之前拿不到佇列裡的任何東西。
+ *
+ *   單一把鎖的代價是多顆 CPU 不能同時進行排程相關的操作;以目前的規模
+ *   (CPU 數很少、臨界區很短)換來的是正確性容易確認。見 DEVLOG 第 16 步。
  */
 #include <stddef.h>
 #include "arch.h"
+#include "cpu.h"
 #include "kmalloc.h"
 #include "kprintf.h"
+#include "kstring.h"
 #include "panic.h"
 #include "pmm.h"
+#include "runq.h"
 #include "sched.h"
+#include "spinlock.h"
 #include "timer.h"
 #include "vm.h"
 
@@ -62,7 +77,9 @@ struct thread {
     void *held;                /* 持有的 mutex 串列(由 sync.c 維護) */
     unsigned slice;            /* 剩餘的時間片(tick 數) */
     uint64_t wake_tick;        /* T_SLEEPING:到這個 tick 就喚醒 */
-    struct thread *next;       /* 串在執行佇列、休眠串列或某個等待佇列中(同時只會在一個) */
+    struct thread *next;       /* 串在休眠串列或某個等待佇列中(同時只會在一個) */
+    struct rq_node rq;         /* 在執行佇列中的節點(由 runq 的實作使用,見 runq.h) */
+    int cpu;                   /* T_RUNNING:正在哪一顆 CPU 上執行 */
     struct thread *all_next;   /* 串在「所有執行緒」串列中,供 thread_join 以編號尋找 */
     struct vm_space *space;    /* 使用的位址空間;NULL = 純 kernel 執行緒 */
     void *data;                /* 附掛資料(所屬的行程) */
@@ -73,24 +90,24 @@ struct thread {
 /* 開機時 boot.S 設定的 stack,main 執行緒繼續使用它;stack_guard 是它下方的保護頁 */
 extern char stack_guard[], stack_bottom[], stack_top[];
 
-uintptr_t kstack_limit;                      /* 見 sched.h */
-
 static struct thread main_thread;            /* 開機流程本身 */
-static struct thread *current;               /* 正在執行的執行緒;NULL = 排程器未啟動 */
-static struct thread *idle_thread;           /* 沒人可跑時執行,不進執行佇列 */
-/*
- * 執行佇列:每個優先權一條 FIFO 串列,另用一個位元圖記錄哪些佇列非空。
- * 選下一條執行緒 = 找位元圖中最高的 1,再取那條佇列的頭,
- * 成本與執行緒總數無關(只和優先權的級數有關,固定 8 級)。
- */
-static struct thread *rq_head[PRIO_LEVELS], *rq_tail[PRIO_LEVELS];
-static unsigned rq_bitmap;                   /* bit p = 1:優先權 p 的佇列非空 */
-static int in_irq;                           /* 是否正在中斷處理程式中 */
-static struct vm_space *loaded_space;        /* CPU 目前載入的位址空間;NULL = kernel 頁表 */
+
+/* 排程器的鎖:保護本檔所有的共用資料(見檔案開頭的上鎖規則) */
+static struct spinlock sched_lk = SPINLOCK_INIT("sched");
+
+/* 目前這顆 CPU 正在執行的執行緒。只能在中斷關閉時使用(見 cpu.h) */
+static inline struct thread *cur(void) { return this_cpu()->current; }
+
+_Static_assert(RUNQ_LEVELS == PRIO_LEVELS, "runq levels");
+
+/* 由執行佇列的節點找回它所屬的執行緒 */
+static inline struct thread *thread_of(struct rq_node *n)
+{
+    return (struct thread *)((char *)n - offsetof(struct thread, rq));
+}
+
 static struct thread *sleepers;              /* 休眠中的執行緒,依喚醒時間由早到晚排序 */
 static struct thread *all_threads;           /* 所有存活的執行緒(不含 main 與 idle) */
-static struct thread *zombie;                /* 剛結束、等待回收的執行緒(最多一條) */
-static volatile int need_resched;            /* 中斷中設定:返回前要重新排程 */
 static unsigned nthreads;                    /* 存活數(不含 idle) */
 static unsigned long nswitches;
 static int next_id;
@@ -100,101 +117,126 @@ static unsigned starve_scan_ticks = 10;      /* STARVE_SCAN_MS 換算成 tick �
 static unsigned long nstarve_boosts;         /* 累計的防飢餓提升次數 */
 
 static void schedule(void);
+static void thread_free(struct thread *t);
 
-/* ---- 執行佇列:尾端加入、頭端取出,所以大家輪流 ---- */
+/* ---- 排程器的鎖 ---- */
 
-/* 排到自己優先權那條佇列的尾端 */
-static void rq_push(struct thread *t)
+unsigned long sched_lock(void)
 {
-    int p = t->prio;
-
-    t->ready_since = timer_ticks();          /* 從現在開始算等待時間 */
-    t->state = T_READY;
-    t->next = NULL;
-    if (rq_tail[p])
-        rq_tail[p]->next = t;
-    else
-        rq_head[p] = t;
-    rq_tail[p] = t;
-    rq_bitmap |= 1u << p;
+    return spin_lock_irqsave(&sched_lk);
 }
 
-/* 排到佇列的最前面:被更高優先權搶佔的執行緒,時間片還沒用完,
+/*
+ * 取出這顆 CPU 上等待回收的執行緒(若有)。
+ * 執行緒不能釋放自己正踩著的 stack,所以結束時只把自己記在 cpu->zombie,
+ * 由「同一顆 CPU 上切換過去的下一條執行緒」在解鎖時代為釋放。
+ * 那時切換已經完成,確定沒有人還在使用那條 stack。
+ */
+static struct thread *take_zombie(void)
+{
+    struct cpu *c = this_cpu();
+    struct thread *z = c->zombie;
+
+    KASSERT(z == NULL || z != c->current);
+    c->zombie = NULL;
+    return z;
+}
+
+void sched_unlock(unsigned long flags)
+{
+    struct thread *z = take_zombie();
+
+    spin_unlock(&sched_lk);
+    /* 釋放記憶體放在解鎖之後:它會用到 heap、頁表、頁面配置器各自的鎖,
+       不要讓排程器的鎖包住它們(持有時間越短越好,也避免鎖的順序問題) */
+    if (z)
+        thread_free(z);
+    arch_irq_restore(flags);
+}
+
+/* 這顆 CPU 目前執行的優先權;idle 視為 -1(任何執行緒都比它優先) */
+static int cpu_running_prio(struct cpu *c)
+{
+    return c->current == c->idle ? -1 : c->current->prio;
+}
+
+/*
+ * 有一條優先權為 prio 的執行緒變成可執行:挑一顆應該讓出來的 CPU,要求它重新排程。
+ * 挑「目前執行的優先權最低、而且低於 prio」的那一顆(閒置的最優先);
+ * 已經被要求重新排程的 CPU 略過,讓同時被喚醒的多條執行緒分散到不同的 CPU。
+ * 從自己開始找:條件相同時留在自己這顆,不必通知別人。
+ */
+static void kick(int prio)
+{
+    struct cpu *me = this_cpu(), *best = NULL;
+    int best_prio = prio;
+
+    for (int i = 0; i < cpu_count; i++) {
+        struct cpu *c = &cpus[(me->id + i) % cpu_count];
+        if (!c->current || c->need_resched)
+            continue;
+        int p = cpu_running_prio(c);
+        if (p < best_prio) {
+            best_prio = p;
+            best = c;
+        }
+    }
+    if (best)
+        best->need_resched = 1;
+    /* 之後(多核心第三段):best 不是自己時,以處理器間中斷(IPI)通知它立刻處理;
+       在那之前,它會在自己的下一個計時器 tick 發現這個旗標 */
+}
+
+/*
+ * ---- 執行佇列 ----
+ * 實際的存放與取出交給 runq(見 runq.h;實作可以替換),這裡只是薄薄的一層:
+ * 設定執行緒的狀態、記錄開始等待的時間。
+ */
+
+/* 排到自己優先權的最後面 */
+static void rq_push(struct thread *t)
+{
+    t->ready_since = timer_ticks();          /* 從現在開始算等待時間 */
+    t->state = T_READY;
+    runq_push(&t->rq, t->prio, 0);
+}
+
+/* 排到最前面:被更高優先權搶佔的執行緒,時間片還沒用完,
    不該因此排到同級的最後面 */
 static void rq_push_front(struct thread *t)
 {
-    int p = t->prio;
-
     t->state = T_READY;
-    t->next = rq_head[p];
-    rq_head[p] = t;
-    if (!rq_tail[p])
-        rq_tail[p] = t;
-    rq_bitmap |= 1u << p;
+    runq_push(&t->rq, t->prio, 1);
 }
 
 /* 目前可執行的最高優先權;沒有任何可執行的執行緒回傳 -1 */
 static int rq_highest(void)
 {
-    for (int p = PRIO_MAX; p >= PRIO_MIN; p--)
-        if (rq_bitmap & (1u << p))
-            return p;
-    return -1;
+    return runq_highest();
 }
 
-/* 取出優先權最高的那條佇列的頭 */
+/* 取出優先權最高的;同級則大致是排最久的 */
 static struct thread *rq_pop(void)
 {
-    int p = rq_highest();
-    if (p < 0)
-        return NULL;
-
-    struct thread *t = rq_head[p];
-    rq_head[p] = t->next;
-    if (!rq_head[p]) {
-        rq_tail[p] = NULL;
-        rq_bitmap &= ~(1u << p);
-    }
-    t->next = NULL;
-    return t;
+    struct rq_node *n = runq_pop();
+    return n ? thread_of(n) : NULL;
 }
 
-/* 把一條 READY 的執行緒從它的佇列中移除(改優先權時用;需要走訪該佇列) */
-static void rq_remove(struct thread *t)
-{
-    int p = t->prio;
-    struct thread *prev = NULL;
-
-    for (struct thread *c = rq_head[p]; c; prev = c, c = c->next) {
-        if (c != t)
-            continue;
-        if (prev)
-            prev->next = t->next;
-        else
-            rq_head[p] = t->next;
-        if (rq_tail[p] == t)
-            rq_tail[p] = prev;
-        if (!rq_head[p])
-            rq_bitmap &= ~(1u << p);
-        t->next = NULL;
-        return;
-    }
-}
-
-/* 一條執行緒剛變成可執行:若它比目前的更優先(或 CPU 正閒著),記下需要重新排程 */
+/* 一條執行緒剛變成可執行:排進佇列;若它比某顆 CPU 正在跑的更優先(或有 CPU 閒著),
+   要求那顆 CPU 重新排程 */
 static void make_ready(struct thread *t)
 {
     rq_push(t);
-    if (current == idle_thread || t->prio > current->prio)
-        need_resched = 1;
+    kick(t->prio);
 }
 
 /* ---- 等待佇列 ---- */
 
 void wq_sleep(struct wait_queue *wq)
 {
-    struct thread *t = current;
+    struct thread *t = cur();
 
+    KASSERT(spin_held(&sched_lk));
     t->state = T_BLOCKED;                    /* 不是 RUNNING,schedule() 就不會把它排回去 */
     t->next = NULL;
     if (wq->tail)
@@ -207,7 +249,7 @@ void wq_sleep(struct wait_queue *wq)
 
 int wq_wake_one(struct wait_queue *wq)
 {
-    unsigned long flags = arch_irq_save();
+    KASSERT(spin_held(&sched_lk));
 
     /* 找出優先權最高的等待者;用 > 而不是 >=,相同優先權時保留最先排隊的 */
     struct thread *best = NULL, *best_prev = NULL, *prev = NULL;
@@ -226,7 +268,6 @@ int wq_wake_one(struct wait_queue *wq)
             wq->tail = best_prev;
         make_ready(best);
     }
-    arch_irq_restore(flags);
     return best != NULL;
 }
 
@@ -236,22 +277,6 @@ int wq_wake_all(struct wait_queue *wq)
     while (wq_wake_one(wq))
         n++;
     return n;
-}
-
-/*
- * 回收已結束的執行緒。執行緒不能釋放自己正踩著的 stack,
- * 所以由「切換過去的下一條執行緒」代為釋放。
- */
-static void stack_free(char *stack);
-
-static void reap(void)
-{
-    struct thread *z = zombie;
-    if (z && z != current) {
-        zombie = NULL;
-        stack_free(z->stack);
-        kfree(z);
-    }
 }
 
 /*
@@ -267,18 +292,19 @@ static void reap(void)
  * 省下的不只是頁面配置,還有「移除保護頁對映 + 清 TLB」與結束時的「對映回來 + 清 TLB」,
  * 這兩個才是比較貴的操作。閒置的 stack 用它自己的第一個可用位元組串成串列。
  */
+static struct spinlock stack_lk = SPINLOCK_INIT("stack-cache");
 static char *stack_cache;                    /* 閒置 stack 的串列(存的是配置區塊起點) */
 static unsigned stack_cached;
 
 static char *stack_alloc(void)
 {
-    unsigned long flags = arch_irq_save();
+    unsigned long flags = spin_lock_irqsave(&stack_lk);
     char *st = stack_cache;
     if (st) {
         stack_cache = *(char **)(st + PAGE_SIZE);
         stack_cached--;
     }
-    arch_irq_restore(flags);
+    spin_unlock_irqrestore(&stack_lk, flags);
     if (st)
         return st;
 
@@ -302,28 +328,75 @@ static void stack_release(char *st)
 
 static void stack_free(char *st)
 {
-    unsigned long flags = arch_irq_save();
+    unsigned long flags = spin_lock_irqsave(&stack_lk);
     if (stack_cached < STACK_CACHE_MAX) {
         *(char **)(st + PAGE_SIZE) = stack_cache;
         stack_cache = st;
         stack_cached++;
         st = NULL;
     }
-    arch_irq_restore(flags);
+    spin_unlock_irqrestore(&stack_lk, flags);
     if (st)
         stack_release(st);
+}
+
+/*
+ * struct thread 的池子:結束的執行緒把結構放回這裡重複使用,不還給 heap。
+ * 兩個理由:
+ *   - 快:建立執行緒不必每次向 heap 配置與釋放
+ *   - 安全:無鎖的執行佇列裡可能留有指向已結束執行緒的過期項目(見 runq_ring.c),
+ *     它們之後會被讀取。只要這塊記憶體永遠是一個 struct thread,讀取就是安全的。
+ *     所以這個池子刻意不提供「還給 heap」的功能
+ */
+static struct thread *thread_pool;
+static size_t pool_bytes;                    /* 池子(含使用中的)累計向 heap 取得的位元組數 */
+
+size_t sched_pool_bytes(void) { return __atomic_load_n(&pool_bytes, __ATOMIC_RELAXED); }
+
+static struct thread *thread_struct_alloc(void)
+{
+    unsigned long flags = spin_lock_irqsave(&stack_lk);
+    struct thread *t = thread_pool;
+    if (t)
+        thread_pool = t->next;
+    spin_unlock_irqrestore(&stack_lk, flags);
+
+    if (!t) {
+        t = kzalloc(sizeof(*t));
+        if (t)
+            __atomic_fetch_add(&pool_bytes, kmalloc_size(t), __ATOMIC_RELAXED);
+        return t;
+    }
+    memset(t, 0, sizeof(*t));
+    return t;
+}
+
+static void thread_struct_free(struct thread *t)
+{
+    unsigned long flags = spin_lock_irqsave(&stack_lk);
+    t->state = T_ZOMBIE;
+    t->next = thread_pool;
+    thread_pool = t;
+    spin_unlock_irqrestore(&stack_lk, flags);
+}
+
+/* 釋放一條已結束的執行緒(它的 stack 與結構本身) */
+static void thread_free(struct thread *t)
+{
+    stack_free(t->stack);
+    thread_struct_free(t);
 }
 
 void sched_trim(void)
 {
     for (;;) {
-        unsigned long flags = arch_irq_save();
+        unsigned long flags = spin_lock_irqsave(&stack_lk);
         char *st = stack_cache;
         if (st) {
             stack_cache = *(char **)(st + PAGE_SIZE);
             stack_cached--;
         }
-        arch_irq_restore(flags);
+        spin_unlock_irqrestore(&stack_lk, flags);
         if (!st)
             break;
         stack_release(st);
@@ -331,14 +404,22 @@ void sched_trim(void)
 }
 
 /*
- * 排程:選出下一條執行緒並切換過去。呼叫前必須已關閉中斷。
- * 目前的執行緒若還能跑(RUNNING)就排回隊尾;若已改成 SLEEPING / ZOMBIE 則不排。
+ * 排程:選出下一條執行緒並切換過去。呼叫前必須持有 sched_lk(中斷因此是關閉的),
+ * 而且不可持有其他任何 spinlock:切換出去之後可能很久才回來,
+ * 這段期間別人會一直等那把鎖(若對方關著中斷自旋,整個系統就卡住了)。
+ * 目前的執行緒若還能跑(RUNNING)就排回佇列;若已改成 SLEEPING / BLOCKED / ZOMBIE 則不排。
  */
 static void schedule(void)
 {
-    struct thread *prev = current;
+    struct cpu *c = this_cpu();
+    struct thread *prev = c->current;
 
-    need_resched = 0;
+    KASSERT(spin_held(&sched_lk));
+    if (c->nlocks != 1)
+        panic("schedule: cpu %d would switch threads while holding %d spinlock(s)",
+              c->id, c->nlocks - 1);
+
+    c->need_resched = 0;
 
     /* 防飢餓的提升只給一次上 CPU 的機會:離開 CPU 時就收回 */
     if (prev->starve_boost) {
@@ -347,7 +428,7 @@ static void schedule(void)
                                                            : prev->base_prio;
     }
 
-    if (prev->state == T_RUNNING && prev != idle_thread) {
+    if (prev->state == T_RUNNING && prev != c->idle) {
         if (prev->slice > 0)
             rq_push_front(prev);             /* 被更優先的搶佔:保留位置與剩餘時間片 */
         else
@@ -356,36 +437,47 @@ static void schedule(void)
 
     struct thread *next = rq_pop();          /* 優先權最高的;同級則是排最久的 */
     if (!next)
-        next = idle_thread;                  /* 所有人都在睡:跑 idle 等中斷 */
+        next = c->idle;                      /* 所有人都在睡:跑 idle 等中斷 */
 
     next->state = T_RUNNING;
+    next->cpu = c->id;
     if (next->slice == 0)
         next->slice = time_slice;            /* 新的一輪;被搶佔回來的沿用剩餘的 */
     if (next == prev)
         return;                              /* 仍然是自己最優先,不必切換 */
 
-    current = next;
-    kstack_limit = next->stack_lo;           /* 例外入口用它檢查 stack 是否溢位 */
+    c->current = next;
+    c->kstack_limit = next->stack_lo;        /* 例外入口用它檢查 stack 是否溢位 */
+    c->kstack_top = next->stack_hi;
     arch_set_kstack(next->stack_hi);         /* 從使用者模式進入 kernel 時要用的 stack */
     /* 換頁表很貴(TLB 會被清空),所以只在必要時才換:kernel 執行緒不需要
        特定的位址空間,繼續用上一個行程的頁表即可(kernel 部分完全相同) */
-    if (next->space && next->space != loaded_space) {
+    if (next->space && next->space != c->loaded_space) {
         vm_space_switch(next->space);
-        loaded_space = next->space;
+        c->loaded_space = next->space;
     }
     nswitches++;
     arch_switch(&prev->sp, next->sp);
 
-    /* 執行到這裡時已經是「之後某次被切回來」;此刻 current == prev */
-    reap();
+    /*
+     * 執行到這裡時已經是「之後某次被切回來」。注意:切回來時可能已經換到
+     * 另一顆 CPU 上了,所以上面的 c 不可以再使用(要用就重新取 this_cpu())。
+     * 鎖此刻由「把我們切回來的那條執行緒」所上,交由呼叫者解鎖。
+     */
 }
 
-/* 新執行緒第一次被切換到時從這裡開始(由 arch_stack_init 安排) */
+/* 新執行緒第一次被切換到時從這裡開始(由 arch_stack_init 安排)。
+   此刻持有著上一條執行緒上的鎖(見檔案開頭),由這裡釋放 */
 static void thread_entry(void)
 {
-    reap();                                  /* 上一條若剛結束,替它收尾 */
-    arch_irq_enable();                       /* schedule() 是關著中斷切過來的 */
-    current->fn(current->arg);
+    struct thread *z = take_zombie();        /* 上一條若剛結束,替它收尾 */
+    struct thread *t = cur();
+
+    spin_unlock(&sched_lk);
+    if (z)
+        thread_free(z);
+    arch_irq_enable();
+    t->fn(t->arg);
     thread_exit();
 }
 
@@ -399,12 +491,12 @@ static void idle_main(void *arg)
 static struct thread *thread_alloc(const char *name, void (*fn)(void *), void *arg,
                                    int prio)
 {
-    struct thread *t = kzalloc(sizeof(*t));
+    struct thread *t = thread_struct_alloc();
     if (!t)
         return NULL;
     t->stack = stack_alloc();
     if (!t->stack) {
-        kfree(t);
+        thread_struct_free(t);
         return NULL;
     }
     t->stack_lo = (uintptr_t)t->stack + PAGE_SIZE;       /* 最低一頁是保護頁 */
@@ -428,6 +520,9 @@ void sched_init(void)
     if (time_slice == 0)
         time_slice = 1;
 
+    runq_init();
+    kprintf("sched: run queue = %s\n", runq_name());
+
     main_thread.id = next_id++;
     main_thread.name = "main";
     main_thread.state = T_RUNNING;
@@ -445,14 +540,18 @@ void sched_init(void)
     /* 開機 stack 下方由 boot.S 預留了一頁,同樣移除對映當作保護頁 */
     if (vm_unmap((uintptr_t)stack_guard) != 0)
         panic("sched: cannot unmap boot stack guard page");
-    kstack_limit = main_thread.stack_lo;
 
-    idle_thread = thread_alloc("idle", idle_main, NULL, PRIO_MIN);
-    if (!idle_thread)
+    /* 開機的這顆 CPU(編號 0)。每顆 CPU 有自己的 idle 執行緒:
+       沒有工作時各自休眠,不能共用同一條(一條執行緒不能同時在兩顆 CPU 上執行) */
+    struct cpu *c = this_cpu();
+    c->kstack_limit = main_thread.stack_lo;
+    c->kstack_top = main_thread.stack_hi;
+    c->idle = thread_alloc("idle", idle_main, NULL, PRIO_MIN);
+    if (!c->idle)
         panic("sched: cannot create idle thread");
-    idle_thread->id = -1;
-
-    current = &main_thread;                  /* 從這一刻起排程器算是啟動了 */
+    c->idle->id = -1;
+    c->online = 1;
+    c->current = &main_thread;               /* 從這一刻起排程器算是啟動了 */
 }
 
 int thread_create(const char *name, void (*fn)(void *), void *arg)
@@ -469,63 +568,87 @@ int thread_create_prio(const char *name, void (*fn)(void *), void *arg, int prio
     if (!t)
         return -1;
 
-    unsigned long flags = arch_irq_save();   /* 佇列也會被中斷路徑修改 */
+    unsigned long flags = sched_lock();
     int id = t->id = next_id++;
     nthreads++;
     t->all_next = all_threads;
     all_threads = t;
     make_ready(t);
     sched_preempt_point();                   /* 新執行緒比自己優先:立刻讓它跑 */
-    arch_irq_restore(flags);
-    /* 注意:開中斷之後 t 隨時可能已經跑完並被釋放,所以回傳先記下的 id,不再碰 t */
+    sched_unlock(flags);
+    /* 注意:解鎖之後 t 隨時可能已經跑完並被釋放,所以回傳先記下的 id,不再碰 t */
     return id;
 }
 
 void thread_join(int tid)
 {
-    unsigned long flags = arch_irq_save();
+    unsigned long flags = sched_lock();
 
-    /* 「尋找」與「睡下去」之間中斷一直是關的,對方不可能剛好在中間結束 */
+    /* 「尋找」與「睡下去」之間一直持有鎖,對方不可能剛好在中間結束 */
     for (struct thread *t = all_threads; t; t = t->all_next) {
         if (t->id == tid) {
-            KASSERT(t != current);           /* 等自己結束會永遠等下去 */
+            KASSERT(t != cur());             /* 等自己結束會永遠等下去 */
             wq_sleep(&t->joiners);
             break;                           /* 被喚醒時 t 已結束,不可再存取 */
         }
     }
-    arch_irq_restore(flags);
+    sched_unlock(flags);
 }
 
 void thread_set_space(struct vm_space *vs)
 {
+    /* 只動到自己與自己這顆 CPU 的資料,關中斷(不被搶佔、不換 CPU)就夠了 */
     unsigned long flags = arch_irq_save();
-    current->space = vs;
+    struct cpu *c = this_cpu();
+    c->current->space = vs;
     vm_space_switch(vs);
-    loaded_space = vs;
+    c->loaded_space = vs;
     arch_irq_restore(flags);
 }
 
-void thread_set_data(void *data) { current->data = data; }
-void *thread_data(void)          { return current ? current->data : NULL; }
-int thread_killed(void)          { return current && current->killed; }
+struct thread *thread_current(void)
+{
+    /* 關中斷再讀:否則可能剛取得這顆 CPU 的指標就被搶佔、換到別顆 CPU,
+       接著讀到的是「別顆 CPU 正在跑的執行緒」 */
+    unsigned long flags = arch_irq_save();
+    struct thread *t = cur();
+    arch_irq_restore(flags);
+    return t;
+}
+
+void thread_set_data(void *data) { thread_current()->data = data; }
+
+void *thread_data(void)
+{
+    struct thread *t = thread_current();
+    return t ? t->data : NULL;
+}
+
+int thread_killed(void)
+{
+    struct thread *t = thread_current();
+    return t && t->killed;
+}
 
 void sched_kill_group(void *data)
 {
-    unsigned long flags = arch_irq_save();
+    KASSERT(spin_held(&sched_lk));
     for (struct thread *t = all_threads; t; t = t->all_next)
         if (t->data == data)
             t->killed = 1;
-    arch_irq_restore(flags);
 }
 
 void sched_preempt_point(void)
 {
-    if (current && need_resched && !in_irq)
+    struct cpu *c = this_cpu();
+
+    KASSERT(spin_held(&sched_lk));
+    if (c->current && c->need_resched && !c->in_irq)
         schedule();
 }
 
 /*
- * 重新計算 t 的有效優先權並維持各佇列的一致。呼叫時中斷已關閉。
+ * 重新計算 t 的有效優先權並維持各佇列的一致。呼叫時已持有 sched_lk。
  *   有效優先權 = 正處於防飢餓提升 ? 最高 : max(自己的, 繼承來的)
  */
 static void update_prio(struct thread *t)
@@ -537,16 +660,14 @@ static void update_prio(struct thread *t)
         return;
 
     if (t->state == T_READY) {
-        uint64_t since = t->ready_since;
-        rq_remove(t);                        /* 換到新優先權的佇列 */
         t->prio = prio;
-        make_ready(t);
-        t->ready_since = since;              /* 換佇列不算重新開始等 */
+        runq_reprio(&t->rq, prio);           /* 改到新優先權的佇列;等待時間照舊計算 */
+        kick(prio);
     } else {
         t->prio = prio;                      /* RUNNING / SLEEPING / BLOCKED:改欄位即可 */
-        /* 自己調低後,若有人比自己優先,要讓出 */
-        if (t == current && rq_highest() > prio)
-            need_resched = 1;
+        /* 正在執行的執行緒被調低後,若有人比它優先,它所在的 CPU 要讓出 */
+        if (t->state == T_RUNNING && rq_highest() > prio)
+            cpus[t->cpu].need_resched = 1;
     }
 }
 
@@ -555,21 +676,22 @@ void thread_set_priority(int prio)
     if (prio < PRIO_MIN || prio > PRIO_MAX)
         return;
 
-    unsigned long flags = arch_irq_save();
-    current->base_prio = prio;
-    update_prio(current);
+    unsigned long flags = sched_lock();
+    cur()->base_prio = prio;
+    update_prio(cur());
     sched_preempt_point();
-    arch_irq_restore(flags);
+    sched_unlock(flags);
 }
 
 int thread_priority(void)
 {
-    return current ? current->prio : PRIO_NORMAL;
+    struct thread *t = thread_current();
+    return t ? t->prio : PRIO_NORMAL;
 }
 
 int thread_effective_prio(struct thread *t) { return t->prio; }
 void *thread_blocked_on(struct thread *t)   { return t->blocked_on; }
-void thread_set_blocked_on(void *m)         { current->blocked_on = m; }
+void thread_set_blocked_on(void *m)         { cur()->blocked_on = m; }
 void **thread_held_list(struct thread *t)   { return &t->held; }
 
 void sched_set_inherit(struct thread *t, int prio)
@@ -591,25 +713,33 @@ int wq_max_prio(struct wait_queue *wq)
  * 防飢餓:找出「可執行卻等了太久」的執行緒,暫時提升到最高優先權。
  * 由計時器 tick 定期呼叫。只需要看每條佇列的頭:同一條佇列裡頭是等最久的。
  * 最高優先權的佇列不必看(它本來就會被執行)。
+ * runq_peek 給的只是「候選者」(可能已經被取走、或其實排在別的優先權),
+ * 所以每一個都要再確認狀態。
  */
 static void starve_scan(uint64_t now)
 {
+    struct rq_node *cand[RUNQ_PEEK_MAX];
+
     for (int p = PRIO_MAX - 1; p >= PRIO_MIN; p--) {
-        struct thread *t = rq_head[p];
-        if (!t || now - t->ready_since < starve_ticks)
-            continue;
-        t->starve_boost = 1;
-        nstarve_boosts++;
-        update_prio(t);                      /* 移到最高優先權的佇列;必要時要求重新排程 */
+        int n = runq_peek(p, cand, RUNQ_PEEK_MAX);
+        for (int i = 0; i < n; i++) {
+            struct thread *t = thread_of(cand[i]);
+            if (t->state != T_READY || t->prio != p || t->starve_boost ||
+                now - t->ready_since < starve_ticks)
+                continue;
+            t->starve_boost = 1;
+            nstarve_boosts++;
+            update_prio(t);                  /* 移到最高優先權的佇列;必要時要求重新排程 */
+        }
     }
 }
 
 void thread_yield(void)
 {
-    unsigned long flags = arch_irq_save();
-    current->slice = 0;                      /* 主動放棄剩餘的時間片,排到同級最後 */
+    unsigned long flags = sched_lock();
+    cur()->slice = 0;                        /* 主動放棄剩餘的時間片,排到同級最後 */
     schedule();
-    arch_irq_restore(flags);
+    sched_unlock(flags);
 }
 
 void thread_sleep(unsigned ms)
@@ -619,89 +749,122 @@ void thread_sleep(unsigned ms)
        而 freestanding 環境沒有連結它(ms 上限因此約為 4 千萬毫秒,足夠) */
     unsigned n = (ms * timer_hz() + 999) / 1000 + 1;
 
-    unsigned long flags = arch_irq_save();
-    current->wake_tick = timer_ticks() + n;
-    current->state = T_SLEEPING;
+    unsigned long flags = sched_lock();
+    struct thread *self = cur();
+    self->wake_tick = timer_ticks() + n;
+    self->state = T_SLEEPING;
 
     /* 依喚醒時間插入到正確位置:每個 tick 只需檢查串列的第一個。
        用 <= 讓同一時間到期的維持先來後到的順序 */
     struct thread **pp = &sleepers;
-    while (*pp && (*pp)->wake_tick <= current->wake_tick)
+    while (*pp && (*pp)->wake_tick <= self->wake_tick)
         pp = &(*pp)->next;
-    current->next = *pp;
-    *pp = current;
+    self->next = *pp;
+    *pp = self;
 
     schedule();                              /* 醒來後才會從這裡返回 */
-    arch_irq_restore(flags);
+    sched_unlock(flags);
 }
 
 void thread_exit(void)
 {
-    arch_irq_disable();
-    if (current == &main_thread || current == idle_thread)
-        panic("thread_exit: %s thread must not exit", current->name);
+    (void)sched_lock();                      /* 不會返回,所以不必記住原本的中斷狀態 */
+    struct cpu *c = this_cpu();
+    struct thread *self = c->current;
+
+    if (self == &main_thread || self == c->idle)
+        panic("thread_exit: %s thread must not exit", self->name);
     /* 從「所有執行緒」串列移除:之後的 thread_join 找不到它,會立即返回 */
     for (struct thread **pp = &all_threads; *pp; pp = &(*pp)->all_next) {
-        if (*pp == current) {
-            *pp = current->all_next;
+        if (*pp == self) {
+            *pp = self->all_next;
             break;
         }
     }
-    wq_wake_all(&current->joiners);          /* 叫醒所有在等我結束的執行緒 */
+    wq_wake_all(&self->joiners);             /* 叫醒所有在等我結束的執行緒 */
 
-    current->state = T_ZOMBIE;
-    zombie = current;                        /* 由下一條執行緒 reap() */
+    self->state = T_ZOMBIE;
+    c->zombie = self;                        /* 由這顆 CPU 上的下一條執行緒回收 */
     nthreads--;
     schedule();
     panic("thread_exit: zombie was scheduled again");
 }
 
+/*
+ * 每顆 CPU 自己的計時器中斷都會呼叫(中斷關閉中)。
+ * 「全系統只需要做一次」的工作(喚醒休眠者、防飢餓檢查)只由第 0 顆 CPU 負責,
+ * 它也是唯一推進 tick 計數的 CPU(見 timer.c);時間片則是每顆 CPU 各算各的。
+ */
 void sched_tick(void)
 {
-    if (!current)
+    struct cpu *c = this_cpu();
+
+    if (!c->current)
         return;                              /* 排程器尚未啟動 */
 
-    /* 喚醒時間到的休眠者。串列已依喚醒時間排序,所以只看最前面的;
-       第一個還沒到期,後面的一定也還沒,可以直接結束 */
-    uint64_t now = timer_ticks();
-    while (sleepers && now >= sleepers->wake_tick) {
-        struct thread *t = sleepers;
-        sleepers = t->next;
-        /* 相同優先權:排到隊尾等待輪到,不插隊(見 DEVLOG 第 10 步的公平性問題)。
-           比目前的更優先:make_ready 會要求立刻重新排程 */
-        make_ready(t);
-    }
+    spin_lock(&sched_lk);
+    if (c->id == 0) {
+        /* 喚醒時間到的休眠者。串列已依喚醒時間排序,所以只看最前面的;
+           第一個還沒到期,後面的一定也還沒,可以直接結束 */
+        uint64_t now = timer_ticks();
+        while (sleepers && now >= sleepers->wake_tick) {
+            struct thread *t = sleepers;
+            sleepers = t->next;
+            /* 相同優先權:排到隊尾等待輪到,不插隊(見 DEVLOG 第 10 步的公平性問題)。
+               比某顆 CPU 正在跑的更優先:make_ready 會要求它立刻重新排程 */
+            make_ready(t);
+        }
 
-    /* 定期檢查有沒有人等太久(防飢餓) */
-    /* 轉成 32 位元再取餘數:i386 上 64 位元的除法 / 餘數需要 libgcc */
-    if ((unsigned)now % starve_scan_ticks == 0)
-        starve_scan(now);
+        /* 定期檢查有沒有人等太久(防飢餓)。
+           轉成 32 位元再取餘數:i386 上 64 位元的除法 / 餘數需要 libgcc */
+        if ((unsigned)now % starve_scan_ticks == 0)
+            starve_scan(now);
+    }
 
     /* 時間片用完:有「優先權不低於自己」的人在等才換人。
        只有較低優先權的在等時不換,它們本來就輪不到 */
-    if (current != idle_thread && current->slice > 0 && --current->slice == 0) {
-        if (rq_highest() >= current->prio)
-            need_resched = 1;
+    struct thread *t = c->current;
+    if (t != c->idle && t->slice > 0 && --t->slice == 0) {
+        /* 靠防飢餓提升上來的執行緒只給一個時間片:用完就讓出,不論別人的優先權高低
+           (它此刻是最高優先權,不這樣做的話會反過來霸佔 CPU) */
+        int floor = t->starve_boost ? 0 : t->prio;
+        if (rq_highest() >= floor)
+            c->need_resched = 1;
         else
-            current->slice = time_slice;
+            t->slice = time_slice;
     }
+    spin_unlock(&sched_lk);
 }
 
 void sched_irq_enter(void)
 {
-    in_irq = 1;
+    this_cpu()->in_irq = 1;
 }
 
 void sched_irq_exit(void)
 {
-    in_irq = 0;
-    if (current && need_resched)
+    struct cpu *c = this_cpu();
+
+    c->in_irq = 0;
+    if (c->current && c->need_resched) {
+        unsigned long flags = sched_lock();
         schedule();
+        sched_unlock(flags);
+    }
 }
 
-struct thread *thread_current(void) { return current; }
-const char *thread_name(void)  { return current ? current->name : "boot"; }
-int thread_id(void)            { return current ? current->id : 0; }
+const char *thread_name(void)
+{
+    struct thread *t = thread_current();
+    return t ? t->name : "boot";
+}
+
+int thread_id(void)
+{
+    struct thread *t = thread_current();
+    return t ? t->id : 0;
+}
+
 unsigned sched_thread_count(void)      { return nthreads; }
 unsigned long sched_switch_count(void) { return nswitches; }
 unsigned long sched_starve_boosts(void) { return nstarve_boosts; }
@@ -726,9 +889,11 @@ int sched_report_overflow(uintptr_t sp, uintptr_t fault_addr)
 
 void sched_stack_bounds(uintptr_t *lo, uintptr_t *hi)
 {
-    if (current) {
-        *lo = current->stack_lo;
-        *hi = current->stack_hi;
+    struct thread *t = thread_current();
+
+    if (t) {
+        *lo = t->stack_lo;
+        *hi = t->stack_hi;
     } else {
         *lo = (uintptr_t)stack_bottom;
         *hi = (uintptr_t)stack_top;

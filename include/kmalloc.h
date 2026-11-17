@@ -18,6 +18,9 @@ void *kzalloc(size_t size);
    傳入不合法的指標或重複釋放會 panic */
 void kfree(void *ptr);
 
+/* ptr 所在的區塊實際佔用 heap 多少位元組(含標頭與對齊);用於記帳 */
+size_t kmalloc_size(void *ptr);
+
 /* heap 使用狀況 */
 struct kheap_stats {
     size_t heap_bytes;    /* 已向 pmm 取得的總位元組數 */

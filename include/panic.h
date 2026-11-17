@@ -7,6 +7,10 @@
  */
 void panic(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
 
+/* 開始 panic 流程:關中斷並讓所有 spinlock 放行。panic() 自己會呼叫;
+   例外處理程式在印出致命錯誤的診斷資訊之前也要先呼叫 */
+void panic_begin(void);
+
 /* 結束 panic 流程:印完診斷資訊後呼叫。見 panic_set_exit */
 void panic_halt(void) __attribute__((noreturn));
 

@@ -6,6 +6,7 @@
  */
 #include <stdint.h>
 #include "arch.h"
+#include "cpu.h"
 #include "kprintf.h"
 #include "sched.h"
 
@@ -147,21 +148,18 @@ void arch_test_fault(void)
     (void)*p;
 }
 
-/* RISC-V 進入 kernel 時用的 stack 記在 sscratch(由 trap.S 在返回使用者模式時設定),
-   不需要另外通知 */
+/* RISC-V 從使用者模式進入 kernel 時,trap.S 直接讀 struct cpu 的 kstack_top
+   (排程器每次切換時更新),不需要另外通知硬體 */
 void arch_set_kstack(uintptr_t top)
 {
     (void)top;
 }
 
-void arch_user_return(uintptr_t entry, uintptr_t usp, uintptr_t arg, uintptr_t ktop)
+void arch_user_return(uintptr_t entry, uintptr_t usp, uintptr_t arg)
     __attribute__((noreturn));          /* switch.S */
 
 void arch_enter_user(uintptr_t entry, uintptr_t usp, uintptr_t arg)
 {
-    uintptr_t lo, hi;
-
     arch_irq_disable();                  /* 設定 sscratch 到 sret 之間不可被中斷 */
-    sched_stack_bounds(&lo, &hi);
-    arch_user_return(entry, usp, arg, hi);
+    arch_user_return(entry, usp, arg);
 }

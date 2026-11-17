@@ -1,5 +1,6 @@
 #ifndef WELYOS_SCHED_H
 #define WELYOS_SCHED_H
+#include <stddef.h>
 #include <stdint.h>
 
 /*
@@ -67,7 +68,7 @@ unsigned long sched_starve_boosts(void); /* 累計的防飢餓提升次數 */
  *   space:這條執行緒使用的位址空間。排程器切換到它時會一併換頁表。
  *          NULL 表示純 kernel 執行緒,沿用當下載入的頁表(kernel 部分各處相同)。
  *   data :附掛的私有資料(行程用來記錄這條執行緒屬於哪個行程)。
- *   kill :把所有 data 相同的執行緒標記為「應終止」。被標記的執行緒不會被強行中斷,
+ *   kill :把所有 data 相同的執行緒標記為「應終止」(呼叫時必須持有排程器的鎖)。被標記的執行緒不會被強行中斷,
  *          而是在下一次要從 kernel 返回使用者模式時自行結束(見 user_return_check)。
  */
 struct vm_space;
@@ -90,28 +91,44 @@ struct wait_queue {
 #define WAIT_QUEUE_INIT { 0, 0 }
 
 /*
+ * 排程器的鎖。等待佇列以及建立在它上面的所有東西(semaphore、mutex、futex、
+ * 行程的結束狀態)都由這一把鎖保護,用法固定是:
+ *
+ *     unsigned long flags = sched_lock();
+ *     while (條件不成立)
+ *         wq_sleep(&佇列);          // 睡著期間鎖會被釋放,醒來時又是持有的
+ *     ...
+ *     sched_unlock(flags);
+ *
+ * sched_lock 同時關閉中斷;sched_unlock 恢復原本的中斷狀態。
+ * 持有期間不可再呼叫 sched_lock(同一顆 CPU 重複上鎖會 panic)。
+ */
+unsigned long sched_lock(void);
+void sched_unlock(unsigned long flags);
+
+/*
  * 讓目前的執行緒睡在 wq 上,直到被 wq_wake_* 喚醒才返回。
- * 呼叫前「必須已關閉中斷」,而且「檢查條件」與「呼叫 wq_sleep」之間不可開中斷,
+ * 呼叫前「必須持有排程器的鎖」,而且「檢查條件」與「呼叫 wq_sleep」之間不可解鎖,
  * 否則條件可能在兩者之間改變、喚醒先發生,之後就再也沒人叫醒(lost wakeup)。
- * 返回時中斷仍是關閉的。
+ * 返回時仍持有鎖。
  */
 void wq_sleep(struct wait_queue *wq);
 
 /* 喚醒 wq 上優先權最高的一條(相同則等最久的優先)/ 全部。回傳喚醒的數量。
-   可在中斷處理程式中呼叫。被喚醒者若比目前的執行緒優先,只會「記下需要重新排程」,
+   呼叫前必須持有排程器的鎖;可在中斷處理程式中呼叫。被喚醒者若比目前的執行緒優先,只會「記下需要重新排程」,
    實際的切換發生在呼叫 sched_preempt_point() 或中斷返回時 */
 int wq_wake_one(struct wait_queue *wq);
 int wq_wake_all(struct wait_queue *wq);
 
 /*
  * 搶佔點:若有更優先的執行緒在等(剛被喚醒或建立),立刻切換過去。
- * 在喚醒別人之後、恢復中斷之前呼叫;呼叫時中斷必須是關閉的。
+ * 在喚醒別人之後、解鎖之前呼叫;呼叫時必須持有排程器的鎖。
  * 在中斷處理程式中呼叫則無作用(切換留到中斷返回時由 sched_irq_exit 處理)。
  */
 void sched_preempt_point(void);
 
 /*
- * 優先權繼承用(kernel/sync.c 的 mutex 使用;呼叫時中斷必須已關閉):
+ * 優先權繼承用(kernel/sync.c 的 mutex 使用;呼叫時必須持有排程器的鎖):
  *   thread_effective_prio(t) :t 目前的有效優先權
  *   sched_set_inherit(t, p)  :設定 t「繼承來的優先權」,-1 表示沒有。
  *                              有效優先權 = max(自己的, 繼承來的)
@@ -133,7 +150,7 @@ int   wq_max_prio(struct wait_queue *wq);
 /* 架構層在中斷處理程式的開頭呼叫:標記「現在在中斷中」 */
 void sched_irq_enter(void);
 
-/* 每個計時器 tick 呼叫一次(中斷關閉中):喚醒到期的休眠者、扣時間片 */
+/* 每顆 CPU 的每個計時器 tick 呼叫一次(中斷關閉中):喚醒到期的休眠者、扣時間片 */
 void sched_tick(void);
 
 /* 架構層在中斷處理的最後(已通知中斷控制器之後)呼叫:
@@ -144,17 +161,14 @@ void sched_irq_exit(void);
 void sched_stack_bounds(uintptr_t *lo, uintptr_t *hi);
 
 /*
- * 目前執行緒 stack 的最低可用位址。RISC-V 與 AArch64 的例外入口(組合語言)
- * 會讀這個變數,在存暫存器之前先檢查 stack pointer 是否已經超出範圍。
- * 排程器在每次切換時更新。0 表示尚未啟用檢查。
- */
-extern uintptr_t kstack_limit;
-
-/*
  * 例外處理程式在致命錯誤時呼叫:依出錯當下的 stack pointer 與出錯位址,
  * 判斷是否為 kernel stack 溢位,是的話印出說明並回傳 1。
  */
 int sched_report_overflow(uintptr_t sp, uintptr_t fault_addr);
+
+/* struct thread 的池子累計向 heap 取得的位元組數。執行緒結束後結構留在池子裡
+   重複使用、不還給 heap(原因見 sched.c),測試核對 heap 用量時要把這部分算進去 */
+size_t sched_pool_bytes(void);
 
 /* 釋放快取中閒置的執行緒 stack(記憶體不足時,或測試要核對記憶體用量時呼叫) */
 void sched_trim(void);

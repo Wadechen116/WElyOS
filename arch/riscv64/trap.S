@@ -16,39 +16,44 @@
  */
 #define FRAME_SIZE 288
 
+/* struct cpu(include/cpu.h)開頭幾個欄位的位移 */
+#define CPU_KLIMIT   0                /* kstack_limit:目前執行緒 stack 的下限 */
+#define CPU_KTOP     8                /* kstack_top:目前執行緒 kernel stack 的頂端 */
+#define CPU_SCRATCH  16               /* scratch[0]:暫放一個暫存器 */
+
     .section .text
     .align 4                          /* stvec 要求位址 4 位元組對齊(直接模式) */
     .global trap_entry
 trap_entry:
     /*
-     * 第一步:分辨是從使用者模式還是 kernel 進來的,並取得可用的 kernel stack。
+     * 第一步:分辨是從使用者模式還是 kernel 進來的,並取得這顆 CPU 的 struct cpu。
      *
-     * 約定:sscratch 在「使用者模式執行期間」存放該執行緒的 kernel stack 頂端,
-     *       在「kernel 執行期間」為 0。
-     * 把 sp 與 sscratch 交換後看 sp:
-     *   非 0 -> 從使用者模式來。sp 現在是 kernel stack,使用者的 sp 在 sscratch
-     *   為 0 -> 從 kernel 來。再交換一次換回原樣,繼續用原本的 stack
-     * 不能直接沿用使用者的 sp:那是不可信任的值,可能指向任何地方。
+     * 約定:
+     *   kernel 執行期間      tp = 這顆 CPU 的 struct cpu,sscratch = 0
+     *   使用者模式執行期間   tp 屬於使用者程式(內容不可信任),sscratch = struct cpu
+     * 把 tp 與 sscratch 交換後看 tp:
+     *   非 0 -> 從使用者模式來。tp 現在是 struct cpu,使用者的 tp 在 sscratch
+     *   為 0 -> 從 kernel 來。再交換一次換回原樣
+     * 每顆 CPU 有自己的 sscratch,所以多核心時各自拿到的是自己的 struct cpu。
      */
-    csrrw   sp, sscratch, sp
-    bnez    sp, from_user
+    csrrw   tp, sscratch, tp
+    bnez    tp, from_user
 
     /* ---- 從 kernel 來 ---- */
-    csrrw   sp, sscratch, sp          /* 換回來:sp = 原本的 kernel sp,sscratch = 0 */
+    csrrw   tp, sscratch, tp          /* 換回來:tp = struct cpu,sscratch = 0 */
 
     /*
      * 檢查 stack 還放不放得下 trap frame。
      * 如果例外的原因正是 stack 溢位,sp 此刻指著保護頁(沒有對映),
      * 直接往下存暫存器會再次觸發例外,又進到這裡,無窮迴圈。
-     * 所以先比較 sp 與目前執行緒的 stack 下限(kstack_limit,排程器維護);
+     * 所以先比較 sp 與目前執行緒的 stack 下限(cpu->kstack_limit,排程器維護);
      * 不夠就改用專用的例外 stack(exc_stack),讓處理程式能正常執行並回報。
      *
      * 做比較需要一個暫存器,但此刻所有暫存器都還是被打斷程式的值,
-     * 不能直接拿來用,所以借 sscratch 暫放 t0,用完再歸 0。
+     * 所以先把 t0 暫存到 struct cpu 裡的空位。
      */
-    csrw    sscratch, t0
-    la      t0, kstack_limit
-    ld      t0, 0(t0)
+    sd      t0, CPU_SCRATCH(tp)
+    ld      t0, CPU_KLIMIT(tp)
     addi    t0, t0, FRAME_SIZE        /* sp 至少要比下限高出一個 frame */
     bgeu    sp, t0, 1f
 
@@ -63,22 +68,27 @@ trap_entry:
     addi    t0, sp, FRAME_SIZE
     sd      t0, 8(sp)                 /* x2 的 slot = 被打斷時的 sp */
 
-2:  csrr    t0, sscratch              /* 取回 t0 原本的值 */
-    csrw    sscratch, zero            /* 恢復約定:在 kernel 中 sscratch 為 0 */
+2:  ld      t0, CPU_SCRATCH(tp)       /* 取回 t0 原本的值 */
+    sd      tp, 3*8(sp)               /* x4 的 slot(僅供除錯時查看;返回 kernel 時不還原它) */
     j       save_regs
 
-    /* ---- 從使用者模式來:sp = kernel stack 頂端,sscratch = 使用者的 sp ---- */
+    /* ---- 從使用者模式來:tp = struct cpu,sscratch = 使用者的 tp ---- */
 from_user:
+    sd      sp, CPU_SCRATCH(tp)       /* 使用者的 sp 先暫存 */
+    ld      sp, CPU_KTOP(tp)          /* 換到這條執行緒的 kernel stack。
+                                         不能沿用使用者的 sp:那是不可信任的值 */
     addi    sp, sp, -FRAME_SIZE
     sd      t0, 4*8(sp)               /* 先存 t0(x5 的 slot),騰出一個暫存器 */
-    csrr    t0, sscratch
+    ld      t0, CPU_SCRATCH(tp)
     sd      t0, 8(sp)                 /* x2 的 slot = 使用者的 sp */
+    csrr    t0, sscratch
+    sd      t0, 3*8(sp)               /* x4 的 slot = 使用者的 tp */
     csrw    sscratch, zero            /* 現在進入 kernel 了:sscratch 歸 0 */
     ld      t0, 4*8(sp)
 
 save_regs:
-    /* 存 x1 與 x3~x31(x2 即 sp,上面已存) */
-    .irp    n, 1,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    /* 存 x1、x3 與 x5~x31(x2 即 sp、x4 即 tp,上面已存) */
+    .irp    n, 1,3,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
     sd      x\n, (\n-1)*8(sp)
     .endr
 
@@ -106,8 +116,9 @@ save_regs:
     bnez    t0, 3f
 
     /* ---- 返回使用者模式 ---- */
-    addi    t0, sp, FRAME_SIZE
-    csrw    sscratch, t0              /* 依約定存入 kernel stack 頂端,下次進來時使用 */
+    csrw    sscratch, tp              /* 依約定存入 struct cpu,下次進來時使用。
+                                         用的是「現在」的 tp:這條執行緒進入 kernel 之後
+                                         可能已經換到另一顆 CPU 上了 */
     .irp    n, 1,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
     ld      x\n, (\n-1)*8(sp)
     .endr
@@ -116,8 +127,13 @@ save_regs:
 
 3:  /* ---- 返回 kernel ---- */
 
-    /* 還原 x1、x3~x31(最後一次載入 t0 會蓋掉上面用的暫存值,正確) */
-    .irp    n, 1,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    /*
+     * 還原 x1、x3 與 x5~x31(最後一次載入 t0 會蓋掉上面用的暫存值,正確)。
+     * 刻意「不」還原 tp(x4):被打斷的執行緒可能在這次中斷裡被搶佔,之後在另一顆 CPU 上
+     * 被切回來;若還原成當初存的 tp,它就會指向原本那顆 CPU 的資料。
+     * tp 在 kernel 中永遠代表「現在這顆 CPU」,不屬於被打斷程式的狀態。
+     */
+    .irp    n, 1,3,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
     ld      x\n, (\n-1)*8(sp)
     .endr
 
@@ -126,7 +142,8 @@ save_regs:
 
 /*
  * 例外專用 stack(8KB):只在偵測到 kernel stack 溢位時使用。
- * 那種情況必定以 panic 收場,不會返回,所以全系統共用一條即可。
+ * 那種情況必定以 panic 收場,不會返回,所以全系統共用一條即可
+ * (兩顆 CPU 同時溢位的機率極低;真的發生時訊息可能交錯,但同樣會停機)。
  */
     .section .bss
     .balign 16
