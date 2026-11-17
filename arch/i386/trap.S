@@ -46,6 +46,12 @@ isr\n:
     .endr
     .global isr128                /* 向量 0x80:系統呼叫(使用者程式以 int $0x80 進入) */
     ISR_NOERR 128
+    /* LAPIC 產生的中斷(多核心用):48 = 每顆 CPU 自己的計時器,49 = 處理器間中斷,
+       255 = 假中斷(spurious):LAPIC 偶爾會發出、不需要處理也不需要回應的中斷 */
+    .global isr48, isr49, isr255
+    ISR_NOERR 48
+    ISR_NOERR 49
+    ISR_NOERR 255
     .irp    n, 8,10,11,12,13,14,17,21,29,30
     ISR_ERR \n
     .endr

@@ -8,6 +8,7 @@
 #include "panic.h"
 #include "pmm.h"
 #include "ring.h"
+#include "sched.h"
 #include "smp.h"
 #include "spinlock.h"
 #include "timer.h"
@@ -20,8 +21,83 @@ _Static_assert(BOOT_MAX_CPUS == MAX_CPUS, "BOOT_MAX_CPUS");
 static volatile int nstarted = 1;            /* 已啟動的 CPU 數(含開機的那一顆) */
 
 /* AP 啟動後的階段,由開機的 CPU 設定、所有 AP 觀察 */
-enum { PH_WAIT, PH_TEST, PH_PARK };
+enum { PH_WAIT, PH_TEST, PH_STANDBY, PH_GO };
 static volatile int phase = PH_WAIT;
+
+/* ---- 處理器間中斷與跨 CPU 呼叫 ---- */
+
+static struct spinlock call_lk = SPINLOCK_INIT("smp-call");   /* 同一時間只進行一個跨 CPU 呼叫 */
+static void (*volatile call_fn)(void *);
+static void *volatile call_arg;
+static volatile int call_acks;               /* 已經執行完 call_fn 的 CPU 數 */
+
+void smp_send(struct cpu *c, unsigned what)
+{
+    __atomic_fetch_or(&c->ipi_pending, what, __ATOMIC_SEQ_CST);  /* 先放內容,再叫它 */
+    arch_ipi_send(c);
+}
+
+void smp_poll(void)
+{
+    struct cpu *c = this_cpu();
+
+    if (!__atomic_load_n(&c->ipi_pending, __ATOMIC_RELAXED))
+        return;                              /* 絕大多數時候沒有事:只花一次讀取 */
+    unsigned p = __atomic_exchange_n(&c->ipi_pending, 0u, __ATOMIC_SEQ_CST);
+
+    if (p & IPI_STOP)
+        arch_smp_park();                     /* 不會返回 */
+    if (p & IPI_CALL) {
+        call_fn(call_arg);
+        __atomic_fetch_add(&call_acks, 1, __ATOMIC_SEQ_CST);
+    }
+    /* IPI_RESCHED:不必做事。need_resched 已經設好,中斷返回前 sched_irq_exit 會處理 */
+}
+
+void smp_ipi_handler(void)
+{
+    smp_poll();
+}
+
+void smp_call_others(void (*fn)(void *), void *arg)
+{
+    if (cpu_count == 1)
+        return;
+
+    unsigned long flags = arch_irq_save();
+    /* 別人也可能正要發起呼叫,而且正在等我們回應:搶不到鎖時要一邊處理它的要求 */
+    while (!spin_trylock(&call_lk)) {
+        smp_poll();
+        arch_cpu_relax();
+    }
+
+    int me = this_cpu()->id, n = 0;
+    call_fn = fn;
+    call_arg = arg;
+    __atomic_store_n(&call_acks, 0, __ATOMIC_SEQ_CST);
+    for (int i = 0; i < cpu_count; i++) {
+        if (i == me)
+            continue;
+        smp_send(&cpus[i], IPI_CALL);
+        n++;
+    }
+    while (__atomic_load_n(&call_acks, __ATOMIC_SEQ_CST) != n) {
+        smp_poll();                          /* 等待期間若系統 panic,自己也要能停下來 */
+        arch_cpu_relax();
+    }
+    spin_unlock(&call_lk);
+    arch_irq_restore(flags);
+}
+
+void smp_stop_others(void)
+{
+    if (nstarted == 1)
+        return;
+    int me = this_cpu()->id;
+    for (int i = 0; i < nstarted; i++)
+        if (i != me && cpus[i].started)
+            smp_send(&cpus[i], IPI_STOP);
+}
 
 /* ---- 並行測試用的共用資料 ---- */
 #define TEST_ROUNDS 20000u
@@ -74,20 +150,31 @@ static void run_test(struct cpu *me)
 
 void smp_ap_main(void)
 {
-    struct cpu *c = this_cpu();              /* AP 的中斷一直是關的,可以放心使用 */
+    struct cpu *c = this_cpu();              /* 到進入排程器之前,AP 不會換 CPU,可以放心使用 */
 
+    arch_smp_cpu_init();                     /* 從這裡起可以接收處理器間中斷 */
     __atomic_store_n(&c->started, 1, __ATOMIC_SEQ_CST);
 
-    /* 等開機的 CPU 決定下一步。這段等待很短(所有 CPU 都啟動後就會有結果) */
+    /* 等開機的 CPU 決定要不要先跑並行測試。這段等待很短(所有 CPU 都啟動後就會有結果) */
     int ph;
     while ((ph = __atomic_load_n(&phase, __ATOMIC_ACQUIRE)) == PH_WAIT)
         arch_cpu_relax();
     if (ph == PH_TEST)
         run_test(c);
 
-    /* 待命:關著中斷休眠。下一段加入每顆 CPU 的計時器與處理器間中斷後,
-       才會從這裡進入排程器 */
-    arch_smp_park();
+    /* 待命:開著中斷休眠,不佔用主機的運算資源。開機的 CPU 呼叫 smp_sched_start()
+       時會發出處理器間中斷把我們叫醒 */
+    arch_irq_enable();
+    while (__atomic_load_n(&phase, __ATOMIC_ACQUIRE) != PH_GO)
+        arch_idle();
+    arch_irq_disable();
+
+    /* 加入排程:目前這段執行流程就成為這顆 CPU 的 idle 執行緒 */
+    sched_init_ap();
+    arch_timer_init_cpu();                   /* 每顆 CPU 自己的計時器:時間片與搶佔靠它 */
+    arch_irq_enable();
+    for (;;)
+        arch_idle();                         /* 有工作時由中斷返回的路徑切換過去 */
 }
 
 /* 等條件成立或逾時。成立回傳 1 */
@@ -148,7 +235,7 @@ void smp_init(const struct boot_info *bi, int run)
     kprintf(")\n");
 
     if (!run) {
-        __atomic_store_n(&phase, PH_PARK, __ATOMIC_RELEASE);
+        __atomic_store_n(&phase, PH_STANDBY, __ATOMIC_RELEASE);
         return;
     }
 
@@ -179,4 +266,33 @@ void smp_init(const struct boot_info *bi, int run)
     KASSERT(id_errors == 0);
     KASSERT(traps_ok == nstarted - 1);
     kprintf("smp: selftest ok\n");
+}
+
+void smp_sched_start(void)
+{
+    if (nstarted == 1 || phase == PH_GO)
+        return;
+
+    __atomic_store_n(&phase, PH_GO, __ATOMIC_RELEASE);
+
+    /* 叫醒待命中的 AP,等它們都登記進排程器。AP 可能剛好在「檢查完、正要休眠」的
+       瞬間錯過這次中斷,所以每隔一個 tick 對還沒就緒的再叫一次 */
+    for (unsigned tries = 0; ; tries++) {
+        int ready = 1;
+        for (int i = 1; i < nstarted; i++) {
+            if (!cpus[i].online) {
+                ready = 0;
+                smp_send(&cpus[i], IPI_RESCHED);
+            }
+        }
+        if (ready)
+            break;
+        if (tries > 1000)
+            panic("smp: secondary cpus did not join the scheduler");
+        thread_sleep(1);
+    }
+
+    /* 從這一行起,排程器與執行佇列才把其他 CPU 算進來 */
+    sched_set_cpu_count(nstarted);
+    kprintf("smp: %d cpus scheduling\n", nstarted);
 }

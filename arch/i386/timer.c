@@ -84,6 +84,11 @@ static uint32_t tsc_per_10ms(void)
     return (uint32_t)(rdtsc() - t0);     /* 10ms 內的計數,32 位元足夠 */
 }
 
+uint64_t arch_tsc_per_tick(void)
+{
+    return tsc_interval;
+}
+
 static void pic_remap(void)
 {
     /* ICW1:開始初始化序列(之後要連續寫入 ICW2~ICW4) */

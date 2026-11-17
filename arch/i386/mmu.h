@@ -15,6 +15,8 @@
  */
 typedef uint64_t pte_t;
 #define MMU_NAME    "i386 PAE"
+/* 清除 TLB 的指令只作用在執行它的那顆 CPU;通知其他 CPU 要靠跨 CPU 呼叫(見 vm.c) */
+#define MMU_TLB_BROADCAST 0
 #define MMU_LEVELS  3
 #define MMU_BITS    9
 #define MMU_VA_BITS 32

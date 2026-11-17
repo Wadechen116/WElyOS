@@ -12,6 +12,7 @@
  */
 #include <stdint.h>
 #include "arch.h"
+#include "cpu.h"
 #include "timer.h"
 #include "sched.h"
 #include "trap.h"
@@ -28,7 +29,9 @@
 #define SIE_STIE (1UL << 5)            /* sie 的 bit 5:允許 S-mode 計時器中斷 */
 
 static uint64_t interval;              /* 每個 tick 相當於多少 timebase 單位 */
-static uint64_t deadline;              /* 下一個 tick 應該發生的絕對時間 */
+/* 下一個 tick 應該發生的絕對時間:每顆 hart 有自己的計時器,
+   所以記在各自的 struct cpu(timer_deadline)裡 */
+#define deadline (this_cpu()->timer_deadline)
 
 #define MAX_CATCHUP 100                /* 一次中斷最多補記幾個 tick */
 
@@ -51,6 +54,12 @@ static void sbi_set_timer(uint64_t when)
 void arch_timer_init(unsigned hz)
 {
     interval = TIMEBASE_HZ / hz;
+    arch_timer_init_cpu();
+}
+
+/* 啟動「目前這顆 hart」的計時器。sbi_set_timer 與 sie 都是每顆 hart 各自的 */
+void arch_timer_init_cpu(void)
+{
     deadline = read_time() + interval;
     sbi_set_timer(deadline);
     __asm__ volatile("csrs sie, %0" : : "r"(SIE_STIE));

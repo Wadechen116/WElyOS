@@ -27,6 +27,8 @@
 #include "panic.h"
 #include "pmm.h"
 #include "vm.h"
+#include "sched.h"
+#include "smp.h"
 #include "spinlock.h"
 
 /* 保護 kernel 頁表、所有位址空間的頁表與 ASID 的分配。
@@ -172,6 +174,33 @@ static pte_t *walk(pte_t *t, uintptr_t va, int target, int create, int split,
 
 /* 權限檢查:拒絕「同時可寫又可執行」的對映(W^X)。
    這種頁讓攻擊者能寫入資料再當成程式碼執行,kernel 沒有任何正當理由需要它 */
+/*
+ * TLB shootdown:讓 va 這一頁的轉換紀錄在「所有 CPU」上失效。
+ * 每顆 CPU 有自己的 TLB,在一顆 CPU 上執行失效指令只清得到它自己的。
+ * 其他 CPU 若繼續使用舊的紀錄,就會存取到已經移除(或權限已改)的對映。
+ *
+ * 做法依架構而定:
+ *   AArch64      有會「廣播」的失效指令(tlbi ...is),硬體自己通知所有 CPU
+ *   RISC-V、i386 以跨 CPU 呼叫請每顆 CPU 各自執行一次,等全部完成才返回
+ *
+ * 只在「原本有效的對映被移除或更改」時才需要。新增對映(原本無效)不必:
+ * CPU 不會把「無效」這件事存進 TLB,其他 CPU 第一次用到時自然會查到新的內容。
+ */
+#if !MMU_TLB_BROADCAST
+static void flush_one_fn(void *arg)
+{
+    arch_tlb_flush((uintptr_t)arg);
+}
+#endif
+
+static void tlb_shootdown(uintptr_t va)
+{
+    arch_tlb_flush(va);
+#if !MMU_TLB_BROADCAST
+    smp_call_others(flush_one_fn, (void *)va);
+#endif
+}
+
 static int flags_ok(unsigned flags)
 {
     return !((flags & VM_WRITE) && (flags & VM_EXEC));
@@ -186,11 +215,16 @@ int vm_map(uintptr_t va, uintptr_t pa, unsigned flags)
     pte_t *e = walk(root, va, 0, 1, 1, 0, NULL);
     int rc = -1;
     if (e) {
+        int was_valid = arch_pte_valid(*e);
         *e = arch_pte_leaf(pa, flags & ~VM_USER, 0);     /* kernel 頁表不放使用者頁 */
         /* CPU 會把查過的轉換結果快取在 TLB;改了 PTE 要讓那一筆失效,
-           否則 CPU 可能繼續用舊的對映 */
-        if (enabled)
-            arch_tlb_flush(va);
+           否則 CPU 可能繼續用舊的對映。取代既有的對映時,所有 CPU 都要失效 */
+        if (enabled) {
+            if (was_valid)
+                tlb_shootdown(va);
+            else
+                arch_tlb_flush(va);
+        }
         rc = 0;
     }
     spin_unlock_irqrestore(&vm_lk, irq);
@@ -226,7 +260,7 @@ int vm_unmap(uintptr_t va)
     if (e && arch_pte_valid(*e)) {
         *e = 0;
         if (enabled)
-            arch_tlb_flush(va);
+            tlb_shootdown(va);               /* 移除對映:每顆 CPU 的舊紀錄都要清掉 */
         rc = 0;
     }
     spin_unlock_irqrestore(&vm_lk, irq);
@@ -299,8 +333,29 @@ static void free_table(pte_t *t, int level)
     table_pages--;
 }
 
+/* 位址空間即將釋放時在每顆 CPU 上執行(跨 CPU 呼叫;中斷關閉、不可上鎖) */
+static void space_gone_fn(void *arg)
+{
+    struct vm_space *vs = arg;
+
+    sched_space_dropped(vs);                 /* 這顆 CPU 若還載入著它的頁表,換回 kernel 的 */
+#if MMU_ASID_MAX > 0
+    /* 編號即將交給別的行程:每顆 CPU 的 TLB 裡屬於這個編號的紀錄都要清掉 */
+    if (vs->asid != 0 && vs->asid < MMU_ASID_MAX)
+        arch_asid_flush(vs->asid);
+#endif
+}
+
 void vm_space_destroy(struct vm_space *vs)
 {
+    /* 先確定沒有任何 CPU 還在使用這份頁表,才能釋放它。呼叫者保證已經沒有
+       執行緒屬於這個位址空間;剩下的只可能是別顆 CPU 上「沿用上一個行程頁表」
+       的 kernel 執行緒(見 sched.c) */
+    unsigned long f = arch_irq_save();
+    space_gone_fn(vs);
+    arch_irq_restore(f);
+    smp_call_others(space_gone_fn, vs);
+
     unsigned long irq = spin_lock_irqsave(&vm_lk);
     int top = MMU_LEVELS - 1;
 
@@ -326,9 +381,14 @@ int vm_space_map(struct vm_space *vs, uintptr_t va, uintptr_t pa, unsigned flags
     pte_t *e = walk(vs->root, va, 0, 1, 0, 1, NULL);
     int rc = -1;
     if (e) {
+        int was_valid = arch_pte_valid(*e);
         *e = arch_pte_leaf(pa, flags, 0);
-        if (enabled)
-            arch_tlb_flush(va);
+        if (enabled) {
+            if (was_valid)
+                tlb_shootdown(va);           /* 同一行程的其他執行緒可能正在別顆 CPU 上執行 */
+            else
+                arch_tlb_flush(va);
+        }
         rc = 0;
     }
     spin_unlock_irqrestore(&vm_lk, irq);

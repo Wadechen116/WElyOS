@@ -66,6 +66,10 @@ void arch_enter_user(uintptr_t entry, uintptr_t usp, uintptr_t arg) __attribute_
  *       c->kstack_top 已設定好。那顆 CPU 會在自己的 stack 上、以 this_cpu() == c
  *       的狀態呼叫 smp_ap_main()。回傳 0 表示啟動要求已送出(不代表已經啟動)。
  *   arch_smp_done():所有 CPU 都啟動(或放棄)之後呼叫,收拾啟動用的暫時資源。
+ *   arch_smp_cpu_init():每顆 AP 啟動後在自己身上呼叫:設定好接收處理器間中斷(IPI)。
+ *   arch_timer_init_cpu():在目前這顆 AP 上啟動它自己的週期性計時器(頻率同開機的 CPU)。
+ *   arch_ipi_send(c):對 c 發出處理器間中斷。c 收到後,架構層的中斷處理程式
+ *       要呼叫 smp_ipi_handler()(kernel/smp.c)。
  *   arch_smp_park():讓目前這顆 CPU 永久休眠(關著中斷)。
  */
 struct boot_info;
@@ -73,6 +77,9 @@ struct cpu;
 int  arch_smp_discover(const struct boot_info *bi, uint64_t *ids, int max);
 int  arch_smp_start(struct cpu *c);
 void arch_smp_done(void);
+void arch_smp_cpu_init(void);
+void arch_timer_init_cpu(void);
+void arch_ipi_send(struct cpu *c);
 void arch_smp_park(void) __attribute__((noreturn));
 
 /*

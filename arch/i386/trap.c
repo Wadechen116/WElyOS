@@ -224,6 +224,19 @@ static void idt_init(void)
     idt[0x80].type_attr   = 0xEE;
     idt[0x80].offset_high = (uint16_t)((uint32_t)isr128 >> 16);
 
+    /* LAPIC 的三個向量(見 trap.S 與 smp.c) */
+    extern void isr48(void), isr49(void), isr255(void);
+    static void (*const lapic_isr[3])(void) = { isr48, isr49, isr255 };
+    static const int lapic_vec[3] = { VEC_LAPIC_TIMER, VEC_IPI, VEC_SPURIOUS };
+    for (int i = 0; i < 3; i++) {
+        int v = lapic_vec[i];
+        idt[v].offset_low  = (uint16_t)((uint32_t)lapic_isr[i] & 0xFFFF);
+        idt[v].selector    = KERNEL_CS;
+        idt[v].zero        = 0;
+        idt[v].type_attr   = 0x8E;
+        idt[v].offset_high = (uint16_t)((uint32_t)lapic_isr[i] >> 16);
+    }
+
     idt_ptr.limit = sizeof(idt) - 1;
     idt_ptr.base  = (uint32_t)idt;
     __asm__ volatile("lidt %0" : : "m"(idt_ptr));
@@ -311,6 +324,16 @@ void trap_handler(struct trap_frame *tf)
             user_return_check();
         return;
     }
+
+    /* LAPIC 的中斷:每顆 CPU 自己的計時器、處理器間中斷 */
+    if (tf->vector == VEC_LAPIC_TIMER || tf->vector == VEC_IPI) {
+        lapic_interrupt(tf->vector);
+        if (from_user)
+            user_return_check();
+        return;
+    }
+    if (tf->vector == VEC_SPURIOUS)
+        return;                                  /* 假中斷:依規範不回應 EOI,直接返回 */
 
     /* 系統呼叫:編號在 eax,參數在 ebx、ecx、edx,回傳值放回 eax */
     if (tf->vector == 0x80) {

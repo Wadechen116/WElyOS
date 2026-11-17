@@ -33,7 +33,9 @@ struct cpu {
     int id;                      /* CPU 編號(cpus[] 的索引);開機的那一顆固定是 0 */
     uint64_t arch_id;            /* 硬體上的編號:RISC-V hartid、AArch64 MPIDR、i386 LAPIC ID */
     volatile int started;        /* 已經啟動並回報(見 smp.c) */
-    int online;                  /* 已啟動並參與排程 */
+    volatile unsigned ipi_pending; /* 別顆 CPU 要求這顆做的事(IPI_* 位元,見 smp.h) */
+    uint64_t timer_deadline;     /* 這顆 CPU 下一個計時器 tick 的預定時間(架構層使用) */
+    volatile int online;         /* 已啟動並參與排程 */
     int in_irq;                  /* 正在中斷處理程式中 */
     volatile int need_resched;   /* 需要重新排程(可由別顆 CPU 設定) */
     int nlocks;                  /* 這顆 CPU 目前持有幾把 spinlock(檢查用) */
@@ -48,7 +50,7 @@ _Static_assert(offsetof(struct cpu, kstack_top) == sizeof(uintptr_t), "cpu.kstac
 _Static_assert(offsetof(struct cpu, scratch) == 2 * sizeof(uintptr_t), "cpu.scratch");
 
 extern struct cpu cpus[MAX_CPUS];
-extern int cpu_count;            /* 參與排程的 CPU 數(目前固定為 1:其他 CPU 啟動後先待命) */
+extern int cpu_count;            /* 參與排程的 CPU 數;編號 0 ~ cpu_count-1。其他 CPU 加入後才增加 */
 
 #include "cpu_arch.h"            /* arch_this_cpu()、arch_cpu_relax() */
 

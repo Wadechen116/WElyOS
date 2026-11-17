@@ -5,6 +5,7 @@
 #include "arch.h"
 #include "kprintf.h"
 #include "panic.h"
+#include "smp.h"
 #include "spinlock.h"
 
 static int exit_on_panic;
@@ -18,6 +19,7 @@ void panic_begin(void)
 {
     arch_irq_disable();        /* 從此不再被搶佔 */
     spin_panic_mode();         /* 出事當下可能正持有某些鎖:之後一律放行,訊息才印得出來 */
+    smp_stop_others();         /* 其他 CPU 不該在系統已經出錯的狀態下繼續執行 */
 }
 
 void panic_halt(void)

@@ -8,6 +8,8 @@
  */
 typedef uint64_t pte_t;
 #define MMU_NAME    "AArch64 4K/39-bit"
+/* 有廣播式的 TLB 失效指令(tlbi ...is):硬體會通知所有 CPU,不需要跨 CPU 呼叫 */
+#define MMU_TLB_BROADCAST 1
 #define MMU_LEVELS  3
 #define MMU_BITS    9
 #define MMU_VA_BITS 39

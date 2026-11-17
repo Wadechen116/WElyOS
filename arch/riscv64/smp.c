@@ -21,6 +21,8 @@
 
 #define SBI_EXT_HSM        0x48534DUL        /* "HSM" */
 #define SBI_HSM_HART_START 0UL
+#define SBI_EXT_IPI        0x735049UL        /* "sPI":處理器間中斷擴充 */
+#define SBI_IPI_SEND       0UL
 
 void ap_entry(void);                         /* boot.S */
 
@@ -72,4 +74,19 @@ void arch_smp_park(void)
 
 void arch_smp_done(void)
 {
+}
+
+/* 接收 IPI 需要的設定(sie 的 SSIE)已在 trap_init 完成 */
+void arch_smp_cpu_init(void)
+{
+}
+
+/*
+ * 發出處理器間中斷:sbi_send_ipi(hart_mask, hart_mask_base)。
+ * 目標以位元遮罩表示:bit i 代表 hartid = base + i。這裡一次只送一顆,
+ * 所以 base 設成目標的 hartid、遮罩為 1。目標 hart 會收到 S-mode 軟體中斷。
+ */
+void arch_ipi_send(struct cpu *c)
+{
+    sbi_call3(SBI_EXT_IPI, SBI_IPI_SEND, 1UL, (unsigned long)c->arch_id, 0);
 }

@@ -37,6 +37,9 @@ void spin_unlock_irqrestore(struct spinlock *l, unsigned long flags);
 void spin_lock(struct spinlock *l);
 void spin_unlock(struct spinlock *l);
 
+/* 試著上鎖,不等待:拿到回傳 1,被別人持有回傳 0。呼叫時中斷必須已經關閉 */
+int spin_trylock(struct spinlock *l);
+
 /* 這把鎖是否正由「目前這顆 CPU」持有(斷言用;呼叫時中斷須已關閉) */
 int spin_held(struct spinlock *l);
 

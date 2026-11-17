@@ -173,14 +173,16 @@ void arch_mmu_switch(pte_t *root, unsigned asid, int flush)
 
 void arch_asid_flush(unsigned asid)
 {
-    /* tlbi aside1:清掉這個 ASID 的所有紀錄;參數的 bit 63~48 為 ASID */
-    __asm__ volatile("tlbi aside1, %0\n dsb nsh\n isb" : : "r"((uint64_t)asid << 48));
+    /* tlbi aside1is:清掉這個 ASID 的所有紀錄;參數的 bit 63~48 為 ASID。
+       結尾的 is(inner shareable)表示廣播給所有 CPU;dsb ish 等大家都完成 */
+    __asm__ volatile("tlbi aside1is, %0\n dsb ish\n isb" : : "r"((uint64_t)asid << 48));
 }
 
 void arch_tlb_flush(uintptr_t va)
 {
-    /* tlbi vaae1 的參數是頁號;dsb 等待失效完成,isb 讓後續指令看到結果 */
-    __asm__ volatile("tlbi vaae1, %0\n dsb nsh\n isb" : : "r"((uint64_t)va >> 12));
+    /* tlbi vaae1is 的參數是頁號;is 表示廣播給所有 CPU(每顆 CPU 的 TLB 都清)。
+       dsb ish 等所有 CPU 完成,isb 讓後續指令看到結果 */
+    __asm__ volatile("tlbi vaae1is, %0\n dsb ish\n isb" : : "r"((uint64_t)va >> 12));
 }
 
 void arch_mmu_map_devices(void)

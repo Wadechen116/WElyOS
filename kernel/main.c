@@ -58,6 +58,7 @@ static int cmdline_has(const char *cmd, const char *word)
  *   crash=exec     跳到資料頁執行(不可執行頁 -> page fault;i386 無此保護)
  *   crash=spin     同一顆 CPU 對同一把 spinlock 上鎖兩次(不偵測的話會永遠卡住)
  *   crash=spinsleep 持有 spinlock 時讓出 CPU(規則禁止;排程器應該擋下)
+ *   crash=smp      其他 CPU 都在忙的時候 panic(它們應該被叫停)
  * (crash=stack、crash=thread、crash=relock、crash=spin* 需要排程器,在 sched_demo 之前另外處理)
  */
 static void crash_test(const char *cmd)
@@ -843,6 +844,14 @@ static void fault_worker(void *arg)
     panic("panic inside thread %d (%s)", thread_id(), thread_name());
 }
 
+/* crash=smp 用:永遠忙碌的執行緒 */
+static void spin_forever(void *arg)
+{
+    (void)arg;
+    for (;;)
+        ;
+}
+
 static void sched_crash_test(const char *cmd)
 {
     if (cmdline_has(cmd, "crash=stack")) {
@@ -902,6 +911,71 @@ static void sched_crash_test(const char *cmd)
         (void)spin_lock_irqsave(&l);
         spin_unlock_irqrestore(&l, flags);
     }
+}
+
+/*
+ * 多核心排程的示範與測試(其他 CPU 已加入排程之後執行):
+ *   1. 每顆 CPU 都真的在執行執行緒:建立比 CPU 數更多的忙碌執行緒,
+ *      記錄它們各自在哪些 CPU 上跑過,最後每一顆 CPU 都應該出現過
+ *   2. 執行緒會在 CPU 之間移動(同一條執行緒先後出現在不同的 CPU 上)
+ *   3. kernel 的 mutex 在真正同時執行時仍然正確:多條執行緒同時遞增同一個計數器
+ */
+#define SMP_WORKERS 8
+static volatile unsigned smp_seen[SMP_WORKERS];      /* 每條執行緒跑過的 CPU(位元遮罩) */
+static volatile unsigned long smp_spins[SMP_WORKERS];
+static struct mutex smp_mtx = MUTEX_INIT;
+static volatile unsigned long smp_counter;
+/* 每條執行緒遞增幾次。爭用時每次上鎖都可能睡下去再被叫醒,不宜太多 */
+#define SMP_ADDS 1000u
+
+static void smp_worker(void *arg)
+{
+    unsigned i = (unsigned)(uintptr_t)arg;
+    uint64_t end = timer_ticks() + 30;       /* 忙 30ms */
+
+    while (timer_ticks() < end) {
+        smp_seen[i] |= 1u << sched_cpu_id();
+        smp_spins[i]++;
+    }
+    for (unsigned n = 0; n < SMP_ADDS; n++) {
+        mutex_lock(&smp_mtx);
+        smp_counter++;
+        mutex_unlock(&smp_mtx);
+    }
+}
+
+static void smp_sched_demo(void)
+{
+    int tid[SMP_WORKERS];
+    int ncpu = smp_started();
+
+    if (ncpu == 1) {
+        kprintf("smp: only one cpu, scheduling demo skipped\n");
+        return;
+    }
+    uint64_t t0 = timer_ticks();
+    unsigned long sw0 = sched_switch_count();
+    for (unsigned i = 0; i < SMP_WORKERS; i++)
+        tid[i] = thread_create("smp-worker", smp_worker, (void *)(uintptr_t)i);
+    for (unsigned i = 0; i < SMP_WORKERS; i++)
+        thread_join(tid[i]);
+
+    unsigned all = 0, migrated = 0;
+    unsigned long spins = 0;
+    for (unsigned i = 0; i < SMP_WORKERS; i++) {
+        all |= smp_seen[i];
+        spins += smp_spins[i];
+        if (smp_seen[i] & (smp_seen[i] - 1))         /* 超過一個位元 = 待過不只一顆 CPU */
+            migrated++;
+    }
+    kprintf("smp: %u busy threads on %d cpus for 30 ms: cpus used mask 0x%x, "
+            "%u threads migrated, %lu loop iterations, %lu context switches, %llu ticks\n",
+            SMP_WORKERS, ncpu, all, migrated, spins, sched_switch_count() - sw0,
+            (unsigned long long)(timer_ticks() - t0));
+    kprintf("smp: mutex under real parallelism: counter %lu (expected %lu)\n",
+            smp_counter, (unsigned long)SMP_WORKERS * SMP_ADDS);
+    KASSERT(all == (1u << ncpu) - 1);                /* 每顆 CPU 都執行過執行緒 */
+    KASSERT(smp_counter == (unsigned long)SMP_WORKERS * SMP_ADDS);
 }
 
 /*
@@ -1074,6 +1148,20 @@ void kmain(const struct boot_info *bi)
         sched_demo();
         sync_demo();
         prio_demo();
+    }
+
+    /* 以上的示範檢查的是「單一 CPU 上的排程行為」(誰先執行、誰搶佔誰),
+       所以在其他 CPU 加入之前跑。從這裡起,執行緒會真正同時在多顆 CPU 上執行 */
+    smp_sched_start();
+    if (cmdline_has(bi->cmdline, "crash=smp")) {
+        /* 其他 CPU 正忙的時候 panic:它們應該被叫停,系統乾淨地結束 */
+        for (int i = 0; i < smp_started(); i++)
+            thread_create("spinner", spin_forever, NULL);
+        thread_sleep(5);
+        panic("test panic while %d cpus are busy", smp_started());
+    }
+    if (selftest) {
+        smp_sched_demo();
         user_demo();
     }
     if (cmdline_has(bi->cmdline, "stress"))

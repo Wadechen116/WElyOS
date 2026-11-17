@@ -34,6 +34,7 @@
 #include "pmm.h"
 #include "sched.h"
 #include "smp.h"
+#include "timer.h"
 #include "trap.h"
 #include "vm.h"
 
@@ -41,6 +42,18 @@
 
 /* LAPIC 暫存器(相對於基底的位移) */
 #define LAPIC_ID       0x020                 /* bit 31~24:這顆 CPU 的 LAPIC ID */
+#define LAPIC_TPR      0x080                 /* 優先權門檻;0 = 接受所有中斷 */
+#define LAPIC_EOI      0x0B0                 /* 寫入:通知目前的中斷處理完畢 */
+#define LAPIC_SVR      0x0F0                 /* bit 8:啟用 LAPIC;低 8 位元:假中斷的向量 */
+#define LAPIC_LVT_TMR  0x320                 /* 計時器:向量與模式 */
+#define LAPIC_LVT_LINT0 0x350                /* LINT0 腳位:傳統中斷控制器(PIC)接在這裡 */
+#define LAPIC_TMR_INIT 0x380                 /* 計時器的起始值(寫入即開始倒數) */
+#define LAPIC_TMR_CUR  0x390                 /* 計時器目前的值 */
+#define LAPIC_TMR_DIV  0x3E0                 /* 計時器的除頻 */
+#define LVT_MASKED     0x00010000u
+#define LVT_EXTINT     0x00000700u           /* 傳遞模式:外部中斷(由 PIC 提供向量) */
+#define TMR_PERIODIC   0x00020000u           /* 倒數到 0 後自動重新開始 */
+#define TMR_DIV_16     0x3u
 #define LAPIC_ICR_LO   0x300                 /* 寫入這裡就送出 IPI */
 #define LAPIC_ICR_HI   0x310                 /* bit 31~24:目標的 LAPIC ID */
 #define ICR_INIT       0x00000500u
@@ -57,6 +70,63 @@ uint32_t ap_boot_cr0, ap_boot_cr3, ap_boot_cr4, ap_boot_efer, ap_boot_stack;
 static struct cpu *ap_boot_cpu;              /* 正在啟動的是哪一顆 */
 
 static volatile uint32_t *lapic;             /* LAPIC 暫存器的位址;NULL = 沒找到 */
+static uint32_t lapic_tick_count;            /* LAPIC 計時器倒數多少相當於一個 tick */
+static uint64_t rdtsc64(void)
+{
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+/*
+ * 啟用「目前這顆 CPU」的 LAPIC(每顆 CPU 各有一個,對映在同一個位址)。
+ * 啟用後才能接收一般的處理器間中斷與自己的計時器中斷。
+ *   開機的 CPU:傳統的計時器(PIT)經由 PIC 接在它的 LINT0 腳位,要維持「外部中斷」模式
+ *   其他 CPU  :LINT0 遮蔽掉,PIC 的中斷只由開機的 CPU 處理
+ */
+static void lapic_enable(int bsp)
+{
+    lapic[LAPIC_TPR / 4] = 0;
+    if (bsp) {
+        uint32_t l0 = lapic[LAPIC_LVT_LINT0 / 4];
+        if ((l0 & LVT_MASKED) || (l0 & 0x700) != LVT_EXTINT)
+            lapic[LAPIC_LVT_LINT0 / 4] = LVT_EXTINT;
+    } else {
+        lapic[LAPIC_LVT_LINT0 / 4] = LVT_MASKED;
+    }
+    lapic[LAPIC_SVR / 4] = 0x100 | VEC_SPURIOUS;
+}
+
+/*
+ * 量測 LAPIC 計時器的速度:它的頻率因機器而異,必須用已知的時鐘校正。
+ * 讓它從最大值開始倒數,用 TSC 等一個 tick 的時間,看它少了多少。
+ * (沒有 TSC 時改用系統的 tick 計數,量兩個 tick 取平均)
+ */
+static void lapic_timer_calibrate(void)
+{
+    uint64_t per_tick = arch_tsc_per_tick();
+
+    lapic[LAPIC_LVT_TMR / 4] = LVT_MASKED;
+    lapic[LAPIC_TMR_DIV / 4] = TMR_DIV_16;
+    if (per_tick) {
+        lapic[LAPIC_TMR_INIT / 4] = 0xFFFFFFFFu;
+        uint64_t t0 = rdtsc64();
+        while (rdtsc64() - t0 < per_tick)
+            arch_cpu_relax();
+        lapic_tick_count = 0xFFFFFFFFu - lapic[LAPIC_TMR_CUR / 4];
+    } else {
+        uint64_t t = timer_ticks();
+        while (timer_ticks() == t)
+            arch_cpu_relax();
+        lapic[LAPIC_TMR_INIT / 4] = 0xFFFFFFFFu;
+        while (timer_ticks() < t + 3)
+            arch_cpu_relax();
+        lapic_tick_count = (0xFFFFFFFFu - lapic[LAPIC_TMR_CUR / 4]) / 2;
+    }
+    lapic[LAPIC_TMR_INIT / 4] = 0;           /* 停止 */
+    if (lapic_tick_count == 0)
+        lapic_tick_count = 1;
+}
 static int tramp_mapped;
 
 /* ---- ACPI ---- */
@@ -173,6 +243,8 @@ int arch_smp_discover(const struct boot_info *bi, uint64_t *ids, int max)
     lapic = (volatile uint32_t *)(uintptr_t)base;
     uint32_t self = lapic[LAPIC_ID / 4] >> 24;
     cpus[0].arch_id = self;
+    lapic_enable(1);
+    lapic_timer_calibrate();
 
     for (uint32_t off = 44; off + 2 <= len; ) {
         uint8_t type = madt[off], rlen = madt[off + 1];
@@ -250,6 +322,39 @@ void arch_ap_start(void)
     trap_init_ap(ap_boot_cpu->id);           /* kernel 的 GDT、IDT 與自己的 TSS */
     vm_enable_secondary();                   /* 確認 CR4 / CR3 / CR0 與開機的 CPU 一致 */
     smp_ap_main();
+}
+
+void arch_smp_cpu_init(void)
+{
+    lapic_enable(0);
+}
+
+/* 啟動「目前這顆 AP」的計時器:LAPIC 內建的計時器,週期性地發出向量 48 的中斷。
+   (開機的 CPU 繼續使用 PIT,系統時間由它推進;AP 的計時器只用來算時間片) */
+void arch_timer_init_cpu(void)
+{
+    lapic[LAPIC_TMR_DIV / 4] = TMR_DIV_16;
+    lapic[LAPIC_LVT_TMR / 4] = VEC_LAPIC_TIMER | TMR_PERIODIC;
+    lapic[LAPIC_TMR_INIT / 4] = lapic_tick_count;
+}
+
+/* 發出處理器間中斷:固定向量 49,目標以 LAPIC ID 指定 */
+void arch_ipi_send(struct cpu *c)
+{
+    if (lapic)
+        lapic_ipi((uint32_t)c->arch_id << 24, VEC_IPI);
+}
+
+/* 由 trap_handler 在向量 48、49 時呼叫 */
+void lapic_interrupt(uint32_t vector)
+{
+    sched_irq_enter();
+    if (vector == VEC_LAPIC_TIMER)
+        timer_tick();                        /* 在 AP 上只會扣時間片,不推進系統時間 */
+    else
+        smp_ipi_handler();
+    lapic[LAPIC_EOI / 4] = 0;                /* 回應之後 LAPIC 才會再送下一個 */
+    sched_irq_exit();                        /* 必須在 EOI 之後:這裡可能切換到別的執行緒 */
 }
 
 void arch_smp_park(void)

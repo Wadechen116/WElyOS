@@ -40,6 +40,7 @@
 #include "pmm.h"
 #include "runq.h"
 #include "sched.h"
+#include "smp.h"
 #include "spinlock.h"
 #include "timer.h"
 #include "vm.h"
@@ -160,6 +161,15 @@ static int cpu_running_prio(struct cpu *c)
     return c->current == c->idle ? -1 : c->current->prio;
 }
 
+/* 要求某顆 CPU 重新排程。對象不是自己時,發處理器間中斷讓它立刻處理
+   (否則它要等到自己的下一個計時器 tick 才會發現) */
+static void cpu_resched(struct cpu *c)
+{
+    c->need_resched = 1;
+    if (c != this_cpu())
+        smp_send(c, IPI_RESCHED);
+}
+
 /*
  * 有一條優先權為 prio 的執行緒變成可執行:挑一顆應該讓出來的 CPU,要求它重新排程。
  * 挑「目前執行的優先權最低、而且低於 prio」的那一顆(閒置的最優先);
@@ -182,9 +192,7 @@ static void kick(int prio)
         }
     }
     if (best)
-        best->need_resched = 1;
-    /* 之後(多核心第三段):best 不是自己時,以處理器間中斷(IPI)通知它立刻處理;
-       在那之前,它會在自己的下一個計時器 tick 發現這個旗標 */
+        cpu_resched(best);
 }
 
 /*
@@ -380,15 +388,25 @@ static void thread_struct_free(struct thread *t)
     spin_unlock_irqrestore(&stack_lk, flags);
 }
 
+/* 已結束、但 stack 還沒被回收的執行緒數(在 sched_lk 下增加;回收後以原子操作減少) */
+static volatile unsigned nzombies;
+
 /* 釋放一條已結束的執行緒(它的 stack 與結構本身) */
 static void thread_free(struct thread *t)
 {
     stack_free(t->stack);
     thread_struct_free(t);
+    __atomic_fetch_sub(&nzombies, 1, __ATOMIC_SEQ_CST);
 }
 
 void sched_trim(void)
 {
+    /* 多核心下,thread_join 返回時對方可能還沒被回收:它在另一顆 CPU 上
+       剛宣告結束,stack 要等那顆 CPU 切換到下一條執行緒之後才釋放。
+       呼叫者要的是「所有已結束的執行緒都收乾淨」,所以先等到沒有待回收的為止 */
+    while (__atomic_load_n(&nzombies, __ATOMIC_SEQ_CST) != 0)
+        thread_yield();
+
     for (;;) {
         unsigned long flags = spin_lock_irqsave(&stack_lk);
         char *st = stack_cache;
@@ -554,6 +572,65 @@ void sched_init(void)
     c->current = &main_thread;               /* 從這一刻起排程器算是啟動了 */
 }
 
+/*
+ * 其他 CPU 加入排程時在自己身上呼叫(中斷關閉中)。
+ * 呼叫者目前的執行流程(從啟動一路走到這裡、用的是啟動時配置的 stack)
+ * 直接登記成這顆 CPU 的 idle 執行緒,就像開機流程被登記成 main 執行緒一樣。
+ */
+void sched_init_ap(void)
+{
+    struct thread *t = thread_struct_alloc();
+    if (!t)
+        panic("sched: cannot allocate the idle thread of a secondary cpu");
+
+    unsigned long flags = sched_lock();
+    struct cpu *c = this_cpu();
+    t->id = -1;
+    t->name = "idle";
+    t->state = T_RUNNING;
+    t->prio = t->base_prio = PRIO_MIN;
+    t->inherit_prio = -1;
+    t->stack_lo = c->kstack_limit;
+    t->stack_hi = c->kstack_top;
+    t->cpu = c->id;
+    c->idle = t;
+    c->current = t;
+    c->online = 1;
+    sched_unlock(flags);
+}
+
+void sched_set_cpu_count(int n)
+{
+    unsigned long flags = sched_lock();
+    cpu_count = n;
+    sched_unlock(flags);
+}
+
+/* 目前這顆 CPU 的編號。只是當下的值:返回時執行緒可能已經被移到別顆 CPU */
+int sched_cpu_id(void)
+{
+    unsigned long flags = arch_irq_save();
+    int id = this_cpu()->id;
+    arch_irq_restore(flags);
+    return id;
+}
+
+/*
+ * 某個位址空間即將被釋放:如果這顆 CPU 還載入著它,換回 kernel 的頁表。
+ * 由 vm.c 以跨 CPU 呼叫在每顆 CPU 上執行(中斷關閉中,只動自己這顆的狀態)。
+ * 會發生這種情況是因為「kernel 執行緒沿用上一個行程的頁表」的最佳化:
+ * 行程的最後一條執行緒在別顆 CPU 上結束了,這顆 CPU 的 idle 卻還用著它的頁表。
+ */
+void sched_space_dropped(struct vm_space *vs)
+{
+    struct cpu *c = this_cpu();
+
+    if (c->loaded_space == vs) {
+        vm_space_switch(NULL);
+        c->loaded_space = NULL;
+    }
+}
+
 int thread_create(const char *name, void (*fn)(void *), void *arg)
 {
     return thread_create_prio(name, fn, arg, PRIO_NORMAL);
@@ -667,7 +744,7 @@ static void update_prio(struct thread *t)
         t->prio = prio;                      /* RUNNING / SLEEPING / BLOCKED:改欄位即可 */
         /* 正在執行的執行緒被調低後,若有人比它優先,它所在的 CPU 要讓出 */
         if (t->state == T_RUNNING && rq_highest() > prio)
-            cpus[t->cpu].need_resched = 1;
+            cpu_resched(&cpus[t->cpu]);
     }
 }
 
@@ -785,6 +862,7 @@ void thread_exit(void)
 
     self->state = T_ZOMBIE;
     c->zombie = self;                        /* 由這顆 CPU 上的下一條執行緒回收 */
+    __atomic_fetch_add(&nzombies, 1, __ATOMIC_SEQ_CST);
     nthreads--;
     schedule();
     panic("thread_exit: zombie was scheduled again");
@@ -824,6 +902,10 @@ void sched_tick(void)
     /* 時間片用完:有「優先權不低於自己」的人在等才換人。
        只有較低優先權的在等時不換,它們本來就輪不到 */
     struct thread *t = c->current;
+    /* 閒置中的 CPU:佇列裡(包括別顆 CPU 的)有工作就去拿。平常有工作時會被直接通知,
+       這裡是保險,確保不會有「有人在排隊、卻有 CPU 閒著」的情況持續超過一個 tick */
+    if (t == c->idle && rq_highest() >= 0)
+        c->need_resched = 1;
     if (t != c->idle && t->slice > 0 && --t->slice == 0) {
         /* 靠防飢餓提升上來的執行緒只給一個時間片:用完就讓出,不論別人的優先權高低
            (它此刻是最高優先權,不這樣做的話會反過來霸佔 CPU) */

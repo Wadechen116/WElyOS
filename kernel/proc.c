@@ -132,14 +132,18 @@ static void proc_thread_exit(void)
 {
     struct proc *p = thread_data();
 
+    /* 先放掉位址空間(換回 kernel 頁表),再把自己從行程的執行緒數中扣掉。
+       順序很重要:扣到 0 的那條執行緒會釋放位址空間,而此時其他執行緒可能還在
+       別顆 CPU 上走完結束流程。只要它們都已經不再「屬於」這個位址空間,
+       排程器就不會再替它們載入這份(即將被釋放的)頁表 */
+    thread_set_space(NULL);
+
     unsigned long flags = sched_lock();
     int last = --p->nthreads == 0;
     sched_unlock(flags);
 
     if (last) {
-        /* 自己是最後一條:已經沒有別人在使用這個位址空間,可以在鎖外慢慢釋放。
-           先換回 kernel 頁表,才能釋放自己正在使用的那一份 */
-        thread_set_space(NULL);
+        /* 自己是最後一條:已經沒有執行緒屬於這個位址空間,可以在鎖外釋放 */
         vm_space_destroy(p->space);
 
         flags = sched_lock();

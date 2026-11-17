@@ -8,6 +8,7 @@
 #include "panic.h"
 #include "proc.h"
 #include "sched.h"
+#include "smp.h"
 #include "trap.h"
 
 /* 編譯期檢查:C 結構必須與 trap.S 的版面一致 */
@@ -22,6 +23,7 @@ extern void trap_entry(void);
 #define EXC_ECALL_U      8              /* 使用者模式執行 ecall:系統呼叫 */
 #define SSTATUS_SPP      (1UL << 8)     /* sstatus:被打斷時的模式,0 = 使用者模式 */
 #define IRQ_S_TIMER      5              /* 中斷碼:S-mode 計時器 */
+#define IRQ_S_SOFT       1              /* S-mode 軟體中斷:處理器間中斷 */
 
 /* 例外原因表(RISC-V 特權規範,scause 低位元) */
 static const char *const exc_names[] = {
@@ -44,6 +46,9 @@ void trap_init(void)
 {
     /* 低 2 位元為模式:0 = direct,所有 trap 都跳到同一個位址 */
     __asm__ volatile("csrw stvec, %0" : : "r"((uintptr_t)trap_entry));
+    /* 允許 S-mode 軟體中斷(sie 的 bit 1,SSIE):處理器間中斷走這條線。
+       每顆 hart 都會執行 trap_init,所以每顆都會打開 */
+    __asm__ volatile("csrs sie, %0" : : "r"(2UL));
 }
 
 /* 暫存器名稱,順序與 struct trap_frame 前 31 個欄位相同 */
@@ -77,6 +82,16 @@ void trap_handler(struct trap_frame *tf)
          */
         if ((cause & ~SCAUSE_INTERRUPT) == IRQ_S_TIMER) {
             timer_interrupt();
+            if (from_user)
+                user_return_check();
+            return;
+        }
+        /* S-mode 軟體中斷:別顆 hart 透過 SBI 發來的處理器間中斷(見 smp.c) */
+        if ((cause & ~SCAUSE_INTERRUPT) == IRQ_S_SOFT) {
+            __asm__ volatile("csrc sip, %0" : : "r"(2UL));   /* 清除待處理狀態(SSIP) */
+            sched_irq_enter();
+            smp_ipi_handler();
+            sched_irq_exit();                /* 被要求重新排程的話,在這裡切換 */
             if (from_user)
                 user_return_check();
             return;

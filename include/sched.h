@@ -145,6 +145,12 @@ void  thread_set_blocked_on(void *m);
 void **thread_held_list(struct thread *t);
 int   wq_max_prio(struct wait_queue *wq);
 
+/* ---- 多核心 ---- */
+void sched_init_ap(void);                /* AP 加入排程時在自己身上呼叫(見 sched.c) */
+void sched_set_cpu_count(int n);         /* 設定參與排程的 CPU 數(所有 AP 都登記之後) */
+int  sched_cpu_id(void);                 /* 目前執行在哪一顆 CPU 上(只是當下的值) */
+void sched_space_dropped(struct vm_space *vs);   /* 位址空間即將釋放:這顆 CPU 若還載入著就換掉 */
+
 /* ---- 以下由中斷處理路徑呼叫 ---- */
 
 /* 架構層在中斷處理程式的開頭呼叫:標記「現在在中斷中」 */
