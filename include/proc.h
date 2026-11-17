@@ -28,8 +28,14 @@ int proc_kill(int pid, int code);
 
 /* ---- 以下由各架構的例外處理程式呼叫 ---- */
 
-/* 系統呼叫的進入點:num 為呼叫編號,a0~a2 為參數;回傳值會放回使用者的暫存器 */
-long syscall_dispatch(long num, long a0, long a1, long a2);
+/* 系統呼叫的進入點:num 為呼叫編號,a0~a2 為參數;回傳值會放回使用者的暫存器。
+   tf 指向這次進入 kernel 時存下來的暫存器(fork 要複製它給子行程) */
+long syscall_dispatch(long num, long a0, long a1, long a2, void *tf);
+
+/* 使用者模式發生 page fault 時先呼叫:addr 為出錯的位址,write 表示是不是寫入。
+   回傳 0 表示已經處理好(寫入時複製、stack 成長),讓程式重新執行那條指令即可;
+   回傳 -1 表示是真正的錯誤,呼叫者應以 user_fault 終止行程 */
+int proc_page_fault(uintptr_t addr, int write);
 
 /* 使用者模式發生無法處理的例外:印出原因並終止該行程。不會返回 */
 void user_fault(const char *what, uintptr_t pc, uintptr_t addr) __attribute__((noreturn));
@@ -62,5 +68,6 @@ enum {
     SYS_exec,               /* (path, argv)    目前的行程改為執行 path;成功則不返回 */
     SYS_wait,               /* (pid)           等待行程結束,回傳它的結束碼 */
     SYS_dup2,               /* (oldfd, newfd)  讓 newfd 也指向 oldfd 的那次開啟;回傳 newfd */
+    SYS_fork,               /* ()              複製目前的行程;父行程得到子行程的 pid,子行程得到 0 */
 };
 #endif

@@ -65,6 +65,17 @@ arch_thread_start:
  *   sscratch= 這顆 CPU 的 struct cpu(約定:在使用者模式期間存放它,見 trap.S)
  * 其餘暫存器全部清 0,不把 kernel 內部的數值(可能是位址)洩漏給使用者程式。
  */
+/*
+ * void arch_user_resume_asm(struct trap_frame *tf)      a0
+ * 依 tf 的內容進入使用者模式:把 sp 指向它,接到例外入口的返回路徑。
+ * 那段路徑會還原所有暫存器、換成使用者的 sp 再 sret,和「從一次系統呼叫返回」完全一樣。
+ * 呼叫時中斷必須已關閉。
+ */
+    .global arch_user_resume_asm
+arch_user_resume_asm:
+    mv      sp, a0
+    j       trap_return
+
     .global arch_user_return
 arch_user_return:
     csrw    sepc, a0

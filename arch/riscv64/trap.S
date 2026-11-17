@@ -105,6 +105,11 @@ save_regs:
     mv      a0, sp                    /* 參數:指向 trap frame 的指標 */
     call    trap_handler              /* C 語言處理函式;可修改 frame(例如改 sepc) */
 
+    /* 以下是「依 sp 所指的 trap frame 還原並返回」的共用路徑。
+       fork 出來的子行程也從這裡進入使用者模式(見 switch.S 的 arch_user_resume_asm) */
+    .global trap_return
+trap_return:
+
     /* 還原 CSR:handler 可能調整了 sepc(例如跳過 ebreak) */
     ld      t0, 31*8(sp)
     csrw    sepc, t0

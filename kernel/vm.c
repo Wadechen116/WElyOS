@@ -415,6 +415,165 @@ int vm_space_query(struct vm_space *vs, uintptr_t va, uintptr_t *pa, unsigned *f
     return rc;
 }
 
+int vm_space_map_new(struct vm_space *vs, uintptr_t va, uintptr_t pa, unsigned flags)
+{
+    flags |= VM_USER;
+    if (((va | pa) & (PAGE_SIZE - 1)) || !flags_ok(flags) || !user_range(va))
+        return -1;
+
+    unsigned long irq = spin_lock_irqsave(&vm_lk);
+    pte_t *e = walk(vs->root, va, 0, 1, 0, 1, NULL);
+    int rc = -1;
+    if (e && arch_pte_valid(*e)) {
+        rc = 1;                              /* 別人已經先對映了 */
+    } else if (e) {
+        *e = arch_pte_leaf(pa, flags, 0);
+        if (enabled)
+            arch_tlb_flush(va);
+        rc = 0;
+    }
+    spin_unlock_irqrestore(&vm_lk, irq);
+    return rc;
+}
+
+/* ---- 寫入時複製 ---- */
+
+static unsigned long cow_copies, cow_reuses;
+
+unsigned long vm_cow_copies(void) { return cow_copies; }
+unsigned long vm_cow_reuses(void) { return cow_reuses; }
+
+/* 讓 vs 的轉換紀錄在每一顆 CPU 上失效(跨 CPU 呼叫;中斷關閉、不可上鎖) */
+static void space_flush_fn(void *arg)
+{
+    struct vm_space *vs = arg;
+
+    sched_space_flush(vs);                   /* 這顆 CPU 正載入著它:重新載入並清空 */
+#if MMU_ASID_MAX > 0
+    /* 沒載入的 CPU 也可能留著帶有這個編號的舊紀錄(它之前在這顆 CPU 上執行過) */
+    if (vs->asid != 0 && vs->asid < MMU_ASID_MAX)
+        arch_asid_flush(vs->asid);
+#endif
+}
+
+/* 複製一張表格底下的所有對映到 child(僅用於使用者範圍)。呼叫時持有 vm_lk。
+   base 為這張表格第 0 項對應的虛擬位址 */
+static int fork_table(struct vm_space *child, pte_t *t, int level, uintptr_t base,
+                      unsigned first, unsigned last)
+{
+    uintptr_t span = (uintptr_t)PAGE_SIZE << (level * MMU_BITS);
+
+    for (unsigned i = first; i <= last; i++) {
+        if (!arch_pte_valid(t[i]))
+            continue;
+        uintptr_t va = base + i * span;
+        if (level > 0) {
+            if (fork_table(child, (pte_t *)arch_pte_addr(t[i]), level - 1, va, 0, ENTRIES - 1) != 0)
+                return -1;
+            continue;
+        }
+
+        uintptr_t pa = arch_pte_addr(t[i]);
+        unsigned flags = arch_pte_flags(t[i]);
+
+        if (!(flags & VM_SHARED)) {
+            /* 這一頁從此多一個擁有者。原本可寫的(或已經是 COW 的)頁,
+               在兩邊都變成「唯讀 + COW」:任何一邊寫入都會觸發 page fault */
+            if (flags & (VM_WRITE | VM_COW)) {
+                flags = (flags & ~VM_WRITE) | VM_COW;
+                t[i] = arch_pte_leaf(pa, flags, 0);
+            }
+        }
+        pte_t *e = walk(child->root, va, 0, 1, 0, 1, NULL);
+        if (!e)
+            return -1;                       /* 記憶體不足(配置不出頁表) */
+        if (!(flags & VM_SHARED))
+            pmm_ref((void *)pa);             /* 對映成功才算數:失敗時 child 會被整個釋放 */
+        *e = arch_pte_leaf(pa, flags, 0);
+    }
+    return 0;
+}
+
+struct vm_space *vm_space_fork(struct vm_space *parent)
+{
+    struct vm_space *child = vm_space_create();
+    int top = MMU_LEVELS - 1;
+
+    if (!child)
+        return NULL;
+
+    unsigned long irq = spin_lock_irqsave(&vm_lk);
+    int rc = fork_table(child, parent->root, top, 0,
+                        va_index(USER_BASE, top), va_index(USER_TOP - 1, top));
+    spin_unlock_irqrestore(&vm_lk, irq);
+
+    /* parent 有些頁剛從可寫變成唯讀:它在各顆 CPU 上的舊紀錄(還寫著「可寫」)都要清掉,
+       否則它之後的寫入不會觸發 page fault,兩邊就會改到同一份資料 */
+    unsigned long f = arch_irq_save();
+    space_flush_fn(parent);
+    arch_irq_restore(f);
+    smp_call_others(space_flush_fn, parent);
+
+    if (rc != 0) {
+        vm_space_destroy(child);             /* 已經對映的部分會各自歸還它們的參考 */
+        return NULL;
+    }
+    return child;
+}
+
+int vm_space_fault(struct vm_space *vs, uintptr_t va, int write)
+{
+    if (!write || !user_range(va))
+        return -1;
+    va &= ~(uintptr_t)(PAGE_SIZE - 1);
+
+    unsigned long irq = spin_lock_irqsave(&vm_lk);
+    int level = 0, rc = -1;
+    pte_t *e = walk(vs->root, va, 0, 0, 0, 0, &level);
+
+    if (e && arch_pte_valid(*e) && level == 0) {
+        unsigned flags = arch_pte_flags(*e);
+        uintptr_t pa = arch_pte_addr(*e);
+
+        if (!(flags & VM_USER)) {
+            /* kernel 的頁:不是我們要處理的 */
+        } else if (flags & VM_WRITE) {
+            /* 已經可寫了:同一行程的另一條執行緒剛剛在別顆 CPU 上處理完同一頁。
+               清掉自己這顆的舊紀錄,重試就會成功 */
+            arch_tlb_flush(va);
+            rc = 0;
+        } else if (flags & VM_COW) {
+            unsigned nflags = (flags & ~VM_COW) | VM_WRITE;
+
+            if (pmm_refcount((void *)pa) == 1) {
+                /* 只剩自己在用(其他人都已經複製走或結束了):不必複製,改回可寫即可 */
+                *e = arch_pte_leaf(pa, nflags, 0);
+                cow_reuses++;
+                rc = 0;
+            } else {
+                void *copy = pmm_alloc();
+                if (copy) {
+                    memcpy(copy, (const void *)pa, PAGE_SIZE);
+                    *e = arch_pte_leaf((uintptr_t)copy, nflags, 0);
+                    pmm_free((void *)pa);    /* 放棄原本那一頁的參考;別人還在用,不會被釋放 */
+                    cow_copies++;
+                    rc = 0;
+                }
+                /* 配置失敗:回傳 -1,這個行程會被終止 */
+            }
+            if (rc == 0)
+                tlb_shootdown(va);           /* 同一行程的其他執行緒可能在別顆 CPU 上 */
+        }
+    }
+    spin_unlock_irqrestore(&vm_lk, irq);
+    return rc;
+}
+
+void vm_space_switch_flush(struct vm_space *vs)
+{
+    arch_mmu_switch(vs->root, vs->asid, 1);
+}
+
 void vm_space_switch(struct vm_space *vs)
 {
     if (!vs) {

@@ -70,6 +70,33 @@ static void dump_frame(const struct trap_frame *tf)
     }
 }
 
+size_t arch_frame_size(void)
+{
+    return sizeof(struct trap_frame);
+}
+
+void arch_frame_set_retval(void *tf, long v)
+{
+    ((struct trap_frame *)tf)->a0 = (uint64_t)v;     /* 系統呼叫的回傳值放在 a0 */
+}
+
+void arch_user_resume_asm(struct trap_frame *tf) __attribute__((noreturn));   /* switch.S */
+
+void arch_user_resume(void *tf)
+{
+    arch_irq_disable();                  /* 還原暫存器到 sret 之間不可被中斷 */
+    arch_user_resume_asm(tf);
+}
+
+/* 使用者模式的 page fault 是不是可以處理的那一種(寫入時複製、stack 成長)。
+   可以的話處理掉並回傳 1:返回後 CPU 會重新執行同一條指令,這次就會成功 */
+static int user_page_fault(struct trap_frame *tf, uint64_t cause)
+{
+    if (cause != 12 && cause != 13 && cause != 15)   /* 指令 / 讀取 / 寫入的 page fault */
+        return 0;
+    return proc_page_fault((uintptr_t)tf->stval, cause == 15) == 0;
+}
+
 void trap_handler(struct trap_frame *tf)
 {
     uint64_t cause = tf->scause;
@@ -104,13 +131,18 @@ void trap_handler(struct trap_frame *tf)
     if (cause == EXC_ECALL_U) {
         tf->sepc += 4;
         tf->a0 = (uint64_t)syscall_dispatch((long)tf->a7, (long)tf->a0,
-                                            (long)tf->a1, (long)tf->a2);
+                                            (long)tf->a1, (long)tf->a2, tf);
         user_return_check();
         return;
     }
 
-    /* 使用者程式造成的其他例外:只終止那個行程,kernel 繼續運作 */
+    /* 使用者程式造成的其他例外:先看是不是可以處理的 page fault;
+       不是的話只終止那個行程,kernel 繼續運作 */
     if (from_user) {
+        if (user_page_fault(tf, cause)) {
+            user_return_check();
+            return;
+        }
         const char *uname = "Unknown exception";
         if (cause < sizeof(exc_names) / sizeof(exc_names[0]) && exc_names[cause])
             uname = exc_names[cause];

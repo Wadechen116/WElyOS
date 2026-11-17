@@ -37,11 +37,12 @@
 - [x] 行程:多個使用者程式(`/bin/init`、`echo`、`cat`、`ls`)、`main(argc, argv)` 參數、`spawn` / `wait` / `exec` 系統呼叫、建立行程時繼承檔案描述符(可重新導向輸出);相同程式的行程共用程式碼頁,正在執行的程式檔不可修改
 - [x] 主控台輸入(序列埠,含行編輯:退格、Ctrl-C、Ctrl-D)與 shell(`/bin/sh`):執行 `/bin` 下的程式、`>` / `>>` 重新導向、引號、script 檔;另有 `mkdir`、`rm`;`dup2` 系統呼叫。不帶 `autoexit` 開機時直接進入 shell
 - [x] 三個架構相同的 WElyOS 文字開機標誌(由 kernel 印出;RISC-V 使用拿掉自身標誌的 OpenSBI)
+- [x] 可恢復的 page fault:寫入時複製(copy-on-write,每頁有參考計數)、`fork` 系統呼叫、使用者 stack 自動成長(每條最多 1MB)
 
 ## 規劃中
 
 - [ ] 多核心(Symmetric Multiprocessing,SMP)效能:縮小排程器的大鎖、喚醒時考慮上次執行的 CPU、mutex 先自旋再睡
-- [ ] 寫入時複製(copy-on-write)、需求分頁與 `fork`;管線;中斷驅動的輸入;磁碟驅動與磁碟上的檔案系統
+- [ ] 管線;中斷驅動的輸入;行程的父子關係與訊號;磁碟驅動與磁碟上的檔案系統
 
 ## 需求
 

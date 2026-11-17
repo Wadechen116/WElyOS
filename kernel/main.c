@@ -216,7 +216,7 @@ static volatile uint64_t spin_deadline;
 
 /* 每條執行緒記錄兩個數字:
      iters  迴圈跑了幾圈(看得出它有在執行)
-     ticks  它執行期間,系統時間前進了幾次(= 它實際得到多少毫秒的 CPU)
+     ticks  排程器記在它頭上的 CPU 時間(tick 數;和時間片用的是同一份記帳)
    公平性看的是 ticks。iters 不能拿來比:同樣的時間能跑幾圈,在模擬器上會受
    「這條執行緒的 stack 剛好配置在哪一頁」影響到好幾倍(見 DEVLOG 第 21 步) */
 struct spin_stat {
@@ -227,15 +227,11 @@ struct spin_stat {
 static void spin_worker(void *arg)
 {
     struct spin_stat *st = arg;
-    uint64_t last = timer_ticks(), now;
+    unsigned long t0 = thread_cpu_ticks();
 
-    while ((now = timer_ticks()) < spin_deadline) {
+    while (timer_ticks() < spin_deadline)
         st->iters++;
-        if (now != last) {
-            st->ticks++;
-            last = now;
-        }
-    }
+    st->ticks = thread_cpu_ticks() - t0;
 }
 
 /* 示範 3:休眠。各自睡不同長度,醒來的順序應該依時間而不是建立順序 */
@@ -861,6 +857,7 @@ enum {
     UMODE_HELLO = 0, UMODE_READ_KERNEL, UMODE_WRITE_TEXT, UMODE_PRIVILEGED, UMODE_NULL,
     UMODE_BAD_POINTER, UMODE_SPIN, UMODE_STACK, UMODE_ISOLATION, UMODE_BAD_SYSCALL,
     UMODE_FUTEX, UMODE_FS, UMODE_PROC, UMODE_EXEC, UMODE_EXEC_THREADS,
+    UMODE_FORK, UMODE_STACK_GROW,
 };
 
 /* 以測試編號 mode 啟動 /bin/init:編號轉成字串,當作 argv[1] 傳給它 */
@@ -915,7 +912,17 @@ static void user_demo(void)
     run_user("spawn, wait, arguments, redirection", UMODE_PROC, 12);
     /* exec:行程把自己換成 /bin/echo。結束碼來自 echo(3 個參數),不是原本的程式 */
     run_user("exec replaces the program", UMODE_EXEC, 3);
-    run_user("exec with a second thread is refused", UMODE_EXEC_THREADS, 13);
+    run_user("exec and fork with a second thread are refused", UMODE_EXEC_THREADS, 13);
+
+    /* fork:複製行程。記憶體以寫入時複製的方式共用,所以順便看複製了幾頁 */
+    {
+        unsigned long c0 = vm_cow_copies(), r0 = vm_cow_reuses();
+        run_user("fork (copy-on-write)", UMODE_FORK, 14);
+        kprintf("user: copy-on-write during that test: %lu pages copied, %lu times a page "
+                "was reused without copying\n", vm_cow_copies() - c0, vm_cow_reuses() - r0);
+    }
+    /* stack 自動成長:用掉約 180KB 的 stack(一開始只配置 16KB) */
+    run_user("stack grows on demand", UMODE_STACK_GROW, 15);
 
     /* shell 執行一份 script:建立目錄、重新導向輸出到檔案、找不到的命令、最後 exit 7。
        除了結束碼,也檢查它留下的檔案內容 */

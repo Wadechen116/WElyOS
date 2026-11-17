@@ -72,6 +72,7 @@ struct ustart {
 };
 
 static void fd_close_all(struct proc *p);
+static int proc_fault(struct proc *p, uintptr_t addr, int write);
 
 static struct proc *proc_find(int pid)
 {
@@ -661,6 +662,51 @@ void user_return_check(void)
 /* ------------------------------------------------------------------ */
 
 /*
+ * 處理一個「也許可以解決」的 page fault。回傳 0 表示已經解決,重試那次存取就會成功。
+ * 能解決的有兩種:
+ *
+ * 1. 寫入時複製:寫入一個 fork 之後和別的行程共用的頁(見 vm_space_fault)。
+ *
+ * 2. stack 自動成長:每條執行緒的 stack 佔一格 1MB 的位址範圍,但一開始只配置
+ *    最上面的 16KB。往下用到還沒配置的部分時,當場配置一頁(內容為 0)。
+ *    大多數程式用不到 16KB,不必為它們預先配置;用得多的程式也不會因此被終止。
+ *    每格最下面的一頁永遠不配置(保護頁):stack 真的用完整格時會在那裡出錯,
+ *    而不是悄悄長進下一條執行緒的 stack。
+ *
+ * 其他情況(存取沒有對映的位址、寫入唯讀的頁)回傳 -1,呼叫者會終止行程。
+ */
+static int proc_fault(struct proc *p, uintptr_t addr, int write)
+{
+    if (write && vm_space_fault(p->space, addr, 1) == 0)
+        return 0;
+
+    uintptr_t lowest = USER_STACK_TOP - (uintptr_t)PROC_MAX_THREADS * USER_STACK_SLOT;
+    if (addr < lowest || addr >= USER_STACK_TOP)
+        return -1;
+    unsigned slot = (unsigned)((USER_STACK_TOP - 1 - addr) / USER_STACK_SLOT);
+    uintptr_t slot_base = USER_STACK_TOP - (uintptr_t)(slot + 1) * USER_STACK_SLOT;
+    uintptr_t page = addr & ~(uintptr_t)(PAGE_SIZE - 1);
+    if (slot >= p->nstacks || page == slot_base)     /* 沒有這條 stack,或碰到保護頁 */
+        return -1;
+
+    void *mem = pmm_alloc();
+    if (!mem)
+        return -1;
+    memset(mem, 0, PAGE_SIZE);
+    int rc = vm_space_map_new(p->space, page, (uintptr_t)mem, VM_READ | VM_WRITE);
+    if (rc != 0)
+        pmm_free(mem);       /* 1 = 同一行程的另一條執行緒搶先配置了同一頁:用它的 */
+    return rc < 0 ? -1 : 0;
+}
+
+int proc_page_fault(uintptr_t addr, int write)
+{
+    struct proc *p = thread_data();
+
+    return p ? proc_fault(p, addr, write) : -1;
+}
+
+/*
  * 把使用者位址 [uaddr, uaddr+len) 的內容複製到 kernel 緩衝區 dst。
  * 逐頁透過行程的頁表查出實體位址,並確認該頁是使用者可存取的;
  * 任何一頁不合格就回傳 -1。不直接解參考使用者的指標。
@@ -671,7 +717,10 @@ static int copy_from_user(struct proc *p, void *dst, uintptr_t uaddr, size_t len
 
     while (len > 0) {
         uintptr_t pa;
-        if (vm_space_query(p->space, uaddr, &pa, NULL) != 0)
+        /* 查不到對映時,先看是不是「用到才配置」的頁(還沒碰過的 stack);
+           是的話配置後再查一次 */
+        if (vm_space_query(p->space, uaddr, &pa, NULL) != 0 &&
+            (proc_fault(p, uaddr, 0) != 0 || vm_space_query(p->space, uaddr, &pa, NULL) != 0))
             return -1;
         size_t n = PAGE_SIZE - (uaddr & (PAGE_SIZE - 1));    /* 這一頁剩下的長度 */
         if (n > len)
@@ -693,8 +742,14 @@ static int copy_to_user(struct proc *p, uintptr_t uaddr, const void *src, size_t
     while (len > 0) {
         uintptr_t pa;
         unsigned flags;
-        if (vm_space_query(p->space, uaddr, &pa, &flags) != 0 || !(flags & VM_WRITE))
-            return -1;
+        if (vm_space_query(p->space, uaddr, &pa, &flags) != 0 || !(flags & VM_WRITE)) {
+            /* kernel 是經由實體位址寫入的,不會像使用者程式那樣觸發 page fault,
+               所以要自己做同樣的事:這一頁若是寫入時複製的(或還沒配置的 stack),
+               先處理好再寫。否則會寫進和別的行程共用的那一頁 */
+            if (proc_fault(p, uaddr, 1) != 0 ||
+                vm_space_query(p->space, uaddr, &pa, &flags) != 0 || !(flags & VM_WRITE))
+                return -1;
+        }
         size_t n = PAGE_SIZE - (uaddr & (PAGE_SIZE - 1));
         if (n > len)
             n = len;
@@ -969,6 +1024,109 @@ static long sys_exec(struct proc *p, uintptr_t upath, uintptr_t uargv)
     arch_enter_user(img.entry, img.usp, img.argp);
 }
 
+/* fork 出來的子行程的第一條(也是唯一一條)執行緒在 kernel 這一側的起點 */
+struct fork_start {
+    struct proc *p;
+    void *frame;                     /* 父行程呼叫 fork 時的暫存器(回傳值已改成 0) */
+};
+
+static void fork_child_main(void *arg)
+{
+    struct fork_start st = *(struct fork_start *)arg;
+    /* trap frame 要放在自己的 kernel stack 上才能用來返回(見 arch_user_resume)。
+       大小依架構而定,這裡取一個夠大的上限 */
+    _Alignas(16) char frame[512];
+
+    kfree(arg);
+    thread_set_data(st.p);
+    thread_set_space(st.p->space);
+    memcpy(frame, st.frame, arch_frame_size());
+    kfree(st.frame);
+
+    unsigned long flags = sched_lock();      /* 和 user_thread_main 相同的檢查 */
+    int dying = st.p->exiting;
+    sched_unlock(flags);
+    if (dying || thread_killed())
+        proc_thread_exit();
+
+    /* 從父行程呼叫 fork 的那個地方「返回」,只是回傳值是 0 */
+    arch_user_resume(frame);
+}
+
+/*
+ * fork:複製目前的行程。新行程(子行程)和原本的(父行程)在這一刻完全相同 —
+ * 同樣的記憶體內容、同樣的開啟中檔案、執行到同一個地方 — 唯一的差別是
+ * fork 的回傳值:父行程得到子行程的編號,子行程得到 0。
+ *
+ * 記憶體不是真的複製:兩邊先共用所有的頁,誰寫入才複製那一頁(寫入時複製)。
+ * 所以 fork 的成本只和「頁表有多大」有關,和行程用了多少記憶體無關;
+ * fork 之後馬上 exec 的常見用法,幾乎沒有複製任何資料。
+ */
+static long sys_fork(struct proc *p, void *tf)
+{
+    if (arch_frame_size() > 512)
+        return -E_INVAL;
+
+    /* 只有一條執行緒時才允許:其他執行緒可能正在寫入即將被改成唯讀的頁,
+       而且子行程裡只會有呼叫 fork 的這一條,其他執行緒持有的鎖在那邊永遠解不開 */
+    unsigned long flags = sched_lock();
+    int single = p->nthreads == 1;
+    sched_unlock(flags);
+    if (!single)
+        return -E_BUSY;
+
+    struct proc *c = kzalloc(sizeof(*c));
+    struct fork_start *st = kmalloc(sizeof(*st));
+    void *frame = kmalloc(arch_frame_size());
+    if (!c || !st || !frame)
+        goto nomem;
+    c->space = vm_space_fork(p->space);
+    if (!c->space)
+        goto nomem;
+
+    memcpy(frame, tf, arch_frame_size());
+    arch_frame_set_retval(frame, 0);         /* 子行程看到的回傳值 */
+    st->p = c;
+    st->frame = frame;
+
+    memcpy(c->name, p->name, sizeof(c->name));
+    c->exe = vfs_dup(p->exe);
+    vfs_exec_hold(c->exe);                   /* 子行程也在執行同一個程式檔 */
+    c->nstacks = p->nstacks;
+    fd_inherit(c, p);
+
+    flags = sched_lock();
+    int pid = c->pid = next_pid++;
+    c->next = procs;
+    procs = c;
+    c->nthreads = 1;
+    sched_unlock(flags);
+
+    if (thread_create(c->name, fork_child_main, st) < 0) {
+        /* 沒有任何執行緒:直接當作已結束,讓 wait 回收 */
+        kfree(st);
+        kfree(frame);
+        vm_space_destroy(c->space);
+        vfs_exec_release(c->exe);
+        vfs_close(c->exe);
+        fd_close_all(c);
+        flags = sched_lock();
+        c->space = NULL;
+        c->nthreads = 0;
+        c->exit_code = PROC_KILLED_FAULT;
+        c->zombie = 1;
+        wq_wake_all(&c->waiters);
+        sched_unlock(flags);
+    }
+    return pid;
+
+nomem:
+    kfree(c);
+    kfree(st);
+    kfree(frame);
+    return -E_NOMEM;
+}
+
 /*
  * futex(fast userspace mutex)的 kernel 這一半。
  *
@@ -1020,7 +1178,7 @@ static long sys_futex_wake(struct proc *p, uintptr_t uaddr)
     return n;
 }
 
-long syscall_dispatch(long num, long a0, long a1, long a2)
+long syscall_dispatch(long num, long a0, long a1, long a2, void *tf)
 {
     struct proc *p = thread_data();
 
@@ -1066,6 +1224,8 @@ long syscall_dispatch(long num, long a0, long a1, long a2)
         return sys_spawn(p, (uintptr_t)a0, (uintptr_t)a1);
     case SYS_exec:
         return sys_exec(p, (uintptr_t)a0, (uintptr_t)a1);
+    case SYS_fork:
+        return sys_fork(p, tf);
     case SYS_wait:
         if (a0 == p->pid)
             return -E_INVAL;         /* 等自己結束會永遠等下去 */

@@ -69,11 +69,28 @@ isr_common:
     push    %esp                  /* 參數:指向 trap frame 的指標 */
     call    trap_handler          /* 可修改 frame(例如調整 eip、放入系統呼叫的回傳值) */
     add     $4, %esp              /* 丟掉參數 */
+
+    /* 以下是「依 esp 所指的 trap frame 還原並返回」的共用路徑。
+       fork 出來的子行程也從這裡進入使用者模式(見 arch_user_resume_asm) */
+    .global trap_return
+trap_return:
     pop     %es
     pop     %ds
     popa                          /* 還原一般暫存器 */
     add     $8, %esp              /* 丟掉 vector 與 err */
     iret                          /* 彈出 eip、cs、eflags(回 ring 3 時還有 esp、ss) */
+
+/*
+ * void arch_user_resume_asm(struct trap_frame *tf)
+ * 依 tf 的內容進入使用者模式:把 esp 指向它,接到上面的返回路徑,
+ * 和「從一次系統呼叫返回」完全一樣。呼叫時中斷必須已關閉。
+ * 下次從使用者模式進入 kernel 時,CPU 會從 TSS 的 esp0(stack 頂端)重新開始,
+ * 所以 tf 放在 stack 的哪裡都可以。
+ */
+    .global arch_user_resume_asm
+arch_user_resume_asm:
+    mov     4(%esp), %esp
+    jmp     trap_return
 
 /*
  * void arch_enter_user(uintptr_t entry, uintptr_t usp, uintptr_t arg)

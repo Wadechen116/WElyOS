@@ -32,6 +32,7 @@
 #define PTE_A  0x40UL
 #define PTE_D  0x80UL
 #define PTE_SW_SHARED 0x100UL             /* bit 8:保留給軟體使用(RSW),硬體忽略 */
+#define PTE_SW_COW    0x200UL             /* bit 9:同上 */
 #define PTE_PPN_SHIFT 10
 #define SATP_SV39 (8UL << 60)
 
@@ -52,6 +53,8 @@ pte_t arch_pte_leaf(uintptr_t pa, unsigned flags, int level)
         e |= PTE_G;                          /* kernel 的頁:所有位址空間共用 TLB 紀錄 */
     if (flags & VM_SHARED)
         e |= PTE_SW_SHARED;
+    if (flags & VM_COW)
+        e |= PTE_SW_COW;
     return e;
 }
 
@@ -81,7 +84,8 @@ uintptr_t arch_pte_addr(pte_t e)
 unsigned arch_pte_flags(pte_t e)
 {
     return VM_READ | ((e & PTE_W) ? VM_WRITE : 0) | ((e & PTE_X) ? VM_EXEC : 0) |
-           ((e & PTE_U) ? VM_USER : 0) | ((e & PTE_SW_SHARED) ? VM_SHARED : 0);
+           ((e & PTE_U) ? VM_USER : 0) | ((e & PTE_SW_SHARED) ? VM_SHARED : 0) |
+           ((e & PTE_SW_COW) ? VM_COW : 0);
 }
 
 void arch_mmu_enable(pte_t *root)

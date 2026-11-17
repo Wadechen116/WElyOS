@@ -19,7 +19,7 @@ enum {
     SYS_write = 1, SYS_exit, SYS_getpid, SYS_yield, SYS_sleep,
     SYS_thread_create, SYS_thread_exit, SYS_gettid, SYS_futex_wait, SYS_futex_wake,
     SYS_open, SYS_close, SYS_read, SYS_readdir, SYS_mkdir, SYS_unlink, SYS_stat,
-    SYS_spawn, SYS_exec, SYS_wait, SYS_dup2,
+    SYS_spawn, SYS_exec, SYS_wait, SYS_dup2, SYS_fork,
 };
 
 /* 檔案相關的定義,必須與 kernel 的 include/fs.h 一致 */
@@ -117,6 +117,8 @@ static inline long sys_exec(const char *path, char **argv)
     return syscall3(SYS_exec, (long)path, (long)argv, 0);
 }
 static inline long sys_wait(long pid)             { return syscall3(SYS_wait, pid, 0, 0); }
+/* 複製目前的行程。回傳值:在原本的行程裡是新行程的 pid,在新行程裡是 0 */
+static inline long sys_fork(void)                 { return syscall3(SYS_fork, 0, 0, 0); }
 static inline long sys_futex_wait(volatile int *addr, int val)
 {
     return syscall3(SYS_futex_wait, (long)addr, val, 0);

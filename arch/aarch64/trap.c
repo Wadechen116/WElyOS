@@ -59,6 +59,29 @@ static void dump_frame(const struct trap_frame *tf)
     kprintf("  sp =0x%016llx\n", (unsigned long long)tf->sp);
 }
 
+_Static_assert(sizeof(struct trap_frame) == 304, "trap_frame size (see trap.S, switch.S)");
+
+size_t arch_frame_size(void)
+{
+    return sizeof(struct trap_frame);
+}
+
+void arch_frame_set_retval(void *tf, long v)
+{
+    ((struct trap_frame *)tf)->x[0] = (uint64_t)v;   /* 系統呼叫的回傳值放在 x0 */
+}
+
+void arch_user_resume_asm(struct trap_frame *tf, uintptr_t ktop) __attribute__((noreturn));
+
+void arch_user_resume(void *tf)
+{
+    uintptr_t lo, hi;
+
+    arch_irq_disable();                  /* 還原暫存器到 eret 之間不可被中斷 */
+    sched_stack_bounds(&lo, &hi);
+    arch_user_resume_asm(tf, hi);
+}
+
 void trap_handler(struct trap_frame *tf, uint64_t kind)
 {
     uint64_t ec = ESR_EC(tf->esr);
@@ -86,14 +109,22 @@ void trap_handler(struct trap_frame *tf, uint64_t kind)
        svc 的 ELR 已經指向下一條指令,不需要調整 */
     if (from_user && ec == EC_SVC) {
         tf->x[0] = (uint64_t)syscall_dispatch((long)tf->x[8], (long)tf->x[0],
-                                              (long)tf->x[1], (long)tf->x[2]);
+                                              (long)tf->x[1], (long)tf->x[2], tf);
         user_return_check();
         return;
     }
 
-    /* 使用者程式造成的其他例外:只終止那個行程,kernel 繼續運作 */
-    if (from_user)
+    /* 使用者程式造成的其他例外:先看是不是可以處理的 page fault(寫入時複製、stack 成長)。
+       EC 0x24 = 資料存取、0x20 = 指令擷取;ESR 的 bit 6(WnR)為 1 表示是寫入。
+       處理成功就返回,CPU 會重新執行同一條指令。否則只終止那個行程 */
+    if (from_user) {
+        if ((ec == 0x24 || ec == 0x20) &&
+            proc_page_fault((uintptr_t)tf->far, ec == 0x24 && (tf->esr & (1u << 6))) == 0) {
+            user_return_check();
+            return;
+        }
         user_fault(ec_name(ec), tf->elr, tf->far);
+    }
 
     /* 可恢復的例外:brk。ELR 指向 brk 本身,跳過它(固定 4 位元組)後繼續 */
     if (ec == EC_BRK) {

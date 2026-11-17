@@ -47,6 +47,10 @@ int thread_create_prio(const char *name, void (*fn)(void *), void *arg, int prio
 void thread_set_priority(int prio);
 int  thread_priority(void);
 
+/* 目前的執行緒累計使用了多少 CPU 時間(以 tick 計:每個計時器 tick 記在當時正在執行的
+   那條執行緒頭上)。這是排程器自己的記帳,和時間片用的是同一個依據 */
+unsigned long thread_cpu_ticks(void);
+
 /* 等待編號為 tid 的執行緒結束。若它已經結束(或不存在)則立即返回。
    等待期間本執行緒不佔 CPU,由對方結束時直接喚醒 */
 void thread_join(int tid);
@@ -150,6 +154,7 @@ void sched_init_ap(void);                /* AP 加入排程時在自己身上呼
 void sched_set_cpu_count(int n);         /* 設定參與排程的 CPU 數(所有 AP 都登記之後) */
 int  sched_cpu_id(void);                 /* 目前執行在哪一顆 CPU 上(只是當下的值) */
 void sched_space_dropped(struct vm_space *vs);   /* 位址空間即將釋放:這顆 CPU 若還載入著就換掉 */
+void sched_space_flush(struct vm_space *vs);     /* 位址空間的對映大量更改:這顆 CPU 若載入著就清空 TLB */
 
 /* ---- 以下由中斷處理路徑呼叫 ---- */
 

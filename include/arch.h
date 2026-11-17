@@ -56,6 +56,21 @@ void *arch_stack_init(void *top, void (*entry)(void));
  *       stack pointer 為 usp,並把 arg 當作第一個參數。不會返回;
  *       之後只會經由系統呼叫、中斷或例外回到 kernel。
  */
+/*
+ * fork 用:tf 指向「這條執行緒從使用者模式進入 kernel 時存下來的暫存器」(trap frame)。
+ * 它的格式各架構不同,所以 kernel 的其他部分只把它當成一塊不透明的資料:
+ *   arch_frame_size()            這塊資料有多大
+ *   arch_frame_set_retval(tf, v) 設定「系統呼叫的回傳值」那個暫存器
+ *   arch_user_resume(tf)         依 tf 的內容還原所有暫存器並進入使用者模式,不會返回。
+ *                                tf 必須位於目前執行緒的 kernel stack 上
+ * 子行程就是這樣「從父行程呼叫 fork 的同一個地方」繼續執行的:
+ * 複製一份父行程的 trap frame,把回傳值改成 0,然後 arch_user_resume。
+ */
+#include <stddef.h>
+size_t arch_frame_size(void);
+void arch_frame_set_retval(void *tf, long v);
+void arch_user_resume(void *tf) __attribute__((noreturn));
+
 void arch_set_kstack(uintptr_t top);
 void arch_enter_user(uintptr_t entry, uintptr_t usp, uintptr_t arg) __attribute__((noreturn));
 

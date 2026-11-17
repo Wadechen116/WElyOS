@@ -25,6 +25,9 @@
 #define VM_SHARED  0x20u       /* 這一頁不屬於這個位址空間(例如和檔案共用的程式碼頁):
                                   位址空間釋放時只移除對映,不釋放實體頁。
                                   記在頁表項目中保留給軟體使用的位元裡,硬體會忽略它 */
+#define VM_COW     0x40u       /* 寫入時複製(copy-on-write):這一頁目前和別的位址空間共用,
+                                  對映成唯讀;有人寫入時才複製出自己的一份(見 vm_space_fault)。
+                                  同樣記在軟體使用的位元裡 */
 
 /* 建立 kernel 頁表並開啟分頁。需先完成 pmm_init() */
 void vm_init(const struct boot_info *bi);
@@ -76,6 +79,32 @@ int vm_space_query(struct vm_space *vs, uintptr_t va, uintptr_t *pa, unsigned *f
 
 /* 讓 CPU 改用這個位址空間;傳 NULL 表示回到 kernel 自己的頁表 */
 void vm_space_switch(struct vm_space *vs);
+
+/*
+ * ---- 寫入時複製(copy-on-write)與 fork ----
+ *
+ * vm_space_fork:建立 parent 的複本。不真的複製任何一頁的內容:兩邊的頁表指向
+ *     同一批實體頁,原本可寫的頁在「兩邊」都改成唯讀並標記 VM_COW。
+ *     之後誰先寫入,誰就在那一刻複製出自己的一份(由 vm_space_fault 處理)。
+ *     從來沒被寫入的頁永遠共用,省下複製的時間與記憶體。
+ *     與檔案共用的程式碼頁(VM_SHARED)照樣共用。失敗回傳 NULL。
+ *
+ * vm_space_fault:使用者程式存取 va 時發生了 page fault,write 表示是不是寫入。
+ *     如果原因是「寫入一個 VM_COW 的頁」,就在這裡解決(複製,或確認只剩自己在用後
+ *     直接改回可寫),回傳 0,呼叫者讓使用者程式重新執行那條指令即可。
+ *     回傳 -1 表示不是這種情況(真正的存取違規),或記憶體不足。
+ *
+ * vm_space_map_new:同 vm_space_map,但 va 已經有對映時不覆蓋,回傳 1。
+ *     用於「用到才配置」的頁:兩條執行緒可能同時為同一頁發生 page fault。
+ */
+struct vm_space *vm_space_fork(struct vm_space *parent);
+int vm_space_fault(struct vm_space *vs, uintptr_t va, int write);
+int vm_space_map_new(struct vm_space *vs, uintptr_t va, uintptr_t pa, unsigned flags);
+void vm_space_switch_flush(struct vm_space *vs);   /* 重新載入 vs 並清掉它在這顆 CPU 上的 TLB 紀錄 */
+
+/* 統計(測試用):寫入時複製真的複製了幾頁、有幾次因為只剩自己在用而免於複製 */
+unsigned long vm_cow_copies(void);
+unsigned long vm_cow_reuses(void);
 
 /* 其他 CPU 啟動時呼叫:在「目前這顆 CPU」上載入 kernel 頁表並開啟分頁。
    頁表本身全系統共用,但開啟分頁、功能位元這些設定是每顆 CPU 各自的 */

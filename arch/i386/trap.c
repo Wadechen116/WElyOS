@@ -309,6 +309,24 @@ static void double_fault_handler(void)
     panic_halt();
 }
 
+size_t arch_frame_size(void)
+{
+    return sizeof(struct trap_frame);
+}
+
+void arch_frame_set_retval(void *tf, long v)
+{
+    ((struct trap_frame *)tf)->eax = (uint32_t)v;    /* 系統呼叫的回傳值放在 eax */
+}
+
+void arch_user_resume_asm(struct trap_frame *tf) __attribute__((noreturn));   /* trap.S */
+
+void arch_user_resume(void *tf)
+{
+    arch_irq_disable();                  /* 還原暫存器到 iret 之間不可被中斷 */
+    arch_user_resume_asm(tf);
+}
+
 void trap_handler(struct trap_frame *tf)
 {
     /*
@@ -338,7 +356,7 @@ void trap_handler(struct trap_frame *tf)
     /* 系統呼叫:編號在 eax,參數在 ebx、ecx、edx,回傳值放回 eax */
     if (tf->vector == 0x80) {
         tf->eax = (uint32_t)syscall_dispatch((long)tf->eax, (long)tf->ebx,
-                                             (long)tf->ecx, (long)tf->edx);
+                                             (long)tf->ecx, (long)tf->edx, tf);
         user_return_check();
         return;
     }
@@ -359,8 +377,15 @@ void trap_handler(struct trap_frame *tf)
     /* 使用者程式造成的例外:只終止那個行程,kernel 繼續運作 */
     if (from_user) {
         uint32_t addr = 0;
-        if (tf->vector == VEC_PAGE_FAULT)
+        if (tf->vector == VEC_PAGE_FAULT) {
             __asm__ volatile("mov %%cr2, %0" : "=r"(addr));
+            /* 先看是不是可以處理的 page fault(寫入時複製、stack 成長)。
+               錯誤碼的 bit 1 為 1 表示是寫入。處理成功就返回,CPU 會重新執行同一條指令 */
+            if (proc_page_fault(addr, (tf->err & 2) != 0) == 0) {
+                user_return_check();
+                return;
+            }
+        }
         user_fault(name, tf->eip, addr);
     }
 

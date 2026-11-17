@@ -121,6 +121,11 @@ trap_common:
     mov     x0, sp                    /* 參數 1:trap frame 指標 */
     bl      trap_handler              /* 可修改 frame(例如調整 elr 跳過指令) */
 
+    /* 以下是「依 sp 所指的 trap frame 還原並返回」的共用路徑。
+       fork 出來的子行程也從這裡進入使用者模式(見 arch_user_resume_asm) */
+    .global trap_return
+trap_return:
+
     /* 還原返回位址與處理器狀態(handler 可能改了 elr) */
     ldp     x2, x3, [sp, #256]
     msr     elr_el1, x2

@@ -21,7 +21,17 @@ void pmm_init(const struct boot_info *bi);
 void *pmm_alloc(void);
 void *pmm_alloc_pages(size_t n);
 
-/* 釋放先前配置的 1 頁 / 連續 n 頁。位址不合法或重複釋放會 panic */
+/*
+ * 每一頁有一個參考計數:有幾個「擁有者」。配置時為 1。
+ * 一頁可以被多個位址空間共用(fork 之後的寫入時複製):每多一個使用者就 pmm_ref 一次,
+ * 每個使用者不再需要時各自 pmm_free 一次,計數降到 0 才真的還給系統。
+ * 所以對只有一個擁有者的頁(絕大多數情況),pmm_free 的行為和以前完全一樣。
+ */
+void pmm_ref(void *page);              /* 多一個擁有者 */
+unsigned pmm_refcount(void *page);     /* 目前有幾個擁有者 */
+
+/* 放棄先前配置的 1 頁 / 連續 n 頁(每頁的參考計數減一,降到 0 才釋放)。
+   位址不合法,或對已經沒有擁有者的頁再放棄一次(重複釋放),會 panic */
 void pmm_free(void *page);
 void pmm_free_pages(void *page, size_t n);
 

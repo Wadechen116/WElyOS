@@ -51,6 +51,29 @@ arch_thread_start:
  * 並把 SP_EL1 重設為 kernel stack 頂端:之後從 EL0 進入例外時就從這裡開始用。
  * 其餘暫存器全部清 0,不把 kernel 內部的數值(可能是位址)洩漏給使用者程式。
  */
+/*
+ * void arch_user_resume_asm(struct trap_frame *tf, uintptr_t ktop)      x0, x1
+ * 依 tf 的內容進入使用者模式。
+ *
+ * AArch64 從使用者模式進入例外時,kernel stack 從「上次離開時的 SP_EL1」開始用,
+ * 所以 trap frame 必須擺在 kernel stack 的最頂端,返回後 SP_EL1 才會回到頂端。
+ * 先把 tf 搬到 [ktop - 304, ktop),再接到例外入口的返回路徑。
+ * tf 本身也在這條 stack 上、位置比較低,兩塊可能重疊,所以「從尾端往前」搬
+ * (目的地在比較高的位址時,這個方向不會蓋掉還沒搬的部分)。
+ * 搬的過程會蓋掉呼叫者的 stack 內容,但我們不會再返回,不需要它們了。
+ * 呼叫時中斷必須已關閉。
+ */
+    .global arch_user_resume_asm
+arch_user_resume_asm:
+    mov     x2, #304                  /* FRAME_SIZE(見 trap.S) */
+1:  sub     x2, x2, #8
+    ldr     x3, [x0, x2]
+    sub     x4, x1, #304
+    str     x3, [x4, x2]
+    cbnz    x2, 1b
+    sub     sp, x1, #304
+    b       trap_return
+
     .global arch_user_return
 arch_user_return:
     msr     elr_el1, x0

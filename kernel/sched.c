@@ -77,6 +77,7 @@ struct thread {
     void *blocked_on;          /* 正在等待的 mutex(優先權繼承沿著它傳遞) */
     void *held;                /* 持有的 mutex 串列(由 sync.c 維護) */
     unsigned slice;            /* 剩餘的時間片(tick 數) */
+    unsigned long cpu_ticks;   /* 累計被記了多少個 tick 的 CPU 時間 */
     uint64_t wake_tick;        /* T_SLEEPING:到這個 tick 就喚醒 */
     struct thread *next;       /* 串在休眠串列或某個等待佇列中(同時只會在一個) */
     struct rq_node rq;         /* 在執行佇列中的節點(由 runq 的實作使用,見 runq.h) */
@@ -631,6 +632,14 @@ void sched_space_dropped(struct vm_space *vs)
     }
 }
 
+/* 某個位址空間的對映被大量更改(fork 把頁改成唯讀):這顆 CPU 若正載入著它,
+   重新載入並清空它的轉換紀錄。由 vm.c 以跨 CPU 呼叫在每顆 CPU 上執行 */
+void sched_space_flush(struct vm_space *vs)
+{
+    if (this_cpu()->loaded_space == vs)
+        vm_space_switch_flush(vs);
+}
+
 int thread_create(const char *name, void (*fn)(void *), void *arg)
 {
     return thread_create_prio(name, fn, arg, PRIO_NORMAL);
@@ -758,6 +767,12 @@ void thread_set_priority(int prio)
     update_prio(cur());
     sched_preempt_point();
     sched_unlock(flags);
+}
+
+unsigned long thread_cpu_ticks(void)
+{
+    struct thread *t = thread_current();
+    return t ? t->cpu_ticks : 0;
 }
 
 int thread_priority(void)
@@ -902,6 +917,7 @@ void sched_tick(void)
     /* 時間片用完:有「優先權不低於自己」的人在等才換人。
        只有較低優先權的在等時不換,它們本來就輪不到 */
     struct thread *t = c->current;
+    t->cpu_ticks++;                          /* 這個 tick 算在正在執行的執行緒頭上 */
     /* 閒置中的 CPU:佇列裡(包括別顆 CPU 的)有工作就去拿。平常有工作時會被直接通知,
        這裡是保險,確保不會有「有人在排隊、卻有 CPU 閒著」的情況持續超過一個 tick */
     if (t == c->idle && rq_highest() >= 0)

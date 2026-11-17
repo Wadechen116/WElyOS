@@ -28,6 +28,7 @@ static struct spinlock pmm_lk = SPINLOCK_INIT("pmm");
 extern char __kernel_start[], __kernel_end[];
 
 static uint8_t  *bitmap;      /* 位元圖本身(放在 kernel 映像之後) */
+static uint16_t *refs;        /* 每頁的參考計數(緊接在位元圖之後);0 = 空閒 */
 static uintptr_t mem_start;   /* 第 0 頁的實體位址 */
 static size_t    npages;      /* 管理的總頁數 */
 static size_t    nfree;       /* 目前空閒頁數 */
@@ -61,7 +62,10 @@ void pmm_init(const struct boot_info *bi)
 
     mem_start = (uintptr_t)start;
     npages    = (size_t)((end - start) >> PAGE_SHIFT);
-    size_t bm_bytes = (npages + 7) / 8;
+    size_t bitmap_bytes = (npages + 7) / 8;
+    /* 位元圖之後緊接著每頁 2 位元組的參考計數。以下的 bm_bytes 是兩者合計的大小 */
+    size_t refs_off = (bitmap_bytes + 7) & ~(size_t)7;
+    size_t bm_bytes = refs_off + npages * sizeof(uint16_t);
 
     /*
      * 決定位元圖放哪裡:從 kernel 映像結尾開始找,避開 bootloader
@@ -78,10 +82,12 @@ void pmm_init(const struct boot_info *bi)
     if (bm < start || bm + bm_bytes > end)
         panic("pmm: no room for bitmap");
     bitmap = (uint8_t *)(uintptr_t)bm;
+    refs = (uint16_t *)(uintptr_t)(bm + refs_off);
 
     /* 先全部標成使用中,再把確定可用的頁逐一放出來。
        這樣即使漏判,結果是「少用幾頁」而不是「把別人的資料配置出去」 */
-    memset(bitmap, 0xFF, bm_bytes);
+    memset(bitmap, 0xFF, bitmap_bytes);
+    memset(refs, 0, npages * sizeof(uint16_t));
     nfree = 0;
     hint  = npages;
     for (size_t i = 0; i < npages; i++) {
@@ -122,6 +128,11 @@ void *pmm_alloc_pages(size_t n)
 {
     unsigned long flags = spin_lock_irqsave(&pmm_lk);
     void *p = alloc_pages_locked(n);
+    if (p) {
+        size_t first = ((uintptr_t)p - mem_start) >> PAGE_SHIFT;
+        for (size_t i = first; i < first + n; i++)
+            refs[i] = 1;                       /* 剛配置:一個擁有者 */
+    }
     spin_unlock_irqrestore(&pmm_lk, flags);
     return p;
 }
@@ -186,15 +197,49 @@ void pmm_free_pages(void *page, size_t n)
         panic("pmm: free out of range %p (%zu pages)", page, n);
 
     for (size_t i = first; i < first + n; i++) {
-        if (!bit_test(i))
+        if (!bit_test(i) || refs[i] == 0)
             panic("pmm: double free of page %p",
                   (void *)(mem_start + ((uintptr_t)i << PAGE_SHIFT)));
+        if (--refs[i] > 0)
+            continue;                          /* 還有別的擁有者:這一頁繼續存在 */
         bit_clear(i);
+        nfree++;
+        if (i < hint)
+            hint = i;
     }
-    nfree += n;
-    if (first < hint)
-        hint = first;
     spin_unlock_irqrestore(&pmm_lk, flags);
+}
+
+/* 位址轉成頁號;不是「配置中的頁」就 panic */
+static size_t page_index(void *page, const char *who)
+{
+    uintptr_t addr = (uintptr_t)page;
+
+    if (addr % PAGE_SIZE != 0 || addr < mem_start ||
+        ((addr - mem_start) >> PAGE_SHIFT) >= npages)
+        panic("pmm: %s of invalid address %p", who, page);
+    return (addr - mem_start) >> PAGE_SHIFT;
+}
+
+void pmm_ref(void *page)
+{
+    unsigned long flags = spin_lock_irqsave(&pmm_lk);
+    size_t i = page_index(page, "ref");
+
+    if (refs[i] == 0)
+        panic("pmm: ref of a free page %p", page);
+    if (refs[i] == UINT16_MAX)
+        panic("pmm: reference count overflow on page %p", page);
+    refs[i]++;
+    spin_unlock_irqrestore(&pmm_lk, flags);
+}
+
+unsigned pmm_refcount(void *page)
+{
+    unsigned long flags = spin_lock_irqsave(&pmm_lk);
+    unsigned n = refs[page_index(page, "refcount")];
+    spin_unlock_irqrestore(&pmm_lk, flags);
+    return n;
 }
 
 void pmm_free(void *page)
