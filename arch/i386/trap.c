@@ -6,11 +6,12 @@
 #include "arch.h"
 #include "kprintf.h"
 #include "panic.h"
+#include "proc.h"
 #include "sched.h"
 #include "trap.h"
 
-_Static_assert(sizeof(struct trap_frame) == 13 * 4, "trap_frame size");
-_Static_assert(offsetof(struct trap_frame, eip) == 10 * 4, "trap_frame eip");
+_Static_assert(sizeof(struct trap_frame) == 17 * 4, "trap_frame size");
+_Static_assert(offsetof(struct trap_frame, eip) == 12 * 4, "trap_frame eip");
 
 /* ------------------------------------------------------------------ */
 /* GDT(全域描述符表)                                                  */
@@ -42,7 +43,10 @@ struct desc_ptr {
 #define TSS_MAIN  0x18     /* GDT 第 3 項:平常使用的 TSS */
 #define TSS_DF    0x20     /* GDT 第 4 項:double fault 專用的 TSS */
 
-static struct gdt_entry gdt[5];
+#define USER_CS   0x2B     /* GDT 第 5 項 | RPL 3:使用者程式碼區段 */
+#define USER_DS   0x33     /* GDT 第 6 項 | RPL 3:使用者資料區段 */
+
+static struct gdt_entry gdt[7];
 static struct desc_ptr gdt_ptr;
 
 extern void gdt_flush(const struct desc_ptr *p);
@@ -123,6 +127,12 @@ static void tss_init(void)
     gdt_set_tss(4, &df_tss);
 }
 
+/* 由使用者模式進入 kernel 時,CPU 從 TSS 的 esp0 取得 kernel stack 的位置 */
+void arch_set_kstack(uintptr_t top)
+{
+    main_tss.esp0 = (uint32_t)top;
+}
+
 /* 工作切換時 CPU 也會載入 TSS 裡的 CR3;必須是有效的頁表,否則立刻 triple fault */
 void trap_set_page_table(uint32_t cr3)
 {
@@ -136,6 +146,10 @@ static void gdt_init(void)
     gdt_set(1, 0x9A);          /* 存在、ring 0、程式碼、可執行可讀 */
     gdt_set(2, 0x92);          /* 存在、ring 0、資料、可讀寫 */
     tss_init();                /* 填入第 3、4 項(TSS) */
+    /* 使用者模式的區段:同樣是平坦的 0~4GB,差別只在權限等級(DPL)為 3。
+       記憶體的保護不靠區段,而是靠分頁的 U/S 位元 */
+    gdt_set(5, 0xFA);          /* 存在、ring 3、程式碼、可執行可讀 */
+    gdt_set(6, 0xF2);          /* 存在、ring 3、資料、可讀寫 */
     gdt_ptr.limit = sizeof(gdt) - 1;
     gdt_ptr.base  = (uint32_t)gdt;
     gdt_flush(&gdt_ptr);
@@ -179,6 +193,16 @@ static void idt_init(void)
     idt[8].zero        = 0;
     idt[8].type_attr   = 0x85;
     idt[8].offset_high = 0;
+
+    /* 向量 0x80(系統呼叫):類型 0xEE = 存在、DPL 3、32 位元中斷閘。
+       DPL 3 表示允許 ring 3 用 int 指令觸發;其他向量的 DPL 是 0,
+       使用者程式若執行 int $14 之類想偽造例外,CPU 會改發 #GP */
+    extern void isr128(void);
+    idt[0x80].offset_low  = (uint16_t)((uint32_t)isr128 & 0xFFFF);
+    idt[0x80].selector    = KERNEL_CS;
+    idt[0x80].zero        = 0;
+    idt[0x80].type_attr   = 0xEE;
+    idt[0x80].offset_high = (uint16_t)((uint32_t)isr128 >> 16);
 
     idt_ptr.limit = sizeof(idt) - 1;
     idt_ptr.base  = (uint32_t)idt;
@@ -244,8 +268,20 @@ void trap_handler(struct trap_frame *tf)
      * 處理完直接返回。中斷閘進入時 CPU 已自動關閉中斷(清 IF),
      * iret 還原 eflags 時會重新開啟。
      */
+    int from_user = (tf->cs & 3) == 3;       /* cs 的低 2 位元 = 被打斷時的權限等級 */
+
     if (tf->vector >= 32 && tf->vector < 48) {
         irq_handler(tf->vector - 32);
+        if (from_user)
+            user_return_check();
+        return;
+    }
+
+    /* 系統呼叫:編號在 eax,參數在 ebx、ecx、edx,回傳值放回 eax */
+    if (tf->vector == 0x80) {
+        tf->eax = (uint32_t)syscall_dispatch((long)tf->eax, (long)tf->ebx,
+                                             (long)tf->ecx, (long)tf->edx);
+        user_return_check();
         return;
     }
 
@@ -261,6 +297,14 @@ void trap_handler(struct trap_frame *tf)
     const char *name = "Unknown";
     if (tf->vector < 32 && exc_names[tf->vector])
         name = exc_names[tf->vector];
+
+    /* 使用者程式造成的例外:只終止那個行程,kernel 繼續運作 */
+    if (from_user) {
+        uint32_t addr = 0;
+        if (tf->vector == VEC_PAGE_FAULT)
+            __asm__ volatile("mov %%cr2, %0" : "=r"(addr));
+        user_fault(name, tf->eip, addr);
+    }
 
     if (tf->vector == VEC_PAGE_FAULT) {
         /* esp 還在有效範圍、但存取落到保護頁的情況(例如超大的區域陣列) */

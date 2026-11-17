@@ -15,8 +15,14 @@
  *   slot 0..30 : x0..x30
  *   slot 31    : 被打斷時的 sp
  *   slot 32..35: elr、spsr、esr、far
+ *   slot 36    : sp_el0(使用者模式的 stack pointer);slot 37 為對齊用的空位
+ *
+ * AArch64 的每個例外等級有自己的 stack pointer:EL0(使用者)用 SP_EL0,
+ * EL1(kernel)用 SP_EL1。從 EL0 進入例外時硬體自動改用 SP_EL1,
+ * 所以不需要像 x86(TSS)或 RISC-V(sscratch)那樣自己安排換 stack。
+ * 只要記得把 SP_EL0 當作被打斷程式的一部分存起來、返回前還原即可。
  */
-#define FRAME_SIZE 288
+#define FRAME_SIZE 304
 
 /*
  * 每個向量入口空間有限(0x80 = 32 條指令)。
@@ -101,6 +107,8 @@ trap_common:
     mrs     x2, esr_el1
     mrs     x3, far_el1
     stp     x2, x3, [sp, #272]
+    mrs     x2, sp_el0
+    str     x2, [sp, #288]
 
     mov     x1, x0                    /* 參數 2:向量種類編號 */
     mov     x0, sp                    /* 參數 1:trap frame 指標 */
@@ -110,6 +118,11 @@ trap_common:
     ldp     x2, x3, [sp, #256]
     msr     elr_el1, x2
     msr     spsr_el1, x3
+    ldr     x2, [sp, #288]
+    msr     sp_el0, x2
+    /* TPIDRRO_EL0 被入口借來暫放 x1,而它在 EL0 是可讀的。
+       清掉它,避免把上一次例外時的暫存器內容洩漏給使用者程式 */
+    msr     tpidrro_el0, xzr
 
     ldp     x0, x1, [sp, #0]
     ldp     x2, x3, [sp, #16]

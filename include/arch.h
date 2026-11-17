@@ -47,6 +47,18 @@ void arch_switch(void **old_sp, void *new_sp);
 void *arch_stack_init(void *top, void (*entry)(void));
 
 /*
+ * 使用者模式。
+ *   arch_set_kstack(top):告訴架構層「目前執行緒的 kernel stack 頂端」。從使用者模式
+ *       進入 kernel(系統呼叫、中斷、例外)時,CPU 必須換到 kernel stack,
+ *       不能繼續用使用者的 stack(那是不可信任的)。排程器每次切換時呼叫。
+ *   arch_enter_user(entry, usp, arg):降到使用者模式,從 entry 開始執行,
+ *       stack pointer 為 usp,並把 arg 當作第一個參數。不會返回;
+ *       之後只會經由系統呼叫、中斷或例外回到 kernel。
+ */
+void arch_set_kstack(uintptr_t top);
+void arch_enter_user(uintptr_t entry, uintptr_t usp, uintptr_t arg) __attribute__((noreturn));
+
+/*
  * 沿著 frame pointer 鏈印出呼叫堆疊(需以 -fno-omit-frame-pointer 編譯)。
  *   pc: 發生例外的位址,非 0 時當作第 0 層印出;傳 0 則略過
  *   fp: 起始的 frame pointer

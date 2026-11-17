@@ -41,3 +41,25 @@ arch_switch:
 arch_thread_start:
     mov     x30, xzr
     br      x19
+
+/*
+ * void arch_user_return(entry, usp, arg, ktop)      x0, x1, x2, x3
+ * 第一次進入使用者模式。做法是偽造成「從 EL0 的例外返回」:
+ *   ELR_EL1  = 進入點(eret 會跳到這裡)
+ *   SPSR_EL1 = 0:模式 EL0t,DAIF 全為 0(開中斷)
+ *   SP_EL0   = 使用者的 stack pointer
+ * 並把 SP_EL1 重設為 kernel stack 頂端:之後從 EL0 進入例外時就從這裡開始用。
+ * 其餘暫存器全部清 0,不把 kernel 內部的數值(可能是位址)洩漏給使用者程式。
+ */
+    .global arch_user_return
+arch_user_return:
+    msr     elr_el1, x0
+    msr     spsr_el1, xzr
+    msr     sp_el0, x1
+    msr     tpidrro_el0, xzr
+    mov     sp, x3
+    mov     x0, x2                    /* 第一個參數 */
+    .irp    n, 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30
+    mov     x\n, xzr
+    .endr
+    eret

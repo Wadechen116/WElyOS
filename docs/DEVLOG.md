@@ -2,12 +2,113 @@
 
 逐步記錄每個步驟「做了什麼、為什麼這樣做、如何驗證」。每新增功能就追加一節。
 
+## 名詞對照
+
+本文件出現的專業名詞與縮寫。內文中每個縮寫第一次出現時也會在括號內附上英文全名。
+
+### 縮寫
+
+| 縮寫 | 英文全名 | 中文 |
+|---|---|---|
+| ASID | Address Space Identifier | 位址空間編號 |
+| BSS | Block Started by Symbol | 未初始化資料區段 |
+| CFS | Completely Fair Scheduler | 完全公平排程器 |
+| CSR | Control and Status Register | 控制與狀態暫存器 |
+| DTB | Device Tree Blob | 裝置樹二進位檔 |
+| EEVDF | Earliest Eligible Virtual Deadline First | 最早合格虛擬截止時間優先 |
+| EFER | Extended Feature Enable Register | 延伸功能啟用暫存器 |
+| ELF | Executable and Linkable Format | 可執行與可連結格式 |
+| EOI | End Of Interrupt | 中斷結束通知 |
+| FDT | Flattened Device Tree | 扁平化裝置樹 |
+| GDB | GNU Debugger | GNU 除錯器 |
+| GDT | Global Descriptor Table | 全域描述符表 |
+| GIC | Generic Interrupt Controller | 通用中斷控制器 |
+| IDT | Interrupt Descriptor Table | 中斷描述符表 |
+| IPI | Inter-Processor Interrupt | 處理器間中斷 |
+| IRQ | Interrupt Request | 中斷請求 |
+| ISR | Interrupt Service Routine | 中斷服務常式 |
+| LAPIC | Local Advanced Programmable Interrupt Controller | 本地進階可程式化中斷控制器 |
+| MLFQ | Multi-Level Feedback Queue | 多層回饋佇列 |
+| MMIO | Memory-Mapped I/O | 記憶體對映輸入輸出 |
+| MMU | Memory Management Unit | 記憶體管理單元 |
+| MSR | Model-Specific Register | 型號特定暫存器 |
+| NX | No-eXecute | 禁止執行位元 |
+| OpenSBI | Open Source Supervisor Binary Interface | RISC-V 的開源 SBI 韌體 |
+| PAE | Physical Address Extension | 實體位址延伸 |
+| PAN | Privileged Access Never | 特權永不存取 |
+| PCID | Process-Context Identifier | 行程上下文識別碼 |
+| PDPT | Page Directory Pointer Table | 頁目錄指標表 |
+| PIC | Programmable Interrupt Controller | 可程式化中斷控制器 |
+| PIT | Programmable Interval Timer | 可程式化間隔計時器 |
+| PL011 | ARM PrimeCell UART (PL011) | ARM 的序列埠控制器 |
+| PMM | Physical Memory Manager | 實體記憶體管理員 |
+| PSCI | Power State Coordination Interface | 電源狀態協調介面 |
+| PTE | Page Table Entry | 頁表項目 |
+| PXN | Privileged eXecute Never | 特權不可執行 |
+| QEMU | Quick Emulator | 快速模擬器 |
+| SBI | Supervisor Binary Interface | 管理者二進位介面 |
+| SMAP | Supervisor Mode Access Prevention | 管理者模式存取保護 |
+| SMEP | Supervisor Mode Execution Prevention | 管理者模式執行保護 |
+| SMP | Symmetric Multiprocessing | 對稱多處理 |
+| TLB | Translation Lookaside Buffer | 轉譯後備緩衝區 |
+| TSC | Time Stamp Counter | 時間戳計數器 |
+| TSS | Task State Segment | 工作狀態區段 |
+| UART | Universal Asynchronous Receiver-Transmitter | 通用非同步收發器 |
+| UXN | Unprivileged eXecute Never | 非特權不可執行 |
+| VGA | Video Graphics Array | 視訊圖形陣列 |
+| W^X | Write XOR Execute | 可寫與可執行互斥 |
+
+### 其他用語
+
+| 用語 | 英文 | 說明 |
+|---|---|---|
+| aging | aging | 老化:等越久優先權越高,用來防止飢餓 |
+| backtrace | backtrace | 呼叫堆疊回溯 |
+| bitmap | bitmap | 位元圖 |
+| break-before-make | break-before-make | ARM 修改頁表的規定:先失效再寫入 |
+| callee-saved | callee-saved registers | 被呼叫者保存的暫存器 |
+| coalescing | coalescing | 合併相鄰的空閒區塊 |
+| context switch | context switch | 上下文切換:換到另一條執行緒執行 |
+| deadlock | deadlock | 死結:互相等待而永遠無法前進 |
+| double fault | double fault | 雙重錯誤:處理例外的過程中又發生例外 |
+| first-fit | first-fit | 最先適合:取第一個夠大的空閒區塊 |
+| frame pointer | frame pointer | 框架指標 |
+| freestanding | freestanding | 獨立環境:不依賴作業系統與標準函式庫 |
+| futex | Fast Userspace Mutex | 快速使用者空間互斥鎖 |
+| guard page | guard page | 保護頁:刻意不對映、用來偵測越界的頁 |
+| heap | heap | 堆積:動態配置記憶體的區域 |
+| identity mapping | identity mapping | 恆等對映:虛擬位址等於實體位址 |
+| large page | large page / huge page | 大分頁:一個項目對映 2MB 或 4MB |
+| linker script | linker script | 連結器腳本:決定各區段的位址 |
+| lost wakeup | lost wakeup | 遺失的喚醒:喚醒發生在睡下去之前 |
+| multiboot | Multiboot Specification | x86 的開機載入規範 |
+| mutex | mutual exclusion lock | 互斥鎖 |
+| page fault | page fault | 分頁錯誤:存取的頁沒有對映或權限不符 |
+| priority inheritance | priority inheritance | 優先權繼承 |
+| priority inversion | priority inversion | 優先權反轉 |
+| race condition | race condition | 競爭條件:結果取決於執行順序 |
+| round-robin | round-robin | 輪流排程 |
+| semaphore | semaphore | 號誌 |
+| semihosting | semihosting | 半主機:由模擬器或除錯器代為執行 I/O |
+| spinlock | spinlock | 自旋鎖:拿不到鎖時原地反覆嘗試 |
+| stack | stack | 堆疊:函式呼叫使用的記憶體 |
+| starvation | starvation | 飢餓:執行緒長期得不到 CPU |
+| system call | system call (syscall) | 系統呼叫 |
+| task gate | task gate | 工作閘:觸發硬體工作切換的 IDT 項目 |
+| tickless | tickless | 無固定 tick:沒事時不產生計時器中斷 |
+| TLB shootdown | TLB shootdown | 通知其他 CPU 讓 TLB 紀錄失效 |
+| trap | trap | 例外與中斷的統稱(RISC-V 用語) |
+| trap frame | trap frame | 進入例外時存放暫存器的結構 |
+| wait queue | wait queue | 等待佇列 |
+
+---
+
 ## 環境
 
 - 開發環境:Windows 11 + WSL2 (Ubuntu),NAT 網路模式
 - 編譯器:WSL 內的 gcc(`-m32 -ffreestanding`),不需另外安裝交叉編譯器
 - 建置:CMake ≥ 3.20 + make
-- 模擬器:Windows 版 QEMU(`C:\Program Files\qemu\qemu-system-i386.exe`),由 WSL 呼叫
+- 模擬器:Windows 版 QEMU(Quick Emulator,`C:\Program Files\qemu\qemu-system-i386.exe`),由 WSL 呼叫
 - 目標架構:i386(32 位元保護模式),以 multiboot v1 由 QEMU `-kernel` 直接載入
 - 語言標準:C11(`CMAKE_C_EXTENSIONS OFF`),freestanding,不連結任何標準庫
 
@@ -29,7 +130,7 @@
 
 **重點概念**
 
-1. QEMU 在 ELF 內找到 multiboot 魔術數 `0x1BADB002`,把 kernel 載入 1MB 並跳到 `_start`。此時 CPU 已在 32 位元保護模式。
+1. QEMU 在 ELF(Executable and Linkable Format) 內找到 multiboot 魔術數 `0x1BADB002`,把 kernel 載入 1MB 並跳到 `_start`。此時 CPU 已在 32 位元保護模式。
 2. C 需要 stack,所以 `boot.S` 先設定 `esp` 才呼叫 `kmain`。
 3. 沒有 libc,輸出直接對 I/O port 寫入;寫入前輪詢 `COM1+5` 的 bit 5,等傳送緩衝區空。
 4. 旗標 `-ffreestanding -nostdlib -fno-pic -fno-stack-protector` 避免編譯器假設有 OS 或 libc。
@@ -40,7 +141,7 @@
 
 ## 第 2 步:`run` 與 `debug` target
 
-**目標**:一個指令建置並啟動;另有可接 GDB 的除錯模式。
+**目標**:一個指令建置並啟動;另有可接 GDB(GNU Debugger) 的除錯模式。
 
 **做法**
 
@@ -102,7 +203,7 @@ ptr=0x00000000 kmain=0x0010005a pct=100%
 
 **目標**:畫面也能顯示輸出;kernel 能讀取 bootloader 傳入的資訊。
 
-**VGA 文字模式**(`kernel/vga.c`、`include/vga.h`)
+**VGA(Video Graphics Array) 文字模式**(`kernel/vga.c`、`include/vga.h`)
 
 - 顯示記憶體映射在 `0xB8000`,80×25,每格 16 位元:低位元組是字元,高位元組是屬性(高 4 位背景、低 4 位前景)。
 - `vga_putc` 處理 `\n \r \b \t`,到行尾自動換行,到螢幕底自動捲動(整體上移一列、清空最後一列)。
@@ -164,7 +265,7 @@ lib/string.c          memcpy/memmove/memset/memcmp/strlen/strcmp/strncmp
 arch/<名稱>/          boot.S、linker.ld、start.c、arch.c、arch.cmake(+ i386 的 serial/vga)
 ```
 
-流程:`boot.S` → `arch_start()`(各架構的 `start.c`,把 multiboot 或 DTB 轉成 `boot_info`)→ `kmain()`。
+流程:`boot.S` → `arch_start()`(各架構的 `start.c`,把 multiboot 或 DTB(Device Tree Blob) 轉成 `boot_info`)→ `kmain()`。
 
 **三種架構的差異**
 
@@ -179,10 +280,10 @@ arch/<名稱>/          boot.S、linker.ld、start.c、arch.c、arch.cmake(+ i38
 
 **重點與踩坑**
 
-- **MMIO vs port I/O**:x86 用 `in/out` 存取獨立的 I/O 位址空間;RISC-V、AArch64 的週邊映射在記憶體位址,用 `volatile` 指標存取。
-- **AArch64 `-mstrict-align`**:MMU 關閉時記憶體為 Device 類型,未對齊存取會觸發例外;`-mgeneral-regs-only` 避免編譯器用到尚未啟用的 FP/SIMD。
+- **MMIO(Memory-Mapped I/O) vs port I/O**:x86 用 `in/out` 存取獨立的 I/O 位址空間;RISC-V、AArch64 的週邊映射在記憶體位址,用 `volatile` 指標存取。
+- **AArch64 `-mstrict-align`**:MMU(Memory Management Unit) 關閉時記憶體為 Device 類型,未對齊存取會觸發例外;`-mgeneral-regs-only` 避免編譯器用到尚未啟用的 FP/SIMD。
 - **RISC-V `-mno-relax`**:連結器的 gp 相對最佳化需要先設定 `gp` 暫存器,目前不做。
-- **BSS**:RISC-V、AArch64 的 `boot.S` 自行清 BSS(linker script 提供 `__bss_start/__bss_end`)。
+- **BSS(Block Started by Symbol)**:RISC-V、AArch64 的 `boot.S` 自行清 BSS(linker script 提供 `__bss_start/__bss_end`)。
 - **多核心**:非 0 號核心在 `boot.S` 直接休眠。
 - **裝置樹**:`fdt.c` 以位元組組合讀取大端整數(避免未對齊存取),只取 `/chosen/bootargs` 與 `/memory` 的第一組 `reg`。
 - **i386 無 libgcc**:32 位元的 libgcc 未安裝,64 位元 `/`、`%` 會缺 `__udivdi3`。`kprintf` 的十進位轉換改用位移-相減的 `udivmod()`。
@@ -294,7 +395,7 @@ cmake --build build/riscv64 --target gdb
 決定過程:
 
 1. **起點由 `linker.ld` 手動指定**,依硬體與韌體的約定:
-   - RISC-V:OpenSBI 佔用 `0x80000000` 起的空間,約定 S-mode kernel 載入於 `0x80200000`。
+   - RISC-V:OpenSBI(Open Source Supervisor Binary Interface) 佔用 `0x80000000` 起的空間,約定 S-mode kernel 載入於 `0x80200000`。
    - AArch64:`virt` 的 RAM 自 `0x40000000` 起,慣例保留前 `0x80000`(給 DTB 等),kernel 放在 `0x40080000`。
 2. **`.text` 內的順序**由 linker script 與連結順序決定:先放 `*(.text.boot)`(`boot.S`,確保 `_start` 在最前),再依 CMake 中列出的檔案順序放 `*(.text*)`:`boot.S` → `start.c` → `arch.c` → `main.c` → `kprintf.c` → `fdt.c` → `string.c`。
 3. **每個函式位址 = 起點 + 它前面所有程式碼的大小**。因此:
@@ -398,7 +499,7 @@ CPU 遇到例外(非法指令、存取錯誤、`ebreak`…)或中斷時,**硬體
 ```
 
 - **跳過 ebreak**:`sepc` 指向 `ebreak` 本身,不調整會無限重複。指令長度看低 2 位元:`11` 為 4 位元組,否則為 2 位元組壓縮指令(`ebreak` 有 2 位元組的 `c.ebreak` 版本)。
-- `handler` 修改 frame 內的 `sepc`,`trap.S` 返回前才寫回 CSR,所以可以改變返回位置。
+- `handler` 修改 frame 內的 `sepc`,`trap.S` 返回前才寫回 CSR(Control and Status Register),所以可以改變返回位置。
 
 ### 常見 scause 值
 
@@ -461,7 +562,7 @@ bash scripts/backtrace.sh riscv64 build/riscv64/welyos.elf < log.txt
 
 - **把架構專屬指令寫進共用程式碼**:一度在 `kernel/main.c` 直接寫 RISC-V 的 `ebreak`,i386 組譯失敗。改成 `arch_test_breakpoint()`、`arch_test_illegal()`,由各架構實作。
 - **檢查建置結果要看結束碼**:我的 `grep error` 只比對小寫,漏掉組譯器的 `Error:`,導致 i386 / AArch64 用舊的執行檔測試,看起來「沒有 panic」。教訓:以 `cmake --build ...; echo rc=$?` 確認建置成功,且比對 `kmain=` 位址是否變動。
-- **AArch64 失敗碼**:PSCI `SYSTEM_OFF` 無法帶結束碼,panic 會被誤判為成功(rc=0)。失敗時改用 semihosting `SYS_EXIT`(`hlt #0xf000`,`qemu.sh` 為 aarch64 加 `-semihosting`),成功仍用 PSCI。
+- **AArch64 失敗碼**:PSCI(Power State Coordination Interface) `SYSTEM_OFF` 無法帶結束碼,panic 會被誤判為成功(rc=0)。失敗時改用 semihosting `SYS_EXIT`(`hlt #0xf000`,`qemu.sh` 為 aarch64 加 `-semihosting`),成功仍用 PSCI。
 - **i386 的結束碼**:`isa-debug-exit` 寫入 N 得到 `(N<<1)|1`,成功為 1(腳本轉成 0)、panic 為 3。
 
 ---
@@ -482,7 +583,7 @@ bash scripts/backtrace.sh riscv64 build/riscv64/welyos.elf < log.txt
 | 0x600 | 較低 EL,AArch32 | 同上 |
 
 - **sync**:由指令本身引發(未定義指令、存取錯誤、`brk`、`svc`)。原因細分看 `ESR_EL1` 的 EC 欄位(bit 31:26)。
-- **IRQ / FIQ / SError**:非同步;目前尚未啟用,收到即 panic。
+- **IRQ(Interrupt Request) / FIQ / SError**:非同步;目前尚未啟用,收到即 panic。
 
 ### 實作
 
@@ -513,7 +614,7 @@ bash scripts/backtrace.sh riscv64 build/riscv64/welyos.elf < log.txt
 
 ### 為什麼 x86 多了 GDT
 
-保護模式下,`cs`/`ds` 等區段暫存器存的是**選擇子**,指向 GDT(全域描述符表)的一項,描述區段的基底、長度、權限。multiboot 進入時區段可用,但 bootloader 的 GDT 位置不保證保留,而 IDT 的每一項都要參照程式碼區段選擇子,所以必須先建立自己的 GDT。
+保護模式下,`cs`/`ds` 等區段暫存器存的是**選擇子**,指向 GDT(Global Descriptor Table,全域描述符表)的一項,描述區段的基底、長度、權限。multiboot 進入時區段可用,但 bootloader 的 GDT 位置不保證保留,而 IDT(Interrupt Descriptor Table) 的每一項都要參照程式碼區段選擇子,所以必須先建立自己的 GDT。
 
 採**平坦模型**:基底 0、長度 4GB,等於不使用分段(位址保護之後交給分頁)。
 
@@ -706,11 +807,11 @@ RISC-V 與 AArch64 把「要不要跳過」交給軟體決定;x86 由硬體依�
 | 處理完畢通知 | 重設計時器即清除 | 寫 GIC 的 EOIR | 對 PIC 寫 EOI(0x20) |
 | 檔案 | `arch/riscv64/timer.c` | `arch/aarch64/timer.c` | `arch/i386/timer.c` |
 
-**RISC-V:為什麼要透過 SBI**
+**RISC-V:為什麼要透過 SBI(Supervisor Binary Interface)**
 
 計時器(`mtime`/`mtimecmp`)屬於 M-mode,S-mode 的 kernel 不能直接設定。以 `ecall` 請 M-mode 韌體(OpenSBI)代勞,這套介面稱為 SBI:`a7` = 擴充 ID(`0x54494D45`,即 "TIME")、`a6` = 功能 ID、`a0` = 參數。流程是「讀目前時間 → 設定下一次觸發時間 → 中斷時再設下一次」。
 
-**AArch64:為什麼需要 GIC**
+**AArch64:為什麼需要 GIC(Generic Interrupt Controller)**
 
 ARM 的週邊中斷都要經過中斷控制器才會送到 CPU:
 
@@ -722,7 +823,7 @@ ARM 的週邊中斷都要經過中斷控制器才會送到 CPU:
 - CPU interface(`0x08010000`):讀 `IAR` 認領中斷(得到中斷號),處理完寫 `EOIR`。沒寫 `EOIR`,GIC 不會再送下一個。
 - EL1 實體計時器是中斷號 30(每個 CPU 私有的 PPI)。
 
-**i386:為什麼要重新對映 PIC**
+**i386:為什麼要重新對映 PIC(Programmable Interrupt Controller)**
 
 開機時 BIOS 把 IRQ 0~7 對應到向量 8~15,但保護模式下向量 0~31 保留給 CPU 例外(8 是 double fault)。不改的話,計時器中斷會被當成 double fault。所以把 IRQ 0~15 改對應到向量 32~47,並在 IDT 增加這 16 個入口(沿用第 7 步的 `ISR_NOERR` 巨集)。
 
@@ -753,9 +854,9 @@ uptime: 2 s (ticks=200)
 ### 已知限制
 
 - RISC-V 的 timebase 頻率寫死為 10MHz(QEMU virt);實機應從裝置樹 `/cpus` 的 `timebase-frequency` 讀取。
-- GIC 與 UART 的位址寫死為 QEMU virt 的值;實機應從裝置樹讀取。
+- GIC 與 UART(Universal Asynchronous Receiver-Transmitter) 的位址寫死為 QEMU virt 的值;實機應從裝置樹讀取。
 - AArch64 假設為 GICv2(virt 的預設);GICv3 需另外實作。
-- PIT 除數為 16 位元,頻率下限約 19Hz;實際頻率為 1193182/11931 ≈ 100.007Hz,有極小誤差。
+- PIT(Programmable Interval Timer) 除數為 16 位元,頻率下限約 19Hz;實際頻率為 1193182/11931 ≈ 100.007Hz,有極小誤差。
 - `kprintf` 不可重入:中斷處理程式與主程式若同時輸出會交錯(目前中斷中不輸出)。
 
 ---
@@ -769,7 +870,7 @@ uptime: 2 s (ticks=200)
 | 實體記憶體管理員(PMM) | `pmm_alloc()` / `pmm_alloc_pages(n)` / `pmm_free()` | 頁(4KB) | `kernel/pmm.c` |
 | kernel heap | `kmalloc()` / `kzalloc()` / `kfree()` | 位元組 | `kernel/kmalloc.c` |
 
-`kmalloc` 不夠用時向 PMM 要頁,PMM 則直接管理整塊主記憶體。兩層都與架構無關,三個架構共用同一份程式。
+`kmalloc` 不夠用時向 PMM(Physical Memory Manager) 要頁,PMM 則直接管理整塊主記憶體。兩層都與架構無關,三個架構共用同一份程式。
 
 ### 為什麼分兩層
 
@@ -1020,7 +1121,7 @@ arch_switch 存的 callee-saved 暫存器      <- thread->sp 指向這裡
 - **`kprintf` 整個呼叫期間關中斷**,一次輸出不會被別的執行緒從中間插入。
 - **`panic()` 一開始就關中斷**,避免印到一半被搶佔、其他執行緒繼續跑。
 - **backtrace 的 stack 範圍檢查**原本寫死開機 stack,改為問排程器「目前執行緒的 stack 範圍」。
-- **中斷處理程式的順序**:`sched_irq_exit()` 必須在通知中斷控制器(PIC / GIC 的 EOI)**之後**呼叫,理由見下面的踩坑。
+- **中斷處理程式的順序**:`sched_irq_exit()` 必須在通知中斷控制器(PIC / GIC 的 EOI(End Of Interrupt))**之後**呼叫,理由見下面的踩坑。
 
 ### stack 溢位偵測
 
@@ -1171,8 +1272,8 @@ stress: ok (stacks reclaimed, heap grew by 112 KB)
 Round-robin 把所有執行緒視為相同。實際上互動型的工作(等鍵盤、等網路)大多在睡覺,醒來時應該優先處理,否則反應會遲鈍;第 10 步「被喚醒者要不要插隊」的取捨就是這個問題。常見做法:
 
 - **多層優先權佇列**:每個優先權一個佇列,再用一個位元圖記錄哪些佇列非空,用一條「找最高位元」的指令就能在 O(1) 選出下一條。
-- **MLFQ(多層回饋佇列)**:自動調整,用完整個時間片的降級、提早讓出的升級。
-- **CFS / EEVDF(Linux)**:記錄每條執行緒已使用的 CPU 時間,永遠選用得最少的那條,用紅黑樹維持順序。
+- **MLFQ(Multi-Level Feedback Queue,多層回饋佇列)**:自動調整,用完整個時間片的降級、提早讓出的升級。
+- **CFS(Completely Fair Scheduler) / EEVDF(Earliest Eligible Virtual Deadline First,Linux)**:記錄每條執行緒已使用的 CPU 時間,永遠選用得最少的那條,用紅黑樹維持順序。
 
 **5. 不需要時停掉計時器(tickless)**
 
@@ -1382,7 +1483,7 @@ AArch64 多一個其他兩者沒有的概念:**記憶體屬性**。它要求明�
 
 ### 安全方面的設計
 
-**1. W^X:可寫的不可執行,可執行的不可寫**
+**1. W^X(Write XOR Execute):可寫的不可執行,可執行的不可寫**
 
 | 區段 | 權限 | 擋下什麼 |
 |---|---|---|
@@ -1405,11 +1506,11 @@ x86 預設 ring 0 可以寫入唯讀頁,只有使用者模式受限制。不開 
 
 **4. i386 沒有「禁止執行」**
 
-傳統的 32 位元頁表格式沒有 NX 位元,要改用 PAE(64 位元的項目、三層)才有。所以 i386 上資料頁仍然可以執行,`vm_query` 也如實回報 `rwx`。這是目前三個架構中安全性最弱的一點,列在已知限制。
+傳統的 32 位元頁表格式沒有 NX(No-eXecute) 位元,要改用 PAE(Physical Address Extension,64 位元的項目、三層)才有。所以 i386 上資料頁仍然可以執行,`vm_query` 也如實回報 `rwx`。這是目前三個架構中安全性最弱的一點,列在已知限制。
 
 ### 效能方面的設計:大分頁
 
-第一版把 128MB 全部用 4KB 頁對映,能運作,但有兩個代價:CPU 的 TLB(轉換結果的快取)只有幾十到幾百筆,每筆涵蓋 4KB 的話很快就不夠用,每次 miss 都要重新走訪頁表;而且最後一層表格本身要佔不少記憶體。
+第一版把 128MB 全部用 4KB 頁對映,能運作,但有兩個代價:CPU 的 TLB(Translation Lookaside Buffer,轉換結果的快取)只有幾十到幾百筆,每筆涵蓋 4KB 的話很快就不夠用,每次 miss 都要重新走訪頁表;而且最後一層表格本身要佔不少記憶體。
 
 改為能用大分頁就用:位址對齊、整塊在記憶體範圍內、而且整塊權限相同時,在上一層直接放一個涵蓋 2MB(i386 為 4MB)的項目。
 
@@ -1505,7 +1606,7 @@ i386 的 `err=0x3` 表示「頁存在」加「寫入」,也就是權限違規而
 
 第 10 步提到可靠的 stack 溢位偵測要靠保護頁:在 stack 下方留一頁不對映,一碰到就觸發例外。有了分頁,移除對映只要一行,但還缺一個條件:**例外處理程式需要另一條 stack**。
 
-目前例外發生時,入口把暫存器存在「當下的 stack」上。stack 溢位時當下的 stack pointer 正指著保護頁,入口一寫入就再次出錯,形成例外中的例外,i386 上會直接重置。要解決得讓例外切換到獨立的 stack:i386 用 TSS,RISC-V 用 `sscratch`,AArch64 用 `SP_EL0` / `SP_EL1` 的分工。這些機制正好也是使用者模式需要的,所以留到下一步一起做。在那之前,stack 溢位仍由第 10 步的記號偵測。
+目前例外發生時,入口把暫存器存在「當下的 stack」上。stack 溢位時當下的 stack pointer 正指著保護頁,入口一寫入就再次出錯,形成例外中的例外,i386 上會直接重置。要解決得讓例外切換到獨立的 stack:i386 用 TSS(Task State Segment),RISC-V 用 `sscratch`,AArch64 用 `SP_EL0` / `SP_EL1` 的分工。這些機制正好也是使用者模式需要的,所以留到下一步一起做。在那之前,stack 溢位仍由第 10 步的記號偵測。
 
 ### 已知限制
 
@@ -1588,7 +1689,7 @@ sbi_set_timer(deadline);
 
 PIT 是週期性計時器,自己不會漂移,但它只會發出中斷。兩次中斷若合併成一次,kernel 就少算一個 tick,而且沒有任何方法知道。
 
-解法是引入獨立的時間來源:**TSC**,CPU 內建、隨時間遞增的 64 位元計數器。PIT 中斷只負責叫醒,實際該記幾個 tick 由 TSC 經過的時間決定,寫法和上面的迴圈相同。
+解法是引入獨立的時間來源:**TSC(Time Stamp Counter)**,CPU 內建、隨時間遞增的 64 位元計數器。PIT 中斷只負責叫醒,實際該記幾個 tick 由 TSC 經過的時間決定,寫法和上面的迴圈相同。
 
 TSC 每秒跳幾次因 CPU 而異,開機時要校正:讓 PIT 的 channel 2 倒數 10ms,輪詢到它結束,看這段期間 TSC 增加多少。CPU 不支援 TSC 時(用 CPUID 檢查)退回每次中斷記一個 tick。
 
@@ -1731,3 +1832,448 @@ backtrace:
 - i386 的 #DF 一律走工作閘,不是 stack 溢位造成的 double fault 也會進到這裡;處理程式會註明原因不是溢位。
 - 例外 stack 本身沒有保護頁。
 - 借用 `TPIDR_EL1`、`TPIDRRO_EL0` 與 `sscratch` 當暫存空間,之後使用者模式需要它們時要重新安排。
+
+---
+
+## 第 14 步:優先權排程與優先權繼承
+
+到上一步為止所有執行緒平等輪流。這在工作性質都相同時沒問題,但實際的系統裡,等鍵盤輸入的工作和做大量計算的工作不該被同等對待:前者大部分時間在睡,一旦醒來應該馬上處理,否則系統反應遲鈍。這一步加入優先權。
+
+### 規則
+
+優先權 0(最低)到 7(最高),預設為 4(`PRIO_NORMAL`):
+
+- 永遠執行可執行的執行緒中優先權最高的那一條。
+- 相同優先權之間輪流,每次一個時間片(10ms)。
+- 較高優先權的執行緒一變成可執行(被喚醒或被建立),**立刻**搶佔目前的執行緒,不等時間片用完。
+
+這稱為固定優先權搶佔式排程,即時作業系統多半採用,因為行為完全可預測。
+
+### 資料結構:每級一條佇列,加一個位元圖
+
+```
+rq_bitmap = 0b01010100        (第 2、4、6 級有人在等)
+rq_head[6] -> H
+rq_head[4] -> N1 -> N2
+rq_head[2] -> L
+```
+
+選下一條執行緒:找位元圖中最高的 1,取那條佇列的頭。成本只和級數有關(固定 8 級),和執行緒總數無關。這是上次討論效率時提到的做法。
+
+找最高位元沒有用 `__builtin_clz`:RISC-V 的基本指令集沒有對應的指令,編譯器會改呼叫 libgcc 的函式,而我們沒有連結 libgcc(和 i386 的 64 位元除法是同一類問題)。8 級用迴圈檢查就夠了。
+
+### 三個需要仔細處理的地方
+
+**1. 被搶佔的人不該吃虧**
+
+執行緒 A 的時間片用到一半,被更優先的 B 搶佔。B 做完之後,A 應該繼續用完剩下的時間片,而不是排到同級的最後面重新等一輪。所以 `schedule()` 依剩餘時間片決定放回佇列的位置:
+
+| 情況 | 剩餘時間片 | 放回位置 |
+|---|---|---|
+| 被更優先的搶佔 | 大於 0 | 同級佇列的**最前面**,保留剩餘時間片 |
+| 時間片用完 | 0 | 同級佇列的最後面 |
+| 主動 `thread_yield()` | 設為 0 | 同級佇列的最後面 |
+
+**2. 喚醒別人時的搶佔點**
+
+`sem_post()` 喚醒了一條更優先的執行緒,它應該立刻執行。但喚醒有兩種場合:
+
+- 在一般執行緒中:可以馬上切換。
+- 在中斷處理程式中:不能在這裡切換,要等中斷處理完、通知過中斷控制器之後(第 10 步的 EOI 問題)。
+
+所以喚醒只「記下需要重新排程」,實際切換由 `sched_preempt_point()` 執行;它在中斷中呼叫時不做事,留給中斷返回前的 `sched_irq_exit()`。為了分辨是否在中斷中,各架構的中斷處理程式開頭多呼叫一個 `sched_irq_enter()`。
+
+**3. 等待佇列喚醒優先權最高的**
+
+semaphore 和 mutex 喚醒等待者時,原本是喚醒等最久的,現在改為喚醒優先權最高的(相同時才比先後)。否則低優先權的等待者會先拿到資源,高優先權的反而繼續等。
+
+### 優先權反轉與優先權繼承
+
+有了優先權,會出現一個不直覺的問題。三條執行緒:
+
+- **low** 拿到一把鎖,還要工作一小段時間才會解鎖
+- **high** 要拿同一把鎖,只好等 low
+- **medium** 和這把鎖毫無關係,只是需要 CPU
+
+medium 比 low 優先,所以 CPU 一直給 medium,low 輪不到、解不了鎖,high 就被卡住。結果是最高優先權的執行緒,被一個中等優先權、而且根本沒碰那把鎖的執行緒無限期擋住,優先權的意義被顛倒了。1997 年火星探路者號反覆重置就是這個原因。
+
+**解法:優先權繼承**。high 在等鎖時,把鎖的持有者 low 的優先權暫時提高到和自己一樣。low 於是能搶過 medium,盡快做完並解鎖;解鎖時優先權恢復原狀。實作在 `mutex_lock()` / `mutex_unlock()`,每條執行緒分別記錄原本的優先權(`base_prio`)與目前有效的優先權(`prio`)。
+
+### 驗證
+
+```
+prio: three threads created as low, normal, high
+  run order: HNL (expected HNL)
+prio: sleep(5 ms) while another thread spins: same priority woke after 10 ticks, high priority after 6
+prio: inversion: high waited 20 ticks for the lock without inheritance, 3 with
+```
+
+- **順序**:依低、中、高的順序建立三條執行緒,實際執行順序是高、中、低。
+- **搶佔延遲**:一條執行緒睡 5ms(換算為 6 個 tick),期間另一條在空轉。兩者同優先權時,醒來要等對方的時間片用完,共 10~11 個 tick;設為高優先權時 6~7 個 tick 就醒來,等於沒有延遲。
+- **優先權反轉**:沒有繼承時 high 等了 20~21 個 tick,正是 medium 佔用 CPU 的時間;有繼承時只等 2~4 個 tick。
+
+三個架構結果一致。回歸矩陣 45 個情境結果不變;三個架構各連續執行 20 次全部測試,60 次全部通過。
+
+### 自我測試改為由開機參數啟用
+
+示範越加越多,每次開機都執行會拖慢開機。現在預設只開機,加上 `selftest` 參數才執行各子系統的自我測試與示範(`cmake --build ... --target run` 會自動帶上)。
+
+| 架構 | 只開機 | 加 `selftest` | 加 `selftest memtest stress` |
+|---|---|---|---|
+| i386 | 0.29 秒 | 0.59 秒 | 0.68 秒 |
+| riscv64 | 0.23 秒 | 0.47 秒 | 0.60 秒 |
+| aarch64 | 0.20 秒 | 0.44 秒 | 0.52 秒 |
+
+「只開機」的時間幾乎都是 QEMU 本身的啟動。
+
+### 踩坑:示範的對照組失效
+
+為了縮短測試時間,曾把搶佔延遲示範中「空轉」的時間由 30ms 縮為 15ms。結果 30 次執行有 10 次斷言失敗。原因是對照組(同優先權)的執行緒要先等對方一個時間片才開始睡,醒來時對方已經空轉完了,CPU 是閒的,於是和高優先權那組一樣立刻醒來,兩組沒有差別。這是示範的時間安排錯誤,不是排程器的錯誤;恢復為 30ms 並在程式裡註明這段時間的下限怎麼算。
+
+這類偶發失敗只跑一兩次很容易錯過,所以每次改動後都重複執行數十次。
+
+### 已知限制
+
+- **飢餓**:高優先權的執行緒若一直不睡,較低的永遠輪不到。目前沒有防護(例如老化機制:等太久的逐漸提高優先權),使用時要自行確保高優先權的工作大部分時間在等待。
+- **優先權繼承只處理單層**:解鎖時直接回到原本的優先權。若一條執行緒同時持有兩把鎖、兩邊都有人在等,解開其中一把後會提早失去另一邊帶來的提升。也不會沿著「A 等 B、B 等 C」的鏈往下傳遞。
+- semaphore 沒有擁有者的概念,無法做優先權繼承;需要保護共用資料時應使用 mutex。
+- 等待佇列喚醒時要走訪整條佇列找最高優先權,成本與等待者數量成正比。
+- 仍然只支援單一 CPU。
+
+---
+
+## 第 15 步:使用者模式、系統呼叫與行程
+
+到上一步為止,所有程式都在 kernel 權限下執行:任何一條執行緒寫錯一個指標,就可能毀掉整個系統。這一步加入使用者模式,讓程式在低權限、各自獨立的位址空間裡執行,做錯事只會害到自己。
+
+| 檔案 | 內容 |
+|---|---|
+| `kernel/proc.c`、`include/proc.h` | 行程管理、程式載入、系統呼叫 |
+| `kernel/vm.c` | 位址空間(`vm_space_*`):每個行程一份頁表 |
+| `arch/<名稱>/trap.S`、`trap.c` | 使用者模式與 kernel 之間的進出 |
+| `user/init.c`、`usys.h`、`user.ld` | 使用者程式本身 |
+| `kernel/userimg.S` | 把使用者程式的二進位嵌入 kernel |
+
+### 三個要素
+
+**1. 權限等級**。CPU 有(至少)兩種模式。使用者模式不能執行特權指令(關中斷、改頁表、存取裝置),也不能存取沒有標記為「使用者可用」的頁。
+
+| | kernel 模式 | 使用者模式 |
+|---|---|---|
+| i386 | ring 0 | ring 3 |
+| RISC-V | S-mode | U-mode |
+| AArch64 | EL1 | EL0 |
+
+**2. 位址空間**。每個行程一份自己的頁表,分成兩部分:
+
+- **kernel 部分**:所有行程共用同一份對映(建立時複製 kernel 頁表最上層的項目,下層表格共用)。進入 kernel 時因此不必換頁表。這些頁沒有使用者權限,使用者模式碰不到。
+- **使用者部分**:每個行程各自獨立。行程 A 的頁表裡根本沒有行程 B 的頁,這就是行程之間的隔離。
+
+| | 使用者範圍 |
+|---|---|
+| i386 | 1GB ~ 2GB(`0x40000000`) |
+| RISC-V、AArch64 | 4GB ~ 8GB(`0x100000000`) |
+
+選這些位置是因為它們和主記憶體、裝置落在最上層表格的不同項目,複製 kernel 部分時不會互相干擾。
+
+**3. 系統呼叫**。使用者程式要做需要權限的事,只能請 kernel 代勞:把編號與參數放進約定的暫存器,執行一條會觸發例外的指令。
+
+| | 指令 | 編號 | 參數 | 回傳值 |
+|---|---|---|---|---|
+| i386 | `int $0x80` | `eax` | `ebx` `ecx` `edx` | `eax` |
+| RISC-V | `ecall` | `a7` | `a0` `a1` `a2` | `a0` |
+| AArch64 | `svc #0` | `x8` | `x0` `x1` `x2` | `x0` |
+
+目前有 8 個:`write`、`exit`、`getpid`、`yield`、`sleep`、`thread_create`、`thread_exit`、`gettid`。
+
+### 進入 kernel 時一定要換 stack
+
+從使用者模式進入 kernel(系統呼叫、中斷、例外)時,kernel **不能繼續使用使用者的 stack**。那個 stack pointer 是使用者程式可以任意設定的值,可能指向沒有對映的位址,也可能指向 kernel 的資料。每條執行緒因此有兩條 stack:使用者模式用的,和進入 kernel 後用的 kernel stack。
+
+三個架構提供的機制不同:
+
+| | 機制 | 需要我們做的事 |
+|---|---|---|
+| i386 | CPU 從 TSS 的 `esp0` 取得 kernel stack,並自動把使用者的 `ss`、`esp` 推上去 | 每次切換執行緒時更新 `esp0` |
+| RISC-V | 硬體不做任何事 | 用 `sscratch` 的約定自己換 |
+| AArch64 | 每個等級有自己的 stack pointer(`SP_EL0`、`SP_EL1`),硬體自動切換 | 把 `SP_EL0` 當作被打斷程式的一部分保存 |
+
+RISC-V 的約定是:`sscratch` 在使用者模式執行期間存放 kernel stack 頂端,在 kernel 執行期間為 0。例外入口把 `sp` 與 `sscratch` 交換後看 `sp`:非 0 表示從使用者模式來,此時 `sp` 已是 kernel stack;為 0 表示從 kernel 來,再換回去。這也取代了第 13 步借用 `sscratch` 當暫存空間的做法(現在是先用完再歸 0)。
+
+第 13 步為了 double fault 建立的 TSS,這一步正好用上它的 `esp0`。
+
+### 第一次進入使用者模式
+
+三個架構都沒有「降低權限」的指令。做法是偽造:把狀態擺成「好像剛從使用者模式被打斷」的樣子,再執行從例外返回的指令(`iret`、`sret`、`eret`),CPU 就會「返回」到使用者模式。這和第 10 步讓新執行緒從 `thread_entry` 開始的手法相同。
+
+進入之前,除了第一個參數以外的暫存器全部清為 0。kernel 剛才用過的暫存器裡可能留著 kernel 的位址或資料,不清掉就等於洩漏給使用者程式。
+
+### 使用者程式怎麼來的
+
+目前沒有檔案系統,所以使用者程式嵌在 kernel 裡:
+
+1. `user/init.c` 用同一個編譯器編譯,但**獨立連結**,位址從使用者範圍的起點開始。它和 kernel 沒有任何共用的符號,連 `kprintf` 都沒有,輸出要自己組字串再呼叫 `write`。
+2. `objcopy` 轉成原始二進位。linker script 在開頭放了一個 20 位元組的標頭,記錄進入點與各區段的範圍。
+3. `kernel/userimg.S` 用 `.incbin` 把它放進 kernel 的唯讀資料區。
+4. `proc_spawn()` 依標頭把內容複製到新配置的頁面,並對映到行程的位址空間。
+
+使用者程式同樣遵守 W^X:程式碼唯讀可執行,資料與 stack 可寫不可執行。新配置的頁面先清為 0 再交給行程,避免把別人用過的資料交出去。
+
+### 安全:系統呼叫是 kernel 的對外邊界
+
+系統呼叫的參數全部來自不可信任的程式。最危險的是指標:使用者可以傳任何數值,包括 kernel 內部的位址。`write(kernel 的位址, 16)` 如果 kernel 不檢查就照著讀出來印,使用者就繞過了所有保護。
+
+做法是 `copy_from_user()`:不直接解參考使用者傳來的指標,而是逐頁透過該行程的頁表查出實體位址,並確認那一頁有使用者權限,再經由 kernel 自己的恆等對映去讀。任何一頁不合格就拒絕整個呼叫。
+
+這個做法還有一個好處:RISC-V 的 S-mode 預設不能存取使用者頁(需要另外設定 `sstatus.SUM`),走實體位址就不需要打開它,kernel 意外解參考使用者指標時仍會出錯而不是默默成功。
+
+其他的檢查:不認得的系統呼叫編號回傳錯誤;`sleep` 與 `write` 的長度有上限;`thread_create` 的進入點必須是使用者可存取的位址。i386 另外把系統呼叫以外的中斷向量都設為只有 ring 0 能觸發,使用者程式執行 `int $14` 想偽造 page fault 會得到 #GP。
+
+### 行程出錯怎麼辦
+
+各架構的例外處理程式現在先判斷例外來自哪裡。來自 kernel 的仍然是 panic;來自使用者模式的呼叫 `user_fault()`,印出一行訊息後只終止那個行程:
+
+```
+[pid 2 init] killed: Load page fault at pc=0x00000001000007a0 addr=0x0000000080200000
+```
+
+### 終止行程:不強行打斷,而是請它自己結束
+
+行程可能有多條執行緒,其中一條呼叫 `exit` 或出錯時,其他執行緒也要結束。但它們可能正在 kernel 裡執行系統呼叫、手上拿著鎖,強行中止會留下不一致的狀態。
+
+做法是把同行程的執行緒標記為「應終止」。被標記的執行緒繼續把手上的事做完,在**下一次要從 kernel 返回使用者模式之前**檢查這個標記並自行結束(`user_return_check()`)。在使用者模式空轉的執行緒也逃不掉,因為計時器中斷每 1ms 就會讓它進一次 kernel。最後一條執行緒結束時釋放整個位址空間。
+
+這也補上了先前列為缺口的「強制終止」:`proc_kill()`。
+
+### 排程器的配合
+
+- 每條執行緒記錄它使用的位址空間,`schedule()` 切換時一併換頁表。
+- **換頁表很貴**(TLB 會被清空),所以只在必要時才換:純 kernel 執行緒不需要特定的位址空間,直接沿用上一個行程的頁表,因為 kernel 部分在每份頁表裡都相同。
+- 每次切換呼叫 `arch_set_kstack()` 更新 i386 的 `esp0`。
+
+### 驗證
+
+```
+user: running a program in user mode
+  [user] hello from user mode, pid=1
+  [user] thread tid=33 computed 5050
+  [user] thread tid=34 computed 20100
+  [user] both threads finished, total=25150
+user: hello, 2 threads, exit(42) -> exit code 42
+  [user] reading kernel memory...
+[pid 2 init] killed: Load page fault at pc=0x00000001000007a0 addr=0x0000000080200000
+user: read kernel memory -> exit code -1
+...
+```
+
+`selftest` 會依序執行以下情境,每一個都檢查結束碼:
+
+| 情境 | 預期 | 驗證的事 |
+|---|---|---|
+| 輸出、建立 2 條執行緒各自計算、`exit(42)` | 結束碼 42 | 使用者模式、系統呼叫、行程內多執行緒共用記憶體 |
+| 讀取 kernel 記憶體 | 被終止 | 使用者模式看不到 kernel |
+| 寫入自己的程式碼 | 被終止 | 使用者程式的 W^X |
+| 執行特權指令 | 被終止 | 權限等級確實生效 |
+| 解參考 NULL | 被終止 | |
+| 使用者 stack 溢位 | 被終止 | stack 下方沒有對映 |
+| 把 kernel 位址傳給 `write` | 呼叫被拒絕,行程繼續,結束碼 7 | 系統呼叫的指標檢查 |
+| 不存在的系統呼叫編號 | 回傳錯誤,結束碼 9 | |
+| 無窮迴圈,20ms 後 `proc_kill` | 結束碼 99 | 使用者程式會被搶佔;強制終止 |
+| 3 個行程同時寫同一個虛擬位址 | 各自的值不受影響 | 行程之間的隔離 |
+
+「被終止」的情境中 kernel 都繼續正常運作並執行下一個測試。全部結束後,核對空閒頁數、頁表頁數、heap 用量都回到測試前的值,確認行程的頁面、頁表、stack 都有歸還。
+
+三個架構結果一致。回歸矩陣 45 個情境結果不變;三個架構各連續執行 20 次全部測試,60 次全部通過。耗時:只開機 0.19~0.31 秒,加 `selftest` 為 0.52~0.70 秒。
+
+### 踩坑:`kprintf` 不支援的格式
+
+測試輸出用了 `%-34s`(靠左對齊),而 `kprintf` 不支援 `%-`。結果格式字串被原樣印出,後面的參數全部錯位,結束碼印成一個很大的數字。程式裡的判斷用的是變數本身所以沒有受影響,但輸出是錯的。改為不用對齊。這個限制從第 3 步就記在文件裡,還是踩到了。
+
+### 已知限制
+
+- **只有一個內建的使用者程式**,以參數選擇行為。沒有檔案系統,也沒有 `exec`、`fork`。
+- **i386 的使用者資料頁可以執行**(沒有 NX)。有了使用者程式之後這個弱點更實際,補上需要改用 PAE 分頁。
+- 沒有使用 ASID(Address Space Identifier) / PCID(Process-Context Identifier),每次換位址空間都清空整個 TLB。
+- 行程內的執行緒共用記憶體,但還沒有提供使用者模式的同步機制(mutex 的系統呼叫或 futex);示範中靠輪詢等待。
+- 使用者 stack 固定為 16KB,不會自動成長;每個行程最多 16 條執行緒,stack 的位置不重複使用。
+- 被終止的執行緒若正睡在 kernel 裡,要等它醒來才會結束。
+- kernel 之後若在全新的最上層項目建立對映,已存在的行程看不到(目前所有 kernel 對映都在行程建立前就位)。
+- 沒有儲存浮點暫存器,使用者程式也以不使用浮點的方式編譯。
+- 「禁止 kernel 意外存取或執行使用者頁」的硬體保護只有 RISC-V 具備(`sstatus.SUM` 預設為 0,S-mode 也永遠不能執行使用者頁)。AArch64 的 PAN(Privileged Access Never) 與 i386 的 SMEP(Supervisor Mode Execution Prevention) / SMAP(Supervisor Mode Access Prevention) 都還沒有啟用。
+
+---
+
+## 第 15.5 步:補強前幾步留下的弱點
+
+進入多核心之前,先把第 12~15 步「已知限制」裡屬於弱點的項目解決。多核心會改動每一個子系統,帶著已知的弱點進去只會讓問題更難分辨。
+
+| 弱點 | 來自 | 處理方式 |
+|---|---|---|
+| 高優先權不睡,低優先權永遠輪不到 | 第 14 步 | 防飢餓(老化,aging) |
+| 優先權繼承(priority inheritance)只有單層 | 第 14 步 | 改為完整版:多把鎖、連鎖等待 |
+| i386 的資料頁可以執行 | 第 12 步 | 改用實體位址延伸(Physical Address Extension,PAE)分頁,取得禁止執行位元(No-eXecute,NX) |
+| kernel 可能被誘導去存取或執行使用者的頁 | 第 15 步 | i386 啟用 SMEP、SMAP;AArch64 啟用 PAN |
+| 每次換位址空間都清空 TLB | 第 15 步 | 位址空間編號(Address Space Identifier,ASID)與全域頁(global page) |
+| 使用者模式沒有同步機制 | 第 15 步 | 快速使用者空間互斥鎖(Fast Userspace Mutex,futex) |
+| 行程建立很慢 | 這一步量測時發現 | 以 `-O2` 編譯;`memcpy` / `memset` 一次處理一個字組 |
+
+### 1. 防飢餓(starvation guard)
+
+固定優先權排程的弱點是:只要有一條高優先權的執行緒一直不睡,所有較低的執行緒就完全停住。
+
+做法是老化(aging):每 10ms 檢查一次各級執行佇列的頭(同一條佇列裡頭是等最久的)。可執行卻等了超過 100ms 的執行緒,暫時提升到最高優先權,執行一次之後(離開 CPU 時)就收回。
+
+這保證低優先權的執行緒仍能緩慢前進:最差情況下每等 100ms 得到一個 10ms 的時間片,約佔 9% 的 CPU。高優先權的工作仍然拿走絕大部分,但系統不會有人完全停擺。
+
+為了支援「暫時提升」,每條執行緒的優先權拆成三個來源,有效優先權由它們算出:
+
+```
+有效優先權 = 正處於防飢餓提升 ? 最高 : max(自己的優先權, 繼承來的優先權)
+```
+
+### 2. 完整的優先權繼承
+
+第 14 步的版本在解鎖時直接回到原本的優先權,有兩種情況處理不對。新的定義是:
+
+> 一條執行緒「繼承來的優先權」= 它持有的**所有** mutex 上,所有等待者中最高的有效優先權。
+
+每條執行緒記錄自己持有的 mutex 串列,以及正在等哪一把 mutex。這個定義自然涵蓋:
+
+- **同時持有多把鎖**:L 持有 A 和 C,H 在等 A。L 解開 C 時依「剩下持有的鎖」重新計算,A 上還有 H 在等,所以提升保留。舊版會在這裡提早掉回低優先權。
+- **連鎖等待**:H 等 M 持有的鎖,M 又在等 L 持有的鎖。H 的優先權先傳給 M,再沿著「M 正在等的鎖」傳給 L,否則 L 還是輪不到。傳遞最多 8 層,同時避免死結(deadlock)時無窮迴圈。
+
+驗證(三個架構相同):
+
+```
+prio: chained inheritance: low thread ran at priority 6, 6 after releasing an unrelated lock, 2 after releasing all
+prio: starvation guard: low thread got 3 boosts and made progress (3241767 iterations) under a 150 ms high-priority hog
+```
+
+低優先權(2)的執行緒經過兩層傳遞後以高優先權(6)執行;解開無關的鎖後仍是 6;全部解開後回到 2。防飢餓方面,高優先權的執行緒連續佔用 CPU 150ms 的期間,低優先權的執行緒得到 3 次提升並持續有進展。
+
+### 3. i386 改用 PAE 分頁
+
+傳統的 32 位元頁表項目沒有地方放「不可執行」,所以第 12 步的 i386 上資料頁一律可以執行。PAE 把項目加寬為 64 位元,最高位元就是 NX。
+
+| | 傳統 32 位元分頁 | PAE |
+|---|---|---|
+| 層數 | 2 | 3 |
+| 最上層 | 頁目錄(page directory),1024 項 | 頁目錄指標表(Page Directory Pointer Table,PDPT),只有 4 項 |
+| 項目大小 | 32 位元 | 64 位元 |
+| 大分頁 | 4MB | 2MB |
+| NX 位元 | 沒有 | 有(bit 63) |
+
+改成 PAE 之後 i386 的結構(3 層、每層 9 位元、2MB 大分頁)和 RISC-V、AArch64 幾乎相同,共用的頁表走訪程式不需要修改。需要個別處理的只有三點:
+
+- **PDPT(Page Directory Pointer Table) 的項目格式不同**:只允許「存在」位元,可寫、使用者位元都是保留位元,設了會出錯。產生表格項目的函式因此多一個「在第幾層」的參數。
+- **PDPT 會被 CPU 快取**:寫入 `CR3` 時 CPU 把 4 個 PDPT 項目讀進內部暫存器,之後修改 PDPT 必須重新寫入 `CR3` 才生效。在最上層新增項目時要通知架構層。
+- **NX 要先啟用再使用**:要設定延伸功能啟用暫存器(Extended Feature Enable Register,EFER(Extended Feature Enable Register))的 NXE 位元。沒啟用就在項目裡設 bit 63,CPU 會把它當成保留位元而觸發 page fault。所以功能偵測移到建立頁表之前。
+
+所有功能都先用 `CPUID` 指令偵測,CPU 不支援就退回沒有該保護的模式。QEMU 預設的 `qemu32` 型號沒有 NX,所以啟動腳本改用 `-cpu max`(提供 QEMU 能模擬的所有功能);可用環境變數 `QEMU_CPU` 改回去測試退回路徑。
+
+### 4. 禁止 kernel 碰使用者的頁
+
+kernel 讀寫使用者資料一律透過 `copy_from_user()`,不直接解參考使用者的指標。但如果某處程式寫錯了,硬體應該擋下來,因為「誘導 kernel 去存取或執行攻擊者控制的記憶體」是提權攻擊最常用的手法。
+
+| | 禁止 kernel **執行**使用者的頁 | 禁止 kernel **讀寫**使用者的頁 |
+|---|---|---|
+| i386 | 管理者模式執行保護(Supervisor Mode Execution Prevention,SMEP) | 管理者模式存取保護(Supervisor Mode Access Prevention,SMAP) |
+| AArch64 | 特權不可執行位元(Privileged eXecute Never,PXN),第 15 步已設定 | 特權永不存取(Privileged Access Never,PAN) |
+| RISC-V | S-mode 永遠不能執行 U 頁,硬體內建 | `sstatus` 的 SUM 位元(permit Supervisor User Memory access)預設為 0 |
+
+SMAP 啟用後,唯一需要直接寫使用者頁的地方是 i386 第一次進入使用者模式時在使用者 stack 上放參數,那裡用 `stac` / `clac` 兩條指令暫時解除再恢復。
+
+### 5. 換位址空間時不再清空整個 TLB
+
+轉譯後備緩衝區(Translation Lookaside Buffer,TLB)是頁表查詢結果的快取。第 15 步每次切換行程都把它清空,切回來之後所有位址都要重新查頁表。
+
+**ASID(RISC-V、AArch64)**:TLB 的每筆紀錄附帶一個編號,只有編號與目前相同的才會被使用。每個行程一個編號,切換時只要換編號,原本的紀錄留在 TLB 裡,切回來立刻可用。
+
+- 編號 1~254 分配給行程,0 給 kernel 自己的頁表,255 是編號用完時大家共用的(用這個編號的行程切換時仍要清空)。
+- 行程結束時先清掉 TLB 裡屬於它的紀錄再歸還編號。這一步是安全上必要的:否則下一個拿到同一編號的行程會看到上一個行程的對映。
+- RISC-V 的規範允許硬體實作少於 16 位元的 ASID,開機時把 ASID 欄位全寫 1 再讀回來偵測;不夠用就退回每次清空。
+
+**全域頁(三個架構)**:kernel 的頁在每份頁表裡都相同,標成全域之後不屬於任何編號,切換時不受影響。i386 的 32 位元模式沒有 ASID(行程上下文識別碼 Process-Context Identifier,PCID 只存在於 64 位元模式),但寫入 `CR3` 時不會清掉全域頁的紀錄,所以 kernel 的部分同樣保留下來,只有使用者的頁需要重查。
+
+`stress` 新增連續建立並結束 300 個行程的階段。可用的編號只有 254 個,所以一定會重複使用;每個行程都要正常執行並得到正確的結束碼,確認沒有受到前一個使用同編號者的殘留影響。
+
+這項改動的效益沒有單獨量測:QEMU 的 TLB 是軟體模擬的,行為與實機差異很大,量出來的數字不具代表性。
+
+### 6. futex:使用者模式的同步機制
+
+第 15 步的使用者程式要等其他執行緒時只能輪詢,也沒有辦法保護共用資料。
+
+futex 的想法是:鎖本身只是使用者記憶體裡的一個整數。沒有競爭時,上鎖與解鎖各只是使用者模式下的一條原子指令,**完全不進 kernel**。只有在「拿不到鎖要睡覺」或「解鎖時有人在等要叫醒」這兩種情況才需要系統呼叫。多數情況下鎖沒有競爭,所以這比每次都進 kernel 的做法快得多。
+
+kernel 提供兩個系統呼叫:
+
+- `futex_wait(addr, val)`:如果 `*addr` 仍然等於 `val`,就讓呼叫者睡在這個位址上。
+- `futex_wake(addr)`:喚醒睡在這個位址上的執行緒。
+
+`futex_wait` 要連數值一起傳的原因,和第 11 步的 lost wakeup 相同:使用者程式剛看到鎖被佔用、還沒睡下去,對方就解鎖並喚醒(此時沒人在睡),之後才睡下去就再也沒人叫了。把「再確認一次數值」交給 kernel 在關中斷之下做,檢查與睡下去之間就沒有空檔;數值若已改變,代表情況變了,直接返回讓使用者程式重試。
+
+使用者端的互斥鎖寫在 `user/usys.h`,用三個數值表示狀態:0 沒人持有、1 有人持有、2 有人持有而且有人在等。解鎖時只有在原本是 2 的情況才呼叫 `futex_wake`。原子操作用編譯器內建的 `__sync_*` 函式(i386 的 `lock cmpxchg`、RISC-V 的 `lr` / `sc`、AArch64 的 `ldxr` / `stxr`)。
+
+行程被終止時,kernel 會主動喚醒它所有睡在 futex 上的執行緒,否則這些執行緒不會醒來,行程也就永遠結束不了。
+
+驗證:3 條執行緒各對共用計數器做 20000 次「上鎖、讀出、加 1、寫回、解鎖」,期間會被計時器搶佔。
+
+```
+  [user] 3 threads x 20000 locked increments = 60000
+user: user-mode mutex (futex), 3 threads -> exit code 11
+```
+
+### 7. 效能:最佳化編譯與字組複製
+
+`stress` 加入「連續建立 300 個行程」之後,量到每個行程要 1.6~2ms,慢得不合理(建立一條 kernel 執行緒只要幾微秒)。原因有兩個:
+
+- **整個 kernel 一直是以不最佳化的方式編譯的**。建置設定從第 1 步起就沒有指定最佳化等級,編譯器預設是 `-O0`。
+- **`memcpy` / `memset` 逐位元組處理**。建立一個行程要清空或複製十來個頁面(程式、stack、頁表),約 40KB。
+
+修正:預設以 `-O2` 編譯(要用 GDB 逐行追蹤時可用 `-DWELYOS_OPT=-O0` 改回);`memcpy` / `memset` 在位址對齊時一次處理一個機器字組。
+
+| 連續建立 300 個行程(tick = 1ms) | 修正前 | 修正後 |
+|---|---|---|
+| i386 | 478 | 55 |
+| riscv64 | 565 | 80~90 |
+| aarch64 | 605 | 74 |
+
+快了約 7~9 倍。這是 QEMU 上的數字,但兩項改動在實機上同樣有效。
+
+開啟最佳化後出現兩個問題,都在使用者程式:
+
+- 編譯器會自行產生對 `memset` 的呼叫(把結構清為 0)。使用者程式沒有連結任何函式庫,也不能用 kernel 裡的那一份,所以要自己提供。
+- 使用者程式裡名為 `main` 的 `static` 函式在取位址時連結失敗(編譯器對 `main` 這個名稱有特殊處理)。改名為 `umain`。
+
+kernel 本身在 `-O2` 下沒有出現任何問題,51 個回歸情境與 60 次重複執行全部通過。這也算是一次額外的驗證:未定義行為或遺漏 `volatile` 之類的錯誤,通常要開了最佳化才會現形。
+
+### 驗證
+
+新增兩個開機參數,確認硬體保護真的生效(而不只是設定了位元):
+
+| 參數 | 動作 | i386 | riscv64 | aarch64 |
+|---|---|---|---|---|
+| `crash=uaccess` | kernel 直接讀取使用者的頁 | Page fault | Load page fault | Data abort |
+| `crash=uexec` | kernel 跳到使用者的頁執行 | Page fault(`err=0x11`,指令擷取) | Instruction page fault | Instruction abort |
+| `crash=exec`(第 12 步既有) | kernel 跳到資料頁執行 | **Page fault**(之前只能略過) | Instruction page fault | Instruction abort |
+
+回歸矩陣(QEMU 結束碼),三個架構各 17 個情境,共 51 個,結果全部符合預期;三個架構各連續執行 20 次全部測試,60 次全部通過。
+
+| 架構 | 只開機 | `selftest` | `selftest memtest stress` | `uaccess` | `uexec` | `stack` | `mainstack` | `null` | `wtext` | `exec` | `relock` | `thread` | `dfree` | `break` | `panic` | `illegal` | `fault` |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| i386 | 0 | 0 | 0 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 0 | 3 | 3 | 3 |
+| riscv64 | 0 | 0 | 0 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 0 | 1 | 1 | 1 |
+| aarch64 | 0 | 0 | 0 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 0 | 1 | 1 | 1 |
+
+耗時:只開機 0.18~0.29 秒;加 `selftest` 為 0.65~0.84 秒(測試項目增加了);全部測試 0.83~1.04 秒。
+
+另外以 `QEMU_CPU=qemu32` 執行 i386 的自我測試,確認在沒有 NX、SMEP、SMAP 的 CPU 上會正確退回並完成所有測試。
+
+### 仍然存在的限制
+
+- **防飢餓的參數是寫死的**(100ms、提升到最高)。被提升的執行緒在那一個時間片內會搶過所有人,包括真正高優先權的工作,對有嚴格時限的即時工作來說是干擾。
+- **futex 的等待者依位址分成 16 桶**,同一桶的會一起被喚醒(醒來後各自重新檢查,不影響正確性,但有多餘的喚醒)。使用者模式的 mutex 沒有優先權繼承。
+- **ASID 用完後不會回收重整**:第 255 個以後同時存在的行程共用一個編號,切換時要清空 TLB。
+- **PAE 的 64 位元項目在 32 位元 CPU 上要分兩次寫入**,不是不可分割的。單一 CPU 且關中斷時沒有問題,多核心下需要注意寫入順序。
+- **i386 沒有啟用 PAE 之外的 36 位元實體位址**,仍只使用 4GB 以下的記憶體。
+- 還沒有檔案系統、`exec`、`fork`,使用者程式仍只有內建的一個。這些是尚未實作的功能,列在後續步驟。

@@ -167,3 +167,21 @@ void arch_test_fault(void)
     volatile int *p = (volatile int *)0x0010000000000000UL;
     (void)*p;
 }
+
+/* AArch64 從 EL0 進入例外時硬體自動改用 SP_EL1,不需要另外通知 */
+void arch_set_kstack(uintptr_t top)
+{
+    (void)top;
+}
+
+void arch_user_return(uintptr_t entry, uintptr_t usp, uintptr_t arg, uintptr_t ktop)
+    __attribute__((noreturn));          /* switch.S */
+
+void arch_enter_user(uintptr_t entry, uintptr_t usp, uintptr_t arg)
+{
+    uintptr_t lo, hi;
+
+    arch_irq_disable();                  /* 設定 ELR/SPSR 到 eret 之間不可被中斷 */
+    sched_stack_bounds(&lo, &hi);
+    arch_user_return(entry, usp, arg, hi);
+}

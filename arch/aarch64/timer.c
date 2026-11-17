@@ -90,6 +90,8 @@ void irq_handler(void)
     if (id == IRQ_SPURIOUS)
         return;
 
+    sched_irq_enter();                       /* 中斷中喚醒別人時,切換要留到返回前 */
+
     if (id == IRQ_TIMER) {
         /*
          * 下一次的時間以「上一次的預定時間 + 間隔」計算,不以「現在」為基準,

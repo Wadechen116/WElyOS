@@ -68,6 +68,8 @@ void arch_timer_init(unsigned hz)
  */
 void timer_interrupt(void)
 {
+    sched_irq_enter();                       /* 中斷中喚醒別人時,切換要留到返回前 */
+
     uint64_t now = read_time();
     int n = 0;
 

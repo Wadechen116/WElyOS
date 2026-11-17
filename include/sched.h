@@ -11,6 +11,24 @@
  */
 struct thread;
 
+/*
+ * 優先權:0(最低)~ 7(最高),數字越大越優先。排程規則:
+ *   - 永遠執行「可執行的執行緒中優先權最高」的那一條
+ *   - 相同優先權之間輪流(round-robin),每次一個時間片
+ *   - 較高優先權的執行緒一變成可執行(被喚醒、被建立),立刻搶佔目前的執行緒
+ * 這是「固定優先權搶佔式」排程,另外有兩個機制會暫時調整「有效優先權」:
+ *   - 防飢餓(老化):可執行卻等了超過 STARVE_MS 都輪不到的執行緒,
+ *     暫時提升到最高優先權執行一個時間片,之後回到原本的優先權。
+ *     所以即使有高優先權的執行緒一直不睡,較低的仍能緩慢前進,不會完全停住。
+ *   - 優先權繼承:見 sync.h 的 mutex。
+ */
+#define PRIO_MIN     0
+#define PRIO_LOW     2
+#define PRIO_NORMAL  4      /* thread_create 的預設值 */
+#define PRIO_HIGH    6
+#define PRIO_MAX     7
+#define PRIO_LEVELS  8
+
 /* 初始化排程器:把目前正在跑的開機流程登記為第一條執行緒(main)。
    需先完成 pmm_init() 與 timer_init()(時間片要依 tick 頻率換算);
    之後才能呼叫本檔其他函式 */
@@ -20,6 +38,13 @@ void sched_init(void);
    回傳執行緒編號(tid,大於 0 且不重複使用);失敗回傳 -1。
    不回傳指標的原因:執行緒結束後結構就被釋放,留著指標會變成懸空指標 */
 int thread_create(const char *name, void (*fn)(void *), void *arg);
+
+/* 同 thread_create,但指定優先權(PRIO_MIN ~ PRIO_MAX) */
+int thread_create_prio(const char *name, void (*fn)(void *), void *arg, int prio);
+
+/* 設定 / 取得目前執行緒的優先權。調低後若有更優先的執行緒在等,會立刻讓出 CPU */
+void thread_set_priority(int prio);
+int  thread_priority(void);
 
 /* 等待編號為 tid 的執行緒結束。若它已經結束(或不存在)則立即返回。
    等待期間本執行緒不佔 CPU,由對方結束時直接喚醒 */
@@ -35,6 +60,22 @@ int thread_id(void);                     /* 目前執行緒的編號(main 為 0)
 
 unsigned sched_thread_count(void);       /* 存活的執行緒數(含 main,不含 idle) */
 unsigned long sched_switch_count(void);  /* 累計的 context switch 次數 */
+unsigned long sched_starve_boosts(void); /* 累計的防飢餓提升次數 */
+
+/*
+ * 行程支援(kernel/proc.c 使用):
+ *   space:這條執行緒使用的位址空間。排程器切換到它時會一併換頁表。
+ *          NULL 表示純 kernel 執行緒,沿用當下載入的頁表(kernel 部分各處相同)。
+ *   data :附掛的私有資料(行程用來記錄這條執行緒屬於哪個行程)。
+ *   kill :把所有 data 相同的執行緒標記為「應終止」。被標記的執行緒不會被強行中斷,
+ *          而是在下一次要從 kernel 返回使用者模式時自行結束(見 user_return_check)。
+ */
+struct vm_space;
+void  thread_set_space(struct vm_space *vs);     /* 設定目前執行緒的位址空間並立即切換 */
+void  thread_set_data(void *data);
+void *thread_data(void);
+int   thread_killed(void);
+void  sched_kill_group(void *data);
 
 /*
  * 等待佇列(wait queue):「在等某件事發生」的執行緒排隊的地方。
@@ -56,11 +97,41 @@ struct wait_queue {
  */
 void wq_sleep(struct wait_queue *wq);
 
-/* 喚醒 wq 上等最久的一條 / 全部。回傳喚醒的數量。可在中斷處理程式中呼叫 */
+/* 喚醒 wq 上優先權最高的一條(相同則等最久的優先)/ 全部。回傳喚醒的數量。
+   可在中斷處理程式中呼叫。被喚醒者若比目前的執行緒優先,只會「記下需要重新排程」,
+   實際的切換發生在呼叫 sched_preempt_point() 或中斷返回時 */
 int wq_wake_one(struct wait_queue *wq);
 int wq_wake_all(struct wait_queue *wq);
 
+/*
+ * 搶佔點:若有更優先的執行緒在等(剛被喚醒或建立),立刻切換過去。
+ * 在喚醒別人之後、恢復中斷之前呼叫;呼叫時中斷必須是關閉的。
+ * 在中斷處理程式中呼叫則無作用(切換留到中斷返回時由 sched_irq_exit 處理)。
+ */
+void sched_preempt_point(void);
+
+/*
+ * 優先權繼承用(kernel/sync.c 的 mutex 使用;呼叫時中斷必須已關閉):
+ *   thread_effective_prio(t) :t 目前的有效優先權
+ *   sched_set_inherit(t, p)  :設定 t「繼承來的優先權」,-1 表示沒有。
+ *                              有效優先權 = max(自己的, 繼承來的)
+ *   thread_blocked_on(t) / thread_set_blocked_on(m)
+ *                            :t 正在等哪一把 mutex(沒有則為 NULL),用來沿著
+ *                              「A 等 B、B 等 C」的鏈往下傳遞優先權
+ *   thread_held_list(t)      :t 持有的 mutex 串列的頭(由 sync.c 維護)
+ *   wq_max_prio(wq)          :等待佇列上最高的有效優先權;沒有人在等回傳 -1
+ */
+int   thread_effective_prio(struct thread *t);
+void  sched_set_inherit(struct thread *t, int prio);
+void *thread_blocked_on(struct thread *t);
+void  thread_set_blocked_on(void *m);
+void **thread_held_list(struct thread *t);
+int   wq_max_prio(struct wait_queue *wq);
+
 /* ---- 以下由中斷處理路徑呼叫 ---- */
+
+/* 架構層在中斷處理程式的開頭呼叫:標記「現在在中斷中」 */
+void sched_irq_enter(void);
 
 /* 每個計時器 tick 呼叫一次(中斷關閉中):喚醒到期的休眠者、扣時間片 */
 void sched_tick(void);

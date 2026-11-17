@@ -10,6 +10,8 @@ struct trap_frame {
     uint64_t spsr;         /* 被打斷時的處理器狀態 */
     uint64_t esr;          /* 例外原因 */
     uint64_t far;          /* 出錯的記憶體位址(僅部分例外有效) */
+    uint64_t sp_el0;       /* 使用者模式的 stack pointer */
+    uint64_t pad;          /* 讓整個 frame 維持 16 位元組對齊 */
 };
 
 void trap_init(void);                                    /* 設定 VBAR_EL1 */

@@ -146,3 +146,22 @@ void arch_test_fault(void)
     volatile int *p = (volatile int *)0;     /* virt 機器的位址 0 沒有裝置 */
     (void)*p;
 }
+
+/* RISC-V 進入 kernel 時用的 stack 記在 sscratch(由 trap.S 在返回使用者模式時設定),
+   不需要另外通知 */
+void arch_set_kstack(uintptr_t top)
+{
+    (void)top;
+}
+
+void arch_user_return(uintptr_t entry, uintptr_t usp, uintptr_t arg, uintptr_t ktop)
+    __attribute__((noreturn));          /* switch.S */
+
+void arch_enter_user(uintptr_t entry, uintptr_t usp, uintptr_t arg)
+{
+    uintptr_t lo, hi;
+
+    arch_irq_disable();                  /* 設定 sscratch 到 sret 之間不可被中斷 */
+    sched_stack_bounds(&lo, &hi);
+    arch_user_return(entry, usp, arg, hi);
+}

@@ -6,11 +6,12 @@
 #include "arch.h"
 #include "kprintf.h"
 #include "panic.h"
+#include "proc.h"
 #include "sched.h"
 #include "trap.h"
 
 /* 編譯期檢查:C 結構必須與 trap.S 的版面一致 */
-_Static_assert(sizeof(struct trap_frame) == 36 * 8, "trap_frame size");
+_Static_assert(sizeof(struct trap_frame) == 38 * 8, "trap_frame size");
 _Static_assert(offsetof(struct trap_frame, sp) == 31 * 8, "trap_frame sp");
 _Static_assert(offsetof(struct trap_frame, elr) == 32 * 8, "trap_frame elr");
 
@@ -19,6 +20,7 @@ extern char trap_vectors[];
 /* ESR_EL1 的 bit 31:26 為 EC(Exception Class),說明例外的類別 */
 #define ESR_EC(esr)   (((esr) >> 26) & 0x3F)
 #define EC_BRK        0x3C
+#define EC_SVC        0x15            /* svc 指令:系統呼叫 */
 
 static const char *ec_name(uint64_t ec)
 {
@@ -65,8 +67,13 @@ void trap_handler(struct trap_frame *tf, uint64_t kind)
      * IRQ:非同步中斷。ELR 指向被打斷、尚未執行的指令,處理完直接返回即可。
      * 實際是哪個裝置要問 GIC(見 timer.c)。
      */
+    /* 向量 8~11 = 例外來自較低的等級(EL0,使用者模式) */
+    int from_user = (kind / 4) == 2;
+
     if (kind % 4 == 1) {
         irq_handler();
+        if (from_user)
+            user_return_check();
         return;
     }
 
@@ -74,6 +81,19 @@ void trap_handler(struct trap_frame *tf, uint64_t kind)
     if (kind % 4 != 0)
         panic("unexpected %s (vector %llu)", kind_names[kind % 4],
               (unsigned long long)kind);
+
+    /* 系統呼叫:編號在 x8,參數在 x0~x2,回傳值放回 x0。
+       svc 的 ELR 已經指向下一條指令,不需要調整 */
+    if (from_user && ec == EC_SVC) {
+        tf->x[0] = (uint64_t)syscall_dispatch((long)tf->x[8], (long)tf->x[0],
+                                              (long)tf->x[1], (long)tf->x[2]);
+        user_return_check();
+        return;
+    }
+
+    /* 使用者程式造成的其他例外:只終止那個行程,kernel 繼續運作 */
+    if (from_user)
+        user_fault(ec_name(ec), tf->elr, tf->far);
 
     /* 可恢復的例外:brk。ELR 指向 brk 本身,跳過它(固定 4 位元組)後繼續 */
     if (ec == EC_BRK) {

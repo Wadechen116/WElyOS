@@ -32,12 +32,15 @@ void sem_post(struct semaphore *s);      /* 可在中斷處理程式中呼叫 */
  *   - 只有上鎖的那一條可以解鎖
  *   - 同一條重複上鎖會被偵測出來(否則會自己等自己,永遠卡住)
  * 兩種錯誤都會 panic。
+ * 另外支援優先權繼承:高優先權的執行緒在等鎖時,持有者暫時繼承它的優先權。
  */
 struct mutex {
     struct thread *owner;                /* NULL = 沒有人持有 */
+    int inherit;                         /* 1 = 啟用優先權繼承(預設)。0 僅供示範反轉現象 */
     struct wait_queue wq;
+    struct mutex *next_held;             /* 串在擁有者「持有的 mutex」串列中 */
 };
-#define MUTEX_INIT { 0, WAIT_QUEUE_INIT }
+#define MUTEX_INIT { 0, 1, WAIT_QUEUE_INIT, 0 }
 
 void mutex_init(struct mutex *m);
 void mutex_lock(struct mutex *m);

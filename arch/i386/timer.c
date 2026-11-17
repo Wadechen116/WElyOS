@@ -125,6 +125,8 @@ void arch_timer_init(unsigned hz)
 /* 由 trap_handler 在向量 32~47 時呼叫 */
 void irq_handler(uint32_t irq)
 {
+    sched_irq_enter();                       /* 中斷中喚醒別人時,切換要留到返回前 */
+
     if (irq == 0) {
         if (tsc_interval) {
             /* 依 TSC 實際經過的時間決定要記幾個 tick(通常是 1 個;

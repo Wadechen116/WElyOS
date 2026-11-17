@@ -1,32 +1,39 @@
 # WElyOS
 
-以標準 C(C11)從零開發的簡易作業系統,支援 **i386、RISC-V 64、AArch64** 三種架構,可在 QEMU 上啟動,並可透過 GDB 除錯追蹤。專案從最陽春的階段開始,逐步擴充。
+以標準 C(C11)從零開發的簡易作業系統,支援 **i386、RISC-V 64、AArch64** 三種架構,可在 QEMU(Quick Emulator) 上啟動,並可透過 GDB(GNU Debugger) 除錯追蹤。專案從最陽春的階段開始,逐步擴充。
 
-> 開發過程的逐步紀錄見 [docs/DEVLOG.md](docs/DEVLOG.md)。
+> 開發過程的逐步紀錄見 [docs/DEVLOG.md](docs/DEVLOG.md),開頭附有專業名詞的中英對照表。
 
 ## 目前功能
 
 - [x] 多架構:i386、RISC-V 64(QEMU virt)、AArch64(QEMU virt),架構相關程式集中於 `arch/`
-- [x] multiboot 開機(i386,32 位元保護模式);裝置樹(DTB)解析(RISC-V / AArch64)
+- [x] multiboot 開機(i386,32 位元保護模式);裝置樹(Device Tree Blob,DTB)解析(RISC-V / AArch64)
 - [x] 序列埠(COM1)輸出
 - [x] CMake 建置,`run` / `debug` target
 - [x] GDB 除錯:QEMU GDB stub(`-s -S`)加 `gdb-multiarch`,三種架構皆可下中斷點、單步、看暫存器
 - [x] `kprintf` 格式化輸出(`%c %s %d %u %x %X %p`,寬度、補零、`l`/`ll`/`z`)
 - [x] 最小字串函式庫(`memcpy`、`strlen` 等)
 - [x] `panic()` 與 backtrace(三個架構;frame pointer 回溯,`scripts/backtrace.sh` 解析成函式與行號)
-- [x] 例外處理(三個架構):RISC-V `stvec`、AArch64 向量表、i386 GDT + IDT;印出原因、暫存器與 backtrace,可恢復的例外(中斷點)能繼續執行
-- [x] VGA 文字螢幕(80x25、顏色、硬體游標、自動捲動),`kprintf` 同步輸出到序列埠與螢幕
+- [x] 例外處理(三個架構):RISC-V `stvec`、AArch64 向量表、i386 GDT(Global Descriptor Table) + IDT(Interrupt Descriptor Table);印出原因、暫存器與 backtrace,可恢復的例外(中斷點)能繼續執行
+- [x] VGA(Video Graphics Array) 文字螢幕(80x25、顏色、硬體游標、自動捲動),`kprintf` 同步輸出到序列埠與螢幕
 - [x] 讀取 multiboot 資訊(開機參數、記憶體大小)
-- [x] 計時器中斷(1000Hz tick):RISC-V SBI timer、AArch64 GICv2 + generic timer、i386 PIC + PIT(以 TSC 校正);中斷延遲時會補記遺失的 tick,不累積誤差
+- [x] 計時器中斷(1000Hz tick):RISC-V SBI(Supervisor Binary Interface) timer、AArch64 GICv2 + generic timer、i386 PIC(Programmable Interrupt Controller) + PIT(Programmable Interval Timer),並以 TSC(Time Stamp Counter)校正;中斷延遲時會補記遺失的 tick,不累積誤差
 - [x] 實體記憶體管理(位元圖頁面配置器,`pmm_alloc`)與 kernel heap(`kmalloc` / `kfree`,first-fit 加相鄰合併,可偵測重複釋放)
 - [x] 核心執行緒與排程器:三個架構的 context switch、round-robin、計時器搶佔(時間片 10ms)、`thread_yield` / `thread_sleep`
 - [x] 同步機制:等待佇列、semaphore、mutex(偵測重複上鎖與非擁有者解鎖)、`thread_join`
-- [x] 分頁(MMU):i386 2 層、RISC-V Sv39、AArch64 4KB/39 位元;恆等對映、大分頁(2MB / 4MB)與自動拆分、W^X(程式碼唯讀、資料不可執行)、NULL 指標偵測
-- [x] kernel stack 保護頁與獨立的例外 stack:溢位在發生當下被攔下並回報(i386 以 TSS 加 double fault 工作閘);閒置 stack 快取重複使用
+- [x] 分頁(Memory Management Unit,MMU):i386 PAE、RISC-V Sv39、AArch64 4KB/39 位元,三者皆為 3 層;恆等對映、大分頁(2MB)與自動拆分、W^X(Write XOR Execute,程式碼唯讀、資料不可執行)、NULL 指標偵測
+- [x] kernel stack 保護頁與獨立的例外 stack:溢位在發生當下被攔下並回報(i386 以 TSS(Task State Segment) 加 double fault 工作閘);閒置 stack 快取重複使用
+- [x] 優先權排程:8 級固定優先權、搶佔式、同級輪流;mutex 的優先權繼承(防止優先權反轉)
+- [x] 使用者模式與行程:每個行程獨立的位址空間、系統呼叫(i386 `int 0x80`、RISC-V `ecall`、AArch64 `svc`)、行程內多執行緒、`proc_spawn` / `proc_wait` / `proc_kill`;使用者程式以 C 撰寫、獨立連結後嵌入 kernel;出錯只終止該行程
+- [x] 排程補強:防飢餓(老化)、完整的優先權繼承(多把鎖、連鎖等待)
+- [x] 記憶體保護補強:i386 改用 PAE(Physical Address Extension) 分頁取得 NX(No-eXecute);SMEP(Supervisor Mode Execution Prevention) / SMAP(Supervisor Mode Access Prevention,i386)與 PAN(Privileged Access Never,AArch64)禁止 kernel 存取或執行使用者的頁;ASID(Address Space Identifier) 與全域頁避免切換行程時清空 TLB(Translation Lookaside Buffer)
+- [x] futex 與使用者模式的 mutex
+- [x] 以 `-O2` 編譯(`-DWELYOS_OPT=-O0` 可改回,方便 GDB 逐行追蹤)
 
 ## 規劃中
 
-- [ ] 系統呼叫、使用者模式、行程(各自的位址空間)、shell
+- [ ] 多核心(Symmetric Multiprocessing,SMP):spinlock、每顆 CPU 的排程狀態、TLB shootdown
+- [ ] 檔案系統、從檔案載入程式(`exec`)、`fork`、shell
 
 ## 需求
 
@@ -45,10 +52,12 @@
 ```
 cmake --preset riscv64
 cmake --build build/riscv64                    # 只建置
-cmake --build build/riscv64 --target run       # 建置並在 QEMU 執行(序列埠輸出,自動結束)
+cmake --build build/riscv64 --target run       # 建置並在 QEMU 執行自我測試(序列埠輸出,自動結束)
 cmake --build build/riscv64 --target debug     # 啟動 QEMU 並暫停,等待 GDB(tcp::1234)
 cmake --build build/riscv64 --target gdb       # (另一個終端機)連上 gdb,輸入 welyos-start 開始
-bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit crash=fault"  # 故意觸發錯誤(crash=panic|fault|illegal|break|dfree|stack|thread|relock|null|wtext|exec|mainstack)
+bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit"              # 只開機,不跑測試(最快)
+bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit selftest"     # 開機並執行各子系統的自我測試與示範
+bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit crash=fault"  # 故意觸發錯誤(crash=panic|fault|illegal|break|dfree|stack|mainstack|thread|relock|null|wtext|exec|uaccess|uexec)
 bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit memtest"      # 完整記憶體測試:寫入並驗證每一個空閒頁
 bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit stress"       # 排程器壓力測試:建立 1000 條執行緒
 cmake --build build/i386    --target run-gui   # 僅 i386:開啟 QEMU 視窗顯示 VGA 畫面
@@ -59,9 +68,10 @@ cmake --build build/i386    --target run-gui   # 僅 i386:開啟 QEMU 視窗顯�
 ```
 arch/<名稱>/  各架構的開機程式、linker script、驅動(i386 / riscv64 / aarch64)
 include/      與架構無關的標頭(arch.h 為架構介面)
-kernel/       kernel 主體(main、kprintf、fdt、panic、timer、pmm、kmalloc、sched、sync、vm)
+kernel/       kernel 主體(main、kprintf、fdt、panic、timer、pmm、kmalloc、sched、sync、vm、proc)
 lib/          最小字串函式庫
 cmake/        各架構的 toolchain 檔
+user/         使用者程式(在使用者模式執行,獨立連結後嵌入 kernel)
 scripts/      QEMU 啟動腳本、GDB 腳本與設定
 docs/         開發紀錄
 ```

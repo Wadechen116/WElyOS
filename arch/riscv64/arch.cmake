@@ -5,3 +5,4 @@ set(ARCH_SOURCES arch/riscv64/boot.S arch/riscv64/trap.S arch/riscv64/switch.S a
 set(ARCH_FLAGS -march=rv64imac_zicsr -mabi=lp64 -mcmodel=medany -mno-relax
                -fno-pic -fno-pie)
 set(ARCH_LINK_FLAGS -march=rv64imac_zicsr -mabi=lp64 -mcmodel=medany -Wl,--no-relax)
+set(ARCH_USER_BASE 0x100000000)  # 使用者位址範圍的起點,須與 mmu.h 的 USER_BASE 一致

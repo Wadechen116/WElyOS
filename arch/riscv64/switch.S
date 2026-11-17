@@ -56,3 +56,28 @@ arch_switch:
 arch_thread_start:
     li      ra, 0
     jr      s1
+
+/*
+ * void arch_user_return(entry, usp, arg, ktop)      a0, a1, a2, a3
+ * 第一次進入使用者模式。做法是偽造成「從使用者模式的 trap 返回」:
+ *   sepc    = 進入點(sret 會跳到這裡)
+ *   sstatus = SPP 清為 0(返回後是 U-mode)、SPIE 設為 1(返回後開中斷)
+ *   sscratch= kernel stack 頂端(約定:在使用者模式期間存放它)
+ * 其餘暫存器全部清 0,不把 kernel 內部的數值(可能是位址)洩漏給使用者程式。
+ */
+    .global arch_user_return
+arch_user_return:
+    csrw    sepc, a0
+    csrr    t0, sstatus
+    li      t1, 0x100                 /* SPP */
+    not     t1, t1
+    and     t0, t0, t1
+    ori     t0, t0, 0x20              /* SPIE */
+    csrw    sstatus, t0
+    csrw    sscratch, a3
+    mv      sp, a1
+    mv      a0, a2                    /* 第一個參數 */
+    .irp    n, 1,3,4,5,6,7,8,9,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    li      x\n, 0
+    .endr
+    sret

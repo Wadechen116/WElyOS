@@ -5,9 +5,12 @@
  *   bit 1:0   類型:0b11 = 中間層表示「下一層表格」,最後一層表示「4KB 頁」
  *                    0b01 = 中間層的「區塊」(block):直接對映一大塊(第 1 層為 2MB)
  *   bit 4:2   AttrIndx:記憶體屬性的編號,指向 MAIR_EL1 的第幾個位元組
- *   bit 7:6   AP:存取權限。0b00 = EL1 可讀寫,0b10 = EL1 唯讀
+ *   bit 7:6   AP:存取權限。bit 7 = 唯讀;bit 6 = EL0(使用者模式)也可存取
+ *                    0b00 EL1 讀寫 / 0b10 EL1 唯讀 / 0b01 EL1+EL0 讀寫 / 0b11 EL1+EL0 唯讀
  *   bit 9:8   SH:共享屬性(0b11 = inner shareable,一般記憶體用)
  *   bit 10    AF:存取旗標。為 0 時第一次存取會觸發例外,所以直接設 1
+ *   bit 11    nG:not global。1 = 這筆對映屬於特定的 ASID(使用者的頁);
+ *                0 = 所有位址空間共用(kernel 的頁)
  *   bit 12~47 實體頁的位址
  *   bit 53    PXN:EL1 不可執行
  *   bit 54    UXN:EL0 不可執行
@@ -18,20 +21,28 @@
  * 每個項目用 AttrIndx 選用其中一個。
  *
  * 相關的系統暫存器:
- *   TTBR0_EL1  根表格的實體位址(低半部位址空間)
+ *   TTBR0_EL1  根表格的實體位址(低半部位址空間);bit 63~48 為 ASID
  *   TCR_EL1    轉換控制:位址寬度、頁大小、表格本身的快取屬性
  *   MAIR_EL1   8 個記憶體屬性定義
- *   SCTLR_EL1  bit 0 = M(開啟 MMU),bit 2 = C(資料快取),bit 12 = I(指令快取)
+ *   SCTLR_EL1  bit 0 = M(開啟 MMU),bit 2 = C(資料快取),bit 12 = I(指令快取),
+ *              bit 23 = SPAN(為 0 時,進入例外會自動設定 PAN)
+ *
+ * PAN(Privileged Access Never):設定後 EL1 存取「EL0 可存取的頁」會觸發例外。
+ * kernel 若因為程式錯誤而解參考了使用者提供的指標,硬體會直接擋下。
+ * 需要 ARMv8.1 以上的 CPU;kernel 讀寫使用者資料一律走恆等對映的實體位址,不受影響。
  */
 #include "mmu.h"
+#include "kprintf.h"
 #include "vm.h"
 
 #define PTE_VALID     0x3UL                  /* 表格 / 頁 */
 #define PTE_BLOCK     0x1UL                  /* 區塊(大分頁) */
 #define PTE_ATTR(n)   ((uint64_t)(n) << 2)
 #define PTE_AP_RO     (2UL << 6)
+#define PTE_AP_USER   (1UL << 6)
 #define PTE_SH_INNER  (3UL << 8)
 #define PTE_AF        (1UL << 10)
+#define PTE_NG        (1UL << 11)
 #define PTE_PXN       (1UL << 53)
 #define PTE_UXN       (1UL << 54)
 #define PTE_ADDR_MASK 0x0000FFFFFFFFF000UL
@@ -43,7 +54,19 @@
 
 pte_t arch_pte_leaf(uintptr_t pa, unsigned flags, int level)
 {
-    pte_t e = (pte_t)pa | (level > 0 ? PTE_BLOCK : PTE_VALID) | PTE_AF | PTE_UXN;
+    pte_t e = (pte_t)pa | (level > 0 ? PTE_BLOCK : PTE_VALID) | PTE_AF;
+
+    if (flags & VM_USER) {
+        /* 使用者頁:kernel 永遠不執行它(PXN);使用者能否執行看 VM_EXEC */
+        e |= PTE_AP_USER | PTE_PXN | PTE_NG;
+        if (!(flags & VM_EXEC))
+            e |= PTE_UXN;
+    } else {
+        /* kernel 頁:使用者永遠不能執行(UXN);kernel 能否執行看 VM_EXEC */
+        e |= PTE_UXN;
+        if (!(flags & VM_EXEC))
+            e |= PTE_PXN;
+    }
 
     if (flags & VM_DEVICE)
         e |= PTE_ATTR(ATTR_DEVICE);
@@ -51,13 +74,13 @@ pte_t arch_pte_leaf(uintptr_t pa, unsigned flags, int level)
         e |= PTE_ATTR(ATTR_NORMAL) | PTE_SH_INNER;
     if (!(flags & VM_WRITE))
         e |= PTE_AP_RO;
-    if (!(flags & VM_EXEC))
-        e |= PTE_PXN;
     return e;
 }
 
-pte_t arch_pte_table(uintptr_t table_pa)
+pte_t arch_pte_table(uintptr_t table_pa, int user, int level)
 {
+    (void)user;                              /* 權限只由最後一層的項目決定 */
+    (void)level;
     return (pte_t)table_pa | PTE_VALID;
 }
 
@@ -82,8 +105,13 @@ unsigned arch_pte_flags(pte_t e)
     unsigned f = VM_READ;
     if (!(e & PTE_AP_RO))
         f |= VM_WRITE;
-    if (!(e & PTE_PXN))
+    if (e & PTE_AP_USER) {
+        f |= VM_USER;
+        if (!(e & PTE_UXN))
+            f |= VM_EXEC;
+    } else if (!(e & PTE_PXN)) {
         f |= VM_EXEC;
+    }
     if (((e >> 2) & 7) == ATTR_DEVICE)
         f |= VM_DEVICE;
     return f;
@@ -113,9 +141,38 @@ void arch_mmu_enable(pte_t *root)
     __asm__ volatile("isb");                 /* 讓上面的設定對後續指令生效 */
     __asm__ volatile("tlbi vmalle1\n dsb nsh\n isb");   /* 清空 TLB */
 
+    /* PAN:ID_AA64MMFR1_EL1 的 bit 23~20 非 0 表示 CPU 支援 */
+    uint64_t mmfr1;
+    __asm__ volatile("mrs %0, id_aa64mmfr1_el1" : "=r"(mmfr1));
+    int has_pan = ((mmfr1 >> 20) & 0xF) != 0;
+
     __asm__ volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
     sctlr |= (1UL << 0) | (1UL << 2) | (1UL << 12);     /* M | C | I */
+    if (has_pan)
+        sctlr &= ~(1UL << 23);               /* SPAN = 0:進入例外時自動設定 PAN */
     __asm__ volatile("msr sctlr_el1, %0\n isb" : : "r"(sctlr));
+
+    if (has_pan) {
+        /* msr pan, #1:設定目前的 PSTATE.PAN。以機器碼寫出,
+           避免要求組譯器以 ARMv8.1 的指令集編譯整個檔案 */
+        __asm__ volatile(".inst 0xD500419F");
+    }
+    kprintf("vm: cpu features: PAN %s\n", has_pan ? "on" : "unavailable");
+}
+
+void arch_mmu_switch(pte_t *root, unsigned asid, int flush)
+{
+    uint64_t ttbr = (uint64_t)(uintptr_t)root | ((uint64_t)asid << 48);
+
+    __asm__ volatile("msr ttbr0_el1, %0\n isb" : : "r"(ttbr));
+    if (flush)
+        __asm__ volatile("tlbi vmalle1\n dsb nsh\n isb");
+}
+
+void arch_asid_flush(unsigned asid)
+{
+    /* tlbi aside1:清掉這個 ASID 的所有紀錄;參數的 bit 63~48 為 ASID */
+    __asm__ volatile("tlbi aside1, %0\n dsb nsh\n isb" : : "r"((uint64_t)asid << 48));
 }
 
 void arch_tlb_flush(uintptr_t va)

@@ -10,7 +10,9 @@ case "$ARCH" in
   i386)
     BIN=qemu-system-i386
     # isa-debug-exit:kernel 可寫 port 0xF4 結束 QEMU(結束碼 (n<<1)|1)
-    MACHINE=(-device isa-debug-exit,iobase=0xf4,iosize=0x04) ;;
+    # -cpu max:提供 QEMU 能模擬的所有功能。預設的 qemu32 沒有 NX、SMEP、SMAP,
+    # kernel 會偵測並退回沒有這些保護的模式
+    MACHINE=(-cpu "${QEMU_CPU:-max}" -device isa-debug-exit,iobase=0xf4,iosize=0x04) ;;
   riscv64)
     BIN=qemu-system-riscv64
     # virt 機器內建 OpenSBI;單核心。結束由 SiFive finisher 裝置處理
@@ -20,7 +22,8 @@ case "$ARCH" in
     # 成功結束由 PSCI SYSTEM_OFF 處理;失敗碼靠 semihosting 回報(需 -semihosting)。
     # 載入原始二進位(.bin)而非 ELF:QEMU 才會把 DTB 位址放進 x0
     ELF="${ELF%.elf}.bin"
-    MACHINE=(-machine virt -cpu cortex-a57 -smp 1 -m 128M -semihosting) ;;
+    # -cpu max:提供 QEMU 能模擬的所有功能(PAN 需要 ARMv8.1;cortex-a57 沒有)
+    MACHINE=(-machine virt -cpu "${QEMU_CPU:-max}" -smp 1 -m 128M -semihosting) ;;
   *) echo "未知架構: $ARCH" >&2; exit 1 ;;
 esac
 

@@ -12,6 +12,7 @@
 #include "kstring.h"
 #include "panic.h"
 #include "pmm.h"
+#include "proc.h"
 #include "sched.h"
 #include "sync.h"
 #include "timer.h"
@@ -411,6 +412,321 @@ static void sync_demo(void)
     KASSERT(sem_trywait(&pc_items) == 0);    /* 沒有項目:trywait 不等待,回傳 0 */
 }
 
+/* ------------------------------------------------------------------ */
+/* 優先權示範                                                          */
+/* ------------------------------------------------------------------ */
+
+/* 佔用 CPU 直到經過 ms 毫秒(以系統時鐘計;期間被搶佔的時間也算在內) */
+static void busy_ms(unsigned ms)
+{
+    uint64_t end = timer_ticks() + ms * timer_hz() / 1000;   /* 32 位元乘除:避開 i386 的 __udivdi3 */
+    while (timer_ticks() < end)
+        ;
+}
+
+/* 示範 1:執行順序。每條執行緒開始執行時把自己的代號記下來 */
+static char prio_log[4];
+static volatile int prio_log_n;
+
+static void prio_worker(void *arg)
+{
+    prio_log[prio_log_n++] = (char)(uintptr_t)arg;
+    busy_ms(3);
+}
+
+/* 示範 2:搶佔延遲。高優先權的執行緒睡 5ms,醒來時 CPU 正被別人佔用 */
+static volatile unsigned latency_ticks;
+
+static void latency_sleeper(void *arg)
+{
+    (void)arg;
+    uint64_t t0 = timer_ticks();
+    thread_sleep(5);
+    latency_ticks = (unsigned)(timer_ticks() - t0);
+}
+
+static void latency_spinner(void *arg)
+{
+    (void)arg;
+    /* 必須比「對方開始睡之前的等待(至多一個時間片)+ 睡眠 + 再一個時間片」還長,
+       對方醒來時這裡才確定還在佔用 CPU;太短的話兩組對照會得到一樣的結果 */
+    busy_ms(30);
+}
+
+static unsigned latency_run(int sleeper_prio)
+{
+    int t[2];
+    t[0] = thread_create_prio("spinner", latency_spinner, NULL, PRIO_NORMAL);
+    t[1] = thread_create_prio("sleeper", latency_sleeper, NULL, sleeper_prio);
+    join_all(t, 2);
+    return latency_ticks;
+}
+
+/*
+ * 示範 3:優先權反轉與優先權繼承。三條執行緒:
+ *   low    先拿到鎖,需要再工作 6ms 才會解鎖
+ *   medium 純粹佔用 CPU 20ms,和這把鎖無關
+ *   high   要拿同一把鎖
+ * 沒有繼承:medium 比 low 優先,low 輪不到、無法解鎖,high 得等 medium 跑完。
+ * 有繼承:high 等鎖時把 low 提高到和自己一樣,low 搶過 medium、很快解鎖。
+ */
+static struct mutex inv_mutex;
+static volatile int inv_locked;
+static volatile unsigned inv_wait;
+
+static void inv_low(void *arg)
+{
+    (void)arg;
+    mutex_lock(&inv_mutex);
+    inv_locked = 1;
+    busy_ms(6);
+    mutex_unlock(&inv_mutex);
+}
+
+static void inv_medium(void *arg)
+{
+    (void)arg;
+    busy_ms(20);
+}
+
+static void inv_high(void *arg)
+{
+    (void)arg;
+    uint64_t t0 = timer_ticks();
+    mutex_lock(&inv_mutex);
+    inv_wait = (unsigned)(timer_ticks() - t0);
+    mutex_unlock(&inv_mutex);
+}
+
+static unsigned inversion_run(int inherit)
+{
+    int t[3];
+
+    mutex_init(&inv_mutex);
+    inv_mutex.inherit = inherit;
+    inv_locked = 0;
+
+    t[0] = thread_create_prio("low", inv_low, NULL, PRIO_LOW);
+    thread_sleep(2);                         /* main 睡著,low 才有機會先拿到鎖 */
+    KASSERT(inv_locked);
+    t[1] = thread_create_prio("medium", inv_medium, NULL, PRIO_NORMAL);
+    t[2] = thread_create_prio("high", inv_high, NULL, PRIO_HIGH);
+    join_all(t, 3);
+    return inv_wait;
+}
+
+/*
+ * 示範 4:完整的優先權繼承。
+ *   連鎖:L 持有鎖 A;M 持有鎖 B 並等待 A;H 等待 B。
+ *         H 的優先權要經過 M 傳到 L,L 才能搶過其他中等優先權的執行緒。
+ *   多把鎖:L 同時持有 A 和 C,H 在等 A。L 先解開 C 時不該失去提升。
+ */
+static struct mutex pi_a, pi_b, pi_c;
+static volatile int pi_stage;
+static volatile int pi_l_prio_chained, pi_l_prio_after_c, pi_l_prio_after_a;
+
+static void pi_low(void *arg)
+{
+    (void)arg;
+    mutex_lock(&pi_a);
+    mutex_lock(&pi_c);
+    pi_stage = 1;                            /* 兩把鎖都到手 */
+    while (pi_stage < 3)                     /* 等 M、H 都排上來 */
+        thread_yield();
+    pi_l_prio_chained = thread_priority();   /* 應該已經是 H 的優先權 */
+    mutex_unlock(&pi_c);                     /* 解開沒人等的 C */
+    pi_l_prio_after_c = thread_priority();   /* A 還有人等:提升必須保留 */
+    mutex_unlock(&pi_a);
+    pi_l_prio_after_a = thread_priority();   /* 全部解開:回到自己的優先權 */
+}
+
+static void pi_mid(void *arg)
+{
+    (void)arg;
+    mutex_lock(&pi_b);
+    pi_stage = 2;
+    mutex_lock(&pi_a);                       /* 被 L 擋住 */
+    mutex_unlock(&pi_a);
+    mutex_unlock(&pi_b);
+}
+
+static void pi_high(void *arg)
+{
+    (void)arg;
+    pi_stage = 3;
+    mutex_lock(&pi_b);                       /* 被 M 擋住,而 M 被 L 擋住 */
+    mutex_unlock(&pi_b);
+}
+
+/* 示範 5:防飢餓。一條高優先權的執行緒完全不睡,低優先權的仍應得到一些 CPU */
+static volatile unsigned long starve_count;
+static volatile int starve_stop;
+
+static void starve_hog(void *arg)
+{
+    (void)arg;
+    busy_ms(150);
+    starve_stop = 1;
+}
+
+static void starve_victim(void *arg)
+{
+    (void)arg;
+    while (!starve_stop)
+        starve_count++;
+}
+
+static void prio_demo(void)
+{
+    int t[3];
+
+    /* main 暫時升到最高:建立的三條在 main 開始等待之前都不會執行 */
+    thread_set_priority(PRIO_MAX);
+
+    kprintf("prio: three threads created as low, normal, high\n");
+    prio_log_n = 0;
+    t[0] = thread_create_prio("low", prio_worker, (void *)'L', PRIO_LOW);
+    t[1] = thread_create_prio("normal", prio_worker, (void *)'N', PRIO_NORMAL);
+    t[2] = thread_create_prio("high", prio_worker, (void *)'H', PRIO_HIGH);
+    KASSERT(prio_log_n == 0);                /* main 最優先,還沒有人跑過 */
+    join_all(t, 3);
+    prio_log[3] = '\0';
+    kprintf("  run order: %s (expected HNL)\n", prio_log);
+    KASSERT(prio_log[0] == 'H' && prio_log[1] == 'N' && prio_log[2] == 'L');
+
+    unsigned same = latency_run(PRIO_NORMAL);
+    unsigned high = latency_run(PRIO_HIGH);
+    kprintf("prio: sleep(5 ms) while another thread spins: same priority woke after "
+            "%u ticks, high priority after %u\n", same, high);
+    /* 高優先權:約 6 個 tick(睡眠本身)就醒來;同優先權要多等對方的時間片。
+       不檢查絕對數字:模擬器上 tick 可能一次補記好幾個,會有 1~3 個 tick 的抖動 */
+    KASSERT(high < same);
+
+    unsigned without = inversion_run(0);
+    unsigned with = inversion_run(1);
+    kprintf("prio: inversion: high waited %u ticks for the lock without inheritance, "
+            "%u with\n", without, with);
+    KASSERT(with < without && with <= 10 && without >= 15);
+
+    /* 完整的繼承。此時 main 是最高優先權,各執行緒靠 main 睡覺的空檔依序就位 */
+    mutex_init(&pi_a);
+    mutex_init(&pi_b);
+    mutex_init(&pi_c);
+    pi_stage = 0;
+    t[0] = thread_create_prio("pi-low", pi_low, NULL, PRIO_LOW);
+    while (pi_stage < 1)
+        thread_sleep(1);
+    t[1] = thread_create_prio("pi-mid", pi_mid, NULL, PRIO_NORMAL);
+    while (pi_stage < 2)
+        thread_sleep(1);
+    thread_sleep(1);                         /* 讓 M 走到等待 A 的地方 */
+    t[2] = thread_create_prio("pi-high", pi_high, NULL, PRIO_HIGH);
+    join_all(t, 3);
+    kprintf("prio: chained inheritance: low thread ran at priority %d, %d after "
+            "releasing an unrelated lock, %d after releasing all\n",
+            pi_l_prio_chained, pi_l_prio_after_c, pi_l_prio_after_a);
+    KASSERT(pi_l_prio_chained == PRIO_HIGH);     /* H -> M -> L 傳遞成功 */
+    KASSERT(pi_l_prio_after_c == PRIO_HIGH);     /* 解開無關的鎖不失去提升 */
+    KASSERT(pi_l_prio_after_a == PRIO_LOW);      /* 全部解開後恢復 */
+
+    /* 防飢餓:hog(高優先權)連續佔用 CPU 150ms,victim(低優先權)只能靠提升執行 */
+    starve_count = 0;
+    starve_stop = 0;
+    unsigned long boosts0 = sched_starve_boosts();
+    t[0] = thread_create_prio("victim", starve_victim, NULL, PRIO_LOW);
+    t[1] = thread_create_prio("hog", starve_hog, NULL, PRIO_HIGH);
+    thread_set_priority(PRIO_NORMAL);        /* main 不參與;降回一般優先權去等待 */
+    thread_join(t[1]);
+    unsigned long during = starve_count;     /* hog 還在跑的期間 victim 做了多少 */
+    thread_join(t[0]);
+    kprintf("prio: starvation guard: low thread got %lu boosts and made progress "
+            "(%lu iterations) under a 150 ms high-priority hog\n",
+            sched_starve_boosts() - boosts0, during);
+    KASSERT(during > 0 && sched_starve_boosts() - boosts0 >= 1);
+
+    thread_set_priority(PRIO_NORMAL);
+}
+
+/* ------------------------------------------------------------------ */
+/* 使用者模式示範                                                      */
+/* ------------------------------------------------------------------ */
+
+/* 傳給使用者程式的 mode;數值必須與 user/init.c 一致 */
+enum {
+    UMODE_HELLO = 0, UMODE_READ_KERNEL, UMODE_WRITE_TEXT, UMODE_PRIVILEGED, UMODE_NULL,
+    UMODE_BAD_POINTER, UMODE_SPIN, UMODE_STACK, UMODE_ISOLATION, UMODE_BAD_SYSCALL,
+    UMODE_FUTEX,
+};
+
+/* 啟動一個行程、等它結束,確認結束碼符合預期 */
+static void run_user(const char *what, long mode, int expect)
+{
+    int pid = proc_spawn("init", mode);
+    KASSERT(pid > 0);
+    int code = proc_wait(pid);
+    kprintf("user: %s -> exit code %d\n", what, code);
+    if (code != expect)
+        panic("user test \"%s\": exit code %d, expected %d", what, code, expect);
+}
+
+static void user_demo(void)
+{
+    sched_trim();
+    size_t free0 = pmm_free_count() + vm_table_pages();
+    struct kheap_stats h0, h1;
+    kheap_stats(&h0);
+
+    kprintf("user: running a program in user mode\n");
+    run_user("hello, 2 threads, exit(42)", UMODE_HELLO, 42);
+
+    /* 使用者模式的 mutex(futex):3 條執行緒搶同一把鎖,總和必須正確 */
+    run_user("user-mode mutex (futex), 3 threads", UMODE_FUTEX, 11);
+
+    /* 以下每一個都是使用者程式做錯事。預期:只有那個行程被終止(結束碼 -1),
+       kernel 繼續正常運作並執行下一個測試 */
+    run_user("read kernel memory", UMODE_READ_KERNEL, PROC_KILLED_FAULT);
+    run_user("write to its own code", UMODE_WRITE_TEXT, PROC_KILLED_FAULT);
+    run_user("privileged instruction", UMODE_PRIVILEGED, PROC_KILLED_FAULT);
+    run_user("NULL dereference", UMODE_NULL, PROC_KILLED_FAULT);
+    run_user("user stack overflow", UMODE_STACK, PROC_KILLED_FAULT);
+
+    /* 系統呼叫的參數檢查:不合法的指標與編號要被拒絕,行程本身不受影響 */
+    run_user("kernel pointer passed to write()", UMODE_BAD_POINTER, 7);
+    run_user("unknown system call number", UMODE_BAD_SYSCALL, 9);
+
+    /* 搶佔與強制終止:行程陷入無窮迴圈、從不呼叫 kernel。
+       計時器中斷仍會把 CPU 拿回來,main 才有機會執行並終止它 */
+    int pid = proc_spawn("init", UMODE_SPIN);
+    KASSERT(pid > 0);
+    thread_sleep(20);
+    KASSERT(proc_kill(pid, 99) == 0);
+    int code = proc_wait(pid);
+    kprintf("user: infinite loop, killed after 20 ms -> exit code %d\n", code);
+    KASSERT(code == 99);
+
+    /* 隔離:三個行程同時執行同一個程式,各自寫入「同一個虛擬位址」的變數。
+       它們的頁表把這個位址對映到不同的實體頁,所以互不影響 */
+    int p[3];
+    for (int i = 0; i < 3; i++) {
+        p[i] = proc_spawn("init", UMODE_ISOLATION);
+        KASSERT(p[i] > 0);
+    }
+    for (int i = 0; i < 3; i++)
+        KASSERT(proc_wait(p[i]) == 0);
+    kprintf("user: 3 processes wrote the same virtual address without interfering\n");
+
+    KASSERT(proc_wait(12345) == -1);         /* 不存在的 pid */
+
+    /* 所有行程結束後,它們的頁面、頁表、stack 都必須歸還 */
+    thread_sleep(2);
+    sched_trim();
+    kheap_stats(&h1);
+    KASSERT(sched_thread_count() == 1);
+    KASSERT(pmm_free_count() + vm_table_pages() == free0);
+    KASSERT(h1.free_bytes == h0.free_bytes);
+    kprintf("user: all processes exited, memory reclaimed\n");
+}
+
 /*
  * 開機參數 stress:建立大量執行緒,確認數量只受記憶體限制。
  * 每條執行緒讓出 CPU 數次後結束;全部結束後記憶體必須完全歸還。
@@ -469,6 +785,17 @@ static void sched_stress(void)
     }
     kprintf("stress: %u sequential create+join in %llu ticks\n", STRESS_THREADS,
             (unsigned long long)(timer_ticks() - t0));
+
+    /* 第三階段:連續建立並結束 300 個行程。位址空間編號(ASID)只有 254 個可用,
+       所以一定會重複使用;每個行程都必須正常執行,不受前一個使用同編號者的殘留影響 */
+    t0 = timer_ticks();
+    for (int i = 0; i < 300; i++) {
+        int pid = proc_spawn("init", UMODE_BAD_SYSCALL);
+        KASSERT(pid > 0 && proc_wait(pid) == 9);
+    }
+    kprintf("stress: 300 sequential processes in %llu ticks\n",
+            (unsigned long long)(timer_ticks() - t0));
+    thread_sleep(2);
     /* stack 必須全部歸還。heap 為了放 1000 個 struct thread 而向 pmm 多要的頁
        不會歸還(kmalloc 的已知限制),所以要扣掉;但那些空間在 heap 內必須都已空閒 */
     kheap_stats(&h1);
@@ -521,6 +848,31 @@ static void sched_crash_test(const char *cmd)
     } else if (cmdline_has(cmd, "crash=thread")) {
         thread_create("faulty", fault_worker, NULL);
         thread_sleep(100);
+    } else if (cmdline_has(cmd, "crash=uaccess") || cmdline_has(cmd, "crash=uexec")) {
+        /*
+         * kernel 直接讀取 / 執行使用者的頁。這在正常的程式裡不該發生(kernel 一律
+         * 透過 copy_from_user 存取使用者資料),一旦發生通常是被惡意的指標誘導。
+         * 硬體保護應該擋下:
+         *   讀取:i386 SMAP、AArch64 PAN、RISC-V 的 sstatus.SUM = 0
+         *   執行:i386 SMEP、AArch64 PXN、RISC-V 的 S-mode 不可執行 U 頁
+         */
+        struct vm_space *vs = vm_space_create();
+        void *page = pmm_alloc();
+        KASSERT(vs && page);
+        memset(page, 0, PAGE_SIZE);
+        int exec = cmdline_has(cmd, "crash=uexec");
+        KASSERT(vm_space_map(vs, USER_BASE, (uintptr_t)page,
+                             exec ? (VM_READ | VM_EXEC) : (VM_READ | VM_WRITE)) == 0);
+        thread_set_space(vs);
+        if (exec) {
+            kprintf("kernel jumping to a user page...\n");
+            ((void (*)(void))(uintptr_t)USER_BASE)();
+            kprintf("execution returned?!\n");
+        } else {
+            kprintf("kernel reading a user page directly...\n");
+            volatile int *p = (volatile int *)(uintptr_t)USER_BASE;
+            kprintf("read %d: NOT blocked on this CPU\n", *p);
+        }
     } else if (cmdline_has(cmd, "crash=relock")) {
         /* 同一條執行緒對同一個 mutex 上鎖兩次:不偵測的話會自己等自己 */
         static struct mutex m = MUTEX_INIT;
@@ -644,8 +996,13 @@ void kmain(const struct boot_info *bi)
     /* 記憶體管理:先建立頁面配置器,之後才能用 kmalloc */
     pmm_init(bi);
     vm_init(bi);                             /* 開啟分頁;之後的存取都經過頁表 */
-    vm_demo();
-    mem_selftest();
+    /* 開機參數 selftest:執行各子系統的自我測試與示範。預設不執行,
+       開機才不會被測試拖慢;回歸測試與 `run` target 會帶上這個參數 */
+    int selftest = cmdline_has(bi->cmdline, "selftest");
+    if (selftest) {
+        vm_demo();
+        mem_selftest();
+    }
     if (cmdline_has(bi->cmdline, "memtest"))
         mem_fulltest();
 
@@ -660,8 +1017,12 @@ void kmain(const struct boot_info *bi)
     kprintf("timer: %u Hz\n", timer_hz());
 
     sched_crash_test(bi->cmdline);
-    sched_demo();
-    sync_demo();
+    if (selftest) {
+        sched_demo();
+        sync_demo();
+        prio_demo();
+        user_demo();
+    }
     if (cmdline_has(bi->cmdline, "stress"))
         sched_stress();
 

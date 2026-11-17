@@ -4,9 +4,11 @@
 
 /* 與 trap.S 的 stack 版面一致(低位址在前) */
 struct trap_frame {
+    uint32_t es, ds;                                         /* isr_common 推入 */
     uint32_t edi, esi, ebp, esp_pusha, ebx, edx, ecx, eax;  /* pusha */
     uint32_t vector, err;                                    /* 入口推入 */
     uint32_t eip, cs, eflags;                                /* CPU 推入 */
+    uint32_t user_esp, user_ss;      /* CPU 推入;僅在從使用者模式進來時存在 */
 };
 
 void trap_init(void);                       /* 建立 GDT、TSS、IDT */

@@ -21,6 +21,7 @@
 #define VM_WRITE   0x02u       /* 可寫 */
 #define VM_EXEC    0x04u       /* 可執行(i386 未使用 PAE,無法禁止執行,此旗標無作用) */
 #define VM_DEVICE  0x08u       /* 裝置暫存器(MMIO):AArch64 需要不同的記憶體屬性 */
+#define VM_USER    0x10u       /* 使用者模式可存取;沒有這個旗標的頁只有 kernel 能碰 */
 
 /* 建立 kernel 頁表並開啟分頁。需先完成 pmm_init() */
 void vm_init(const struct boot_info *bi);
@@ -43,4 +44,33 @@ int vm_unmap(uintptr_t va);
 int vm_query(uintptr_t va, uintptr_t *pa, unsigned *flags);
 
 unsigned long vm_table_pages(void);    /* 頁表本身用掉的頁數 */
+
+/*
+ * 位址空間(address space):一份獨立的頁表,每個行程一份。
+ *
+ * 每個位址空間分成兩部分:
+ *   kernel 部分:所有位址空間共用同一份對映(建立時從 kernel 頁表複製最上層的項目,
+ *               下層表格是共用的)。所以進入 kernel(系統呼叫、中斷)時不必換頁表。
+ *               這些頁沒有 VM_USER,使用者模式碰不到。
+ *   使用者部分:[USER_BASE, USER_TOP)(範圍依架構而定,見 mmu.h),每個行程各自獨立。
+ *               行程 A 的頁表裡根本沒有行程 B 的頁,這就是行程之間的隔離。
+ */
+struct vm_space;
+
+struct vm_space *vm_space_create(void);          /* 失敗回傳 NULL */
+
+/* 釋放位址空間:使用者部分的所有實體頁與頁表都還給 pmm。
+   呼叫時這個位址空間不可以是 CPU 正在使用的那一份 */
+void vm_space_destroy(struct vm_space *vs);
+
+/* 在使用者範圍內對映一頁(flags 會自動加上 VM_USER)。pa 必須是 pmm_alloc 取得的頁,
+   之後歸這個位址空間所有,destroy 時一併釋放。va 超出使用者範圍回傳 -1 */
+int vm_space_map(struct vm_space *vs, uintptr_t va, uintptr_t pa, unsigned flags);
+
+/* 查詢使用者位址 va 的對映;只回報帶有 VM_USER 的頁,其餘視為不存在。
+   kernel 存取使用者傳來的指標之前,一定要先經過這個檢查 */
+int vm_space_query(struct vm_space *vs, uintptr_t va, uintptr_t *pa, unsigned *flags);
+
+/* 讓 CPU 改用這個位址空間;傳 NULL 表示回到 kernel 自己的頁表 */
+void vm_space_switch(struct vm_space *vs);
 #endif

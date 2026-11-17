@@ -6,6 +6,7 @@
 #include "arch.h"
 #include "kprintf.h"
 #include "panic.h"
+#include "proc.h"
 #include "sched.h"
 #include "trap.h"
 
@@ -18,6 +19,8 @@ extern void trap_entry(void);
 
 #define SCAUSE_INTERRUPT (1ULL << 63)   /* scause 最高位元:1 = 中斷,0 = 例外 */
 #define EXC_BREAKPOINT   3
+#define EXC_ECALL_U      8              /* 使用者模式執行 ecall:系統呼叫 */
+#define SSTATUS_SPP      (1UL << 8)     /* sstatus:被打斷時的模式,0 = 使用者模式 */
 #define IRQ_S_TIMER      5              /* 中斷碼:S-mode 計時器 */
 
 /* 例外原因表(RISC-V 特權規範,scause 低位元) */
@@ -65,6 +68,7 @@ static void dump_frame(const struct trap_frame *tf)
 void trap_handler(struct trap_frame *tf)
 {
     uint64_t cause = tf->scause;
+    int from_user = !(tf->sstatus & SSTATUS_SPP);
 
     if (cause & SCAUSE_INTERRUPT) {
         /*
@@ -73,9 +77,29 @@ void trap_handler(struct trap_frame *tf)
          */
         if ((cause & ~SCAUSE_INTERRUPT) == IRQ_S_TIMER) {
             timer_interrupt();
+            if (from_user)
+                user_return_check();
             return;
         }
         panic("unexpected interrupt, scause=0x%llx", (unsigned long long)cause);
+    }
+
+    /* 系統呼叫:編號在 a7,參數在 a0~a2,回傳值放回 a0。
+       sepc 指向 ecall 本身,要加 4 跳過它,否則返回後會再執行一次 */
+    if (cause == EXC_ECALL_U) {
+        tf->sepc += 4;
+        tf->a0 = (uint64_t)syscall_dispatch((long)tf->a7, (long)tf->a0,
+                                            (long)tf->a1, (long)tf->a2);
+        user_return_check();
+        return;
+    }
+
+    /* 使用者程式造成的其他例外:只終止那個行程,kernel 繼續運作 */
+    if (from_user) {
+        const char *uname = "Unknown exception";
+        if (cause < sizeof(exc_names) / sizeof(exc_names[0]) && exc_names[cause])
+            uname = exc_names[cause];
+        user_fault(uname, tf->sepc, tf->stval);
     }
 
     /* 可恢復的例外:ebreak。印出訊息後跳過該指令,繼續執行 */

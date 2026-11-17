@@ -5,3 +5,4 @@ set(ARCH_SOURCES arch/i386/boot.S arch/i386/trap.S arch/i386/switch.S arch/i386/
 # -mgeneral-regs-only:kernel 不使用 x87/SSE(尚未初始化 FPU,也避免例外入口要存浮點狀態)
 set(ARCH_FLAGS -m32 -mgeneral-regs-only -fno-pic -fno-pie)
 set(ARCH_LINK_FLAGS -m32)
+set(ARCH_USER_BASE 0x40000000)   # 使用者位址範圍的起點,須與 mmu.h 的 USER_BASE 一致

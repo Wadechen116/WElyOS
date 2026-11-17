@@ -22,11 +22,30 @@ set(CMAKE_C_EXTENSIONS OFF)
 # freestanding:不假設有 OS 或 libc。
 # -fno-tree-loop-distribute-patterns:避免 lib/string.c 的迴圈被改寫成自我呼叫
 # -fno-omit-frame-pointer:保留 frame pointer 鏈,backtrace 才能回溯
+# 最佳化等級。預設 -O2;要用 GDB 逐行追蹤時,未最佳化的程式比較好對照原始碼,
+# 可改用:cmake --preset <架構> -DWELYOS_OPT=-O0
+set(WELYOS_OPT "-O2" CACHE STRING "編譯器最佳化等級,例如 -O2、-Og、-O0")
+add_compile_options(${WELYOS_OPT})
+
 add_compile_options(${ARCH_FLAGS} -ffreestanding -fno-stack-protector -fno-builtin
                     -fno-tree-loop-distribute-patterns -fno-omit-frame-pointer -nostdlib -Wall -Wextra -g)
-add_link_options(${ARCH_LINK_FLAGS} -ffreestanding -nostdlib -static -no-pie
-                 -Wl,--no-warn-rwx-segments
-                 -T ${CMAKE_SOURCE_DIR}/arch/${ARCH}/linker.ld)
+# 連結選項分成共用的部分與各自的 linker script:kernel 與使用者程式是兩個獨立的執行檔
+set(COMMON_LINK_FLAGS ${ARCH_LINK_FLAGS} -ffreestanding -nostdlib -static -no-pie
+                      -Wl,--no-warn-rwx-segments -Wl,--build-id=none)
+
+# ---- 使用者程式 ----
+# 獨立連結在 USER_BASE(各架構的使用者位址範圍起點),再轉成原始二進位,
+# 由 kernel/userimg.S 以 .incbin 嵌入 kernel。
+add_executable(init.elf user/init.c)
+target_link_options(init.elf PRIVATE ${COMMON_LINK_FLAGS}
+    -T ${CMAKE_SOURCE_DIR}/user/user.ld -Wl,--defsym=USER_BASE=${ARCH_USER_BASE})
+set_target_properties(init.elf PROPERTIES LINK_DEPENDS ${CMAKE_SOURCE_DIR}/user/user.ld)
+set(USER_IMG ${CMAKE_BINARY_DIR}/init.bin)
+add_custom_command(OUTPUT ${USER_IMG}
+    COMMAND ${CMAKE_OBJCOPY} -O binary $<TARGET_FILE:init.elf> ${USER_IMG}
+    DEPENDS init.elf
+    COMMENT "產生使用者程式映像 init.bin")
+add_custom_target(user_image DEPENDS ${USER_IMG})
 
 add_executable(welyos.elf
     ${ARCH_SOURCES}
@@ -40,7 +59,16 @@ add_executable(welyos.elf
     kernel/sched.c
     kernel/sync.c
     kernel/vm.c
+    kernel/proc.c
+    kernel/userimg.S
     lib/string.c)
+target_link_options(welyos.elf PRIVATE ${COMMON_LINK_FLAGS}
+    -T ${CMAKE_SOURCE_DIR}/arch/${ARCH}/linker.ld)
+# userimg.S 內嵌 init.bin:映像改變時要重新組譯
+add_dependencies(welyos.elf user_image)
+set_source_files_properties(kernel/userimg.S PROPERTIES
+    COMPILE_DEFINITIONS "USER_IMG_PATH=\"${USER_IMG}\""
+    OBJECT_DEPENDS ${USER_IMG})
 target_include_directories(welyos.elf PRIVATE include arch/${ARCH})
 set_target_properties(welyos.elf PROPERTIES LINK_DEPENDS
     ${CMAKE_SOURCE_DIR}/arch/${ARCH}/linker.ld)
@@ -55,9 +83,10 @@ endif()
 
 # ---- QEMU 目標 ----
 set(QEMU_SCRIPT ${CMAKE_SOURCE_DIR}/scripts/qemu.sh)
-# run:直接執行,序列埠輸出到終端機;帶 autoexit 讓 kernel 結束時關閉 QEMU
+# run:直接執行,序列埠輸出到終端機;autoexit 讓 kernel 結束時關閉 QEMU,
+# selftest 執行各子系統的自我測試與示範
 add_custom_target(run
-    COMMAND bash ${QEMU_SCRIPT} ${ARCH} $<TARGET_FILE:welyos.elf> -append autoexit
+    COMMAND bash ${QEMU_SCRIPT} ${ARCH} $<TARGET_FILE:welyos.elf> -append "autoexit selftest"
     DEPENDS welyos.elf USES_TERMINAL)
 # debug:開 GDB stub(tcp::1234)並在第一條指令前暫停,等待 gdb 連線
 add_custom_target(debug
