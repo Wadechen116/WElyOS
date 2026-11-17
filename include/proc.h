@@ -61,5 +61,6 @@ enum {
     SYS_spawn,              /* (path, argv)    建立新行程執行 path;回傳 pid。新行程繼承開啟中的檔案 */
     SYS_exec,               /* (path, argv)    目前的行程改為執行 path;成功則不返回 */
     SYS_wait,               /* (pid)           等待行程結束,回傳它的結束碼 */
+    SYS_dup2,               /* (oldfd, newfd)  讓 newfd 也指向 oldfd 的那次開啟;回傳 newfd */
 };
 #endif

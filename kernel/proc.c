@@ -3,6 +3,7 @@
  */
 #include <stddef.h>
 #include "arch.h"
+#include "console.h"
 #include "fs.h"
 #include "kmalloc.h"
 #include "kprintf.h"
@@ -371,6 +372,7 @@ static void proc_begin_exit(struct proc *p, int code)
     /* 睡在 futex 上的執行緒不會自己醒來:叫醒它們,它們返回使用者模式前就會結束 */
     for (unsigned i = 0; i < FUTEX_BUCKETS; i++)
         wq_wake_all(&p->futex[i]);
+    console_wake_readers();          /* 正在等主控台輸入的也一樣 */
 }
 
 /* 結束整個行程(由行程自己的執行緒呼叫) */
@@ -805,6 +807,28 @@ static long sys_close(struct proc *p, long fd)
     return 0;
 }
 
+/* dup2:讓 newfd 指向和 oldfd 同一次開啟。newfd 原本若開著,先關閉。
+   重新導向靠它:把檔案「接到」1 號描述符上,之後再接回原本的 */
+static long sys_dup2(struct proc *p, long oldfd, long newfd)
+{
+    if (newfd < 0 || newfd >= (long)PROC_MAX_FD)
+        return -E_BADF;
+    struct file *f = fd_get(p, oldfd);           /* 多拿一個參考,交給 newfd */
+    if (!f)
+        return -E_BADF;
+    if (oldfd == newfd) {
+        vfs_close(f);
+        return newfd;
+    }
+    unsigned long fl = spin_lock_irqsave(&fd_lk);
+    struct file *old = p->fd[newfd];
+    p->fd[newfd] = f;
+    spin_unlock_irqrestore(&fd_lk, fl);
+    if (old)
+        vfs_close(old);
+    return newfd;
+}
+
 static long sys_readdir(struct proc *p, long fd, uintptr_t uent)
 {
     struct dirent d;
@@ -1012,6 +1036,8 @@ long syscall_dispatch(long num, long a0, long a1, long a2)
         return sys_open(p, (uintptr_t)a0, (int)a1);
     case SYS_close:
         return sys_close(p, a0);
+    case SYS_dup2:
+        return sys_dup2(p, a0, a1);
     case SYS_readdir:
         return sys_readdir(p, a0, (uintptr_t)a1);
     case SYS_mkdir:

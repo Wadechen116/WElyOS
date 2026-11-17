@@ -35,6 +35,15 @@ void serial_putc(char c)
     outb(COM1, (uint8_t)c);
 }
 
+/* 線路狀態暫存器 bit 0(DR,data ready):為 1 表示接收到的資料還沒被讀走。
+   沒有資料時回傳 -1,不等待 */
+int serial_getc(void)
+{
+    if (!(inb(COM1 + 5) & 0x01))
+        return -1;
+    return inb(COM1);
+}
+
 void serial_puts(const char *s)
 {
     while (*s)

@@ -14,6 +14,7 @@
  * 兩者都是 0 才釋放。所以「檔案被刪除時還有人開著」是允許的:
  * 名稱立刻消失,內容留到最後一個開啟者關閉為止。
  */
+#include "console.h"
 #include "fs.h"
 #include "kmalloc.h"
 #include "kprintf.h"
@@ -430,45 +431,12 @@ int vfs_stat(const char *path, struct stat *st)
     return 0;
 }
 
-/* ---- /dev/console:把主控台包裝成一個檔案 ---- */
-
-/* 寫入 = 輸出到主控台。這樣使用者程式的輸出就只是「寫入 1 號檔案描述符」,
-   之後要把輸出導向檔案,只要換掉描述符指向的東西,程式不必修改 */
-static long console_write(const void *buf, size_t n)
-{
-    const char *p = buf;
-    char chunk[128];
-    size_t done = 0;
-
-    while (done < n) {
-        size_t k = n - done;
-        if (k > sizeof(chunk) - 1)
-            k = sizeof(chunk) - 1;
-        for (size_t i = 0; i < k; i++)
-            chunk[i] = p[done + i];
-        chunk[k] = '\0';
-        kprintf("%s", chunk);
-        done += k;
-    }
-    return (long)n;
-}
-
-/* 還沒有鍵盤 / 序列埠的輸入驅動:讀取一律回報「沒有資料」 */
-static long console_read(void *buf, size_t n)
-{
-    (void)buf;
-    (void)n;
-    return 0;
-}
-
-static const struct dev_ops console_dev = { console_read, console_write };
-
 void vfs_init(void)
 {
     root = ramfs_create_root();
     if (!root)
         panic("vfs: cannot create the root file system");
     root->nlink = 1;                         /* 根目錄永遠存在 */
-    if (vfs_mkdir("/dev") != 0 || vfs_mkdev("/dev/console", &console_dev) != 0)
+    if (vfs_mkdir("/dev") != 0 || vfs_mkdev("/dev/console", console_dev_ops()) != 0)
         panic("vfs: cannot create /dev/console");
 }

@@ -37,6 +37,16 @@ if [ -z "$QEMU" ]; then
 fi
 case "$QEMU" in *.exe) ELF="$(wslpath -w "$ELF")";; esac
 
+# 從終端機直接執行時(標準輸入是終端機):關掉終端機自己的「整行緩衝」與「回顯」。
+# 否則打的字要等按下 Enter 才一次送進去(一長串同時到達,客體來不及收會掉字),
+# 而且每個字會顯示兩次(終端機顯示一次、WElyOS 自己再回顯一次)。
+# 保留 Ctrl-C 的作用(結束 QEMU)。結束時還原終端機的設定。
+if [ -t 0 ]; then
+  STTY_SAVED="$(stty -g)"
+  trap 'stty "$STTY_SAVED" 2>/dev/null' EXIT
+  stty -icanon -echo
+fi
+
 set +e
 "$QEMU" "${MACHINE[@]}" -kernel "$ELF" -serial stdio \
         -display "${QEMU_DISPLAY:-none}" -no-reboot "$@"

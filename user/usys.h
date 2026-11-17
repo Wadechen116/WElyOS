@@ -19,7 +19,7 @@ enum {
     SYS_write = 1, SYS_exit, SYS_getpid, SYS_yield, SYS_sleep,
     SYS_thread_create, SYS_thread_exit, SYS_gettid, SYS_futex_wait, SYS_futex_wake,
     SYS_open, SYS_close, SYS_read, SYS_readdir, SYS_mkdir, SYS_unlink, SYS_stat,
-    SYS_spawn, SYS_exec, SYS_wait,
+    SYS_spawn, SYS_exec, SYS_wait, SYS_dup2,
 };
 
 /* 檔案相關的定義,必須與 kernel 的 include/fs.h 一致 */
@@ -83,6 +83,8 @@ static inline long sys_open(const char *path, long flags)
     return syscall3(SYS_open, (long)path, flags, 0);
 }
 static inline long sys_close(long fd)             { return syscall3(SYS_close, fd, 0, 0); }
+/* 讓 newfd 也指向 oldfd 所指的那次開啟(newfd 原本若開著會先被關閉) */
+static inline long sys_dup2(long oldfd, long newfd) { return syscall3(SYS_dup2, oldfd, newfd, 0); }
 static inline long sys_readdir(long fd, struct dirent *d)
 {
     return syscall3(SYS_readdir, fd, (long)d, 0);

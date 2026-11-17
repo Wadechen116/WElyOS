@@ -9,6 +9,7 @@
 
 void arch_init(void);                          /* 初始化主控台,之後才能 kprintf */
 void arch_putc(char c);                        /* 輸出一個字元到主控台 */
+int  arch_console_getc(void);                  /* 讀取一個輸入的字元;沒有輸入時立刻回傳 -1(不等待) */
 void arch_halt(void) __attribute__((noreturn));/* 關閉中斷並永久停住(panic 用) */
 void arch_exit(int code) __attribute__((noreturn)); /* 結束模擬器(僅測試用) */
 const char *arch_name(void);                   /* 架構名稱字串 */

@@ -13,12 +13,26 @@
 #define UART_DR     (0x00 / 4)    /* 資料暫存器 */
 #define UART_FR     (0x18 / 4)    /* 旗標暫存器:bit 5 = 傳送 FIFO 滿 */
 #define UART_FR_TXFF (1u << 5)
+#define UART_FR_RXFE (1u << 4)    /* bit 4 = 接收 FIFO 是空的 */
+#define UART_CR     (0x30 / 4)    /* 控制暫存器:bit 0 啟用 UART、bit 8 啟用傳送、bit 9 啟用接收 */
 
 static volatile uint32_t *const uart = (volatile uint32_t *)UART0_BASE;
 
 /* QEMU 的 PL011 開機即可傳送,不需初始化(實機需設定鮑率與啟用,日後再補) */
 void arch_init(void)
 {
+    /* QEMU 的 UART 開機即可輸出;這裡明確啟用傳送與接收,不依賴預設值 */
+    uart[UART_CR] = 0x301;
+    /* 線路控制暫存器(0x2C):8 位元資料(bit 6~5 = 11)並啟用 FIFO(bit 4)。
+       沒有 FIFO 時只能暫存 1 個字元,連續進來的字元會被後面的擠掉 */
+    uart[0x2C / 4] = 0x70;
+}
+
+int arch_console_getc(void)
+{
+    if (uart[UART_FR] & UART_FR_RXFE)
+        return -1;
+    return (int)(uart[UART_DR] & 0xFF);
 }
 
 void arch_putc(char c)

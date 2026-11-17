@@ -22,9 +22,13 @@
 
 static volatile uint8_t *const uart = (volatile uint8_t *)UART0_BASE;
 
-/* QEMU 的 UART 開機即可用,不需初始化(實機需設定鮑率,日後再補) */
+/* QEMU 的 UART 開機即可輸出,不需設定鮑率(實機需要,日後再補)。
+   這裡只啟用 FIFO(暫存器 2 寫入 0x07:啟用並清空收發緩衝):
+   沒有 FIFO 時硬體只能暫存 1 個字元,kernel 每 1ms 才來取一次,
+   連續進來的字元會被後面的擠掉;有了 FIFO 可以暫存 16 個 */
 void arch_init(void)
 {
+    uart[2] = 0x07;
 }
 
 void arch_putc(char c)
@@ -32,6 +36,14 @@ void arch_putc(char c)
     while (!(uart[UART_LSR] & 0x20))     /* 等待傳送緩衝區空 */
         ;
     uart[UART_THR] = (uint8_t)c;
+}
+
+/* 線路狀態暫存器 bit 0(DR,data ready):為 1 表示接收到的資料還沒被讀走 */
+int arch_console_getc(void)
+{
+    if (!(uart[UART_LSR] & 0x01))
+        return -1;
+    return uart[UART_THR];                   /* 讀取時同一個位址是接收暫存器 */
 }
 
 void arch_halt(void)

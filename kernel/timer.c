@@ -5,6 +5,7 @@
  * tick 計數是 kernel 的時間基準,之後的排程器也靠它切換工作。
  */
 #include "arch.h"
+#include "console.h"
 #include "cpu.h"
 #include "sched.h"
 #include "timer.h"
@@ -23,8 +24,10 @@ void timer_tick(void)
 {
     /* 每顆 CPU 都有自己的計時器中斷,但系統時間只由第 0 顆 CPU 推進,
        否則 N 顆 CPU 時間就會走快 N 倍 */
-    if (this_cpu()->id == 0)
+    if (this_cpu()->id == 0) {
         ticks++;
+        console_poll();        /* 看看主控台有沒有新的輸入(見 console.c) */
+    }
     sched_tick();              /* 喚醒休眠者、扣時間片(排程器未啟動時無作用) */
 }
 

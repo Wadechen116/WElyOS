@@ -214,11 +214,28 @@ static void coop_worker(void *arg)
 /* 示範 2:搶佔。完全不讓出 CPU 的忙碌迴圈,只能靠計時器中斷換人 */
 static volatile uint64_t spin_deadline;
 
+/* 每條執行緒記錄兩個數字:
+     iters  迴圈跑了幾圈(看得出它有在執行)
+     ticks  它執行期間,系統時間前進了幾次(= 它實際得到多少毫秒的 CPU)
+   公平性看的是 ticks。iters 不能拿來比:同樣的時間能跑幾圈,在模擬器上會受
+   「這條執行緒的 stack 剛好配置在哪一頁」影響到好幾倍(見 DEVLOG 第 21 步) */
+struct spin_stat {
+    volatile unsigned long iters;
+    volatile unsigned long ticks;
+};
+
 static void spin_worker(void *arg)
 {
-    volatile unsigned long *counter = arg;
-    while (timer_ticks() < spin_deadline)
-        (*counter)++;
+    struct spin_stat *st = arg;
+    uint64_t last = timer_ticks(), now;
+
+    while ((now = timer_ticks()) < spin_deadline) {
+        st->iters++;
+        if (now != last) {
+            st->ticks++;
+            last = now;
+        }
+    }
 }
 
 /* 示範 3:休眠。各自睡不同長度,醒來的順序應該依時間而不是建立順序 */
@@ -246,16 +263,17 @@ static void sched_demo(void)
     join_all(t, 3);
 
     kprintf("sched: preemptive (busy loops, no yield)\n");
-    static volatile unsigned long c1, c2;
+    static struct spin_stat s1, s2;
     unsigned long sw0 = sched_switch_count();
     spin_deadline = timer_ticks() + timer_hz() * 60 / 1000;   /* 各自空轉 60ms = 6 個時間片 */
-    t[0] = thread_create("spin1", spin_worker, (void *)&c1);
-    t[1] = thread_create("spin2", spin_worker, (void *)&c2);
+    t[0] = thread_create("spin1", spin_worker, &s1);
+    t[1] = thread_create("spin2", spin_worker, &s2);
     join_all(t, 2);
-    kprintf("  spin1=%lu spin2=%lu, %lu context switches\n",
-            (unsigned long)c1, (unsigned long)c2, sched_switch_count() - sw0);
-    /* 兩條都要跑到,而且沒有一條被餓死(差距在 3 倍以內) */
-    KASSERT(c1 > 0 && c2 > 0 && c1 < c2 * 3 && c2 < c1 * 3);
+    kprintf("  spin1: %lu ms of cpu (%lu loops), spin2: %lu ms (%lu loops), %lu context switches\n",
+            s1.ticks, s1.iters, s2.ticks, s2.iters, sched_switch_count() - sw0);
+    /* 兩條都要跑到,而且得到的 CPU 時間相近(差距在 2 倍以內) */
+    unsigned long c1 = s1.ticks, c2 = s2.ticks;
+    KASSERT(s1.iters > 0 && s2.iters > 0 && c1 > 0 && c2 > 0 && c1 < c2 * 2 && c2 < c1 * 2);
 
     kprintf("sched: sleep\n");
     t[0] = thread_create("s30", sleep_worker, (void *)30);
@@ -899,6 +917,37 @@ static void user_demo(void)
     run_user("exec replaces the program", UMODE_EXEC, 3);
     run_user("exec with a second thread is refused", UMODE_EXEC_THREADS, 13);
 
+    /* shell 執行一份 script:建立目錄、重新導向輸出到檔案、找不到的命令、最後 exit 7。
+       除了結束碼,也檢查它留下的檔案內容 */
+    {
+        const char *argv[] = { "sh", "/etc/test.sh", NULL };
+        struct file *f;
+        char buf[80];
+        static const char want[] = "first line\nsecond line, with  two  spaces\n";
+        int pid = proc_spawn("/bin/sh", argv);
+        KASSERT(pid > 0);
+        int code = proc_wait(pid);
+        kprintf("user: shell script /etc/test.sh -> exit code %d\n", code);
+        KASSERT(code == 7);
+        KASSERT(vfs_open("/work/result", O_RDONLY, &f) == 0);
+        long n = vfs_read(f, buf, sizeof(buf));
+        vfs_close(f);
+        KASSERT(n == (long)sizeof(want) - 1 && memcmp(buf, want, (size_t)n) == 0);
+        KASSERT(vfs_unlink("/work/result") == 0 && vfs_unlink("/work") == 0);
+    }
+
+    /* 正在等主控台輸入的行程也要能被終止:啟動一個互動式的 shell(沒有人打字,
+       它會一直睡在讀取裡),過一下子把它終止,確認它真的結束了 */
+    {
+        int pid = proc_spawn("/bin/sh", NULL);
+        KASSERT(pid > 0);
+        thread_sleep(10);
+        KASSERT(proc_kill(pid, 98) == 0);
+        int code = proc_wait(pid);
+        kprintf("\nuser: shell blocked on console input, killed -> exit code %d\n", code);
+        KASSERT(code == 98);
+    }
+
     /* 使用者模式的 mutex(futex):3 條執行緒搶同一把鎖,總和必須正確 */
     run_user("user-mode mutex (futex), 3 threads", UMODE_FUTEX, 11);
 
@@ -1394,8 +1443,24 @@ void kmain(const struct boot_info *bi)
 
     kprintf("uptime: %llu ticks, %lu context switches\n",
             (unsigned long long)timer_ticks(), sched_switch_count());
+
+    /*
+     * 啟動 shell:從主控台讀命令並執行。
+     *   一般開機(沒有 autoexit):一定啟動,這是使用者與系統互動的地方
+     *   自動化測試(autoexit)    :只有另外給了 shell 參數才啟動;shell 結束後
+     *                              以它的結束碼結束模擬器
+     */
+    int exit_code = 0;
+    if (!autoexit || cmdline_has(bi->cmdline, "shell")) {
+        kprintf("starting /bin/sh (type \"help\" for a list of commands)\n");
+        int pid = proc_spawn("/bin/sh", NULL);
+        if (pid < 0)
+            panic("cannot start /bin/sh");
+        exit_code = proc_wait(pid);
+        kprintf("shell exited with code %d\n", exit_code);
+    }
     if (autoexit)
-        arch_exit(0);
+        arch_exit(exit_code);
     for (;;)
         thread_sleep(1000);                  /* main 無事可做;CPU 交給 idle 執行緒休眠 */
 }

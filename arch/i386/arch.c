@@ -20,6 +20,12 @@ void arch_putc(char c)
     vga_putc(c);                         /* 同步輸出到螢幕 */
 }
 
+/* 輸入只接序列埠(QEMU 把它接到終端機)。PS/2 鍵盤尚未支援 */
+int arch_console_getc(void)
+{
+    return serial_getc();
+}
+
 void arch_halt(void)
 {
     for (;;)
