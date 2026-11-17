@@ -1362,9 +1362,26 @@ static void mem_fulltest(void)
     kprintf("memtest: %zu pages written and verified\n", count);
 }
 
+/*
+ * 開機標誌。由 kernel 自己印出,所以三個架構完全相同(走的是同一份程式),
+ * 序列埠與 i386 的螢幕上都看得到。寬度 55 個字元,80 欄的文字畫面放得下。
+ * 不交給各平台的韌體:只有 RISC-V 的韌體會印標誌,而且每個平台的韌體都不一樣。
+ */
+static const char boot_logo[] =
+    "\n"
+    " __          __  ______   _            ____     _____\n"
+    " \\ \\        / / |  ____| | |          / __ \\   / ____|\n"
+    "  \\ \\  /\\  / /  | |__    | |  _   _  | |  | | | (___\n"
+    "   \\ \\/  \\/ /   |  __|   | | | | | | | |  | |  \\___ \\\n"
+    "    \\  /\\  /    | |____  | | | |_| | | |__| |  ____) |\n"
+    "     \\/  \\/     |______| |_|  \\__, |  \\____/  |_____/\n"
+    "                               __/ |\n"
+    "                              |___/\n";
+
 /* kernel 主函式。主控台此時已可使用。此函式不會返回。 */
 void kmain(const struct boot_info *bi)
 {
+    kprintf("%s\n", boot_logo);
     kprintf("Hello WElyOS\n");
     kprintf("arch: %s (%u-bit)\n", arch_name(), (unsigned)(sizeof(void *) * 8));
     kprintf("cmdline: \"%s\"\n", bi->cmdline);

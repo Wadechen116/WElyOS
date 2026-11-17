@@ -16,8 +16,13 @@ case "$ARCH" in
     MACHINE=(-cpu "${QEMU_CPU:-max}" -smp "${QEMU_SMP:-4}" -device isa-debug-exit,iobase=0xf4,iosize=0x04) ;;
   riscv64)
     BIN=qemu-system-riscv64
-    # virt 機器內建 OpenSBI。結束由 SiFive finisher 裝置處理
-    MACHINE=(-machine virt -smp "${QEMU_SMP:-4}" -m 128M -bios default) ;;
+    # 開機韌體 OpenSBI:使用專案內自行建置、開機標誌為 WElyOS 的版本
+    # (firmware/opensbi-riscv64-welyos.bin,由 scripts/build-opensbi.sh 產生)。
+    # 找不到該檔案,或設定 QEMU_BIOS=default 時,改用 QEMU 內附的版本。
+    # 結束由 SiFive finisher 裝置處理
+    BIOS="${QEMU_BIOS:-$(dirname "$0")/../firmware/opensbi-riscv64-welyos.bin}"
+    [ "$BIOS" != default ] && [ ! -f "$BIOS" ] && BIOS=default
+    MACHINE=(-machine virt -smp "${QEMU_SMP:-4}" -m 128M -bios "$BIOS") ;;
   aarch64)
     BIN=qemu-system-aarch64
     # 成功結束由 PSCI SYSTEM_OFF 處理;失敗碼靠 semihosting 回報(需 -semihosting)。
@@ -35,7 +40,15 @@ if [ -z "$QEMU" ]; then
     QEMU="/mnt/c/Program Files/qemu/$BIN.exe"
   else echo "找不到 $BIN,請設定環境變數 QEMU" >&2; exit 1; fi
 fi
-case "$QEMU" in *.exe) ELF="$(wslpath -w "$ELF")";; esac
+case "$QEMU" in *.exe)
+  ELF="$(wslpath -w "$ELF")"
+  # Windows 版的 QEMU 看不懂 WSL 的路徑:韌體檔的路徑也要轉換
+  for i in "${!MACHINE[@]}"; do
+    if [ "${MACHINE[$i]}" = -bios ] && [ "${MACHINE[$((i+1))]}" != default ]; then
+      MACHINE[$((i+1))]="$(wslpath -w "${MACHINE[$((i+1))]}")"
+    fi
+  done ;;
+esac
 
 # 從終端機直接執行時(標準輸入是終端機):關掉終端機自己的「整行緩衝」與「回顯」。
 # 否則打的字要等按下 Enter 才一次送進去(一長串同時到達,客體來不及收會掉字),

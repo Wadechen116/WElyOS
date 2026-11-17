@@ -36,6 +36,7 @@
 - [x] 檔案系統:VFS(Virtual File System)介面、記憶體檔案系統(ramfs)、開機檔案包(tar 嵌入 kernel,開機時解開)、裝置檔案 `/dev/console`;系統呼叫 `open` / `close` / `read` / `write` / `readdir` / `mkdir` / `unlink` / `stat` 與每個行程的檔案描述符表;使用者程式改由 `/bin/init` 載入
 - [x] 行程:多個使用者程式(`/bin/init`、`echo`、`cat`、`ls`)、`main(argc, argv)` 參數、`spawn` / `wait` / `exec` 系統呼叫、建立行程時繼承檔案描述符(可重新導向輸出);相同程式的行程共用程式碼頁,正在執行的程式檔不可修改
 - [x] 主控台輸入(序列埠,含行編輯:退格、Ctrl-C、Ctrl-D)與 shell(`/bin/sh`):執行 `/bin` 下的程式、`>` / `>>` 重新導向、引號、script 檔;另有 `mkdir`、`rm`;`dup2` 系統呼叫。不帶 `autoexit` 開機時直接進入 shell
+- [x] 三個架構相同的 WElyOS 文字開機標誌(由 kernel 印出;RISC-V 使用拿掉自身標誌的 OpenSBI)
 
 ## 規劃中
 
@@ -70,6 +71,7 @@ bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit stress" 
 cmake --build build/i386    --target run-gui   # 僅 i386:開啟 QEMU 視窗顯示 VGA 畫面
 cmake --preset riscv64 -DWELYOS_RUNQ=list      # 換用另一種執行佇列的實作(預設 ring)
 bash scripts/host-test.sh                      # 在主機上以多條執行緒測試執行佇列(不需要 QEMU)
+bash scripts/build-opensbi.sh                  # (選用)重新建置 RISC-V 的開機韌體;換 OpenSBI 版本時才需要
 bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf                                # 開機後進入 shell(輸入 help 看有哪些命令;以 Ctrl-C 結束 QEMU)
 python3 scripts/type-input.py 1.5 0.01 'ls /\nexit\n' | bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit shell"   # 自動化:模擬打字餵給 shell
 QEMU_SMP=8 bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit selftest"   # 指定 CPU 數(預設 4,最多 8;1 = 單核心)
@@ -84,6 +86,7 @@ kernel/       kernel 主體(main、kprintf、fdt、panic、timer、pmm、kmalloc
 lib/          最小字串函式庫
 cmake/        各架構的 toolchain 檔
 user/         使用者程式(各自獨立連結後放進開機檔案包的 /bin/):init(測試)、sh(shell)、echo、cat、ls、mkdir、rm;crt0.c 為共用的啟動程式,ulib.h 為共用的小工具
+firmware/     RISC-V 的開機韌體(拿掉自己標誌的 OpenSBI;說明見 firmware/README.md)
 rootfs/       開機檔案包的內容(建置時打包成 tar 嵌入 kernel,開機時解開到檔案系統)
 tests/host/   在主機上執行的測試(執行佇列的並行測試)
 scripts/      QEMU 啟動腳本、GDB 腳本與設定、主機測試腳本
