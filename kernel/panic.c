@@ -24,6 +24,7 @@ void panic(const char *fmt, ...)
 {
     va_list ap;
 
+    arch_irq_disable();        /* 從此不再被搶佔,其他執行緒也不會繼續跑 */
     kprintf("\n*** KERNEL PANIC: ");
     va_start(ap, fmt);
     kvprintf(fmt, ap);

@@ -20,6 +20,7 @@
 #include "arch.h"
 #include "kprintf.h"
 #include "panic.h"
+#include "sched.h"
 #include "timer.h"
 #include "trap.h"
 
@@ -86,4 +87,7 @@ void irq_handler(void)
     }
 
     mmio_w32(GICC_BASE + GICC_EOIR, iar);            /* 處理完畢,GIC 才會再送下一個 */
+
+    /* 必須在 EOI 之後:這裡可能切換到別的執行緒,很久才回來 */
+    sched_irq_exit();
 }

@@ -5,6 +5,7 @@
  * tick 計數是 kernel 的時間基準,之後的排程器也靠它切換工作。
  */
 #include "arch.h"
+#include "sched.h"
 #include "timer.h"
 
 /* volatile:在中斷處理程式中被修改,主程式每次都必須重新讀取 */
@@ -20,6 +21,7 @@ void timer_init(unsigned hz)
 void timer_tick(void)
 {
     ticks++;
+    sched_tick();              /* 喚醒休眠者、扣時間片(排程器未啟動時無作用) */
 }
 
 /*

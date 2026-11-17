@@ -5,6 +5,7 @@ SECTIONS
 {
     /* OpenSBI 佔用 0x80000000 起的空間,S-mode kernel 慣例載入於 0x80200000 */
     . = 0x80200000;
+    __kernel_start = .;                     /* kernel 映像的起點(記憶體管理員用) */
 
     .text   : { *(.text.boot) *(.text*) }   /* _start 所在的 .text.boot 放最前面 */
     .rodata : { *(.rodata*) *(.srodata*) }
@@ -17,4 +18,5 @@ SECTIONS
         . = ALIGN(8);
         __bss_end = .;
     }
+    __kernel_end = .;                       /* kernel 映像的終點;之後的記憶體才可配置 */
 }

@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include "arch.h"
 #include "kprintf.h"
+#include "sched.h"
 
 /* virt 機器的 NS16550A 序列埠,基底 0x10000000 */
 #define UART0_BASE  0x10000000UL
@@ -67,8 +68,37 @@ const char *arch_name(void)
     return "riscv64";
 }
 
-/* boot.S 定義的 stack 範圍,用來驗證 frame pointer 是否合理 */
-extern char stack_bottom[], stack_top[];
+unsigned long arch_irq_save(void)
+{
+    unsigned long old;
+    /* csrrc:讀出 sstatus 舊值,同時清除指定位元(SIE),一條指令完成 */
+    __asm__ volatile("csrrc %0, sstatus, %1" : "=r"(old) : "r"(2UL));
+    return old;
+}
+
+void arch_irq_restore(unsigned long flags)
+{
+    if (flags & 2UL)                     /* 原本 SIE 是開的才打開 */
+        __asm__ volatile("csrs sstatus, %0" : : "r"(2UL));
+}
+
+/*
+ * 新執行緒的初始 stack,對應 switch.S 的版面(13 個 slot,補到 112 位元組):
+ *     slot 0 = ra = arch_thread_start:arch_switch 最後的 ret 會跳到這裡
+ *     slot 1 = s0 = 0                :frame pointer 歸零,backtrace 以此判斷終點
+ *     slot 2 = s1 = entry            :arch_thread_start 把 ra 清 0 後跳到 s1
+ */
+void arch_thread_start(void);            /* switch.S */
+
+void *arch_stack_init(void *top, void (*entry)(void))
+{
+    uint64_t *sp = (uint64_t *)top - 14;     /* 112 位元組 */
+    for (int i = 0; i < 14; i++)
+        sp[i] = 0;
+    sp[0] = (uint64_t)arch_thread_start;
+    sp[2] = (uint64_t)entry;
+    return sp;
+}
 
 /*
  * RISC-V 的 frame 版面(使用 -fno-omit-frame-pointer):s0 = fp 指向 frame 頂端,
@@ -80,13 +110,15 @@ extern char stack_bottom[], stack_top[];
 void arch_backtrace(uintptr_t pc, uintptr_t fp)
 {
     int n = 0;
+    uintptr_t lo, hi;
 
     kprintf("backtrace:\n");
     if (pc)
         kprintf("  #%d pc=%p\n", n++, (void *)pc);
 
+    sched_stack_bounds(&lo, &hi);        /* 目前執行緒的 stack 範圍 */
     while (n < 16) {
-        if (fp & 7 || fp < (uintptr_t)stack_bottom + 16 || fp > (uintptr_t)stack_top)
+        if (fp & 7 || fp < lo + 16 || fp > hi)
             break;
         uintptr_t ra   = ((uintptr_t *)fp)[-1];
         uintptr_t prev = ((uintptr_t *)fp)[-2];

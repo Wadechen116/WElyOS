@@ -42,8 +42,22 @@ int fdt_parse(const void *fdt, struct boot_info *bi)
     bi->cmdline = "";
     bi->mem_base = 0;
     bi->mem_size = 0;
+    bi->n_reserved = 0;
     if (!base || be32(base) != FDT_MAGIC)
         return -1;
+
+    /* DTB 本身位於主記憶體內(cmdline 也指向它裡面),必須保留。
+       header 偏移 4 的 totalsize 是整份 DTB 的大小 */
+    boot_reserve(bi, (uintptr_t)base, be32(base + 4));
+
+    /* 記憶體保留表(off_mem_rsvmap,偏移 16):一連串 64 位元的
+       (位址, 大小),以 (0, 0) 結尾。bootloader 用它標示不可使用的範圍 */
+    for (const uint8_t *r = base + be32(base + 16); ; r += 16) {
+        uint64_t addr = be_cells(r, 2), size = be_cells(r + 8, 2);
+        if (addr == 0 && size == 0)
+            break;
+        boot_reserve(bi, addr, size);
+    }
 
     const uint8_t *p = base + be32(base + 8);            /* off_dt_struct */
     const char *strs = (const char *)base + be32(base + 12); /* off_dt_strings */

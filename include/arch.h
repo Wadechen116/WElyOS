@@ -26,6 +26,27 @@ void arch_irq_disable(void);
 void arch_idle(void);
 
 /*
+ * 暫時關閉中斷來保護一小段程式(臨界區段),結束後恢復「原本的」狀態:
+ *     unsigned long flags = arch_irq_save();
+ *     ... 不可被中斷打斷的操作 ...
+ *     arch_irq_restore(flags);
+ * 不直接用 disable/enable 的原因:如果進來之前中斷本來就是關的
+ * (例如在中斷處理程式裡,或巢狀呼叫),結束時不可以擅自把它打開。
+ */
+unsigned long arch_irq_save(void);
+void arch_irq_restore(unsigned long flags);
+
+/*
+ * 執行緒切換(實作在 arch/<名稱>/switch.S 與 arch.c)。
+ *   arch_switch(old_sp, new_sp):把目前的 callee-saved 暫存器存到目前的 stack,
+ *       stack pointer 寫入 *old_sp;再換成 new_sp 並還原那邊存的暫存器後返回。
+ *   arch_stack_init(top, entry):在一塊新 stack(top 為最高位址)上擺好初始內容,
+ *       使第一次 arch_switch 切過來時從 entry() 開始執行。回傳初始的 stack pointer。
+ */
+void arch_switch(void **old_sp, void *new_sp);
+void *arch_stack_init(void *top, void (*entry)(void));
+
+/*
  * 沿著 frame pointer 鏈印出呼叫堆疊(需以 -fno-omit-frame-pointer 編譯)。
  *   pc: 發生例外的位址,非 0 時當作第 0 層印出;傳 0 則略過
  *   fp: 起始的 frame pointer

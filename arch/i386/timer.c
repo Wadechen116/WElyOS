@@ -18,6 +18,7 @@
 #include "io.h"
 #include "kprintf.h"
 #include "timer.h"
+#include "sched.h"
 #include "trap.h"
 
 #define PIC1_CMD   0x20
@@ -74,4 +75,8 @@ void irq_handler(uint32_t irq)
     if (irq >= 8)
         outb(PIC2_CMD, PIC_EOI);
     outb(PIC1_CMD, PIC_EOI);
+
+    /* 必須在 EOI 之後:這裡可能切換到別的執行緒,很久才回來。
+       若還沒 EOI 就切走,PIC 會一直不送下一個計時器中斷 */
+    sched_irq_exit();
 }

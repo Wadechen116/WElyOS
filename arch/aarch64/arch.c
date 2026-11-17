@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include "arch.h"
 #include "kprintf.h"
+#include "sched.h"
 
 /* virt 機器的 PL011 UART,基底 0x09000000 */
 #define UART0_BASE  0x09000000UL
@@ -89,8 +90,36 @@ const char *arch_name(void)
     return "aarch64";
 }
 
-/* boot.S 定義的 stack 範圍,用來驗證 frame pointer 是否合理 */
-extern char stack_bottom[], stack_top[];
+unsigned long arch_irq_save(void)
+{
+    unsigned long flags;
+    __asm__ volatile("mrs %0, daif" : "=r"(flags));   /* 讀出目前的遮蔽位元 */
+    __asm__ volatile("msr daifset, #2");               /* 遮蔽 IRQ */
+    return flags;
+}
+
+void arch_irq_restore(unsigned long flags)
+{
+    __asm__ volatile("msr daif, %0" : : "r"(flags));  /* 整組寫回原本的值 */
+}
+
+/*
+ * 新執行緒的初始 stack,對應 switch.S 的版面(12 個 slot = 96 位元組):
+ *     slot 0  = x19 = entry            :arch_thread_start 把 x30 清 0 後跳到 x19
+ *     slot 10 = x29 = 0                :frame pointer 歸零,backtrace 以此判斷終點
+ *     slot 11 = x30 = arch_thread_start:arch_switch 最後的 ret 會跳到這裡
+ */
+void arch_thread_start(void);            /* switch.S */
+
+void *arch_stack_init(void *top, void (*entry)(void))
+{
+    uint64_t *sp = (uint64_t *)top - 12;
+    for (int i = 0; i < 12; i++)
+        sp[i] = 0;
+    sp[0]  = (uint64_t)entry;
+    sp[11] = (uint64_t)arch_thread_start;
+    return sp;
+}
 
 /*
  * AArch64 的 frame record(使用 -fno-omit-frame-pointer,x29 為 frame pointer):
@@ -101,13 +130,15 @@ extern char stack_bottom[], stack_top[];
 void arch_backtrace(uintptr_t pc, uintptr_t fp)
 {
     int n = 0;
+    uintptr_t lo, hi;
 
     kprintf("backtrace:\n");
     if (pc)
         kprintf("  #%d pc=%p\n", n++, (void *)pc);
 
+    sched_stack_bounds(&lo, &hi);        /* 目前執行緒的 stack 範圍 */
     while (n < 16) {
-        if (fp & 15 || fp < (uintptr_t)stack_bottom || fp + 16 > (uintptr_t)stack_top)
+        if (fp & 15 || fp < lo || fp + 16 > hi)
             break;
         uintptr_t prev = ((uintptr_t *)fp)[0];
         uintptr_t ra   = ((uintptr_t *)fp)[1];

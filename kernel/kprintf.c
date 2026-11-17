@@ -164,12 +164,18 @@ int kvprintf(const char *fmt, va_list ap)
     return count;
 }
 
-/* 可變參數版本:包裝 kvprintf */
+/*
+ * 可變參數版本:包裝 kvprintf。
+ * 整個輸出期間關閉中斷,所以一次 kprintf 的內容不會被其他執行緒
+ * 或中斷處理程式的輸出從中間插入(單一 CPU 上關中斷即不會被搶佔)。
+ */
 int kprintf(const char *fmt, ...)
 {
     va_list ap;
+    unsigned long flags = arch_irq_save();
     va_start(ap, fmt);
     int n = kvprintf(fmt, ap);
     va_end(ap);
+    arch_irq_restore(flags);
     return n;
 }

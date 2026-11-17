@@ -4,6 +4,7 @@
 #include "arch.h"
 #include "io.h"
 #include "kprintf.h"
+#include "sched.h"
 #include "serial.h"
 #include "vga.h"
 
@@ -57,8 +58,40 @@ const char *arch_name(void)
     return "i386";
 }
 
-/* boot.S 定義的 stack 範圍,用來驗證 frame pointer 是否合理 */
-extern char stack_bottom[], stack_top[];
+unsigned long arch_irq_save(void)
+{
+    unsigned long flags;
+    /* pushf 把 eflags 推上 stack 再彈到暫存器;然後 cli 關中斷 */
+    __asm__ volatile("pushf; pop %0; cli" : "=r"(flags));
+    return flags;
+}
+
+void arch_irq_restore(unsigned long flags)
+{
+    if (flags & 0x200)                   /* eflags bit 9 = IF:原本是開的才打開 */
+        __asm__ volatile("sti");
+}
+
+/*
+ * 新執行緒的初始 stack(高位址在上),對應 switch.S 的彈出順序:
+ *     0            假的返回位址:entry 不會返回,只是讓 stack 版面與一般呼叫相同
+ *     entry        arch_switch 最後的 ret 會跳到這裡
+ *     ebp = 0      backtrace 以 0 判斷鏈的終點
+ *     ebx esi edi = 0
+ * i386 ABI 要求函式進入時 (esp + 4) 為 16 的倍數,top 已對齊,
+ * 所以 entry 開始執行時 esp = top - 4,符合要求。
+ */
+void *arch_stack_init(void *top, void (*entry)(void))
+{
+    uint32_t *sp = top;
+    *--sp = 0;
+    *--sp = (uint32_t)entry;
+    *--sp = 0;                           /* ebp */
+    *--sp = 0;                           /* ebx */
+    *--sp = 0;                           /* esi */
+    *--sp = 0;                           /* edi */
+    return sp;
+}
 
 /*
  * i386 的 frame 版面(使用 -fno-omit-frame-pointer,ebp 為 frame pointer):
@@ -69,13 +102,15 @@ extern char stack_bottom[], stack_top[];
 void arch_backtrace(uintptr_t pc, uintptr_t fp)
 {
     int n = 0;
+    uintptr_t lo, hi;
 
     kprintf("backtrace:\n");
     if (pc)
         kprintf("  #%d pc=%p\n", n++, (void *)pc);
 
+    sched_stack_bounds(&lo, &hi);        /* 目前執行緒的 stack 範圍 */
     while (n < 16) {
-        if (fp & 3 || fp < (uintptr_t)stack_bottom || fp + 8 > (uintptr_t)stack_top)
+        if (fp & 3 || fp < lo || fp + 8 > hi)
             break;
         uintptr_t prev = ((uintptr_t *)fp)[0];
         uintptr_t ra   = ((uintptr_t *)fp)[1];

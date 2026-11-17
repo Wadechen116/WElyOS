@@ -7,6 +7,7 @@
 #include "boot_info.h"
 #include "multiboot.h"
 #include "kprintf.h"
+#include "kstring.h"
 #include "trap.h"
 
 /*
@@ -33,6 +34,11 @@ void arch_start(uint32_t magic, uint32_t mbi_addr)
     /* flags 的 bit 0 為 1 才代表 mem_* 有效;mem_upper 為 1MB 以上的 KB 數 */
     bi.mem_base = 0x100000;
     bi.mem_size = (mbi->flags & 1u) ? (uint64_t)mbi->mem_upper * 1024 : 0;
+
+    /* bootloader 留下的資料不可被配置出去。QEMU 把開機參數字串放在
+       kernel 映像的正後方(1MB 以上),不保留的話會被記憶體管理員覆蓋 */
+    boot_reserve(&bi, mbi_addr, sizeof(*mbi));
+    boot_reserve(&bi, (uintptr_t)bi.cmdline, strlen(bi.cmdline) + 1);
 
     kmain(&bi);
 }

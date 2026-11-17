@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include "arch.h"
 #include "timer.h"
+#include "sched.h"
 #include "trap.h"
 
 /*
@@ -56,4 +57,5 @@ void timer_interrupt(void)
 {
     sbi_set_timer(read_time() + interval);   /* 設定下一次,並清除本次的待處理狀態 */
     timer_tick();
+    sched_irq_exit();                        /* 時間片用完就在這裡換人(下一次鬧鐘已設好) */
 }
