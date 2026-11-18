@@ -1,0 +1,8 @@
+# One reviewed JSON object per line: id, reviewer, reason, date.
+# Only the following three individually reviewed exceptions are accepted.
+# All other existing findings remain NEW until reviewed; never bulk-accept a run.
+# Example schema (not an accepted entry):
+# {"id":"<24 hex digits>","reviewer":"name","reason":"specific justification","date":"YYYY-MM-DD"}
+{"id":"583cf28b1010cef15ac4450e","reviewer":"Codex","date":"2026-11-18","reason":"kernel/net/stack.c learn: intentional one-shot pending datagram. send_frame records tx_errors, pending is released even on driver failure, and UDP does not promise asynchronous delivery or retry. Host test_errors verifies this path; retrying could duplicate a datagram."}
+{"id":"77255367499ec978012f791b","reviewer":"Codex","date":"2026-11-18","reason":"kernel/net/stack.c arp_rx: inbound ARP reply transmission has no synchronous caller to return an error to. arp_send/send_frame records tx_errors and increments arp_replies_sent only on success. Host test_arp_matching covers reply-driver failure; dropping the failed reply is intentional."}
+{"id":"aca5329f582097dd9d59e040","reviewer":"Codex","date":"2026-11-18","reason":"kernel/net/stack.c net_tick: ARP retry send failures are counted by send_frame; attempts remain bounded and pending expires at 4 seconds. Host test_errors verifies failed retry accounting and test_timers_capacity verifies bounded give-up. Timer callback has no error return channel."}

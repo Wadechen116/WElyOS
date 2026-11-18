@@ -565,7 +565,7 @@ int main(int argc, char **argv)
             puts_("built-in: cd [dir], pwd, limit [KB], exit [code], status, help, jobs, fg [n], bg [n], wait\n"
                   "programs: anything in /bin (try: ls /bin), e.g. echo, cat, ls, wc, sort, date, mkdir, rm, cp, mv, sleep, kill, ps, top, df, sync\n"
                   "network: net, ping 10.0.2.2, host NAME, tftp REMOTE-FILE [LOCAL-FILE] (files come from the host)\n"
-                  "reliability: faultlog (events kept across reboots), supervise COMMAND (restart on failure)\n"
+                  "reliability: faultlog (events kept across reboots), supervise COMMAND (restart on failure), scrub (verify the disk)\n"
                   "users: id, su USER (exit returns), chmod MODE FILE, chown USER FILE; ls -l shows owners\n"
                   "redirection: command > file, command >> file, command < file\n"
                   "pipes: command | command | ...\n"

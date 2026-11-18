@@ -86,6 +86,8 @@ static int out_num(uint64_t v, unsigned base, int upper, int width,
 /*
  * 核心格式化函式。格式規格:%[0][寬度][l|ll|z]轉換字元
  */
+#define KFMT_WIDTH_MAX 256                   /* 格式的寬度上限 */
+
 int kvprintf(const char *fmt, va_list ap)
 {
     int count = 0;
@@ -103,8 +105,14 @@ int kvprintf(const char *fmt, va_list ap)
             pad = '0';
             fmt++;
         }
-        while (*fmt >= '0' && *fmt <= '9')
-            width = width * 10 + (*fmt++ - '0');
+        /* 寬度有上限:沒有的話,很長的數字會讓 int 溢位(未定義行為),
+           而且寬度就是要補幾個字元 — 在持有主控台的鎖、關著中斷的情況下補上幾億個空白,
+           等於讓整個系統停住。kernel 自己的格式字串不會這樣寫,但這個函式不該依賴這一點 */
+        for (; *fmt >= '0' && *fmt <= '9'; fmt++)
+            if (width < KFMT_WIDTH_MAX)
+                width = width * 10 + (*fmt - '0');
+        if (width > KFMT_WIDTH_MAX)
+            width = KFMT_WIDTH_MAX;
         while (*fmt == 'l' || *fmt == 'z') {   /* l=1, ll=2;z 視為 long */
             lcount++;
             fmt++;

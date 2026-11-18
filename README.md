@@ -54,12 +54,14 @@
 - [x] 網路(到 UDP):網路卡驅動(RISC-V / AArch64 的 virtio-net、i386 的 NE2000)、協定堆疊(乙太網路、ARP、IPv4、ICMP、UDP;純 C、不配置記憶體、主機端以 sanitizer 測試,由 Codex 實作)、整合層與以檔案描述符表示的 UDP socket;新增 `ping`、`net`、`tftp`(可從主機下載檔案)
 - [x] DNS 查詢:`host`(訊息的組合與解析 `user/dns.h` 由 Codex 實作並以 sanitizer 測試)
 - [x] 可靠性之一:看門狗(CPU 互相監看心跳,卡死時 panic)、黑盒子(磁碟最後 8KB 的事件紀錄,每筆有 CRC-32,panic 時以不上鎖的緊急路徑寫入,重新開機後可讀)、`supervise`(程式當掉時重新啟動,退避、有上限)、`faultlog`
+- [x] 可靠性之二:磁碟每個區塊的 CRC-32(讀取時核對,損壞的資料不會交給程式)、superblock 兩份(主要的壞了用備份並修復,而不是誤判成新磁碟而格式化)、背景巡檢與 `scrub` 命令、位元翻轉的錯誤注入;磁碟格式 WFS2(舊格式仍可掛載)
+- [x] 靜態檢查(由 Codex 實作):`scripts/static-check.sh` — 快速的規則掃描(遞迴、未檢查的錯誤回傳、禁用函式等)與按需的 GCC `-fanalyzer`;已據此修正 `printf` 寬度的溢位等缺陷
 
 ## 規劃中
 
 - [ ] 多核心(Symmetric Multiprocessing,SMP)效能:縮小排程器的大鎖、喚醒時考慮上次執行的 CPU、mutex 先自旋再睡
 - [ ] TCP;i386 的 PS/2 鍵盤;檔案系統的日誌(journaling)、以磁碟為根目錄
-- [ ] 可靠性(參考航太飛行軟體的做法):磁碟區塊的檢查碼、superblock 備份與巡檢;安全模式;期限排程;三重執行加投票;靜態分析
+- [ ] 可靠性(參考航太飛行軟體的做法):安全模式;期限排程;三重執行加投票
 - [ ] 結構整理:中斷與裝置的註冊介面、kernel 與使用者共用的定義檔、拆分 `proc.c` / `main.c`、區塊快取獨立成一層
 
 ## 需求
@@ -90,13 +92,14 @@ bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit stress" 
 cmake --build build/i386    --target run-gui   # 僅 i386:開啟 QEMU 視窗顯示 VGA 畫面
 cmake --preset riscv64 -DWELYOS_RUNQ=list      # 換用另一種執行佇列的實作(預設 ring)
 bash scripts/host-test.sh                      # 在主機上以多條執行緒測試執行佇列(不需要 QEMU)
-bash scripts/regress.sh                        # 回歸測試:三個架構各 21 個情境加上磁碟跨開機測試(七次開機)與主機端的網路測試,核對結束碼(-r 6 另外重複測試,-q 只跑基本情境)
+bash scripts/regress.sh                        # 回歸測試:三個架構各 21 個情境加上磁碟跨開機測試(九次開機)與主機端的網路測試,核對結束碼(-r 6 另外重複測試,-q 只跑基本情境)
 bash scripts/build-opensbi.sh                  # (選用)重新建置 RISC-V 的開機韌體;換 OpenSBI 版本時才需要
 bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf                                # 開機後進入 shell(輸入 help 看有哪些命令;top 看即時的系統狀態,q 離開)。Ctrl-C 終止、Ctrl-Z 暫停執行中的命令(fg / bg 繼續);輸入 exit 關機;Ctrl-] 強制結束 QEMU
 python3 scripts/type-input.py 1.5 0.01 'ls /\nexit\n' | bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit shell"   # 自動化:模擬打字餵給 shell
 QEMU_SMP=8 bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit selftest"   # 指定 CPU 數(預設 4,最多 8;1 = 單核心)
 QEMU_NET=none bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf                  # 不接網路卡(預設接上;QEMU_TFTP=目錄 可指定以 tftp 分享給客體的主機目錄,預設 rootfs/)
 bash scripts/host-test-net.sh                  # 在主機上測試網路的協定堆疊(不需要 QEMU)
+bash scripts/static-check.sh                   # 靜態檢查(快速模式約 2 秒;--mode analyze 以 GCC 分析器檢查三個架構)
 QEMU_DISK=none bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf                 # 不接磁碟(預設接上 build/<架構>/disk.img,掛載在 /disk;QEMU_DISK=路徑 可指定別的映像檔)
 ```
 
@@ -106,9 +109,9 @@ QEMU_DISK=none bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf            
 arch/<名稱>/  各架構的開機程式、linker script、驅動(i386 / riscv64 / aarch64)
 include/      與架構無關的標頭(arch.h 為架構介面;cred.h 為身分與特權;net.h 為網路的介面)
 kernel/       kernel 主體(main、kprintf、fdt、panic、timer、pmm、kmalloc、sched、runq_ring / runq_list、spinlock、smp、sync、vm、proc、vfs、ramfs、wfs、virtio_blk、virtio_net、blkfault、netif、blackbox、watchdog、initrd、console、pipe;net/ 為網路的協定堆疊)
-lib/          最小字串函式庫
+lib/          最小字串函式庫、CRC-32
 cmake/        各架構的 toolchain 檔
-user/         使用者程式(各自獨立連結後放進開機檔案包的 /bin/):init(測試)、sh(shell)、echo、cat、ls、wc、sort、date、mkdir、rm、cp、mv、sleep、kill、ps、top、df、sync、id、su、chmod、chown、ping、net、tftp、host、faultlog、supervise;crt0.c 為共用的啟動程式,libc.c / libc.h 為小型 C 函式庫,ulib.h 為較早的小工具
+user/         使用者程式(各自獨立連結後放進開機檔案包的 /bin/):init(測試)、sh(shell)、echo、cat、ls、wc、sort、date、mkdir、rm、cp、mv、sleep、kill、ps、top、df、sync、id、su、chmod、chown、ping、net、tftp、host、faultlog、supervise、scrub;crt0.c 為共用的啟動程式,libc.c / libc.h 為小型 C 函式庫,ulib.h 為較早的小工具
 firmware/     RISC-V 的開機韌體(拿掉自己標誌的 OpenSBI;說明見 firmware/README.md)
 rootfs/       開機檔案包的內容(建置時打包成 tar 嵌入 kernel,開機時解開到檔案系統)
 tests/host/   在主機上執行的測試(執行佇列的並行測試;net/ 為網路堆疊的測試)

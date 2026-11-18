@@ -68,6 +68,16 @@ void blk_fault_set(int reads, int writes)
     fail_writes = writes;
 }
 
+int blk_fault_flip(uint64_t lba, unsigned byte, unsigned bit)
+{
+    static uint8_t sector[BLK_SECTOR];
+
+    if (!real || byte >= BLK_SECTOR || bit > 7 || real->rw(real, lba, 1, sector, 0) != 0)
+        return -E_IO;
+    sector[byte] ^= (uint8_t)(1u << bit);
+    return real->rw(real, lba, 1, sector, 1);
+}
+
 unsigned long blk_fault_count(void)
 {
     return injected;

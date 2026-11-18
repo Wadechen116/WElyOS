@@ -7,7 +7,7 @@
 #   -a "架構..."  只測指定的架構,例如 -a "riscv64"
 #   -q            只跑最基本的三個情境(只開機、selftest、全部測試)
 # 環境變數 QEMU_SMP 決定 20 個情境使用的 CPU 數(預設 4)。
-# 另外每個架構做一次「磁碟跨開機測試」(七次開機,使用獨立的映像檔;-q 時略過)。
+# 另外每個架構做一次「磁碟跨開機測試」(九次開機,使用獨立的映像檔;-q 時略過)。
 # 20 個情境使用預設的磁碟映像 build/<架構>/disk.img(測試結束時會把自己建立的東西刪掉)。
 #
 # 預期的結束碼:
@@ -69,7 +69,7 @@ for a in $ARCHS; do
   # 見 kernel/main.c 的 disk_stage_test
   if [ "$QUICK" -eq 0 ]; then
     img="$OUT/disk-$a.img"; rm -f "$img"; dok=0
-    for s in 1 2 3 4 5 6 7; do
+    for s in 1 2 3 4 5 6 7 8 9; do
       log="$OUT/$a-disktest$s.txt"
       # 第 6 階段故意 panic(測試黑盒子):預期的結束碼和其他當機情境相同
       dwant=0; [ "$s" -eq 6 ] && { [ "$a" = i386 ] && dwant=3 || dwant=1; }
@@ -82,7 +82,7 @@ for a in $ARCHS; do
       fi
     done
     rm -f "$img"
-    echo "$a: 磁碟跨開機測試 ${dok}/7 個階段通過"
+    echo "$a: 磁碟跨開機測試 ${dok}/9 個階段通過"
   fi
 
   if [ "$REPEAT" -gt 0 ]; then

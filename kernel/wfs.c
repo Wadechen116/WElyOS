@@ -40,6 +40,29 @@
  *      掛載時發現記號是清掉的(上次沒有正常關機),就做一次完整的檢查與修復
  *      (wfs_check):從根目錄走過所有目錄,重新算出哪些 inode 與區塊真的有人用
  *
+ * ---- 檢查碼(WFS2) ----
+ *
+ * 儲存媒體上的資料會無聲無息地壞掉:某個位元翻轉了(在太空中是輻射,在地面上是老化的媒體),
+ * 磁碟照樣回報「讀取成功」。沒有檢查碼的檔案系統會把壞掉的資料當成正確的交出去,
+ * 或者照著壞掉的區塊編號去讀寫別的地方。
+ *
+ * 所以每個區塊有一個 CRC-32,存在另外一張表裡(位元圖之後、inode 表之前):
+ *   寫入一個區塊   算出它的檢查碼,記進表裡
+ *   從磁碟讀進來   重算一次,和表裡的不符就當作「讀取失敗」(-E_IO),絕不把它交給上層
+ * 檢查碼和資料分開存放,是為了抓到「寫到別的地方去了」「這次寫入根本沒有發生」這類錯誤:
+ * 如果檢查碼就放在區塊自己裡面,一個完整但過時(或放錯位置)的區塊看起來仍然是對的。
+ * 表格整份留在記憶體裡,所以驗證不需要額外的磁碟讀取;只在 sync 與關機時寫回磁碟。
+ *
+ * superblock 不在表裡,它自己帶一個檢查碼,而且有兩份:一份在區塊 0,一份在檔案系統的
+ * 最後一個區塊。掛載時第一份壞了就用第二份,並把第一份修好。
+ *
+ * 巡檢(scrub):很久沒被讀到的區塊就算壞了也沒有人知道。一條背景執行緒慢慢地把整顆磁碟
+ * 讀過一遍又一遍,逐塊核對檢查碼,在資料還沒被用到之前就發現損壞。
+ *
+ * 能做到的是「發現」,不是「修復」:這裡沒有第二份資料可以拿來還原。
+ * 當機之後檢查碼表可能比資料舊(資料寫了、表還沒寫),所以沒有正常關機的那一次掛載
+ * 會依磁碟上實際的內容重新計算整張表 — 那一次等於沒有檢查碼的保護。
+ *
  * ---- 寫入失敗之後 ----
  *
  * 寫回磁碟失敗時,記憶體裡的狀態(「已經建立了這個檔案」)和磁碟上的(「沒有」)就不一致了,
@@ -64,6 +87,7 @@
  */
 #include <stddef.h>
 #include "blk.h"
+#include "crc32.h"
 #include "fs.h"
 #include "kprintf.h"
 #include "kstring.h"
@@ -72,7 +96,8 @@
 #include "sync.h"
 #include "timer.h"
 
-#define WFS_MAGIC   0x31534657u              /* "WFS1" */
+#define WFS_MAGIC1  0x31534657u              /* "WFS1":第 27 步的格式,沒有檢查碼(仍然可以掛載) */
+#define WFS_MAGIC   0x32534657u              /* "WFS2":第 38 步起的格式,見下方「檢查碼」 */
 #define BSIZE       PAGE_SIZE
 #define BSECT       (BSIZE / BLK_SECTOR)     /* 一個區塊是幾個磁區 */
 #define NDIRECT     10u
@@ -90,6 +115,9 @@ struct wsuper {
     uint32_t data_start;
     uint32_t clean;                          /* 1 = 上次正常卸載 */
     uint32_t mounts;                         /* 被掛載過幾次 */
+    /* ---- 以下只有 WFS2 有 ---- */
+    uint32_t csum_start, csum_blocks;        /* 檢查碼表:每個區塊 4 個位元組 */
+    uint32_t crc;                            /* 這個結構前面所有欄位的 CRC-32 */
 };
 
 /*
@@ -140,6 +168,14 @@ static uint32_t free_blocks, free_inodes;
 static uint32_t balloc_hint, ialloc_hint;
 static unsigned last_repairs;
 static int mounted;
+static int csum_on;                          /* 這個檔案系統有檢查碼(WFS2) */
+static int csum_verify;                      /* 讀取時核對檢查碼。沒有正常關機之後,表格重算完成之前是 0:
+                                                那段期間表格可能比資料舊,拿它來核對只會誤判 */
+static uint32_t *csum;                       /* 整張檢查碼表在記憶體裡的複本;0 = 沒有記錄 */
+static uint8_t csum_dirty[1024];             /* 表的第 i 個區塊改過了、還沒寫回磁碟 */
+static uint8_t *scratch;                     /* 一頁暫存空間(巡檢、重算檢查碼時直接讀磁碟用) */
+static unsigned long csum_errors, scrub_errors, scrub_blocks;
+static int sb_restored;                      /* 這次掛載時,superblock 是從備份救回來的 */
 static int fs_failed;                        /* 寫入磁碟失敗過:之後拒絕所有修改(見下方「寫入失敗之後」) */
 static const struct inode_ops wfs_ops;
 
@@ -161,6 +197,47 @@ static struct buf bufs[NBUF];
 static unsigned long use_clock;
 static unsigned long disk_reads, disk_writes;
 
+/* 這個區塊有沒有記在檢查碼表裡:superblock 的兩份(自己帶檢查碼)與表格本身除外 */
+static int covered(uint32_t no)
+{
+    return csum_on && no != 0 && no != sb.nblocks - 1 &&
+           !(no >= sb.csum_start && no < sb.csum_start + sb.csum_blocks);
+}
+
+static uint32_t block_crc(const void *data)
+{
+    uint32_t c = crc32(data, BSIZE);
+    return c ? c : 1;                        /* 0 保留給「沒有記錄」 */
+}
+
+static void csum_set(uint32_t no, uint32_t value)
+{
+    if (csum[no] != value) {
+        csum[no] = value;
+        csum_dirty[no / (BSIZE / 4)] = 1;
+    }
+}
+
+/* 把改過的檢查碼表寫回磁碟(在資料都寫完之後) */
+static int csum_flush(void)
+{
+    int rc = 0;
+
+    for (uint32_t i = 0; csum_on && i < sb.csum_blocks; i++) {
+        if (!csum_dirty[i])
+            continue;
+        if (disk->rw(disk, (uint64_t)(sb.csum_start + i) * BSECT, BSECT,
+                     (uint8_t *)csum + (size_t)i * BSIZE, 1) != 0) {
+            fs_failed = 1;
+            rc = -E_IO;
+        } else {
+            csum_dirty[i] = 0;
+            disk_writes++;
+        }
+    }
+    return rc;
+}
+
 static int bwrite(struct buf *b)
 {
     if (disk->rw(disk, (uint64_t)b->no * BSECT, BSECT, b->data, 1) != 0) {
@@ -171,6 +248,8 @@ static int bwrite(struct buf *b)
     }
     disk_writes++;
     b->dirty = 0;
+    if (covered(b->no))
+        csum_set(b->no, block_crc(b->data));
     return 0;
 }
 
@@ -207,6 +286,12 @@ static struct buf *bget(uint32_t no, int load)
         if (disk->rw(disk, (uint64_t)no * BSECT, BSECT, victim->data, 0) != 0)
             return NULL;
         disk_reads++;
+        /* 磁碟說讀成功了,但內容和當初寫進去的一樣嗎?不一樣就當作讀取失敗 */
+        if (csum_verify && covered(no) && csum[no] && csum[no] != block_crc(victim->data)) {
+            if (csum_errors++ < 3)
+                kprintf("disk: block %u is corrupted (checksum mismatch); the read is refused\n", no);
+            return NULL;
+        }
     } else {
         memset(victim->data, 0, BSIZE);
     }
@@ -250,6 +335,11 @@ static int bsync_opt(int barrier)
             rc = -E_IO;
         }
     }
+    /* 檢查碼表只在 barrier(sync、關機)時寫回磁碟,不是每次同步都寫:
+       掛載期間以記憶體裡的那一份為準;而沒有正常關機的話,下次掛載本來就會依磁碟的內容
+       整張重算(見 csum_rebuild),中途寫回去的表用不到。省下的是每個操作一次以上的磁碟寫入 */
+    if (barrier && csum_flush() != 0)
+        rc = -E_IO;
     if (barrier && disk->flush && disk->flush(disk) != 0)
         rc = -E_IO;
     return fs_failed ? -E_IO : rc;
@@ -264,15 +354,26 @@ static int bsync(void)
 /* 區塊與 inode 的配置                                                  */
 /* ------------------------------------------------------------------ */
 
+/* superblock 的檢查碼(只算到 crc 欄位之前) */
+static uint32_t sb_crc(const struct wsuper *s)
+{
+    return crc32(s, offsetof(struct wsuper, crc));
+}
+
+/* 把 superblock 放進快取等著寫回。WFS2 有兩份:區塊 0 與最後一個區塊。
+   同步時依編號由大到小寫,所以備份先落地、主要的那一份最後;任何時候當機,至少有一份是完整的 */
 static int sb_write(void)
 {
-    struct buf *b = bget(0, 0);
-
-    if (!b)
-        return -E_IO;
-    memcpy(b->data, &sb, sizeof(sb));
-    b->dirty = 1;
-    bput(b);
+    if (csum_on)
+        sb.crc = sb_crc(&sb);
+    for (int copy = 0; copy < (csum_on ? 2 : 1); copy++) {
+        struct buf *b = bget(copy ? sb.nblocks - 1 : 0, 0);
+        if (!b)
+            return -E_IO;
+        memcpy(b->data, &sb, sizeof(sb));
+        b->dirty = 1;
+        bput(b);
+    }
     return 0;
 }
 
@@ -322,6 +423,8 @@ static void bfree(uint32_t no)
         return;                              /* 磁碟上的編號不合理:不理它 */
     if (bitmap_op(no, 1, 0) == 1)
         free_blocks++;
+    if (covered(no))
+        csum_set(no, 0);                     /* 不再有內容:之後的巡檢不必核對它 */
     /* 快取裡若還有這個區塊的髒內容,不必寫回了 */
     for (struct buf *b = bufs; b < bufs + NBUF; b++)
         if (b->valid && b->no == no && b->pins == 0)
@@ -788,8 +891,10 @@ static int wfs_unlink(struct inode *dir, const char *name, struct inode **victim
                把它釋放;還有人開著的話先留著(這時當機,下次掛載的檢查會把它收掉) */
             if (n->d.nlink > 0)
                 n->d.nlink--;
-            iupdate(n);
-            iupdate(wn(dir));                    /* 目錄的修改時間(VFS 已經更新了) */
+            /* 兩個 inode 都要寫得進去才算成功(失敗時名稱已經從目錄拿掉了,但還沒寫回磁碟:
+               下面的 bsync 會把檔案系統轉為唯讀,下次掛載的檢查以磁碟上的為準) */
+            if (iupdate(n) != 0 || iupdate(wn(dir)) != 0)
+                err = -E_IO;
             *victim = &n->in;
         }
     }
@@ -1030,6 +1135,8 @@ static int wfs_check(int at_mount)
        重新算的這一份也要照做,否則全新的磁碟第一次檢查就會被當成「位元圖不符」 */
     for (uint32_t no = sb.nblocks; no < sb.bitmap_blocks * BSIZE * 8; no++)
         c.bitmap[no / 8] |= (uint8_t)(1u << (no % 8));
+    if (csum_on)                             /* 最後一個區塊是 superblock 的備份 */
+        c.bitmap[(sb.nblocks - 1) / 8] |= (uint8_t)(1u << ((sb.nblocks - 1) % 8));
 
     for (uint32_t i = 0; at_mount && i < sb.ninodes; i++)
         nodes[i].loaded = 0;
@@ -1058,7 +1165,8 @@ static int wfs_check(int at_mount)
         }
         if (c.refs[inum] == 0) {                 /* 走不到:釋放(它的區塊不標記,等於一起釋放) */
             memset(&d, 0, sizeof(d));
-            dinode_rw(inum, &d, 1);
+            if (dinode_rw(inum, &d, 1) != 0)     /* 修不進去:檢查失敗,不要假裝已經修好 */
+                goto out;
             if (at_mount)
                 nodes[inum].loaded = 0;
             free_inodes++;
@@ -1098,7 +1206,8 @@ static int wfs_check(int at_mount)
             bput(ib);
         }
         if (changed) {
-            dinode_rw(inum, &d, 1);
+            if (dinode_rw(inum, &d, 1) != 0)
+                goto out;
             if (at_mount)
                 nodes[inum].loaded = 0;          /* 下次用到時重新讀入修正後的內容 */
             c.fixes++;
@@ -1136,17 +1245,77 @@ out:
 /* ------------------------------------------------------------------ */
 
 /* 依總區塊數與 inode 數算出各區的位置(格式化與驗證 superblock 都用同一套算法) */
-static void layout(struct wsuper *s, uint32_t nblocks, uint32_t ninodes)
+static void layout(struct wsuper *s, uint32_t nblocks, uint32_t ninodes, int v2)
 {
     memset(s, 0, sizeof(*s));
-    s->magic = WFS_MAGIC;
+    s->magic = v2 ? WFS_MAGIC : WFS_MAGIC1;
     s->nblocks = nblocks;
     s->ninodes = ninodes;
     s->bitmap_start = 1;
     s->bitmap_blocks = (nblocks + BSIZE * 8 - 1) / (BSIZE * 8);
     s->inode_start = s->bitmap_start + s->bitmap_blocks;
+    if (v2) {                                /* 檢查碼表夾在位元圖與 inode 表之間 */
+        s->csum_start = s->inode_start;
+        s->csum_blocks = (nblocks * 4 + BSIZE - 1) / BSIZE;
+        s->inode_start = s->csum_start + s->csum_blocks;
+    }
     s->inode_blocks = (ninodes + IPB - 1) / IPB;
     s->data_start = s->inode_start + s->inode_blocks;
+}
+
+/* 配置檢查碼表在記憶體裡的複本(大小依 sb.csum_blocks) */
+static int csum_alloc(void);
+
+static int csum_alloc_impl(void)
+{
+    if (sb.csum_blocks == 0 || sb.csum_blocks > sizeof(csum_dirty))
+        return -E_INVAL;
+    csum = pmm_alloc_pages(sb.csum_blocks);
+    return csum ? 0 : -E_NOMEM;
+}
+
+static int csum_alloc(void)
+{
+    return csum_alloc_impl();
+}
+
+/* superblock 的內容是否可信:記號、檢查碼(WFS2)、大小,以及各區的位置必須和依大小算出來的完全一致 */
+static int sb_valid(const struct wsuper *s, uint64_t dev_blocks)
+{
+    struct wsuper want;
+    int v2 = s->magic == WFS_MAGIC;
+
+    if ((!v2 && s->magic != WFS_MAGIC1) || s->nblocks < 64 || s->nblocks > dev_blocks ||
+        s->ninodes < IPB || s->ninodes > MAX_INODES)
+        return 0;
+    if (v2 && s->crc != sb_crc(s))
+        return 0;
+    layout(&want, s->nblocks, s->ninodes, v2);
+    return s->bitmap_start == want.bitmap_start && s->bitmap_blocks == want.bitmap_blocks &&
+           s->csum_start == want.csum_start && s->csum_blocks == want.csum_blocks &&
+           s->inode_start == want.inode_start && s->inode_blocks == want.inode_blocks &&
+           s->data_start == want.data_start && s->data_start + 8 <= s->nblocks;
+}
+
+/* 沒有正常關機之後:檢查碼表可能比資料舊。依磁碟上實際的內容重新計算整張表 */
+static int csum_rebuild(void)
+{
+    for (uint32_t no = 1; no < sb.nblocks; no++) {
+        if (!covered(no))
+            continue;
+        int used = no < sb.data_start ? 1 : bitmap_op(no, 0, 0);
+        if (used < 0)
+            return -E_IO;
+        if (!used) {
+            csum_set(no, 0);
+            continue;
+        }
+        /* 快取裡有還沒寫回的新內容時,它寫回的時候自然會更新;這裡算磁碟上的 */
+        if (disk->rw(disk, (uint64_t)no * BSECT, BSECT, scratch, 0) != 0)
+            return -E_IO;
+        csum_set(no, block_crc(scratch));
+    }
+    return 0;
 }
 
 /* 在空白的磁碟上建立一個空的檔案系統 */
@@ -1157,11 +1326,16 @@ static int wfs_format(uint32_t nblocks)
 
     ninodes = ninodes < 64 ? 64 : ninodes > MAX_INODES ? MAX_INODES : ninodes;
     ninodes = (ninodes + IPB - 1) / IPB * IPB;
-    layout(&sb, nblocks, ninodes);
-    if (sb.data_start + 8 > nblocks)
-        return -E_NOSPC;                         /* 磁碟太小 */
+    layout(&sb, nblocks, ninodes, 1);
+    if (sb.data_start + 8 > nblocks || csum_alloc() != 0)
+        return -E_NOSPC;                         /* 磁碟太小(或記憶體不足) */
+    memset(csum, 0, (size_t)sb.csum_blocks * BSIZE);
+    memset(csum_dirty, 1, sb.csum_blocks);       /* 整張表都要寫到磁碟上 */
+    csum_on = 1;
 
     for (uint32_t no = 1; no < sb.data_start; no++) {    /* 位元圖與 inode 表全部清 0 */
+        if (no >= sb.csum_start && no < sb.csum_start + sb.csum_blocks)
+            continue;                            /* 檢查碼表不經過快取,由 csum_flush 寫 */
         struct buf *b = bget(no, 0);
         if (!b)
             return -E_IO;
@@ -1177,6 +1351,8 @@ static int wfs_format(uint32_t nblocks)
     for (uint32_t no = nblocks; no < sb.bitmap_blocks * BSIZE * 8; no++)
         if (bitmap_op(no, 1, 1) < 0)
             return -E_IO;
+    if (bitmap_op(nblocks - 1, 1, 1) < 0)        /* 最後一個區塊:superblock 的備份 */
+        return -E_IO;
     memset(&root, 0, sizeof(root));
     root.type = I_DIR;
     root.nlink = 1;
@@ -1190,7 +1366,6 @@ static int wfs_format(uint32_t nblocks)
 
 int wfs_mount(struct blkdev *dev, struct inode **root_out)
 {
-    struct wsuper want;
     int err = -E_IO, formatted = 0;
     uint64_t dev_blocks = dev->sectors / BSECT;
 
@@ -1215,40 +1390,69 @@ int wfs_mount(struct blkdev *dev, struct inode **root_out)
     for (unsigned i = 0; i < NBUF; i++)
         bufs[i].data = cache + (size_t)i * BSIZE;
 
+    scratch = pmm_alloc();
+    if (!scratch) {
+        err = -E_NOMEM;
+        goto fail;
+    }
     mutex_lock(&wfs_lk);
     disk = dev;
-    sb.nblocks = 1;                              /* 先只允許讀第 0 個區塊 */
-    struct buf *b = bget(0, 1);
-    if (!b)
-        goto fail_locked;
-    memcpy(&sb, b->data, sizeof(sb));
-    int blank = 1;
-    for (unsigned i = 0; i < BSIZE && blank; i++)
-        blank = b->data[i] == 0;
-    bput(b);
-    b->valid = 0;
+    csum_on = 0;
+    csum_verify = 0;
+    csum = NULL;
+    sb_restored = 0;
+    csum_errors = scrub_errors = scrub_blocks = 0;
+    memset(csum_dirty, 0, sizeof(csum_dirty));
 
-    if (blank) {
-        /* 全新的磁碟(開頭全是 0):建立檔案系統。開頭有別的內容時絕不格式化 —
-           那可能是別人的資料 */
-        /* 最後 2 個區塊(8KB)留給黑盒子(blackbox.c),不屬於檔案系統 */
-        dev_blocks -= 2;
-        sb.nblocks = (uint32_t)dev_blocks;
-        err = wfs_format((uint32_t)dev_blocks);
+    /* 最後 2 個區塊(8KB)留給黑盒子(blackbox.c),不屬於檔案系統 */
+    uint64_t fs_max = dev_blocks - 2;
+    /* 讀出兩份 superblock:區塊 0,以及(如果磁碟是 WFS2 而且佔滿可用範圍)最後一個區塊的備份 */
+    struct wsuper primary, backup;
+    int blank = 1;
+    if (disk->rw(disk, 0, BSECT, scratch, 0) != 0)
+        goto fail_locked;
+    memcpy(&primary, scratch, sizeof(primary));
+    for (unsigned i = 0; i < BSIZE && blank; i++)
+        blank = scratch[i] == 0;
+    if (disk->rw(disk, (fs_max - 1) * BSECT, BSECT, scratch, 0) != 0)
+        goto fail_locked;
+    memcpy(&backup, scratch, sizeof(backup));
+    int backup_ok = backup.magic == WFS_MAGIC && backup.nblocks == fs_max && sb_valid(&backup, dev_blocks);
+
+    err = -E_INVAL;
+    if (sb_valid(&primary, dev_blocks)) {
+        sb = primary;
+    } else if (backup_ok) {
+        /* 區塊 0 壞了(或被清掉了),但備份完好:用備份,稍後把區塊 0 寫回去。
+           這個判斷要在「全空白就格式化」之前:否則區塊 0 被清成 0 的磁碟會被當成新的而整個重來 */
+        sb = backup;
+        sb_restored = 1;
+        kprintf("disk: the primary superblock is damaged; using the backup copy and repairing it\n");
+    } else if (blank) {
+        /* 全新的磁碟(開頭全是 0,也沒有備份):建立檔案系統。
+           開頭有別的內容時絕不格式化 — 那可能是別人的資料 */
+        sb.nblocks = (uint32_t)fs_max;
+        err = wfs_format((uint32_t)fs_max);
         if (err)
             goto fail_locked;
         formatted = 1;
+    } else {
+        goto fail_locked;
     }
-    /* superblock 來自磁碟,不可信任:各區的位置必須和依大小算出來的完全一致 */
-    err = -E_INVAL;
-    if (sb.magic != WFS_MAGIC || sb.nblocks < 64 || sb.nblocks > dev_blocks ||
-        sb.ninodes < IPB || sb.ninodes > MAX_INODES)
-        goto fail_locked;
-    layout(&want, sb.nblocks, sb.ninodes);
-    if (sb.bitmap_start != want.bitmap_start || sb.bitmap_blocks != want.bitmap_blocks ||
-        sb.inode_start != want.inode_start || sb.inode_blocks != want.inode_blocks ||
-        sb.data_start != want.data_start || sb.data_start + 8 > sb.nblocks)
-        goto fail_locked;
+    if (!formatted && sb.magic == WFS_MAGIC) {
+        /* 載入檢查碼表。從這裡起,讀進來的每個區塊都會被核對 */
+        err = csum_alloc();
+        if (err)
+            goto fail_locked;
+        err = -E_IO;
+        for (uint32_t i = 0; i < sb.csum_blocks; i++)
+            if (disk->rw(disk, (uint64_t)(sb.csum_start + i) * BSECT, BSECT,
+                         (uint8_t *)csum + (size_t)i * BSIZE, 0) != 0)
+                goto fail_locked;
+        csum_on = 1;
+    }
+    if (sb_restored)
+        sb.clean = 0;                            /* 發生過損壞:這次掛載做一次完整的檢查 */
 
     last_repairs = 0;
     if (!sb.clean) {
@@ -1261,6 +1465,10 @@ int wfs_mount(struct blkdev *dev, struct inode **root_out)
         last_repairs = (unsigned)fixes;
         kprintf("disk: the file system was not shut down cleanly; checked it and repaired "
                 "%d problem(s)\n", fixes);
+        if (csum_on && (csum_rebuild() != 0 || bsync_opt(1) != 0)) {
+            err = -E_IO;
+            goto fail_locked;
+        }
     } else {
         /* 算出空閒的區塊與 inode 數(之後由配置與釋放維護) */
         struct dinode d;
@@ -1282,6 +1490,7 @@ int wfs_mount(struct blkdev *dev, struct inode **root_out)
             free_inodes += d.type == 0;
         }
     }
+    csum_verify = csum_on;                       /* 表格現在和磁碟一致(剛載入,或剛重算完) */
     struct wnode *root = nget(ROOT_INUM);
     if (!root || root->d.type != I_DIR)
         goto fail_locked;
@@ -1301,6 +1510,13 @@ int wfs_mount(struct blkdev *dev, struct inode **root_out)
 fail_locked:
     mutex_unlock(&wfs_lk);
 fail:
+    if (scratch)
+        pmm_free(scratch);
+    if (csum)
+        pmm_free_pages(csum, sb.csum_blocks);
+    scratch = NULL;
+    csum = NULL;
+    csum_on = 0;
     if (cache)
         pmm_free_pages(cache, NBUF);
     if (nodes)
@@ -1340,9 +1556,57 @@ void wfs_stats(struct wfs_stats *st)
     st->mounts = sb.mounts;
     st->repairs = last_repairs;
     st->failed = fs_failed;
+    st->checksums = csum_on;
+    st->csum_errors = csum_errors;
+    st->scrub_errors = scrub_errors;
+    st->scrub_blocks = scrub_blocks;
+    st->sb_restored = sb_restored;
     st->disk_reads = disk_reads;
     st->disk_writes = disk_writes;
     mutex_unlock(&wfs_lk);
+}
+
+/*
+ * 巡檢:從第 *pos 個區塊起,直接從磁碟讀 count 個區塊,逐一核對檢查碼;*pos 往後移(到尾端繞回 1)。
+ * 回傳這一批裡不符的數目;沒有檢查碼的檔案系統回傳 0。不經過快取:要看的是磁碟上現在的樣子。
+ */
+unsigned wfs_scrub(uint32_t *pos, unsigned count)
+{
+    unsigned bad = 0;
+
+    if (!mounted || !csum_on)
+        return 0;
+    mutex_lock(&wfs_lk);
+    for (unsigned i = 0; i < count; i++) {
+        uint32_t no = *pos;
+        *pos = no + 1 >= sb.nblocks ? 1 : no + 1;
+        if (no == 0 || no >= sb.nblocks || !covered(no) || !csum[no])
+            continue;                            /* 沒有內容(或不在表裡)的不必看 */
+        if (disk->rw(disk, (uint64_t)no * BSECT, BSECT, scratch, 0) != 0)
+            continue;                            /* 讀不到是另一種錯誤,由一般的讀取路徑回報 */
+        scrub_blocks++;
+        if (csum_verify && csum[no] != block_crc(scratch)) {
+            bad++;
+            if (scrub_errors++ < 3)
+                kprintf("disk: scrub found block %u corrupted (checksum mismatch)\n", no);
+        }
+    }
+    mutex_unlock(&wfs_lk);
+    return bad;
+}
+
+uint32_t wfs_block_count(void)
+{
+    return mounted ? sb.nblocks : 0;
+}
+
+/* 測試用:檔案 in 的第 fb 個區塊在磁碟上的編號(0 = 沒有配置) */
+uint32_t wfs_test_file_block(struct inode *in, uint32_t fb)
+{
+    mutex_lock(&wfs_lk);
+    uint32_t no = bmap(wn(in), fb, 0);
+    mutex_unlock(&wfs_lk);
+    return no;
 }
 
 /* 測試用:把快取裡的東西都寫回去,然後整個清空,讓之後的讀取一定要碰磁碟 */

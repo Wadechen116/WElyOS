@@ -1481,6 +1481,25 @@ static int mode_heap(void)
         return 1141;
     if (snprintf(text, 5, "%s", "truncated") != 9 || strcmp(text, "trun") != 0)   /* 回傳完整的長度 */
         return 1142;
+    /* 寬度的極端值(Codex 的靜態檢查發現原本會溢位):現在一律限制在 1024,結果是確定的。
+       格式字串與寬度經由 volatile 變數傳入:否則編譯器會依「標準的 snprintf」的行為
+       預先算出結果並發出警告,而我們要測的正是自己的實作在執行時怎麼處理 */
+    {
+        const char *volatile star = "%*d", *volatile huge = "%2147483648d",
+                   *volatile huger = "%99999999999999999999d";
+        volatile int int_min = -2147483647 - 1;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+#pragma GCC diagnostic ignored "-Wformat-security"
+        if (snprintf(text, sizeof(text), star, int_min, 1) != 1024 || text[0] != '1' || text[1] != ' ')
+            return 1146;                                 /* 負的寬度:靠左,補在後面 */
+        if (snprintf(text, sizeof(text), huge, 1) != 1024 || text[0] != ' ' ||
+            snprintf(text, sizeof(text), huger, 7) != 1024)
+            return 1147;
+#pragma GCC diagnostic pop
+    }
+    if (snprintf(text, sizeof(text), "%*d|%-*d|", 3, 5, 3, 5) != 8 || strcmp(text, "  5|5  |") != 0)
+        return 1148;                                     /* 一般的寬度不受影響 */
     if (strlen("abc") != 3 || strcmp("abc", "abd") >= 0 || strncmp("abcx", "abcy", 3) != 0)
         return 1143;
     strcpy(text, "0123456789");

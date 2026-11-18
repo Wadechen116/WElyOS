@@ -4,6 +4,7 @@
 #include <stdarg.h>
 #include "blackbox.h"
 #include "blk.h"
+#include "crc32.h"
 #include "kprintf.h"
 #include "kstring.h"
 #include "pmm.h"
@@ -25,21 +26,6 @@ static unsigned next_slot;                   /* 下一筆要寫在哪一格 */
 static uint32_t this_boot;
 static int enabled;
 static struct mutex bb_lock = MUTEX_INIT;
-
-/* CRC-32(IEEE 802.3 的多項式,和 zip、乙太網路用的相同)。逐位元計算:慢但不需要表格,
-   這裡每次只算 124 個位元組 */
-static uint32_t crc32(const void *data, size_t len)
-{
-    const uint8_t *p = data;
-    uint32_t crc = 0xFFFFFFFFu;
-
-    for (size_t i = 0; i < len; i++) {
-        crc ^= p[i];
-        for (int b = 0; b < 8; b++)
-            crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1)));
-    }
-    return ~crc;
-}
 
 static int rec_valid(const struct bb_record *r)
 {

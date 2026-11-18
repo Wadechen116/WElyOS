@@ -113,7 +113,9 @@ int initrd_unpack(const uint8_t *image, size_t len)
                那取決於建置時主機檔案系統的設定(在 Windows 的磁碟上每個檔案都被當成可執行),
                由這裡決定,結果才固定 */
             const char *rel = memcmp(path, "/./", 3) == 0 ? path + 2 : path;   /* 檔案包裡的名稱以 "./" 開頭 */
-            vfs_chmod(path, memcmp(rel, "/bin/", 5) == 0 ? 0755 : 0644);
+            err = vfs_chmod(path, memcmp(rel, "/bin/", 5) == 0 ? 0755 : 0644);
+            if (err)
+                return err;                  /* 權限設不上去的檔案不該留在系統裡被執行 */
             files++;
         }
         /* 其他類型(符號連結等)目前不支援,略過 */

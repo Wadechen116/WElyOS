@@ -252,6 +252,7 @@ static void sleep_worker(void *arg)
 
 static void sched_demo(void)
 {
+    unsigned threads0 = sched_thread_count();    /* 開始時已經存在的執行緒(main 與常駐的 kernel 執行緒) */
     sched_trim();                            /* 基準:快取中不留閒置的 stack */
     size_t free0 = pmm_free_count() + vm_table_pages();
     struct kheap_stats h0, h1;
@@ -287,7 +288,7 @@ static void sched_demo(void)
     /* 所有示範執行緒都結束後,它們的 stack 與結構都應該已歸還 */
     sched_trim();                            /* 快取中閒置的 stack 也要還回去才能核對 */
     kheap_stats(&h1);
-    KASSERT(sched_thread_count() == 1);
+    KASSERT(sched_thread_count() == threads0);
     /* 保護頁會把所在的大分頁拆開,多出來的頁表不會歸還,所以一併計入 */
     KASSERT(pmm_free_count() + vm_table_pages() == free0);
     KASSERT(h1.free_bytes + (sched_pool_bytes() - pool0) == h0.free_bytes);
@@ -737,6 +738,37 @@ static void nic_selftest(void)
 /* 磁碟                                                                */
 /* ------------------------------------------------------------------ */
 
+/*
+ * 巡檢執行緒:每 500ms 核對 16 個區塊的檢查碼,一遍又一遍地走過整顆磁碟
+ * (16MB 的磁碟約兩分鐘一輪)。刻意做得很慢:它的工作不急,不該和正常的讀寫搶磁碟。
+ * 發現損壞時記進黑盒子(每一輪最多記一次,免得同一個壞區塊灌滿紀錄)。
+ */
+static int scrub_running;
+
+static void scrub_thread(void *arg)
+{
+    uint32_t pos = 1;
+    unsigned bad_this_pass = 0;
+
+    (void)arg;
+    for (;;) {
+        thread_sleep(500);
+        uint32_t before = pos;
+        unsigned bad = wfs_scrub(&pos, 16);
+        if (bad && !bad_this_pass)
+            blackbox_log(BB_DISK, "scrub: %u corrupted block(s) found near block %u", bad, before);
+        bad_this_pass += bad;
+        if (pos < before)                    /* 繞回開頭:新的一輪 */
+            bad_this_pass = 0;
+    }
+}
+
+/* 常駐的 kernel 執行緒數(main 以外):網路的接收執行緒、磁碟的巡檢執行緒。測試核對執行緒數時使用 */
+static unsigned resident_threads(void)
+{
+    return (boot_nic != NULL) + (unsigned)scrub_running;
+}
+
 /* 開機時找到的磁碟(包了一層可以故意出錯的那一個);沒有磁碟為 NULL */
 static struct blkdev *boot_disk;
 static struct blkdev *arch_blk_probe_cached(void) { return boot_disk; }
@@ -772,6 +804,10 @@ static void disk_init(void)
             st.mounts, st.free_blocks * (unsigned)(PAGE_SIZE / 1024));
 
     /* 黑盒子:磁碟最後 8KB 的事件紀錄。先看上一次開機是怎麼結束的,再記下這一次開機 */
+    if (st.sb_restored)
+        kprintf("disk: superblock restored from its backup copy\n");
+    if (st.checksums && thread_create_prio("scrub", scrub_thread, NULL, PRIO_LOW) > 0)
+        scrub_running = 1;                   /* 低優先權:只在沒有別的事要做時才巡檢 */
     blackbox_init(dev, st.blocks, st.mounts);
     if (!blackbox_enabled()) {
         kprintf("blackbox: disabled (this disk was formatted before the log area existed)\n");
@@ -790,6 +826,8 @@ static void disk_init(void)
     blackbox_log(BB_BOOT, "boot #%u on %s", st.mounts, arch_name());
     if (st.repairs)
         blackbox_log(BB_NOTE, "file system check repaired %u problem(s) at mount", st.repairs);
+    if (st.sb_restored)
+        blackbox_log(BB_DISK, "primary superblock was damaged; restored from the backup copy");
 }
 
 /* 關機(結束模擬器)。先把磁碟上的檔案系統正常卸載 */
@@ -952,6 +990,41 @@ static void disk_demo(void)
     wfs_stats(&s2);
     KASSERT(s2.free_blocks == s1.free_blocks - 1 && s2.free_inodes == s1.free_inodes);
 
+    /* 檢查碼:把一個檔案的資料在磁碟上翻轉一個位元(模擬儲存媒體的位元錯誤)。
+       讀取必須失敗,而不是把壞掉的內容交出來;巡檢也要找得到它 */
+    wfs_stats(&s2);
+    if (s2.checksums) {
+        static char cbuf[3000];
+        uint32_t pos = 1;
+        unsigned bad = 0;
+        long n;
+
+        disk_write_file("/disk/selftest/flip", 9000, 5);
+        KASSERT(wfs_test_drop_cache() == 0);
+        KASSERT(wfs_scrub(&pos, wfs_block_count()) == 0);            /* 目前整顆磁碟都是好的 */
+        KASSERT(vfs_open("/disk/selftest/flip", O_RDONLY, &f) == 0);
+        uint32_t blk = wfs_test_file_block(vfs_file_inode(f), 1);    /* 檔案的第 2 個區塊 */
+        KASSERT(blk != 0);
+        KASSERT(blk_fault_flip((uint64_t)blk * 8 + 3, 100, 5) == 0);
+        while ((n = vfs_read(f, cbuf, sizeof(cbuf))) > 0)
+            ;
+        KASSERT(n == -E_IO);                                         /* 讀到壞掉的那一塊:拒絕 */
+        vfs_close(f);
+        wfs_stats(&s2);
+        KASSERT(s2.csum_errors >= 1);
+        pos = 1;
+        for (uint32_t done = 0; done < wfs_block_count(); done += 256)
+            bad += wfs_scrub(&pos, 256);
+        KASSERT(bad == 1);                                           /* 巡檢找到的正好是那一塊 */
+        /* 檔案系統本身沒有壞:刪掉那個檔案(壞掉的區塊被釋放)之後,巡檢又是乾淨的 */
+        KASSERT(vfs_unlink("/disk/selftest/flip") == 0);
+        pos = 1;
+        KASSERT(wfs_scrub(&pos, wfs_block_count()) == 0);
+        kprintf("disk: a single flipped bit on the disk was detected: the read failed with an I/O "
+                "error and the scrub located 1 bad block among %lu checked\n",
+                (unsigned long)(s2.scrub_blocks ? s2.scrub_blocks : 1));
+    }
+
     /* 全部刪除後,空間回到測試之前;再做一次完整檢查,應該找不到任何問題 */
     KASSERT(vfs_unlink("/disk/selftest") == 0);
     KASSERT(vfs_sync() == 0);
@@ -973,6 +1046,8 @@ static void disk_demo(void)
  *   5  確認上一次的唯讀狀態讓這次掛載做了檢查,檔案完好,又可以寫入;刪除測試檔
  *   6  黑盒子:留下一筆註記,然後故意 panic(這一階段預期以失敗的結束碼結束)
  *   7  確認黑盒子裡有上一次的註記與 panic 的訊息;把最新的一筆弄壞,確認它被認出來並略過
+ *   8  寫一個檔案、正常卸載,然後把磁碟上的 superblock(區塊 0)整個清成 0
+ *   9  確認掛載時改用備份的 superblock 並修好了區塊 0(而不是把磁碟當成新的重新格式化),檔案完好
  */
 static void disk_stage_test(const char *cmd)
 {
@@ -1088,6 +1163,27 @@ static void disk_stage_test(const char *cmd)
         KASSERT(blackbox_read(0, &r) == 0 && !memcmp(r.text, "stage 7 done", 12));
         kprintf("disktest 7: the black box kept the note and the panic message across the reboot; "
                 "a record with one flipped bit was rejected\n");
+    } else if (cmdline_has(cmd, "disktest=8")) {
+        static uint8_t zero[512];
+        struct blkdev *dev = arch_blk_probe_cached();
+
+        KASSERT(s.mounted && s.checksums && !s.sb_restored);
+        vfs_unlink("/disk/sbtest");
+        disk_write_file("/disk/sbtest", 20000, 9);
+        blackbox_log(BB_SHUTDOWN, "clean shutdown before the superblock test");
+        wfs_shutdown();                                  /* 正常卸載:兩份 superblock 都是最新的 */
+        /* 把區塊 0 的 8 個磁區全部清成 0:最壞的情況,看起來就像一顆全新的磁碟 */
+        for (unsigned i = 0; i < 8; i++)
+            KASSERT(dev->rw(dev, i, 1, zero, 1) == 0);
+        kprintf("disktest 8: wrote /disk/sbtest, unmounted, then wiped the primary superblock\n");
+        arch_exit(0);
+    } else if (cmdline_has(cmd, "disktest=9")) {
+        KASSERT(s.mounted && s.checksums && s.sb_restored);
+        disk_verify_file("/disk/sbtest", 20000, 9);      /* 沒有被重新格式化:檔案還在而且正確 */
+        KASSERT(wfs_check_now() == 0);
+        KASSERT(vfs_unlink("/disk/sbtest") == 0);
+        kprintf("disktest 9: the backup superblock was used and the primary repaired; "
+                "/disk/sbtest is intact\n");
     }
 }
 
@@ -1529,7 +1625,7 @@ static void user_demo(void)
     thread_sleep(2);
     sched_trim();
     kheap_stats(&h1);
-    KASSERT(sched_thread_count() == 1 + (boot_nic != NULL));   /* main,加上網路的接收執行緒(有網路卡時) */
+    KASSERT(sched_thread_count() == 1 + resident_threads());   /* main,加上網路的接收執行緒(有網路卡時) */
     /* heap 向頁面配置器要來的頁不會歸還(見 kmalloc.c),所以這段期間 heap 若長大了
        (例如管線的緩衝區第一次配置),要把那部分算進去:那些頁現在是 heap 的空閒空間 */
     size_t heap_grow = h1.heap_bytes - h0.heap_bytes;
@@ -1584,7 +1680,7 @@ static void sched_stress(void)
     thread_sleep(10);                        /* post 之後它們還要一點時間真正結束並被回收 */
     kprintf("stress: all finished in %llu ticks, %lu context switches\n",
             (unsigned long long)(timer_ticks() - t0), sched_switch_count() - sw0);
-    KASSERT(created == STRESS_THREADS && sched_thread_count() == 1 + (boot_nic != NULL));
+    KASSERT(created == STRESS_THREADS && sched_thread_count() == 1 + resident_threads());
 
     /* 第二階段:一條接一條地建立並等待結束(同時只有一條存活)。
        這是 stack 快取發揮作用的情況:每次都重複使用同一條 stack,

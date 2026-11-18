@@ -27,7 +27,7 @@ enum {
     SYS_getuid, SYS_getgid, SYS_setuid, SYS_capget, SYS_capdrop, SYS_chmod, SYS_chown,
     SYS_mmap, SYS_munmap, SYS_memlimit,
     SYS_ping, SYS_udp_open, SYS_udp_send, SYS_udp_recv, SYS_netinfo,
-    SYS_bbread, SYS_bblog,
+    SYS_bbread, SYS_bblog, SYS_scrub,
 };
 #define SYS_SIGRETURN_NUM 40 /* SYS_sigreturn 的數值:crt0.c 裡的組合語言要用(下面有檢查) */
 _Static_assert(SYS_sigreturn == SYS_SIGRETURN_NUM, "update SYS_SIGRETURN_NUM");
@@ -333,6 +333,9 @@ struct bb_record {
 static inline long sys_bbread(long index, struct bb_record *r) { return syscall3(SYS_bbread, index, (long)r, 0); }
 /* 留下一筆紀錄(type 為 BB_NOTE 或 BB_RESTART);需要系統管理的特權 */
 static inline long sys_bblog(long type, const char *text) { return syscall3(SYS_bblog, type, (long)text, 0); }
+/* 立刻把整顆磁碟巡檢一遍:直接從磁碟讀每個區塊,核對檢查碼。需要系統管理的特權 */
+struct scrubinfo { unsigned int checksums, blocks, bad, read_errors, sb_restored, pad; };
+static inline long sys_scrub(struct scrubinfo *info) { return syscall3(SYS_scrub, (long)info, 0, 0); }
 /* 現在的日期時間:1970-01-01 00:00:00 UTC 至今的秒數與微秒(換成年月日見 libc.h 的 gmtime_) */
 static inline long sys_time(struct timeval *tv)   { return syscall3(SYS_time, (long)tv, 0, 0); }
 /* 把還留在記憶體裡的修改寫到磁碟上 */

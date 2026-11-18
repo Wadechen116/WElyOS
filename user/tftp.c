@@ -50,9 +50,11 @@ int main(int argc, char **argv)
     /* 讀取要求:操作碼 1、檔名、0、"octet"、0 */
     req[0] = 0;
     req[1] = OP_RRQ;
-    strcpy((char *)req + reqlen, argv[1]);
-    reqlen += (unsigned)strlen(argv[1]) + 1;
-    strcpy((char *)req + reqlen, "octet");
+    /* 檔名的長度在開頭已經檢查過(最多 120);用明確長度的複製,不用 strcpy */
+    unsigned namelen = (unsigned)strlen(argv[1]) + 1;
+    memcpy(req + reqlen, argv[1], namelen);
+    reqlen += namelen;
+    memcpy(req + reqlen, "octet", 6);
     reqlen += 6;
 
     for (;;) {

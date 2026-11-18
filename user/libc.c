@@ -216,6 +216,8 @@ static void out_number(struct out *o, unsigned long long v, unsigned base, int u
         out_char(o, ' ');
 }
 
+#define FMT_WIDTH_MAX 1024                       /* 格式的寬度上限(見 format 裡的說明) */
+
 static void format(struct out *o, const char *fmt, va_list ap)
 {
     for (; *fmt; fmt++) {
@@ -232,16 +234,29 @@ static void format(struct out *o, const char *fmt, va_list ap)
             else
                 zero = 1;
         }
+        /*
+         * 寬度有上限(FMT_WIDTH_MAX)。兩個理由:
+         *   - 數值:沒有上限的話,"%2147483648d" 在累加時會讓 int 溢位;
+         *     "%*d" 傳入 INT_MIN 時取負號也會溢位(兩者都是未定義行為)
+         *   - 時間:寬度就是要補幾個空白。即使數值本身沒有溢位,一個 20 億的寬度
+         *     也會讓這個函式跑上很久,而呼叫者的緩衝區可能只有幾十個位元組
+         * 超過上限的一律當成上限;先比較再運算,所以任何輸入都不會溢位。
+         */
         if (*fmt == '*') {
-            width = va_arg(ap, int);
+            int w = va_arg(ap, int);
             fmt++;
+            if (w < 0) {
+                left = 1;
+                width = w < -FMT_WIDTH_MAX ? FMT_WIDTH_MAX : -w;     /* 先確認範圍才取負號 */
+            } else {
+                width = w > FMT_WIDTH_MAX ? FMT_WIDTH_MAX : w;
+            }
         } else {
-            while (*fmt >= '0' && *fmt <= '9')
-                width = width * 10 + (*fmt++ - '0');
-        }
-        if (width < 0) {
-            left = 1;
-            width = -width;
+            for (; *fmt >= '0' && *fmt <= '9'; fmt++)
+                if (width < FMT_WIDTH_MAX)                           /* 已經到上限:後面的數字只略過 */
+                    width = width * 10 + (*fmt - '0');
+            if (width > FMT_WIDTH_MAX)
+                width = FMT_WIDTH_MAX;
         }
         for (; *fmt == 'l' || *fmt == 'z'; fmt++)
             longs += *fmt == 'z' ? 1 : 1;

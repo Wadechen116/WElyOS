@@ -124,6 +124,7 @@ enum {
     /* ---- 黑盒子(見 blackbox.h) ---- */
     SYS_bbread,             /* (index, rec)    讀取一筆事件紀錄(0 = 最新的);0 = 取得,1 = 沒有這麼多筆 */
     SYS_bblog,              /* (type, text)    留下一筆紀錄(BB_NOTE 或 BB_RESTART);需要 CAP_ADMIN */
+    SYS_scrub,              /* (info)          立刻把整顆磁碟巡檢一遍(需要 CAP_ADMIN);結果寫入 struct scrubinfo */
 };
 
 /* SYS_waitpid 的選項 */
@@ -157,6 +158,16 @@ struct udpmsg {
     uint16_t port, pad;
     uint32_t len, pad2;
     uint64_t data;              /* 使用者位址(固定用 64 位元,三個架構的格式才相同) */
+};
+
+/* SYS_scrub 回報的內容(使用者端的定義在 user/usys.h,必須一致) */
+struct scrubinfo {
+    uint32_t checksums;         /* 0 = 這個磁碟(或沒有磁碟)沒有檢查碼,無法巡檢 */
+    uint32_t blocks;            /* 檔案系統的區塊總數 */
+    uint32_t bad;               /* 這一遍發現幾個損壞的區塊 */
+    uint32_t read_errors;       /* 開機至今,讀取時因檢查碼不符而拒絕的次數 */
+    uint32_t sb_restored;       /* 這次開機時 superblock 是從備份救回來的 */
+    uint32_t pad;
 };
 
 /* SYS_time 回報的內容 */

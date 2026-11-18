@@ -271,6 +271,11 @@ struct wfs_stats {
     uint32_t mounts;             /* 這個檔案系統被掛載過幾次(含這一次) */
     unsigned repairs;            /* 這次掛載時修復了幾個問題 */
     int failed;                  /* 寫入磁碟失敗過,檔案系統已轉為唯讀 */
+    int checksums;               /* 這個檔案系統的每個區塊有檢查碼(第 38 步起格式化的) */
+    unsigned long csum_errors;   /* 讀取時發現檢查碼不符、因而拒絕的次數 */
+    unsigned long scrub_errors;  /* 巡檢發現的損壞區塊數(累計) */
+    unsigned long scrub_blocks;  /* 巡檢核對過的區塊數(累計) */
+    int sb_restored;             /* 這次掛載時,superblock 是從備份救回來的 */
     unsigned long disk_reads, disk_writes;   /* 實際對磁碟讀寫的區塊數 */
 };
 int  wfs_mount(struct blkdev *dev, struct inode **root);
@@ -279,6 +284,10 @@ void wfs_stats(struct wfs_stats *st);
 int  wfs_check_now(void);
 int  wfs_test_damage(const char *victim_name);
 int  wfs_test_drop_cache(void);
+uint32_t wfs_test_file_block(struct inode *in, uint32_t fb);
+/* 巡檢:從 *pos 起直接讀磁碟核對 count 個區塊的檢查碼;回傳不符的數目,*pos 往後移(會繞回) */
+unsigned wfs_scrub(uint32_t *pos, unsigned count);
+uint32_t wfs_block_count(void);
 
 /* initrd.c:把開機檔案包(ustar 格式的 tar)解開到檔案系統。回傳建立的檔案數,失敗回傳負值 */
 int initrd_unpack(const uint8_t *image, size_t len);

@@ -35,6 +35,9 @@ struct blkdev *arch_blk_probe(void);
 struct blkdev *blk_fault_wrap(struct blkdev *dev);
 void blk_fault_set(int fail_reads, int fail_writes);
 unsigned long blk_fault_count(void);
+/* 測試用:把磁碟上第 lba 個磁區的第 byte 個位元組翻轉一個位元(模擬儲存媒體上的位元錯誤)。
+   直接改底下的裝置,不經過任何快取 */
+int blk_fault_flip(uint64_t lba, unsigned byte, unsigned bit);
 
 /* virtio 區塊裝置(kernel/virtio_blk.c;RISC-V 與 AArch64 的 QEMU virt 機器使用):
    在 base 起、每隔 stride 位元組一個、共 slots 個的 virtio-mmio 位置中尋找磁碟 */

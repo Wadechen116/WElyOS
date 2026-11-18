@@ -2364,6 +2364,24 @@ long syscall_dispatch(long num, long a0, long a1, long a2, void *tf)
         blackbox_log((int)a0, "%s", text);
         return 0;
     }
+    case SYS_scrub: {                /* 讀整顆磁碟:只給有特權的行程 */
+        struct scrubinfo si;
+        struct wfs_stats ws;
+        uint32_t pos = 1;
+        if (!(p->cred.caps & CAP_ADMIN))
+            return -E_PERM;
+        memset(&si, 0, sizeof(si));
+        wfs_stats(&ws);
+        si.checksums = (uint32_t)ws.checksums;
+        si.blocks = ws.blocks;
+        /* 分批做,每批之間放開檔案系統的鎖:巡檢期間別的行程照常可以讀寫 */
+        for (uint32_t done = 0; ws.checksums && done < ws.blocks; done += 64)
+            si.bad += wfs_scrub(&pos, 64);
+        wfs_stats(&ws);
+        si.read_errors = (uint32_t)ws.csum_errors;
+        si.sb_restored = (uint32_t)ws.sb_restored;
+        return copy_to_user(p, (uintptr_t)a0, &si, sizeof(si)) == 0 ? 0 : -E_FAULT;
+    }
     case SYS_ping:
         if (a1 < 0 || a1 > 60000)
             return -E_INVAL;

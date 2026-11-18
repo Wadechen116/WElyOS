@@ -24,6 +24,7 @@ WElyOS root file system
 /bin/tftp      fetches a file from the host (tftp etc/motd /disk/motd)
 /bin/host      looks up the address of a name (host example.com)
 /bin/faultlog  shows the black box: events kept on disk across reboots (panics, faults, restarts)
+/bin/scrub     reads every disk block and verifies its checksum
 /bin/supervise restarts a command when it fails (supervise -n 3 COMMAND)
 /bin/sh        the shell (pipes, redirection, background jobs with &, Ctrl-Z, fg, bg)
 /etc/test.sh   shell script used by the self-test
