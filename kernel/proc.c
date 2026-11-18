@@ -1235,11 +1235,21 @@ void user_return_check(void *tf)
     }
     if (thread_killed())
         proc_thread_exit();
-    if (p->seu_pending && __atomic_exchange_n(&p->seu_pending, 0, __ATOMIC_SEQ_CST)) {
-        uint8_t byte;                            /* 被注入的位元翻轉:位址不合法就什麼都不做 */
-        if (copy_from_user(p, &byte, p->seu_addr, 1) == 0) {
-            byte ^= p->seu_mask;
-            (void)!copy_to_user(p, p->seu_addr, &byte, 1);
+    if (p->seu_pending) {                        /* 不上鎖先看一眼,理由同上 */
+        /* 被注入的位元翻轉。「有沒有、位址、哪個位元」三樣要在鎖裡一次取出:
+           只把旗標清掉、之後才讀位址的話,中間若有第二筆注入進來,這一次用到的就是第二筆的位址,
+           而第二筆的旗標還立著,等於同一筆做了兩次、第一筆沒做 */
+        unsigned long flags = sched_lock();
+        int pending = p->seu_pending;
+        uintptr_t addr = p->seu_addr;
+        uint8_t mask = p->seu_mask, byte;
+        p->seu_pending = 0;
+        sched_unlock(flags);
+        /* 位址不合法就什麼都不做 */
+        if (pending && copy_from_user(p, &byte, addr, 1) == 0) {
+            byte ^= mask;
+            if (copy_to_user(p, addr, &byte, 1) != 0)
+                pending = 0;
         }
     }
     if (p->sig_pending)                          /* 不上鎖先看一眼,理由同上 */
@@ -2344,7 +2354,9 @@ long syscall_dispatch(long num, long a0, long a1, long a2, void *tf)
             return -E_INVAL;
         unsigned long flags = sched_lock();
         struct proc *q = proc_find((int)a0);
-        if (q && !q->zombie) {
+        if (q && !q->zombie && q->seu_pending) {
+            rc = -E_BUSY;                        /* 上一筆還沒被對方處理:不覆蓋它(一次只保留一筆) */
+        } else if (q && !q->zombie) {
             q->seu_addr = (uintptr_t)a1;
             q->seu_mask = (uint8_t)(1u << a2);
             q->seu_pending = 1;

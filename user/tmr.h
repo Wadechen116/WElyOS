@@ -64,6 +64,22 @@ static void tmr_kill(long pid, int sig)
         return;
 }
 
+/* 等一個子行程結束並取得結束碼。等待被訊號打斷(-E_INTR)時再試,次數有上限;
+   其他的失敗(或一直被打斷)回傳 -1 — 這時最後再終止它一次、不等待地收一次,盡量不留下殭屍行程 */
+static int tmr_reap(long pid, int *status)
+{
+    long r = -E_INTR;
+
+    for (int tries = 0; tries < 16 && r == -E_INTR; tries++)
+        r = sys_waitpid(pid, status, 0);
+    if (r == pid)
+        return 0;
+    tmr_kill(pid, SIGKILL);
+    if (sys_waitpid(pid, status, WNOHANG) == pid)
+        return 0;
+    return -1;
+}
+
 static int tmr_same(const struct tmr_result *a, const struct tmr_result *b)
 {
     return !a->invalid && !b->invalid && a->status == b->status && a->len == b->len &&
@@ -142,20 +158,25 @@ static int tmr_run(tmr_fn fn, void *arg, unsigned timeout_ms, tmr_hook hook, voi
             continue;
         unsigned char extra[256];
         long n;
+        n = 0;
         while (res[i].len < TMR_OUT_MAX &&
                (n = sys_read(out[i][0], res[i].out + res[i].len, TMR_OUT_MAX - res[i].len)) > 0)
             res[i].len += (unsigned)n;
+        /* 讀取失敗要當場記下:下面第二個迴圈的讀取可能回傳 0(結尾),會把這個負值蓋掉,
+           一份讀到一半就失敗的輸出就會被當成完整的 */
+        if (n < 0)
+            res[i].invalid = 1;
         while ((n = sys_read(out[i][0], extra, sizeof(extra))) > 0)
             res[i].invalid = 1;                      /* 超過上限:讀完丟掉,這一份不算 */
         if (n < 0)
             res[i].invalid = 1;
         tmr_close(out[i][0]);
-        if (rep->pid[i] > 0 && sys_waitpid(rep->pid[i], &res[i].status, 0) != rep->pid[i])
+        if (rep->pid[i] > 0 && tmr_reap(rep->pid[i], &res[i].status) != 0)
             res[i].invalid = 1;
     }
     if (timer > 0) {
         tmr_kill(timer, SIGKILL);
-        if (sys_waitpid(timer, &st, 0) == timer && st == 0)
+        if (tmr_reap(timer, &st) == 0 && st == 0)
             rep->timed_out = 1;                      /* 它是自己結束的:表示時間到了、動過手 */
     }
     if (!released)

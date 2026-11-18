@@ -88,6 +88,10 @@ file(GLOB NET_STACK_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/kernel/net/*.c
 add_executable(welyos.elf
     ${ARCH_SOURCES}
     kernel/main.c
+    kernel/test/mem_test.c
+    kernel/test/sched_test.c
+    kernel/test/io_test.c
+    kernel/test/user_test.c
     kernel/kprintf.c
     kernel/fdt.c
     kernel/panic.c
