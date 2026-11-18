@@ -52,12 +52,14 @@
 - [x] 使用者與權限:行程的 uid / gid 與四項可個別放棄的特權(只能減少、不能增加,所以不需要密碼)、檔案的擁有者與權限位元(VFS 檢查;磁碟上的 inode 不增加大小且相容舊映像)、送訊號的限制;新增 `id`、`su`、`chmod`、`chown`,`ls -l` 顯示權限與擁有者
 - [x] 記憶體配額:承諾記帳(超過行程配額或系統上限的要求當場回報 `E_NOMEM`,不再事後終止行程)、保留給 kernel 的記憶體、`memlimit` 與 shell 的 `limit`;匿名對映 `mmap` / `munmap`
 - [x] 網路(到 UDP):網路卡驅動(RISC-V / AArch64 的 virtio-net、i386 的 NE2000)、協定堆疊(乙太網路、ARP、IPv4、ICMP、UDP;純 C、不配置記憶體、主機端以 sanitizer 測試,由 Codex 實作)、整合層與以檔案描述符表示的 UDP socket;新增 `ping`、`net`、`tftp`(可從主機下載檔案)
+- [x] DNS 查詢:`host`(訊息的組合與解析 `user/dns.h` 由 Codex 實作並以 sanitizer 測試)
+- [x] 可靠性之一:看門狗(CPU 互相監看心跳,卡死時 panic)、黑盒子(磁碟最後 8KB 的事件紀錄,每筆有 CRC-32,panic 時以不上鎖的緊急路徑寫入,重新開機後可讀)、`supervise`(程式當掉時重新啟動,退避、有上限)、`faultlog`
 
 ## 規劃中
 
 - [ ] 多核心(Symmetric Multiprocessing,SMP)效能:縮小排程器的大鎖、喚醒時考慮上次執行的 CPU、mutex 先自旋再睡
-- [ ] DNS 查詢工具、TCP;i386 的 PS/2 鍵盤;檔案系統的日誌(journaling)、以磁碟為根目錄
-- [ ] 可靠性(參考航太飛行軟體的做法):看門狗與健康監控、黑盒子紀錄;磁碟區塊的檢查碼、superblock 備份與巡檢;安全模式;期限排程;三重執行加投票;靜態分析
+- [ ] TCP;i386 的 PS/2 鍵盤;檔案系統的日誌(journaling)、以磁碟為根目錄
+- [ ] 可靠性(參考航太飛行軟體的做法):磁碟區塊的檢查碼、superblock 備份與巡檢;安全模式;期限排程;三重執行加投票;靜態分析
 - [ ] 結構整理:中斷與裝置的註冊介面、kernel 與使用者共用的定義檔、拆分 `proc.c` / `main.c`、區塊快取獨立成一層
 
 ## 需求
@@ -82,13 +84,13 @@ cmake --build build/riscv64 --target debug     # 啟動 QEMU 並暫停,等待 GD
 cmake --build build/riscv64 --target gdb       # (另一個終端機)連上 gdb,輸入 welyos-start 開始
 bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit"              # 只開機,不跑測試(最快)
 bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit selftest"     # 開機並執行各子系統的自我測試與示範
-bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit crash=fault"  # 故意觸發錯誤(crash=panic|fault|illegal|break|dfree|stack|mainstack|thread|relock|null|wtext|exec|uaccess|uexec|spin|spinsleep|smp)
+bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit crash=fault"  # 故意觸發錯誤(crash=panic|fault|illegal|break|dfree|stack|mainstack|thread|relock|null|wtext|exec|uaccess|uexec|spin|spinsleep|smp|wdog)
 bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit memtest"      # 完整記憶體測試:寫入並驗證每一個空閒頁
 bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit stress"       # 排程器壓力測試:建立 1000 條執行緒
 cmake --build build/i386    --target run-gui   # 僅 i386:開啟 QEMU 視窗顯示 VGA 畫面
 cmake --preset riscv64 -DWELYOS_RUNQ=list      # 換用另一種執行佇列的實作(預設 ring)
 bash scripts/host-test.sh                      # 在主機上以多條執行緒測試執行佇列(不需要 QEMU)
-bash scripts/regress.sh                        # 回歸測試:三個架構各 20 個情境加上磁碟跨開機測試(五次開機),核對結束碼(-r 6 另外重複測試,-q 只跑基本情境)
+bash scripts/regress.sh                        # 回歸測試:三個架構各 21 個情境加上磁碟跨開機測試(七次開機)與主機端的網路測試,核對結束碼(-r 6 另外重複測試,-q 只跑基本情境)
 bash scripts/build-opensbi.sh                  # (選用)重新建置 RISC-V 的開機韌體;換 OpenSBI 版本時才需要
 bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf                                # 開機後進入 shell(輸入 help 看有哪些命令;top 看即時的系統狀態,q 離開)。Ctrl-C 終止、Ctrl-Z 暫停執行中的命令(fg / bg 繼續);輸入 exit 關機;Ctrl-] 強制結束 QEMU
 python3 scripts/type-input.py 1.5 0.01 'ls /\nexit\n' | bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit shell"   # 自動化:模擬打字餵給 shell
@@ -103,10 +105,10 @@ QEMU_DISK=none bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf            
 ```
 arch/<名稱>/  各架構的開機程式、linker script、驅動(i386 / riscv64 / aarch64)
 include/      與架構無關的標頭(arch.h 為架構介面;cred.h 為身分與特權;net.h 為網路的介面)
-kernel/       kernel 主體(main、kprintf、fdt、panic、timer、pmm、kmalloc、sched、runq_ring / runq_list、spinlock、smp、sync、vm、proc、vfs、ramfs、wfs、virtio_blk、virtio_net、blkfault、netif、initrd、console、pipe;net/ 為網路的協定堆疊)
+kernel/       kernel 主體(main、kprintf、fdt、panic、timer、pmm、kmalloc、sched、runq_ring / runq_list、spinlock、smp、sync、vm、proc、vfs、ramfs、wfs、virtio_blk、virtio_net、blkfault、netif、blackbox、watchdog、initrd、console、pipe;net/ 為網路的協定堆疊)
 lib/          最小字串函式庫
 cmake/        各架構的 toolchain 檔
-user/         使用者程式(各自獨立連結後放進開機檔案包的 /bin/):init(測試)、sh(shell)、echo、cat、ls、wc、sort、date、mkdir、rm、cp、mv、sleep、kill、ps、top、df、sync、id、su、chmod、chown、ping、net、tftp;crt0.c 為共用的啟動程式,libc.c / libc.h 為小型 C 函式庫,ulib.h 為較早的小工具
+user/         使用者程式(各自獨立連結後放進開機檔案包的 /bin/):init(測試)、sh(shell)、echo、cat、ls、wc、sort、date、mkdir、rm、cp、mv、sleep、kill、ps、top、df、sync、id、su、chmod、chown、ping、net、tftp、host、faultlog、supervise;crt0.c 為共用的啟動程式,libc.c / libc.h 為小型 C 函式庫,ulib.h 為較早的小工具
 firmware/     RISC-V 的開機韌體(拿掉自己標誌的 OpenSBI;說明見 firmware/README.md)
 rootfs/       開機檔案包的內容(建置時打包成 tar 嵌入 kernel,開機時解開到檔案系統)
 tests/host/   在主機上執行的測試(執行佇列的並行測試;net/ 為網路堆疊的測試)

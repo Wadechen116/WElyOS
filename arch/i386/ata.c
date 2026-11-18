@@ -56,14 +56,32 @@ static int ata_wait(int need_drq)
     return -1;
 }
 
+/* 讀寫的本體(不上鎖) */
+static int ata_do_rw(uint64_t lba, unsigned count, void *buf, int write);
+
 static int ata_rw(struct blkdev *d, uint64_t lba, unsigned count, void *buf, int write)
+{
+    if (count == 0 || count > 255 || lba + count > d->sectors)
+        return -E_INVAL;
+    mutex_lock(&ata_lock);
+    int rc = ata_do_rw(lba, count, buf, write);
+    mutex_unlock(&ata_lock);
+    return rc;
+}
+
+/* 緊急寫入(panic 時):不拿鎖。先等裝置把手上的事做完(ata_wait 有上限),再送出自己的 */
+static int ata_write_now(struct blkdev *d, uint64_t lba, const void *buf)
+{
+    if (lba >= d->sectors)
+        return -E_INVAL;
+    return ata_do_rw(lba, 1, (void *)(uintptr_t)buf, 1);
+}
+
+static int ata_do_rw(uint64_t lba, unsigned count, void *buf, int write)
 {
     uint16_t *p = buf;
     int rc = 0;
 
-    if (count == 0 || count > 255 || lba + count > d->sectors)
-        return -E_INVAL;
-    mutex_lock(&ata_lock);
     if (ata_wait(0) != 0) {
         rc = -E_IO;
         goto out;
@@ -87,7 +105,6 @@ static int ata_rw(struct blkdev *d, uint64_t lba, unsigned count, void *buf, int
     if (write && ata_wait(0) != 0)
         rc = -E_IO;
 out:
-    mutex_unlock(&ata_lock);
     return rc;
 }
 
@@ -128,5 +145,6 @@ struct blkdev *arch_blk_probe(void)
     ata_dev.sectors = (uint32_t)id[60] | ((uint32_t)id[61] << 16);   /* 28 位元 LBA 的磁區總數 */
     ata_dev.rw = ata_rw;
     ata_dev.flush = ata_flush;
+    ata_dev.write_now = ata_write_now;
     return ata_dev.sectors ? &ata_dev : NULL;
 }

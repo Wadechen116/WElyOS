@@ -16,6 +16,9 @@ su alice rm /work/p.txt
 su alice su root
 ls -l /work
 rm /work/p.txt
+# a supervised program that keeps failing is restarted twice, then given up on
+supervise -n 2 cat /does/not/exist
+faultlog 4
 echo first line > /work/result
 echo "second line, with  two  spaces" >> /work/result
 cat /work/result

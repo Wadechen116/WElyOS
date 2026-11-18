@@ -1,6 +1,7 @@
 #ifndef WELYOS_KPRINTF_H
 #define WELYOS_KPRINTF_H
 #include <stdarg.h>
+#include <stddef.h>
 
 /*
  * kernel 版 printf,透過 arch_putc 輸出到主控台。回傳輸出的字元數。
@@ -12,4 +13,7 @@
  */
 int kprintf(const char *fmt, ...);
 int kvprintf(const char *fmt, va_list ap);   /* 已有 va_list 時使用(例如包裝 panic) */
+/* 格式相同,但結果寫進 buf(最多 cap - 1 個字元,一定以 0 結尾)而不是印出來 */
+int ksnprintf(char *buf, size_t cap, const char *fmt, ...);
+int kvsnprintf(char *buf, size_t cap, const char *fmt, va_list ap);
 #endif

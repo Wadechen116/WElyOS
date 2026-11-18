@@ -3,6 +3,7 @@
  */
 #include <stddef.h>
 #include "arch.h"
+#include "blackbox.h"
 #include "console.h"
 #include "cpu.h"
 #include "cred.h"
@@ -1114,6 +1115,8 @@ void user_fault(const char *what, uintptr_t pc, uintptr_t addr)
 
     kprintf("[pid %d %s] killed: %s at pc=%p addr=%p\n", p ? p->pid : 0,
             p ? p->name : "?", what, (void *)pc, (void *)addr);
+    blackbox_log(BB_FAULT, "pid %d %s: %s at pc=%p addr=%p", p ? p->pid : 0, p ? p->name : "?", what,
+                 (void *)pc, (void *)addr);
     proc_exit(PROC_KILLED_FAULT);
     for (;;)
         ;                            /* 不會到達;讓編譯器知道本函式不返回 */
@@ -2332,6 +2335,35 @@ long syscall_dispatch(long num, long a0, long a1, long a2, void *tf)
         return sys_munmap(p, (uintptr_t)a0);
     case SYS_memlimit:
         return sys_memlimit(p, a0);
+    case SYS_bbread: {               /* 讀取黑盒子的一筆紀錄(0 = 最新的) */
+        struct bb_record r;
+        if (a0 < 0)
+            return -E_INVAL;
+        if (blackbox_read((unsigned)a0, &r) != 0)
+            return 1;
+        return copy_to_user(p, (uintptr_t)a1, &r, sizeof(r)) == 0 ? 0 : -E_FAULT;
+    }
+    case SYS_bblog: {                /* 在黑盒子留下一筆紀錄;需要 CAP_ADMIN(否則任何人都能把它灌滿) */
+        char text[BB_TEXT_MAX + 1];
+        if (!(p->cred.caps & CAP_ADMIN))
+            return -E_PERM;
+        if (a0 != BB_NOTE && a0 != BB_RESTART)
+            return -E_INVAL;
+        if (!blackbox_enabled())
+            return -E_IO;                    /* 沒有黑盒子(沒有磁碟,或磁碟沒有留出那一區) */
+        size_t i = 0;
+        for (; i < BB_TEXT_MAX; i++) {
+            if (copy_from_user(p, &text[i], (uintptr_t)a1 + i, 1) != 0)
+                return -E_FAULT;
+            if (!text[i])
+                break;
+            if ((unsigned char)text[i] < 0x20 || (unsigned char)text[i] > 0x7E)
+                text[i] = '?';               /* 只留可以顯示的字元:紀錄會被原樣印到終端機上 */
+        }
+        text[i] = '\0';
+        blackbox_log((int)a0, "%s", text);
+        return 0;
+    }
     case SYS_ping:
         if (a1 < 0 || a1 > 60000)
             return -E_INVAL;

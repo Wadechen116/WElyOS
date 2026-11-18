@@ -3,6 +3,8 @@
  */
 #include <stdarg.h>
 #include "arch.h"
+#include "blackbox.h"
+#include "kstring.h"
 #include "cpu.h"
 #include "kprintf.h"
 #include "panic.h"
@@ -40,8 +42,15 @@ void panic_begin(void)
     smp_stop_others();         /* 其他 CPU 不該在系統已經出錯的狀態下繼續執行 */
 }
 
+static int recorded;           /* 這次 panic 已經記進黑盒子了 */
+
 void panic_halt(void)
 {
+    /* 由 CPU 例外直接走到這裡的(沒有經過 panic()):細節只印在主控台上,黑盒子裡留一筆概要 */
+    if (!recorded) {
+        recorded = 1;
+        blackbox_panic(BB_PANIC, "fatal CPU exception in the kernel (details were printed on the console)");
+    }
     if (exit_on_panic)
         arch_exit(1);          /* 非 0:讓腳本與 CI 能判斷失敗 */
     arch_halt();
@@ -51,7 +60,12 @@ void panic(const char *fmt, ...)
 {
     va_list ap;
 
+    static char text[BB_TEXT_MAX + 1];
+
     panic_begin();
+    va_start(ap, fmt);
+    kvsnprintf(text, sizeof(text), fmt, ap); /* 先組成文字:要印出來,也要記進黑盒子 */
+    va_end(ap);
     kprintf("\n*** KERNEL PANIC: ");
     va_start(ap, fmt);
     kvprintf(fmt, ap);
@@ -59,5 +73,10 @@ void panic(const char *fmt, ...)
     va_end(ap);
     kprintf(" ***\n");
     arch_backtrace(0, arch_current_fp());
+    /* 寫進黑盒子放在最後:萬一寫磁碟的過程又出錯,該印的訊息都已經印出來了 */
+    if (!recorded) {
+        recorded = 1;
+        blackbox_panic(memcmp(text, "watchdog:", 9) == 0 ? BB_WATCHDOG : BB_PANIC, text);
+    }
     panic_halt();
 }

@@ -6,6 +6,7 @@
  */
 #include <stdint.h>
 #include "arch.h"
+#include "blackbox.h"
 #include "blk.h"
 #include "boot_info.h"
 #include "console.h"
@@ -23,6 +24,7 @@
 #include "sync.h"
 #include "timer.h"
 #include "vm.h"
+#include "watchdog.h"
 #include "mmu.h"
 #include "netdev.h"
 #include "netif.h"
@@ -64,6 +66,7 @@ static int cmdline_has(const char *cmd, const char *word)
  *   crash=spin     同一顆 CPU 對同一把 spinlock 上鎖兩次(不偵測的話會永遠卡住)
  *   crash=spinsleep 持有 spinlock 時讓出 CPU(規則禁止;排程器應該擋下)
  *   crash=smp      其他 CPU 都在忙的時候 panic(它們應該被叫停)
+ *   crash=wdog     一顆 CPU 關著中斷空轉(卡死):隔壁的 CPU 的看門狗應該發現並 panic
  * (crash=stack、crash=thread、crash=relock、crash=spin* 需要排程器,在 sched_demo 之前另外處理)
  */
 static void crash_test(const char *cmd)
@@ -767,11 +770,37 @@ static void disk_init(void)
             (unsigned long long)(dev->sectors / 2048),
             rc == 1 ? "new file system created and mounted" : "mounted",
             st.mounts, st.free_blocks * (unsigned)(PAGE_SIZE / 1024));
+
+    /* 黑盒子:磁碟最後 8KB 的事件紀錄。先看上一次開機是怎麼結束的,再記下這一次開機 */
+    blackbox_init(dev, st.blocks, st.mounts);
+    if (!blackbox_enabled()) {
+        kprintf("blackbox: disabled (this disk was formatted before the log area existed)\n");
+        return;
+    }
+    struct bb_record last;
+    if (blackbox_read(0, &last) != 0)
+        kprintf("blackbox: empty (first boot with this disk)\n");
+    else if (last.type == BB_SHUTDOWN)
+        kprintf("blackbox: %u records; the previous boot shut down cleanly\n", blackbox_count());
+    else if (last.type == BB_PANIC || last.type == BB_WATCHDOG)
+        kprintf("blackbox: %u records; the previous boot ended with: %s\n", blackbox_count(), last.text);
+    else
+        kprintf("blackbox: %u records; the previous boot did not shut down (power loss, or the "
+                "emulator was closed)\n", blackbox_count());
+    blackbox_log(BB_BOOT, "boot #%u on %s", st.mounts, arch_name());
+    if (st.repairs)
+        blackbox_log(BB_NOTE, "file system check repaired %u problem(s) at mount", st.repairs);
 }
 
 /* 關機(結束模擬器)。先把磁碟上的檔案系統正常卸載 */
 static void shutdown(int code)
 {
+    struct wfs_stats st;
+
+    wfs_stats(&st);
+    if (st.failed)
+        blackbox_log(BB_DISK, "shutting down with the file system read-only after a write error");
+    blackbox_log(BB_SHUTDOWN, "clean shutdown, exit code %d", code);
     wfs_shutdown();
     arch_exit(code);
 }
@@ -942,6 +971,8 @@ static void disk_demo(void)
  *   3  確認掛載時發現並修復了問題,原本的檔案完好
  *   4  磁碟錯誤:讀取失敗只影響那一次操作;寫入失敗之後檔案系統轉為唯讀
  *   5  確認上一次的唯讀狀態讓這次掛載做了檢查,檔案完好,又可以寫入;刪除測試檔
+ *   6  黑盒子:留下一筆註記,然後故意 panic(這一階段預期以失敗的結束碼結束)
+ *   7  確認黑盒子裡有上一次的註記與 panic 的訊息;把最新的一筆弄壞,確認它被認出來並略過
  */
 static void disk_stage_test(const char *cmd)
 {
@@ -1024,6 +1055,39 @@ static void disk_stage_test(const char *cmd)
         KASSERT(vfs_mkdir("/disk/ok") == 0 && vfs_unlink("/disk/ok") == 0);      /* 又可以寫入了 */
         KASSERT(vfs_unlink("/disk/persist") == 0);
         kprintf("disktest 5: /disk/persist is intact and the file system is writable again\n");
+    } else if (cmdline_has(cmd, "disktest=6")) {
+        KASSERT(s.mounted && blackbox_enabled());
+        blackbox_log(BB_NOTE, "stage 6 marker %d", 4711);
+        kprintf("disktest 6: left a note in the black box; now panicking on purpose\n");
+        panic("black box test panic %d", 77);
+    } else if (cmdline_has(cmd, "disktest=7")) {
+        struct bb_record r;
+        int saw_panic = 0, saw_note = 0, saw_boot = 0;
+        uint32_t prev_seq = 0;
+
+        KASSERT(s.mounted && blackbox_enabled());
+        /* 由新到舊走一遍:序號遞減;找得到上一次開機的註記、panic 的訊息、以及開機紀錄 */
+        for (unsigned i = 0; blackbox_read(i, &r) == 0; i++) {
+            KASSERT(i == 0 || r.seq < prev_seq);
+            prev_seq = r.seq;
+            KASSERT(r.len <= BB_TEXT_MAX && r.time > 1700000000ull);
+            if (r.boot == s.mounts - 1) {
+                saw_panic |= r.type == BB_PANIC && !memcmp(r.text, "black box test panic 77", 23);
+                saw_note |= r.type == BB_NOTE && !memcmp(r.text, "stage 6 marker 4711", 19);
+                saw_boot |= r.type == BB_BOOT;
+            }
+        }
+        KASSERT(saw_panic && saw_note && saw_boot);
+        /* 最新的一筆是這次的開機紀錄。把它在磁碟上翻轉一個位元:檢查碼不符,載入時被略過 */
+        unsigned before = blackbox_count();
+        KASSERT(blackbox_read(0, &r) == 0 && r.type == BB_BOOT && r.boot == s.mounts);
+        KASSERT(blackbox_test_corrupt_newest() == 0);
+        KASSERT(blackbox_count() == before - 1);
+        KASSERT(blackbox_read(0, &r) == 0 && r.boot == s.mounts - 1);   /* 現在最新的是上一次開機留下的 */
+        blackbox_log(BB_NOTE, "stage 7 done");
+        KASSERT(blackbox_read(0, &r) == 0 && !memcmp(r.text, "stage 7 done", 12));
+        kprintf("disktest 7: the black box kept the note and the panic message across the reboot; "
+                "a record with one flipped bit was rejected\n");
     }
 }
 
@@ -1583,6 +1647,15 @@ static void fault_worker(void *arg)
     panic("panic inside thread %d (%s)", thread_id(), thread_name());
 }
 
+/* crash=wdog 用:關著中斷空轉。這顆 CPU 從此不再處理任何中斷 */
+static void spin_irqs_off(void *arg)
+{
+    (void)arg;
+    arch_irq_disable();
+    for (;;)
+        ;
+}
+
 /* crash=smp 用:永遠忙碌的執行緒 */
 static void spin_forever(void *arg)
 {
@@ -1932,6 +2005,18 @@ void kmain(const struct boot_info *bi)
     /* 以上的示範檢查的是「單一 CPU 上的排程行為」(誰先執行、誰搶佔誰),
        所以在其他 CPU 加入之前跑。從這裡起,執行緒會真正同時在多顆 CPU 上執行 */
     smp_sched_start();
+    if (cmdline_has(bi->cmdline, "crash=wdog")) {
+        if (smp_started() < 2) {
+            /* 只有一顆 CPU 時沒有人可以看它(見 watchdog.c 的限制):這個測試無法進行 */
+            panic("watchdog test needs at least 2 cpus");
+        }
+        watchdog_set_timeout(300);           /* 測試用較短的期限 */
+        kprintf("one cpu now spins with interrupts disabled; the watchdog should notice...\n");
+        thread_create("stuck", spin_irqs_off, NULL);
+        thread_sleep(3000);
+        kprintf("the watchdog did not fire\n");
+        arch_exit(0);                        /* 預期不會到這裡:以「成功」結束會讓測試失敗 */
+    }
     if (cmdline_has(bi->cmdline, "crash=smp")) {
         /* 其他 CPU 正忙的時候 panic:它們應該被叫停,系統乾淨地結束 */
         for (int i = 0; i < smp_started(); i++)

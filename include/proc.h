@@ -121,6 +121,9 @@ enum {
     SYS_udp_send,           /* (fd, msg)       送出一個封包(struct udpmsg:目的位址、埠、資料);回傳長度 */
     SYS_udp_recv,           /* (fd, msg, timeout_ms)  等一個封包;填入來源與資料,回傳長度 */
     SYS_netinfo,            /* (info)          網路的設定與統計(struct netinfo,見 netif.h) */
+    /* ---- 黑盒子(見 blackbox.h) ---- */
+    SYS_bbread,             /* (index, rec)    讀取一筆事件紀錄(0 = 最新的);0 = 取得,1 = 沒有這麼多筆 */
+    SYS_bblog,              /* (type, text)    留下一筆紀錄(BB_NOTE 或 BB_RESTART);需要 CAP_ADMIN */
 };
 
 /* SYS_waitpid 的選項 */

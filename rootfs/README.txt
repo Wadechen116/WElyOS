@@ -22,6 +22,9 @@ WElyOS root file system
 /bin/chmod     changes permissions (chmod 755 FILE); chown changes the owner (root only)
 /bin/ping      checks that another machine answers (ping 10.0.2.2); net shows the network state
 /bin/tftp      fetches a file from the host (tftp etc/motd /disk/motd)
+/bin/host      looks up the address of a name (host example.com)
+/bin/faultlog  shows the black box: events kept on disk across reboots (panics, faults, restarts)
+/bin/supervise restarts a command when it fails (supervise -n 3 COMMAND)
 /bin/sh        the shell (pipes, redirection, background jobs with &, Ctrl-Z, fg, bg)
 /etc/test.sh   shell script used by the self-test
 /etc/motd      message shown by the file system self-test

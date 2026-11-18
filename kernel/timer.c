@@ -8,6 +8,7 @@
 #include "cpu.h"
 #include "sched.h"
 #include "timer.h"
+#include "watchdog.h"
 
 /* volatile:在中斷處理程式中被修改,主程式每次都必須重新讀取 */
 static volatile uint64_t ticks;
@@ -25,6 +26,7 @@ void timer_tick(void)
        否則 N 顆 CPU 時間就會走快 N 倍 */
     if (this_cpu()->id == 0)
         ticks++;
+    watchdog_tick();           /* 心跳,並看看隔壁的 CPU 是不是還活著 */
     sched_tick();              /* 喚醒休眠者、扣時間片(排程器未啟動時無作用) */
 }
 

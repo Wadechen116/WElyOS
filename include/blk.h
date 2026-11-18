@@ -10,6 +10,7 @@
  *   sectors   容量(磁區數)
  *   rw        從第 lba 個磁區起讀或寫 count 個磁區。等到做完才返回;0 = 成功,負值 = 失敗
  *   flush     要求裝置把它自己暫存的資料真正寫到儲存媒體上(可以不提供)
+ *   write_now 緊急寫入一個磁區,不上鎖(見下)
  *
  * 目前的驅動程式都是「輪詢」(polling):送出要求後反覆檢查裝置是否完成,不使用中斷。
  * 同一個裝置的要求由驅動程式自己的鎖排成一次一個。
@@ -21,6 +22,9 @@ struct blkdev {
     uint64_t sectors;
     int (*rw)(struct blkdev *d, uint64_t lba, unsigned count, void *buf, int write);
     int (*flush)(struct blkdev *d);
+    /* 緊急寫入一個磁區(panic 時記錄黑盒子用):不上鎖、不睡覺。只能在其他 CPU 都已經停下、
+       不會再有別的要求時使用。可以不提供(NULL) */
+    int (*write_now)(struct blkdev *d, uint64_t lba, const void *buf);
 };
 
 /* 找出這台機器的磁碟(各架構實作);沒有磁碟回傳 NULL。要在排程器啟動之後呼叫 */

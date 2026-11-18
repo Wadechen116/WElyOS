@@ -310,6 +310,26 @@ static void test_malformed(void)
     uint8_t huge[NET_FRAME_MAX+1]={0}; expect_drop(huge,sizeof(huge));
     puts("  truncations + exhaustive length fields: PASS");
 }
+static void test_trailing(void)
+{
+    uint8_t f[1518]; reset(0); CHECK(net_udp_bind(123,udp_cb,&got_udp)==0);
+    for (size_t len=45;len<=1518;++len) {
+        size_t n=udp_frame(f,123,3,1); memset(f+n,0xa5,len-n);
+        unsigned old=got_udp; uint32_t dropped=snapshot().rx_bad_length;
+        receive(f,len);
+        if (len<=NET_FRAME_MAX) {
+            CHECK(got_udp==old+1 && got_len==3 && got_data[2]==38);
+        } else {
+            CHECK(got_udp==old && snapshot().rx_bad_length==dropped+1);
+        }
+    }
+    for (size_t len=NET_FRAME_MAX;len<=1518;++len) {
+        size_t n=udp_frame(f,123,NET_UDP_MAX,1); memset(f+n,0xa5,len-n);
+        unsigned old=got_udp; receive(f,len);
+        CHECK(got_udp==old+(len==NET_FRAME_MAX ? 1u : 0u));
+    }
+    puts("  trailing bytes: <=1514 accepted without payload extension; 1515..1518 rejected PASS");
+}
 static uint32_t random_state=0x8172ab39u;
 static uint32_t random32(void)
 {
@@ -341,6 +361,6 @@ static void test_random(void)
 int main(void)
 {
     test_arp(); test_timers_capacity(); test_arp_matching(); test_icmp(); test_udp(); test_errors();
-    test_malformed(); test_random();
+    test_malformed(); test_trailing(); test_random();
     printf("net: PASS (%u checks)\n",checks); return 0;
 }

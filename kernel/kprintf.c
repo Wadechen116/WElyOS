@@ -13,9 +13,18 @@
 #include "kprintf.h"
 #include "spinlock.h"
 
+/* 不為 NULL 時,輸出改寫進這塊緩衝區而不是主控台(ksnprintf 使用;受 console_lk 保護) */
+static char *sink;
+static size_t sink_cap, sink_len;
+
 /* 輸出單一字元。回傳 1(輸出字元數) */
 static int out_char(char c)
 {
+    if (sink) {
+        if (sink_len + 1 < sink_cap)
+            sink[sink_len++] = c;            /* 放不下的部分丟掉(留一格給結尾的 0) */
+        return 1;
+    }
     if (c == '\n')
         arch_putc('\r');        /* 序列終端機需要 CRLF */
     arch_putc(c);
@@ -183,5 +192,31 @@ int kprintf(const char *fmt, ...)
     va_end(ap);
     arch_console_flush();
     spin_unlock_irqrestore(&console_lk, flags);
+    return n;
+}
+
+/* 同 kvprintf,但結果寫進 buf(最多 cap - 1 個字元,一定以 0 結尾)。回傳完整輸出的長度 */
+int kvsnprintf(char *buf, size_t cap, const char *fmt, va_list ap)
+{
+    if (cap == 0)
+        return 0;
+    unsigned long flags = spin_lock_irqsave(&console_lk);
+    sink = buf;
+    sink_cap = cap;
+    sink_len = 0;
+    int n = kvprintf(fmt, ap);
+    buf[sink_len] = '\0';
+    sink = NULL;
+    spin_unlock_irqrestore(&console_lk, flags);
+    return n;
+}
+
+int ksnprintf(char *buf, size_t cap, const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    int n = kvsnprintf(buf, cap, fmt, ap);
+    va_end(ap);
     return n;
 }

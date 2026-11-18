@@ -41,6 +41,14 @@ static int fault_flush(struct blkdev *d)
     return real->flush ? real->flush(real) : 0;
 }
 
+static int fault_write_now(struct blkdev *d, uint64_t lba, const void *buf)
+{
+    (void)d;
+    if (fail_writes || !real->write_now)
+        return -E_IO;
+    return real->write_now(real, lba, buf);
+}
+
 struct blkdev *blk_fault_wrap(struct blkdev *dev)
 {
     if (!dev)
@@ -50,6 +58,7 @@ struct blkdev *blk_fault_wrap(struct blkdev *dev)
     wrapper.sectors = dev->sectors;
     wrapper.rw = fault_rw;
     wrapper.flush = fault_flush;
+    wrapper.write_now = fault_write_now;
     return &wrapper;
 }
 

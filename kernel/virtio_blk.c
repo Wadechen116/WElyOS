@@ -69,11 +69,34 @@ static uint32_t rd(struct vblk *v, unsigned off)           { return v->reg[off /
 static void wr(struct vblk *v, unsigned off, uint32_t val) { v->reg[off / 4] = val; }
 
 /* 送出一個要求並等它完成。buf 為 NULL 表示沒有資料(flush) */
+static int vblk_do_request(struct vblk *v, uint32_t type, uint64_t sector, void *buf, uint32_t len);
+
 static int vblk_request(struct vblk *v, uint32_t type, uint64_t sector, void *buf, uint32_t len)
+{
+    mutex_lock(&v->lock);
+    int rc = vblk_do_request(v, type, sector, buf, len);
+    mutex_unlock(&v->lock);
+    return rc;
+}
+
+/* 緊急寫入(panic 時):不拿鎖。如果有一個要求還沒完成(送出它的 CPU 已經被停下),
+   先等裝置做完它(有上限),再送出自己的 — 佇列一次只放一個要求,不能重疊 */
+static int vblk_write_now(struct blkdev *d, uint64_t lba, const void *buf)
+{
+    struct vblk *v = (struct vblk *)d;
+
+    if (lba >= d->sectors)
+        return -E_INVAL;
+    for (unsigned i = 0; i < 50000000u && v->used->idx != v->avail->idx; i++)
+        ;
+    v->last_used = v->used->idx;
+    return vblk_do_request(v, 1, lba, (void *)(uintptr_t)buf, BLK_SECTOR);
+}
+
+static int vblk_do_request(struct vblk *v, uint32_t type, uint64_t sector, void *buf, uint32_t len)
 {
     int rc = 0;
 
-    mutex_lock(&v->lock);
     v->req->type = type;
     v->req->reserved = 0;
     v->req->sector = sector;
@@ -95,9 +118,11 @@ static int vblk_request(struct vblk *v, uint32_t type, uint64_t sector, void *bu
     wr(v, R_QUEUE_NOTIFY, 0);
 
     /* 輪詢:等已用環往前走。設一個上限,裝置沒有回應時回報錯誤而不是永遠卡住 */
+    /* 兩種上限:平常以時間計(5 秒);panic 時中斷是關的,時間不會前進,所以另外有次數的上限 */
     uint64_t t0 = timer_ticks();
+    unsigned long spins = 0;
     while (v->used->idx == v->last_used) {
-        if (timer_ticks() - t0 > 5000) {
+        if (timer_ticks() - t0 > 5000 || ++spins > 200000000ul) {
             rc = -E_IO;
             break;
         }
@@ -107,7 +132,6 @@ static int vblk_request(struct vblk *v, uint32_t type, uint64_t sector, void *bu
         if (*v->status != 0)
             rc = -E_IO;
     }
-    mutex_unlock(&v->lock);
     return rc;
 }
 
@@ -193,6 +217,7 @@ struct blkdev *virtio_blk_probe(uintptr_t base, uintptr_t stride, unsigned slots
         v->dev.name = "virtio-blk";
         v->dev.rw = vblk_rw;
         v->dev.flush = vblk_flush;
+        v->dev.write_now = vblk_write_now;
         if (vblk_setup(v) != 0) {
             wr(v, R_STATUS, ST_FAILED);
             kprintf("disk: virtio device %u could not be set up\n", i);

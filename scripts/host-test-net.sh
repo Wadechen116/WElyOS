@@ -8,11 +8,9 @@ COMMON=(-std=c11 -Wall -Wextra -Werror -fno-builtin -iquote include)
 gcc "${COMMON[@]}" -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
     -fno-pie -no-pie tests/host/net/test_net.c kernel/net/stack.c -o "$NET_TEST_OUT/test_net"
 ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 "$NET_TEST_OUT/test_net"
-if [[ -f tests/host/net/test_dns.c ]]; then
-    gcc "${COMMON[@]}" -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-        -fno-pie -no-pie tests/host/net/test_dns.c -o "$NET_TEST_OUT/test_dns"
-    ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 "$NET_TEST_OUT/test_dns"
-fi
+gcc "${COMMON[@]}" -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+    -fno-pie -no-pie tests/host/net/test_dns.c -o "$NET_TEST_OUT/test_dns"
+ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 "$NET_TEST_OUT/test_dns"
 for target in i386 riscv64 aarch64; do
     case "$target" in
         i386) compiler=gcc; options=(-m32 -mgeneral-regs-only) ;;
@@ -24,12 +22,10 @@ for target in i386 riscv64 aarch64; do
     fi
     "$compiler" "${COMMON[@]}" "${options[@]}" -O2 -ffreestanding -nostdlib \
         -c kernel/net/stack.c -o "$NET_TEST_OUT/stack-$target.o"
-    if [[ -f tests/host/net/compile_dns.c ]]; then
-        "$compiler" "${COMMON[@]}" "${options[@]}" -O2 -ffreestanding -nostdlib \
-            -c tests/host/net/compile_dns.c -o "$NET_TEST_OUT/dns-$target.o"
-    fi
+    "$compiler" "${COMMON[@]}" "${options[@]}" -O2 -ffreestanding -nostdlib \
+        -c tests/host/net/compile_dns.c -o "$NET_TEST_OUT/dns-$target.o"
     # i386 不連結 libgcc,不能偷偷產生除法、浮點等執行期輔助函式。
-    if nm -u "$NET_TEST_OUT/stack-$target.o" | grep -Eq '__.*(div|mod|float|muldi)'; then
+    if nm -u "$NET_TEST_OUT/stack-$target.o" "$NET_TEST_OUT/dns-$target.o" | grep -E '__.*(div|mod|float|muldi)' >/dev/null; then
         echo "$target: forbidden runtime helper"; exit 1
     fi
     echo "$target: freestanding compile PASS"

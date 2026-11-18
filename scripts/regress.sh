@@ -2,12 +2,12 @@
 # 回歸測試:建置三個架構,逐一執行各種開機參數,核對 QEMU 的結束碼。
 #
 # 用法: bash scripts/regress.sh [選項]
-#   (不帶選項)   每個架構跑完整的 20 個情境
+#   (不帶選項)   每個架構跑完整的 21 個情境
 #   -r N          另外重複執行「全部測試」N 次,分別以 1、4、8 顆 CPU(找偶發的錯誤)
 #   -a "架構..."  只測指定的架構,例如 -a "riscv64"
 #   -q            只跑最基本的三個情境(只開機、selftest、全部測試)
 # 環境變數 QEMU_SMP 決定 20 個情境使用的 CPU 數(預設 4)。
-# 另外每個架構做一次「磁碟跨開機測試」(五次開機,使用獨立的映像檔;-q 時略過)。
+# 另外每個架構做一次「磁碟跨開機測試」(七次開機,使用獨立的映像檔;-q 時略過)。
 # 20 個情境使用預設的磁碟映像 build/<架構>/disk.img(測試結束時會把自己建立的東西刪掉)。
 #
 # 預期的結束碼:
@@ -29,7 +29,7 @@ while getopts "r:a:q" opt; do
 done
 
 OUT=build/regress; mkdir -p "$OUT"
-CRASH="panic fault illegal break dfree stack mainstack thread relock null wtext exec uaccess uexec spin spinsleep smp"
+CRASH="panic fault illegal break dfree stack mainstack thread relock null wtext exec uaccess uexec spin spinsleep smp wdog"
 fail=0
 
 for a in $ARCHS; do
@@ -69,17 +69,20 @@ for a in $ARCHS; do
   # 見 kernel/main.c 的 disk_stage_test
   if [ "$QUICK" -eq 0 ]; then
     img="$OUT/disk-$a.img"; rm -f "$img"; dok=0
-    for s in 1 2 3 4 5; do
+    for s in 1 2 3 4 5 6 7; do
       log="$OUT/$a-disktest$s.txt"
-      if QEMU_DISK="$img" timeout 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
-           -append "autoexit disktest=$s" > "$log" 2>&1 < /dev/null; then
+      # 第 6 階段故意 panic(測試黑盒子):預期的結束碼和其他當機情境相同
+      dwant=0; [ "$s" -eq 6 ] && { [ "$a" = i386 ] && dwant=3 || dwant=1; }
+      QEMU_DISK="$img" timeout 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
+           -append "autoexit disktest=$s" > "$log" 2>&1 < /dev/null
+      if [ "$?" -eq "$dwant" ]; then
         dok=$((dok + 1))
       else
         fail=1; echo "  $a 磁碟測試第 $s 階段失敗,輸出在 $log"
       fi
     done
     rm -f "$img"
-    echo "$a: 磁碟跨開機測試 ${dok}/5 個階段通過"
+    echo "$a: 磁碟跨開機測試 ${dok}/7 個階段通過"
   fi
 
   if [ "$REPEAT" -gt 0 ]; then

@@ -1231,6 +1231,8 @@ int wfs_mount(struct blkdev *dev, struct inode **root_out)
     if (blank) {
         /* 全新的磁碟(開頭全是 0):建立檔案系統。開頭有別的內容時絕不格式化 —
            那可能是別人的資料 */
+        /* 最後 2 個區塊(8KB)留給黑盒子(blackbox.c),不屬於檔案系統 */
+        dev_blocks -= 2;
         sb.nblocks = (uint32_t)dev_blocks;
         err = wfs_format((uint32_t)dev_blocks);
         if (err)

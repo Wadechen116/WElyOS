@@ -27,6 +27,7 @@ enum {
     SYS_getuid, SYS_getgid, SYS_setuid, SYS_capget, SYS_capdrop, SYS_chmod, SYS_chown,
     SYS_mmap, SYS_munmap, SYS_memlimit,
     SYS_ping, SYS_udp_open, SYS_udp_send, SYS_udp_recv, SYS_netinfo,
+    SYS_bbread, SYS_bblog,
 };
 #define SYS_SIGRETURN_NUM 40 /* SYS_sigreturn 的數值:crt0.c 裡的組合語言要用(下面有檢查) */
 _Static_assert(SYS_sigreturn == SYS_SIGRETURN_NUM, "update SYS_SIGRETURN_NUM");
@@ -315,6 +316,23 @@ static inline long sys_udp_recv(long fd, void *buf, unsigned cap, unsigned *ip, 
     return n;
 }
 static inline long sys_netinfo(struct netinfo *info) { return syscall3(SYS_netinfo, (long)info, 0, 0); }
+/*
+ * 黑盒子:kernel 記在磁碟上、重新開機後還在的事件紀錄(開機、關機、panic、看門狗、
+ * 程式因例外被終止、磁碟錯誤、受監督的程式被重新啟動、註記)。
+ */
+enum { BB_BOOT = 1, BB_SHUTDOWN, BB_PANIC, BB_WATCHDOG, BB_FAULT, BB_DISK, BB_RESTART, BB_NOTE };
+struct bb_record {
+    unsigned int magic, seq;                 /* seq:序號,越大越新 */
+    unsigned long long time;                 /* 1970-01-01 UTC 至今的秒數 */
+    unsigned int boot;                       /* 第幾次開機 */
+    unsigned short type, len;                /* BB_*;text 的長度 */
+    char text[100];
+    unsigned int crc;
+};
+/* 讀取第 index 筆(0 = 最新的)。0 = 取得,1 = 沒有這麼多筆 */
+static inline long sys_bbread(long index, struct bb_record *r) { return syscall3(SYS_bbread, index, (long)r, 0); }
+/* 留下一筆紀錄(type 為 BB_NOTE 或 BB_RESTART);需要系統管理的特權 */
+static inline long sys_bblog(long type, const char *text) { return syscall3(SYS_bblog, type, (long)text, 0); }
 /* 現在的日期時間:1970-01-01 00:00:00 UTC 至今的秒數與微秒(換成年月日見 libc.h 的 gmtime_) */
 static inline long sys_time(struct timeval *tv)   { return syscall3(SYS_time, (long)tv, 0, 0); }
 /* 把還留在記憶體裡的修改寫到磁碟上 */
