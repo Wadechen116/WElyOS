@@ -679,14 +679,20 @@ static void prio_demo(void)
 /* 磁碟                                                                */
 /* ------------------------------------------------------------------ */
 
+/* 開機時找到的磁碟(包了一層可以故意出錯的那一個);沒有磁碟為 NULL */
+static struct blkdev *boot_disk;
+static struct blkdev *arch_blk_probe_cached(void) { return boot_disk; }
+
 /* 找出磁碟,把上面的檔案系統掛載到 /disk。沒有磁碟、或磁碟上不是我們的檔案系統時,
    只印出訊息,系統照常使用記憶體檔案系統 */
 static void disk_init(void)
 {
-    struct blkdev *dev = arch_blk_probe();
+    /* 外面包一層可以故意出錯的裝置(測試磁碟錯誤時使用;平常只是原樣轉送) */
+    struct blkdev *dev = blk_fault_wrap(arch_blk_probe());
     struct inode *fsroot;
     struct wfs_stats st;
 
+    boot_disk = dev;
     if (!dev) {
         kprintf("disk: none\n");
         return;
@@ -875,10 +881,12 @@ static void disk_demo(void)
 }
 
 /*
- * 跨開機的測試(回歸測試依序以 disktest=1、2、3 開機三次,用同一個磁碟映像):
+ * 跨開機的測試(回歸測試依序以 disktest=1 ~ 5 開機五次,用同一個磁碟映像):
  *   1  寫入一個檔案,正常關機
  *   2  確認檔案還在、內容正確(資料真的留在磁碟上);然後故意把檔案系統弄壞,不正常關機
- *   3  確認掛載時發現並修復了問題,原本的檔案完好;刪除它
+ *   3  確認掛載時發現並修復了問題,原本的檔案完好
+ *   4  磁碟錯誤:讀取失敗只影響那一次操作;寫入失敗之後檔案系統轉為唯讀
+ *   5  確認上一次的唯讀狀態讓這次掛載做了檢查,檔案完好,又可以寫入;刪除測試檔
  */
 static void disk_stage_test(const char *cmd)
 {
@@ -890,10 +898,16 @@ static void disk_stage_test(const char *cmd)
         KASSERT(s.mounted);
         vfs_unlink("/disk/persist");
         disk_write_file("/disk/persist", 9000, 3);
-        kprintf("disktest 1: wrote /disk/persist (9000 bytes)\n");
+        KASSERT(vfs_chown("/disk/persist", 1000, 1001) == 0 && vfs_chmod("/disk/persist", 0640) == 0);
+        kprintf("disktest 1: wrote /disk/persist (9000 bytes, owner 1000:1001, mode 640)\n");
     } else if (cmdline_has(cmd, "disktest=2")) {
         KASSERT(s.mounted && s.repairs == 0);
         disk_verify_file("/disk/persist", 9000, 3);
+        /* 修改時間也存在磁碟上:是上一次開機時寫入的時間,不會比現在晚 */
+        KASSERT(vfs_stat("/disk/persist", &st) == 0 && st.mtime > 1700000000ull &&
+                st.mtime <= timer_epoch(NULL));
+        /* 擁有者與權限也是:重新開機後從磁碟讀回來的和當初設定的相同 */
+        KASSERT(st.uid == 1000 && st.gid == 1001 && st.mode == 0640);
         KASSERT(wfs_test_damage("persist") == 0);
         kprintf("disktest 2: /disk/persist survived the reboot; damaged the file system on purpose, "
                 "exiting without a clean shutdown\n");
@@ -906,8 +920,55 @@ static void disk_stage_test(const char *cmd)
         KASSERT(vfs_stat("/disk/persist", &st) == 0 && st.nlink == 1);
         KASSERT(vfs_stat("/disk/ghost", &st) == -E_NOENT);
         KASSERT(wfs_check_now() == 0);
-        KASSERT(vfs_unlink("/disk/persist") == 0);
         kprintf("disktest 3: /disk/persist is intact; a second check found nothing\n");
+    } else if (cmdline_has(cmd, "disktest=4")) {
+        struct file *f;
+        char buf[64];
+        unsigned long n0 = blk_fault_count();
+
+        KASSERT(s.mounted && s.repairs == 0 && !s.failed);
+        /* 讀取失敗:清空快取之後讀檔案,得到 -E_IO;磁碟恢復之後同一個檔案照常可讀 */
+        KASSERT(wfs_test_drop_cache() == 0);
+        blk_fault_set(1, 0);
+        KASSERT(vfs_open("/disk/persist", O_RDONLY, &f) == -E_IO ||
+                (vfs_read(f, buf, sizeof(buf)) == -E_IO && (vfs_close(f), 1)));
+        KASSERT(blk_fault_count() > n0);
+        blk_fault_set(0, 0);
+        disk_verify_file("/disk/persist", 9000, 3);
+        wfs_stats(&s);
+        KASSERT(!s.failed);                              /* 讀取失敗不影響檔案系統的狀態 */
+
+        /* 寫入失敗:建立目錄得到 -E_IO,檔案系統轉為唯讀 */
+        blk_fault_set(0, 1);
+        KASSERT(vfs_mkdir("/disk/broken") == -E_IO);
+        blk_fault_set(0, 0);
+        wfs_stats(&s);
+        KASSERT(s.failed);
+        /* 磁碟恢復了也一樣:記憶體和磁碟已經對不上,不再接受任何修改 */
+        KASSERT(vfs_mkdir("/disk/again") == -E_IO);
+        KASSERT(vfs_unlink("/disk/persist") == -E_IO);
+        KASSERT(vfs_open("/disk/persist", O_WRONLY | O_APPEND, &f) == 0);
+        KASSERT(vfs_write(f, "x", 1) == -E_IO);
+        vfs_close(f);
+        KASSERT(vfs_open("/disk/new", O_CREAT | O_WRONLY, &f) == -E_IO);
+        KASSERT(vfs_rename("/disk/persist", "/disk/moved") == -E_IO);
+        disk_verify_file("/disk/persist", 9000, 3);      /* 讀取照常 */
+        /* 超出範圍的讀寫要求:驅動程式拒絕,不會碰到別的地方 */
+        struct blkdev *dev = arch_blk_probe_cached();
+        KASSERT(dev && dev->rw(dev, dev->sectors, 8, buf, 0) != 0);
+        KASSERT(dev->rw(dev, dev->sectors - 1, 8, buf, 0) != 0);
+        kprintf("disktest 4: a read error only failed that one read; after a write error the file "
+                "system refused every change but could still be read\n");
+    } else if (cmdline_has(cmd, "disktest=5")) {
+        KASSERT(s.mounted && !s.failed);
+        /* 上一次因為寫入失敗沒有記「正常卸載」:這次掛載時一定做過檢查 */
+        kprintf("disktest 5: after the write error the mount-time check ran (%u repair(s))\n", s.repairs);
+        disk_verify_file("/disk/persist", 9000, 3);
+        KASSERT(vfs_stat("/disk/broken", &st) == -E_NOENT && vfs_stat("/disk/again", &st) == -E_NOENT);
+        KASSERT(wfs_check_now() == 0);
+        KASSERT(vfs_mkdir("/disk/ok") == 0 && vfs_unlink("/disk/ok") == 0);      /* 又可以寫入了 */
+        KASSERT(vfs_unlink("/disk/persist") == 0);
+        kprintf("disktest 5: /disk/persist is intact and the file system is writable again\n");
     }
 }
 
@@ -1164,7 +1225,9 @@ enum {
     UMODE_BAD_POINTER, UMODE_SPIN, UMODE_STACK, UMODE_ISOLATION, UMODE_BAD_SYSCALL,
     UMODE_FUTEX, UMODE_FS, UMODE_PROC, UMODE_EXEC, UMODE_EXEC_THREADS,
     UMODE_FORK, UMODE_STACK_GROW, UMODE_PIPE, UMODE_SIGNAL, UMODE_JOBS,
-    UMODE_STOP, UMODE_DISK, UMODE_SYSINFO,
+    UMODE_STOP, UMODE_DISK, UMODE_SYSINFO, UMODE_FILEOPS, UMODE_HEAP,
+    UMODE_SIGHANDLER, UMODE_TIME, UMODE_PERM,
+    UMODE_MEMQUOTA,
 };
 
 /* 以測試編號 mode 啟動 /bin/init:編號轉成字串,當作 argv[1] 傳給它 */
@@ -1186,8 +1249,9 @@ static void run_user(const char *what, long mode, int expect)
 {
     int pid = spawn_init(mode);
     KASSERT(pid > 0);
+    uint64_t t0 = timer_ticks();
     int code = proc_wait(pid);
-    kprintf("user: %s -> exit code %d\n", what, code);
+    kprintf("user: %s -> exit code %d (%u ms)\n", what, code, (unsigned)(timer_ticks() - t0));
     if (code != expect)
         panic("user test \"%s\": exit code %d, expected %d", what, code, expect);
 }
@@ -1244,6 +1308,25 @@ static void user_demo(void)
         if (ws.mounted)
             run_user("run a program from the disk, statfs, sync", UMODE_DISK, 20);
     }
+    /* 檔案介面的另一半:讀寫位置、改名、硬連結、工作目錄(記憶體檔案系統與磁碟上各測一次) */
+    run_user("lseek, rename, link, working directory", UMODE_FILEOPS, 22);
+    {
+        /* 改名與硬連結動到磁碟上的目錄與名稱數:做完之後整個檔案系統必須仍然一致 */
+        struct wfs_stats ws;
+        wfs_stats(&ws);
+        if (ws.mounted)
+            KASSERT(wfs_check_now() == 0);
+    }
+    /* 使用者 heap(sbrk:用到才配置、縮小時歸還)與函式庫(malloc、printf、字串) */
+    run_user("user heap and C library", UMODE_HEAP, 23);
+    /* 訊號處理函式:暫存器存到使用者 stack、執行、還原;忽略;打斷等待;捏造的 sigreturn */
+    run_user("signal handlers", UMODE_SIGHANDLER, 24);
+    /* 日期時間:硬體時鐘、秒數與年月日的換算、檔案的修改時間 */
+    run_user("date and time", UMODE_TIME, 25);
+    /* 使用者與權限:檔案的擁有者與權限位元(記憶體與磁碟各測一次)、特權只能減少、送訊號的限制 */
+    run_user("users and permissions", UMODE_PERM, 26);
+    /* 記憶體配額(超過的要求當場失敗)與匿名對映 */
+    run_user("memory quota and mmap", UMODE_MEMQUOTA, 27);
     /* top 的基礎:系統狀態、行程的記憶體用量、主控台的輸入模式 */
     run_user("system information for top", UMODE_SYSINFO, 21);
     thread_sleep(30);
@@ -1752,6 +1835,7 @@ void kmain(const struct boot_info *bi)
     timer_init(1000);
     sched_init();
     arch_irq_enable();
+    timer_clock_init();                      /* 向硬體的即時時鐘問一次現在的時間 */
     kprintf("timer: %u Hz\n", timer_hz());
     console_init();                          /* 序列埠收到字元時發中斷(中斷控制器已由 timer_init 設定好) */
 

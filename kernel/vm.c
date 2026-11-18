@@ -471,6 +471,32 @@ int vm_space_map_new(struct vm_space *vs, uintptr_t va, uintptr_t pa, unsigned f
     return rc;
 }
 
+/* 移除一個使用者頁的對映,並放棄那一頁(行程自己的頁會被釋放;和檔案共用的頁不歸它釋放)。
+   0 = 已移除,-1 = 那裡本來就沒有對映 */
+int vm_space_unmap(struct vm_space *vs, uintptr_t va)
+{
+    if ((va & (PAGE_SIZE - 1)) || !user_range(va))
+        return -1;
+
+    unsigned long irq = spin_lock_irqsave(&vm_lk);
+    int level = 0;
+    pte_t *e = walk(vs->root, va, 0, 0, 0, 0, &level);
+    int rc = -1;
+    if (e && arch_pte_valid(*e) && level == 0) {
+        uintptr_t pa = arch_pte_addr(*e);
+        unsigned flags = arch_pte_flags(*e);
+        *e = 0;
+        vs->pages--;
+        if (enabled)
+            tlb_shootdown_space(vs, va);     /* 同一行程的其他執行緒可能正在別顆 CPU 上使用這一頁 */
+        if (!(flags & VM_SHARED))
+            pmm_free((void *)pa);            /* 參考計數減一;fork 之後還和別人共用的話不會真的釋放 */
+        rc = 0;
+    }
+    spin_unlock_irqrestore(&vm_lk, irq);
+    return rc;
+}
+
 unsigned long vm_space_pages(struct vm_space *vs)
 {
     return vs->pages;                        /* 只是統計用的數字,不上鎖 */

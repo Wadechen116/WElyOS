@@ -33,7 +33,7 @@ int main(void)
     struct procinfo pi;
     long after = 0;
 
-    puts_("  PID  PPID  PGID  THR  STATE     TIME  NAME\n");
+    puts_("  PID  PPID  PGID   UID  THR  STATE     TIME  NAME\n");
     while (sys_procinfo(after, &pi) == 0) {
         struct line l = { .len = 0 };
 
@@ -41,6 +41,7 @@ int main(void)
         line_pad_num(&l, pi.pid, 5);
         line_pad_num(&l, pi.ppid, 6);
         line_pad_num(&l, pi.pgid, 6);
+        line_pad_num(&l, (long)pi.uid, 6);
         line_pad_num(&l, pi.nthreads, 5);
         line_str(&l, pi.state == PROC_RUNNING ? "  run   " :
                      pi.state == PROC_SLEEPING ? "  sleep " :

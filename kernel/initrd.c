@@ -109,6 +109,11 @@ int initrd_unpack(const uint8_t *image, size_t len)
             vfs_close(f);
             if (w != (long)size)
                 return w < 0 ? (int)w : -E_NOMEM;
+            /* 權限:/bin 底下的是程式(可以執行),其餘是資料。不採用檔案包裡記的權限 —
+               那取決於建置時主機檔案系統的設定(在 Windows 的磁碟上每個檔案都被當成可執行),
+               由這裡決定,結果才固定 */
+            const char *rel = memcmp(path, "/./", 3) == 0 ? path + 2 : path;   /* 檔案包裡的名稱以 "./" 開頭 */
+            vfs_chmod(path, memcmp(rel, "/bin/", 5) == 0 ? 0755 : 0644);
             files++;
         }
         /* 其他類型(符號連結等)目前不支援,略過 */

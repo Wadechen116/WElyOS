@@ -71,6 +71,39 @@ void arch_frame_set_retval(void *tf, long v)
     ((struct trap_frame *)tf)->x[0] = (uint64_t)v;   /* 系統呼叫的回傳值放在 x0 */
 }
 
+uintptr_t arch_frame_user_sp(void *tf)
+{
+    return (uintptr_t)((struct trap_frame *)tf)->sp_el0;
+}
+
+unsigned arch_frame_call(void *vtf, uintptr_t frame, uintptr_t pc, uintptr_t arg, uintptr_t ret,
+                         uintptr_t words[2])
+{
+    struct trap_frame *tf = vtf;
+
+    (void)words;
+    tf->sp_el0 = frame;                  /* 參數與返回位址都用暫存器傳:stack 上不必放東西 */
+    tf->x[0] = arg;
+    tf->x[30] = ret;
+    tf->elr = pc;
+    return 0;
+}
+
+void arch_frame_restore(void *vtf, const void *saved)
+{
+    struct trap_frame *tf = vtf;
+    uint64_t spsr = tf->spsr, sp = tf->sp;   /* 例外等級與中斷遮蔽在 spsr;sp 是 kernel 自己的 stack */
+
+    *tf = *(const struct trap_frame *)saved;
+    tf->spsr = spsr;
+    tf->sp = sp;
+}
+
+long arch_frame_get_retval(void *tf)
+{
+    return (long)((struct trap_frame *)tf)->x[0];
+}
+
 void arch_user_resume_asm(struct trap_frame *tf, uintptr_t ktop) __attribute__((noreturn));
 
 void arch_user_resume(void *tf)
@@ -96,7 +129,7 @@ void trap_handler(struct trap_frame *tf, uint64_t kind)
     if (kind % 4 == 1) {
         irq_handler();
         if (from_user)
-            user_return_check();
+            user_return_check(tf);
         return;
     }
 
@@ -110,7 +143,7 @@ void trap_handler(struct trap_frame *tf, uint64_t kind)
     if (from_user && ec == EC_SVC) {
         tf->x[0] = (uint64_t)syscall_dispatch((long)tf->x[8], (long)tf->x[0],
                                               (long)tf->x[1], (long)tf->x[2], tf);
-        user_return_check();
+        user_return_check(tf);
         return;
     }
 
@@ -120,7 +153,7 @@ void trap_handler(struct trap_frame *tf, uint64_t kind)
     if (from_user) {
         if ((ec == 0x24 || ec == 0x20) &&
             proc_page_fault((uintptr_t)tf->far, ec == 0x24 && (tf->esr & (1u << 6))) == 0) {
-            user_return_check();
+            user_return_check(tf);
             return;
         }
         user_fault(ec_name(ec), tf->elr, tf->far);

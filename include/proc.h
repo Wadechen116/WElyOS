@@ -49,8 +49,10 @@ int proc_page_fault(uintptr_t addr, int write);
 /* 使用者模式發生無法處理的例外:印出原因並終止該行程。不會返回 */
 void user_fault(const char *what, uintptr_t pc, uintptr_t addr) __attribute__((noreturn));
 
-/* 每次要從 kernel 返回使用者模式之前呼叫:若這條執行緒已被要求終止,就在這裡結束 */
-void user_return_check(void);
+/* 每次要從 kernel 返回使用者模式之前呼叫:若這條執行緒已被要求終止,就在這裡結束;
+   行程被暫停就在這裡等;有訊號要交給處理函式,就把 tf(進入 kernel 時存下來的暫存器)
+   改成去執行那個函式 */
+void user_return_check(void *tf);
 
 /* 系統呼叫編號(使用者端的對應定義在 user/usys.h,兩邊必須一致) */
 enum {
@@ -91,6 +93,28 @@ enum {
     SYS_statfs,             /* (path, info)    path 所在的檔案系統的用量(struct fsinfo,見 fs.h) */
     SYS_sysinfo,            /* (info)          整個系統的狀態:運作時間、各 CPU 的使用量、記憶體(struct sysinfo) */
     SYS_tcsetmode,          /* (mode)          設定主控台的輸入模式(CON_RAW、CON_NOECHO;0 = 一般) */
+    SYS_lseek,              /* (fd, off, whence)  改變讀寫位置(SEEK_SET / SEEK_CUR / SEEK_END);回傳新的位置 */
+    SYS_rename,             /* (old, new)      改名或搬移(同一個檔案系統內;目的已存在則失敗) */
+    SYS_link,               /* (old, new)      硬連結:讓 new 成為檔案 old 的另一個名稱 */
+    SYS_chdir,              /* (path)          改變目前的工作目錄(相對路徑的起點) */
+    SYS_getcwd,             /* (buf, len)      取得目前的工作目錄(以 0 結尾的字串);回傳長度 */
+    SYS_sbrk,               /* (incr)          把 heap 的結尾移動 incr 個位元組;回傳移動之前的結尾 */
+    SYS_signal,             /* (sig, handler, restorer)  設定訊號的處理方式;回傳原本的。handler 為
+                                               SIG_DFL(0)、SIG_IGN(1)或函式的位址 */
+    SYS_sigreturn,          /* (frame)         處理函式結束時由 restorer 呼叫:還原被打斷時的暫存器 */
+    SYS_time,               /* (tv)            現在的日期時間(struct timeval:1970-01-01 UTC 至今的秒與微秒) */
+    /* ---- 身分與權限(見 cred.h、fs.h 的「權限」) ---- */
+    SYS_getuid,             /* ()              自己的使用者編號 */
+    SYS_getgid,             /* ()              自己的群組編號 */
+    SYS_setuid,             /* (uid, gid)      改變自己的身分(需要 CAP_SETID);改成非 root 會失去所有特權 */
+    SYS_capget,             /* ()              自己目前的特權(CAP_* 的組合) */
+    SYS_capdrop,            /* (mask)          永久放棄 mask 裡的特權;回傳剩下的 */
+    SYS_chmod,              /* (path, mode)    更改權限位元(擁有者或 CAP_FS) */
+    SYS_chown,              /* (path, uid, gid) 更改擁有者與群組(CAP_FS) */
+    /* ---- 記憶體 ---- */
+    SYS_mmap,               /* (len)           要一塊內容為 0 的記憶體(匿名對映);回傳位址 */
+    SYS_munmap,             /* (addr)          歸還 mmap 得到的一整塊 */
+    SYS_memlimit,           /* (kb)            記憶體配額:0 = 查詢;調低隨時可以,調高需要 CAP_ADMIN。回傳配額(KB) */
 };
 
 /* SYS_waitpid 的選項 */
@@ -116,6 +140,13 @@ struct sysinfo {
     } cpu[SYSINFO_MAX_CPUS];
 };
 
+/* SYS_time 回報的內容 */
+struct timeval {
+    uint64_t sec;               /* 1970-01-01 00:00:00 UTC 至今的秒數 */
+    uint32_t usec;              /* 秒以下的部分(微秒) */
+    uint32_t pad;
+};
+
 /* SYS_tcsetmode 的模式(可以相加) */
 #define CON_RAW    1            /* 不等整行:每個按鍵立刻交給讀取者,不做行編輯 */
 #define CON_NOECHO 2            /* 不把打的字顯示出來 */
@@ -129,6 +160,7 @@ struct procinfo {
     int nthreads;
     unsigned int cpu_ticks; /* 累計用掉的 CPU 時間(tick,1 tick = 1ms) */
     unsigned int mem_kb;     /* 對映的記憶體(KB;含和其他行程共用的程式碼與尚未複製的頁) */
+    unsigned int uid;        /* 行程的使用者編號 */
     char name[32];
 };
 #endif

@@ -365,6 +365,15 @@ static void set_message(const char *what, long pid, long rc)
     }
 }
 
+/* 被 Ctrl-C(SIGINT)或 kill(SIGTERM)終止時:先把畫面與主控台還原再結束,
+   游標才不會留在畫面中間、顏色也不會留在最後使用的那一種 */
+static void on_terminate(int sig)
+{
+    sys_write(1, "\x1b[0m\x1b[24;1H\r\n", 14);
+    sys_tcsetmode(0);
+    sys_exit(128 + sig);
+}
+
 int main(int argc, char **argv)
 {
     char keys[16];
@@ -375,7 +384,7 @@ int main(int argc, char **argv)
     sys_sysinfo(&si);
     sample();                                    /* 第一次取樣只是建立基準 */
     if (batch) {
-        sys_sleep(200);
+        sys_sleep(100);                          /* 兩次取樣之間的間隔:夠算出使用率就好 */
         sort_key = 'p';
         sample();
         draw();
@@ -386,6 +395,8 @@ int main(int argc, char **argv)
         puts_("top: not in the foreground of the console (try: top -b)\n");
         return 1;
     }
+    sys_signal(SIGINT, on_terminate);
+    sys_signal(SIGTERM, on_terminate);
     sys_write(1, "\x1b[2J", 4);                  /* 清除整個畫面 */
     sys_sleep(200);
     sample();
@@ -395,7 +406,9 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    while ((n = sys_read(0, keys, sizeof(keys))) > 0) {
+    while ((n = sys_read(0, keys, sizeof(keys))) > 0 || n == -E_INTR) {
+        if (n < 0)
+            continue;                            /* 讀取被訊號打斷:再讀一次 */
         umutex_lock(&lock);
         for (long i = 0; i < n; i++) {
             int c = keys[i], move = 0, idx;

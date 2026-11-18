@@ -38,5 +38,9 @@ int main(int argc, char **argv)
         return fail("read error: ", argv[1]);
     sys_close(out);                              /* 關閉時 kernel 把內容寫回磁碟 */
     sys_close(in);
+    /* 權限跟著複製(複製出來的程式才一樣可以執行);擁有者是執行 cp 的人 */
+    struct stat st;
+    if (sys_stat(argv[1], &st) == 0)
+        sys_chmod(argv[2], (long)st.mode);
     return 0;
 }

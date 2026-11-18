@@ -15,12 +15,15 @@
  * 名稱立刻消失,內容留到最後一個開啟者關閉為止。
  */
 #include "console.h"
+#include "cred.h"
 #include "fs.h"
 #include "kmalloc.h"
 #include "kprintf.h"
 #include "kstring.h"
 #include "panic.h"
 #include "spinlock.h"
+#include "sync.h"
+#include "timer.h"
 
 struct file {
     struct inode *in;
@@ -42,6 +45,10 @@ void inode_init(struct inode *in, const struct inode_ops *ops, int type)
     in->refs = 0;
     in->nlink = 0;
     in->exec_count = 0;
+    in->uid = in->gid = 0;
+    /* 預設的權限:目錄與檔案都是「擁有者可改,其他人可讀」;裝置誰都可以讀寫 */
+    in->mode = type == I_DIR ? 0755 : type == I_DEV ? 0666 : 0644;
+    in->mtime = 0;
     in->mounted = NULL;
     in->covered = NULL;
     mutex_init(&in->lock);
@@ -62,6 +69,25 @@ static void iput(struct inode *in)
     spin_unlock_irqrestore(&inode_lk, f);
     if (dead)
         in->ops->release(in);                /* 在鎖外:釋放記憶體可能要花時間 */
+}
+
+/*
+ * 目前的行程對 in 是否有 want(PERM_R / PERM_W / PERM_X 的組合)的權限。
+ * 依序看:是擁有者就用擁有者那一組位元;否則同群組用群組那一組;否則用「其他人」那一組。
+ * 只看符合的那一組,不會往下找(擁有者那一組不允許時,即使「其他人」允許也不行)。
+ * 有 CAP_FS 的行程不受限制,唯一的例外是「執行」:一個完全沒有執行位元的檔案
+ * 連特權行程也不能執行,避免不小心把資料檔當成程式跑。
+ */
+static int may(struct inode *in, int want)
+{
+    const struct cred *c = cred_current();
+
+    if (!c)
+        return 0;                            /* kernel 自己 */
+    if (c->caps & CAP_FS)
+        return (want & PERM_X) && in->type == I_FILE && !(in->mode & 0111) ? -E_ACCES : 0;
+    unsigned bits = c->uid == in->uid ? in->mode >> 6 : c->gid == in->gid ? in->mode >> 3 : in->mode;
+    return ((bits & 7u) & (unsigned)want) == (unsigned)want ? 0 : -E_ACCES;
 }
 
 /* 取出路徑的下一段到 name;回傳剩下的部分。沒有下一段回傳 NULL;太長時 *err 設為錯誤碼 */
@@ -138,6 +164,11 @@ static int walk(const char *path, int want_parent, char *last, struct inode **ou
         }
         if (name[0] == '.' && name[1] == '\0')
             continue;                        /* "." 就是目前的目錄 */
+        err = may(cur, PERM_X);              /* 要經過一個目錄,必須有它的「執行」權限 */
+        if (err) {
+            iput(cur);
+            return err;
+        }
 
         struct inode *next;
         /* 掛載的根目錄往上走(".."):先回到它蓋住的那個目錄,再從那裡往上 */
@@ -180,7 +211,9 @@ static int create_at(const char *path, int type, int excl, struct inode **out)
         return -E_EXIST;
     }
     mutex_lock(&dir->lock);
-    err = dir->ops->lookup(dir, last, &in);
+    err = may(dir, PERM_X);
+    if (err == 0)
+        err = dir->ops->lookup(dir, last, &in);
     if (err == 0) {
         if (in->mounted)
             in = in->mounted;
@@ -193,8 +226,21 @@ static int create_at(const char *path, int type, int excl, struct inode **out)
         unsigned long f = spin_lock_irqsave(&inode_lk);
         int gone = dir->nlink == 0 && dir != root;
         spin_unlock_irqrestore(&inode_lk, f);
-        err = gone ? -E_NOENT : dir->ops->create(dir, last, type, &in);
+        err = gone ? -E_NOENT : may(dir, PERM_W);    /* 在目錄裡建立東西:要有它的「寫入」權限 */
         if (err == 0) {
+            dir->mtime = timer_epoch(NULL);      /* 目錄的內容要變了(先設定:磁碟檔案系統寫回時一併存下) */
+            err = dir->ops->create(dir, last, type, &in);
+        }
+        if (err == 0) {
+            const struct cred *c = cred_current();
+            if (!in->mtime)
+                in->mtime = dir->mtime;
+            if (c) {                             /* 新的檔案屬於建立它的人 */
+                in->uid = c->uid;
+                in->gid = c->gid;
+                if (in->ops->setattr)
+                    in->ops->setattr(in);
+            }
             f = spin_lock_irqsave(&inode_lk);
             in->nlink = 1;
             in->refs++;
@@ -220,8 +266,21 @@ int vfs_open(const char *path, int flags, struct file **out)
         iput(in);
         return -E_ISDIR;
     }
+    /* 權限:依開啟的方式需要讀、寫或兩者;清空內容算寫入。之後的讀寫不再檢查 —
+       權限是在「開啟的那一刻」決定的,開啟之後即使檔案的權限被改掉,這次開啟仍然有效 */
+    int acc = flags & O_ACCMODE;
+    int want = (acc != O_WRONLY ? PERM_R : 0) | (acc != O_RDONLY || (flags & O_TRUNC) ? PERM_W : 0);
+    mutex_lock(&in->lock);
+    err = may(in, want);
+    mutex_unlock(&in->lock);
+    if (err) {
+        iput(in);
+        return err;
+    }
     if ((flags & O_TRUNC) && in->type == I_FILE) {
         mutex_lock(&in->lock);
+        if (!in->exec_count)
+            in->mtime = timer_epoch(NULL);
         err = in->exec_count ? -E_TXTBSY : in->ops->truncate(in, 0);
         mutex_unlock(&in->lock);
         if (err) {
@@ -312,6 +371,31 @@ long vfs_read(struct file *f, void *buf, size_t n)
     return r;
 }
 
+long vfs_seek(struct file *f, long off, int whence)
+{
+    struct inode *in = f->in;
+    long r = -E_INVAL;
+
+    if (in->type == I_PIPE || in->type == I_DEV)
+        return -E_SPIPE;
+    mutex_lock(&f->lock);
+    if (in->type == I_DIR) {
+        if (off == 0 && whence == SEEK_SET)      /* 目錄只能「從頭再列一次」 */
+            r = (long)(f->off = 0);
+    } else if (whence == SEEK_SET || whence == SEEK_CUR || whence == SEEK_END) {
+        int64_t base = whence == SEEK_SET ? 0 : whence == SEEK_CUR ? (int64_t)f->off : (int64_t)in->size;
+        int64_t pos = base + off;
+        /* 可以移到結尾之後(之後寫入時,中間沒寫過的部分讀起來是 0),但不可以是負的;
+           上限取 long 放得下的範圍,回傳值才不會被誤認成錯誤碼 */
+        if (pos >= 0 && pos <= 0x7FFFFFFF) {
+            f->off = (uint64_t)pos;
+            r = (long)pos;
+        }
+    }
+    mutex_unlock(&f->lock);
+    return r;
+}
+
 long vfs_write(struct file *f, const void *buf, size_t n)
 {
     struct inode *in = f->in;
@@ -331,6 +415,8 @@ long vfs_write(struct file *f, const void *buf, size_t n)
     if (f->flags & O_APPEND)
         f->off = in->size;                   /* 鎖著 inode 才決定位置:兩個人同時附加不會互相覆蓋 */
     /* 正被執行的程式檔不可修改:它的頁直接對映在行程裡,改了就等於改了執行中的程式 */
+    if (!in->exec_count)
+        in->mtime = timer_epoch(NULL);       /* 先設定再寫:磁碟檔案系統會把它和大小一起存進 inode */
     r = in->exec_count ? -E_TXTBSY : in->ops->write(in, buf, n, f->off);
     mutex_unlock(&in->lock);
     if (r > 0)
@@ -423,17 +509,21 @@ int vfs_unlink(const char *path)
         return -E_INVAL;
     }
     mutex_lock(&dir->lock);
-    err = dir->ops->lookup(dir, last, &in);
+    err = may(dir, PERM_W | PERM_X);         /* 刪除看的是「目錄」的權限,不是檔案本身的 */
+    if (err == 0)
+        err = dir->ops->lookup(dir, last, &in);
     if (err == 0 && in->mounted)
         err = -E_BUSY;                       /* 掛載點不可以刪除 */
     if (err == 0) {
         /* 先鎖上層、再鎖下層。鎖著要刪除的目錄檢查它是不是空的,
            並一直鎖到名稱移除為止:這段期間沒有人能在裡面建立新的東西 */
         mutex_lock(&in->lock);
-        if (in->type == I_DIR && !in->ops->is_empty(in))
+        if (in->type == I_DIR && !in->ops->is_empty(in)) {
             err = -E_NOTEMPTY;
-        else
+        } else {
+            dir->mtime = timer_epoch(NULL);
             err = dir->ops->unlink(dir, last, &victim);
+        }
         int dead = 0;
         if (err == 0) {
             unsigned long f = spin_lock_irqsave(&inode_lk);
@@ -449,6 +539,157 @@ int vfs_unlink(const char *path)
     return err;
 }
 
+/*
+ * ---- 改名與硬連結 ----
+ *
+ * 兩者都建立在同一個操作上:在目錄裡多加一個名稱,指向已經存在的 inode(inode_ops 的 link)。
+ *   硬連結 = 加上新名稱
+ *   改名   = 先加上新名稱,再移除舊名稱
+ * 改名刻意分成這兩步、而且是這個順序:中途不論發生什麼事(另一條執行緒插進來、
+ * 磁碟上寫到一半當機),檔案最少都還有一個名稱,不會消失;最壞的結果只是兩個名稱都在。
+ * 兩步各自只鎖一個目錄,所以不必同時鎖兩個目錄(那樣要處理上鎖的順序,容易死結)。
+ *
+ * 搬移目錄時要防止「搬進自己的子目錄」(那會讓一段目錄樹從根目錄再也走不到)。
+ * 檢查的方法是從目的目錄一路往上走到根目錄,途中不可以遇到被搬的那個目錄。
+ * 這個檢查和實際的搬移之間不能有別的改名插進來,所以所有的改名由一把鎖排成一次一個。
+ */
+static struct mutex rename_mx = MUTEX_INIT;
+
+/* dir 是不是 in 本身或它底下的某一層。兩者都已經有參考 */
+static int is_inside(struct inode *dir, struct inode *in)
+{
+    struct inode *cur = iget(dir), *up;
+    int inside = 0;
+
+    for (int depth = 0; depth < 64; depth++) {
+        if (cur == in) {
+            inside = 1;
+            break;
+        }
+        mutex_lock(&cur->lock);
+        int err = cur->ops->lookup(cur, "..", &up);
+        if (err == 0)
+            iget(up);
+        mutex_unlock(&cur->lock);
+        if (err || up == cur) {                  /* 到這個檔案系統的根目錄了 */
+            if (err == 0)
+                iput(up);
+            break;
+        }
+        iput(cur);
+        cur = up;
+    }
+    iput(cur);
+    return inside;
+}
+
+/* 在 dir 裡加上名稱 name 指向 in。名稱已經存在回傳 -E_EXIST */
+static int link_at(struct inode *dir, const char *name, struct inode *in)
+{
+    struct inode *tmp;
+    int err;
+
+    if (dir->ops != in->ops || !dir->ops->link)
+        return -E_XDEV;
+    mutex_lock(&dir->lock);
+    unsigned long f = spin_lock_irqsave(&inode_lk);
+    int gone = dir->nlink == 0 && dir != root && !dir->covered;
+    spin_unlock_irqrestore(&inode_lk, f);
+    if (gone) {
+        err = -E_NOENT;                          /* 目的目錄已經被刪除 */
+    } else if ((err = may(dir, PERM_W | PERM_X)) != 0) {
+        /* 沒有在目的目錄裡建立名稱的權限 */
+    } else if (dir->ops->lookup(dir, name, &tmp) == 0) {
+        err = -E_EXIST;
+    } else {
+        if (in->type == I_DIR)
+            mutex_lock(&in->lock);               /* 它的「上層目錄」會被改掉 */
+        err = dir->ops->link(dir, name, in);
+        if (in->type == I_DIR)
+            mutex_unlock(&in->lock);
+        if (err == 0) {
+            f = spin_lock_irqsave(&inode_lk);
+            in->nlink++;
+            spin_unlock_irqrestore(&inode_lk, f);
+        }
+    }
+    mutex_unlock(&dir->lock);
+    return err;
+}
+
+int vfs_link(const char *oldpath, const char *newpath)
+{
+    char name[FS_NAME_MAX + 1];
+    struct inode *in, *dir;
+    int err = walk(oldpath, 0, NULL, &in);
+
+    if (err)
+        return err;
+    err = in->type == I_FILE ? walk(newpath, 1, name, &dir) : -E_INVAL;   /* 只有一般檔案可以有多個名稱 */
+    if (err == 0) {
+        err = name_is_dots(name) ? -E_EXIST : link_at(dir, name, in);
+        iput(dir);
+    }
+    iput(in);
+    return err;
+}
+
+int vfs_rename(const char *oldpath, const char *newpath)
+{
+    char oname[FS_NAME_MAX + 1], nname[FS_NAME_MAX + 1];
+    struct inode *odir, *ndir, *in = NULL, *victim;
+    int err = walk(oldpath, 1, oname, &odir);
+
+    if (err)
+        return err;
+    err = walk(newpath, 1, nname, &ndir);
+    if (err) {
+        iput(odir);
+        return err;
+    }
+    mutex_lock(&rename_mx);
+    if (name_is_dots(oname) || name_is_dots(nname)) {
+        err = -E_INVAL;
+    } else {
+        mutex_lock(&odir->lock);
+        err = may(odir, PERM_W | PERM_X);        /* 要從來源目錄拿走一個名稱 */
+        if (err == 0)
+            err = odir->ops->lookup(odir, oname, &in);
+        if (err == 0)
+            iget(in);
+        else
+            in = NULL;
+        mutex_unlock(&odir->lock);
+    }
+    if (err == 0 && in->mounted)
+        err = -E_BUSY;                           /* 掛載點不可以搬走 */
+    if (err == 0 && odir == ndir && !strcmp(oname, nname))
+        goto out;                                /* 改成同一個名稱:什麼都不必做 */
+    if (err == 0 && in->type == I_DIR && is_inside(ndir, in))
+        err = -E_INVAL;                          /* 不可以把目錄搬進它自己底下 */
+    if (err == 0)
+        err = link_at(ndir, nname, in);          /* 第一步:加上新名稱 */
+    if (err == 0) {
+        /* 第二步:移除舊名稱。先確認舊名稱指的還是同一個東西(這段期間可能被別人刪掉或換掉) */
+        struct inode *cur;
+        mutex_lock(&odir->lock);
+        if (odir->ops->lookup(odir, oname, &cur) == 0 && cur == in &&
+            odir->ops->unlink(odir, oname, &victim) == 0) {
+            unsigned long f = spin_lock_irqsave(&inode_lk);
+            in->nlink--;                         /* 還有新名稱,不會降到 0 */
+            spin_unlock_irqrestore(&inode_lk, f);
+        }
+        mutex_unlock(&odir->lock);
+    }
+out:
+    mutex_unlock(&rename_mx);
+    if (in)
+        iput(in);
+    iput(odir);
+    iput(ndir);
+    return err;
+}
+
 int vfs_stat(const char *path, struct stat *st)
 {
     struct inode *in;
@@ -458,11 +699,75 @@ int vfs_stat(const char *path, struct stat *st)
         return err;
     st->type = (uint32_t)in->type;
     st->size = in->size;
+    st->mtime = in->mtime;
+    st->uid = in->uid;
+    st->gid = in->gid;
+    st->mode = in->mode;
     unsigned long f = spin_lock_irqsave(&inode_lk);
     st->nlink = in->nlink;
     spin_unlock_irqrestore(&inode_lk, f);
     iput(in);
     return 0;
+}
+
+/* ---- 權限 ---- */
+
+int vfs_access(const char *path, int want)
+{
+    struct inode *in;
+    int err = walk(path, 0, NULL, &in);
+
+    if (err)
+        return err;
+    mutex_lock(&in->lock);
+    err = may(in, want);
+    mutex_unlock(&in->lock);
+    iput(in);
+    return err;
+}
+
+/* chmod 與 chown 共用:mode 為 -1 表示不改權限;change_owner 為 0 表示不改擁有者 */
+static int set_attr(const char *path, long mode, int change_owner, uint32_t uid, uint32_t gid)
+{
+    const struct cred *c = cred_current();
+    struct inode *in;
+    int err = walk(path, 0, NULL, &in);
+
+    if (err)
+        return err;
+    mutex_lock(&in->lock);
+    int privileged = !c || (c->caps & CAP_FS);
+    if (change_owner ? !privileged : !(privileged || c->uid == in->uid)) {
+        err = -E_PERM;
+    } else {
+        uint32_t old_uid = in->uid, old_gid = in->gid;
+        uint16_t old_mode = in->mode;
+        if (mode >= 0)
+            in->mode = (uint16_t)((unsigned)mode & S_PERM_MASK);
+        if (change_owner) {
+            in->uid = uid;
+            in->gid = gid;
+        }
+        err = in->ops->setattr ? in->ops->setattr(in) : 0;
+        if (err) {                           /* 存不進去:記憶體裡的也還原,兩邊保持一致 */
+            in->uid = old_uid;
+            in->gid = old_gid;
+            in->mode = old_mode;
+        }
+    }
+    mutex_unlock(&in->lock);
+    iput(in);
+    return err;
+}
+
+int vfs_chmod(const char *path, unsigned mode)
+{
+    return set_attr(path, (long)(mode & S_PERM_MASK), 0, 0, 0);
+}
+
+int vfs_chown(const char *path, uint32_t uid, uint32_t gid)
+{
+    return set_attr(path, -1, 1, uid, gid);
 }
 
 /* ---- 掛載 ---- */

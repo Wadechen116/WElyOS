@@ -42,3 +42,27 @@ void *memcpy(void *dst, const void *src, unsigned long n)
         *d++ = *s++;
     return dst;
 }
+
+/*
+ * 訊號處理函式返回時跳到這裡(kernel 把它設成處理函式的返回位址)。
+ * 它呼叫 sigreturn,並把「kernel 存放暫存器的位置」當作參數傳回去:
+ * 那份資料就在處理函式開始執行時的 stack pointer 上方(見 kernel/proc.c 的 deliver_signal)。
+ * 必須用組合語言寫:C 函式一進來就會動到 stack pointer,這裡需要它原本的值。
+ */
+#if defined(__i386__)
+/* 處理函式 ret 之後,esp 指向 kernel 放的參數(sig);存放位置在 esp + 16 */
+__asm__(".text\n.global __sig_restorer\n__sig_restorer:\n"
+        "    lea 16(%esp), %ebx\n"
+        "    mov $40, %eax\n"
+        "    int $0x80\n");
+#elif defined(__riscv)
+__asm__(".text\n.global __sig_restorer\n__sig_restorer:\n"
+        "    mv a0, sp\n"
+        "    li a7, 40\n"
+        "    ecall\n");
+#elif defined(__aarch64__)
+__asm__(".text\n.global __sig_restorer\n__sig_restorer:\n"
+        "    mov x0, sp\n"
+        "    mov x8, #40\n"
+        "    svc #0\n");
+#endif

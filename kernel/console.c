@@ -202,7 +202,7 @@ static long console_read(void *buf, size_t n)
     unsigned long flags = sched_lock();
 
     for (;;) {
-        if (thread_killed())
+        if (thread_interrupted())
             break;
         if (!proc_self_stopped() && !may_read())
             proc_signal_group_locked(proc_self_pgid(), 21);  /* SIGTTIN:背景的行程不可以讀鍵盤 */
@@ -212,8 +212,11 @@ static long console_read(void *buf, size_t n)
         wq_sleep(&readers);
     }
 
-    if (thread_killed() && (proc_self_stopped() || !may_read())) {
-        /* 被終止而離開等待:不是輪到它讀,什麼都不拿 */
+    if (thread_interrupted() && (proc_self_stopped() || !may_read())) {
+        /* 被終止或被訊號打斷而離開等待:不是輪到它讀,什麼都不拿 */
+    } else if (cooked_count == 0 && eof_pending == 0 && thread_interrupted() && !thread_killed()) {
+        sched_unlock(flags);
+        return -E_INTR;                      /* 被訊號打斷而且沒有輸入:不是「結束」 */
     } else if (cooked_count == 0) {
         if (eof_pending)
             eof_pending--;                   /* 一次 Ctrl-D 只讓一次讀取看到「結束」 */

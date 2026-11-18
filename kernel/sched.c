@@ -87,6 +87,7 @@ struct thread {
     struct vm_space *space;    /* 使用的位址空間;NULL = 純 kernel 執行緒 */
     void *data;                /* 附掛資料(所屬的行程) */
     volatile int killed;       /* 被要求終止:返回使用者模式前自行結束 */
+    volatile int interrupted;  /* 有訊號等著它的行程處理:正在等的事情先放下,回使用者模式去執行處理函式 */
     struct wait_queue joiners; /* 正在 thread_join 等我結束的執行緒 */
 };
 
@@ -719,6 +720,20 @@ int thread_killed(void)
     return t && t->killed;
 }
 
+/* 是否該放下正在等的事情:被終止了,或有訊號要處理 */
+int thread_interrupted(void)
+{
+    struct thread *t = thread_current();
+    return t && (t->killed || t->interrupted);
+}
+
+void thread_clear_interrupt(void)
+{
+    struct thread *t = thread_current();
+    if (t)
+        t->interrupted = 0;
+}
+
 /* 把一條正在睡的執行緒提早叫醒(不論它在等什麼)。呼叫時持有 sched_lk */
 static void wake_early(struct thread *t)
 {
@@ -768,6 +783,19 @@ void sched_kill_group(void *data)
         if (t->data != data)
             continue;
         t->killed = 1;
+        wake_early(t);
+    }
+}
+
+/* 讓屬於 data(行程)的每條執行緒放下正在等的事情:標記為「被打斷」並提早叫醒。
+   和 sched_kill_group 的差別是執行緒不會結束,只是它所在的系統呼叫提早返回(-E_INTR) */
+void sched_interrupt_group(void *data)
+{
+    KASSERT(spin_held(&sched_lk));
+    for (struct thread *t = all_threads; t; t = t->all_next) {
+        if (t->data != data)
+            continue;
+        t->interrupted = 1;
         wake_early(t);
     }
 }
@@ -909,7 +937,7 @@ void thread_sleep(unsigned ms)
     /* 已經被要求終止的執行緒不再睡:它該盡快回到返回使用者模式的檢查點去結束。
        「標記為終止」與這裡的檢查都在同一把鎖之下,所以不會有「剛檢查完就被標記、
        接著照樣睡下去」的空檔 */
-    if (self->killed) {
+    if (self->killed || self->interrupted) {
         sched_unlock(flags);
         return;
     }

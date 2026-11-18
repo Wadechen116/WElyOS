@@ -246,3 +246,13 @@ struct blkdev *arch_blk_probe(void)
 {
     return virtio_blk_probe(0x10001000UL, 0x1000, 8);
 }
+
+/* 即時時鐘:QEMU virt 機器的 Goldfish RTC 在 0x101000。讀取位移 0 得到「1970 年至今的奈秒數」
+   的低 32 位元(同時把高 32 位元鎖存起來),位移 4 讀出高 32 位元 */
+uint64_t arch_rtc_read(void)
+{
+    volatile uint32_t *rtc = (volatile uint32_t *)0x101000UL;
+    uint64_t lo = rtc[0], hi = rtc[1];
+
+    return ((hi << 32) | lo) / 1000000000ull;
+}

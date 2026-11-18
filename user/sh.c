@@ -19,6 +19,10 @@
  *   # 註解                  這一行從 # 起到結尾都忽略
  * 內建命令(由 shell 自己處理,不建立行程):
  *   exit [數字]             結束 shell;沒有給數字時以上一個命令的結束碼結束
+ *   cd [目錄]               改變目前的工作目錄(沒有給:回到 /)。必須是內建的:
+ *                           工作目錄是每個行程自己的,另外啟動一個程式去改,改到的是那個程式的
+ *   pwd                     印出目前的工作目錄
+ *   limit [KB]              顯示或調低記憶體配額;之後啟動的命令都受它限制(只能調低)
  *   status                  印出上一個命令的結束碼
  *   help                    列出可用的命令
  *   jobs                    列出背景工作
@@ -424,7 +428,8 @@ static long run(struct stage *st, int ns, int background)
 
         if (ok && pids[i] < 0)
             complain(st[i].argv[0],
-                     pids[i] == -E_NOENT ? ": command not found" : ": cannot execute");
+                     pids[i] == -E_NOENT ? ": command not found" :
+                     pids[i] == -E_ACCES ? ": permission denied" : ": cannot execute");
     }
     if (prev_rd >= 0)
         sys_close(prev_rd);
@@ -499,8 +504,16 @@ int main(int argc, char **argv)
 
     for (;;) {
         jobs_reap();                             /* 有背景工作結束了的話,在提示符號之前通知 */
-        if (interactive)
+        if (interactive) {
+            /* 提示符號:在根目錄時是 "$ ",其他地方前面加上目前的目錄("/disk$ ") */
+            char cwd[200];
+            long uid = sys_getuid();
+            if (uid != 0)                        /* 不是 root:顯示目前是誰(su 之後看得出來) */
+                print_num("[uid ", uid, "] ");
+            if (sys_getcwd(cwd, sizeof(cwd)) > 1)
+                puts_(cwd);
             puts_("$ ");
+        }
         if (!read_line(&in, linebuf, sizeof(linebuf)))
             break;                               /* 輸入結束 */
         int n = split(linebuf, words, MAX_ARGS * MAX_STAGES);
@@ -525,12 +538,33 @@ int main(int argc, char **argv)
 
         if (streq(words[0], "exit")) {
             return n > 1 ? (int)uatoi(words[1]) : (int)status;
+        } else if (streq(words[0], "cd")) {
+            long rc = sys_chdir(n > 1 ? words[1] : "/");
+            if (rc != 0)
+                complain(rc == -E_NOTDIR ? "cd: not a directory: " : "cd: no such directory: ",
+                         n > 1 ? words[1] : "/");
+            status = rc != 0;
+        } else if (streq(words[0], "pwd")) {
+            char cwd[256];
+            if (sys_getcwd(cwd, sizeof(cwd)) > 0) {
+                puts_(cwd);
+                puts_("\n");
+            }
+            status = 0;
+        } else if (streq(words[0], "limit")) {
+            long kb = sys_memlimit(n > 1 ? uatoi(words[1]) : 0);
+            if (kb < 0)
+                puts_("sh: limit: cannot raise the limit (lowering it is always allowed)\n");
+            else
+                print_num("memory limit: ", kb, " KB per process\n");
+            status = kb < 0;
         } else if (streq(words[0], "status")) {
             print_num("", status, "\n");
             status = 0;
         } else if (streq(words[0], "help")) {
-            puts_("built-in: exit [code], status, help, jobs, fg [n], bg [n], wait\n"
-                  "programs: anything in /bin (try: ls /bin), e.g. echo, cat, ls, wc, mkdir, rm, cp, sleep, kill, ps, top, df, sync\n"
+            puts_("built-in: cd [dir], pwd, limit [KB], exit [code], status, help, jobs, fg [n], bg [n], wait\n"
+                  "programs: anything in /bin (try: ls /bin), e.g. echo, cat, ls, wc, sort, date, mkdir, rm, cp, mv, sleep, kill, ps, top, df, sync\n"
+                  "users: id, su USER (exit returns), chmod MODE FILE, chown USER FILE; ls -l shows owners\n"
                   "redirection: command > file, command >> file, command < file\n"
                   "pipes: command | command | ...\n"
                   "background: command &   then: jobs, fg [n], wait; ps lists all processes\n"

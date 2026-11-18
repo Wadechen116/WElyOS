@@ -26,6 +26,12 @@ struct blkdev {
 /* 找出這台機器的磁碟(各架構實作);沒有磁碟回傳 NULL。要在排程器啟動之後呼叫 */
 struct blkdev *arch_blk_probe(void);
 
+/* 測試用(kernel/blkfault.c):在 dev 外面包一層可以故意出錯的裝置,回傳包好的那一個。
+   blk_fault_set(讀, 寫):不為 0 表示之後該類要求一律回報失敗;blk_fault_count:回報過幾次 */
+struct blkdev *blk_fault_wrap(struct blkdev *dev);
+void blk_fault_set(int fail_reads, int fail_writes);
+unsigned long blk_fault_count(void);
+
 /* virtio 區塊裝置(kernel/virtio_blk.c;RISC-V 與 AArch64 的 QEMU virt 機器使用):
    在 base 起、每隔 stride 位元組一個、共 slots 個的 virtio-mmio 位置中尋找磁碟 */
 struct blkdev *virtio_blk_probe(uintptr_t base, uintptr_t stride, unsigned slots);

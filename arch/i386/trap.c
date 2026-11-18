@@ -319,6 +319,50 @@ void arch_frame_set_retval(void *tf, long v)
     ((struct trap_frame *)tf)->eax = (uint32_t)v;    /* 系統呼叫的回傳值放在 eax */
 }
 
+uintptr_t arch_frame_user_sp(void *tf)
+{
+    return ((struct trap_frame *)tf)->user_esp;
+}
+
+unsigned arch_frame_call(void *vtf, uintptr_t frame, uintptr_t pc, uintptr_t arg, uintptr_t ret,
+                         uintptr_t words[2])
+{
+    struct trap_frame *tf = vtf;
+
+    /* i386 的呼叫慣例:返回位址與參數都在 stack 上。進入函式時 esp 指向返回位址,
+       其上一格是第一個參數;而且「esp + 4」要對齊 16 */
+    words[0] = ret;
+    words[1] = arg;
+    tf->user_esp = (uint32_t)(frame - 20);
+    tf->eip = (uint32_t)pc;
+    return 2;
+}
+
+void arch_frame_restore(void *vtf, const void *saved)
+{
+    struct trap_frame *tf = vtf;
+    const struct trap_frame *s = saved;
+    /* 區段暫存器決定特權等級,eflags 裡有中斷開關與 I/O 權限:這些一律保留 kernel 原本的。
+       eflags 只採用運算結果的那幾個位元(CF PF AF ZF SF DF OF) */
+    const uint32_t arith = 0x00000CD5;
+
+    tf->edi = s->edi;
+    tf->esi = s->esi;
+    tf->ebp = s->ebp;
+    tf->ebx = s->ebx;
+    tf->edx = s->edx;
+    tf->ecx = s->ecx;
+    tf->eax = s->eax;
+    tf->eip = s->eip;
+    tf->user_esp = s->user_esp;
+    tf->eflags = (tf->eflags & ~arith) | (s->eflags & arith);
+}
+
+long arch_frame_get_retval(void *tf)
+{
+    return (long)((struct trap_frame *)tf)->eax;
+}
+
 void arch_user_resume_asm(struct trap_frame *tf) __attribute__((noreturn));   /* trap.S */
 
 void arch_user_resume(void *tf)
@@ -339,7 +383,7 @@ void trap_handler(struct trap_frame *tf)
     if (tf->vector >= 32 && tf->vector < 48) {
         irq_handler(tf->vector - 32);
         if (from_user)
-            user_return_check();
+            user_return_check(tf);
         return;
     }
 
@@ -347,7 +391,7 @@ void trap_handler(struct trap_frame *tf)
     if (tf->vector == VEC_LAPIC_TIMER || tf->vector == VEC_IPI) {
         lapic_interrupt(tf->vector);
         if (from_user)
-            user_return_check();
+            user_return_check(tf);
         return;
     }
     if (tf->vector == VEC_SPURIOUS)
@@ -357,7 +401,7 @@ void trap_handler(struct trap_frame *tf)
     if (tf->vector == 0x80) {
         tf->eax = (uint32_t)syscall_dispatch((long)tf->eax, (long)tf->ebx,
                                              (long)tf->ecx, (long)tf->edx, tf);
-        user_return_check();
+        user_return_check(tf);
         return;
     }
 
@@ -382,7 +426,7 @@ void trap_handler(struct trap_frame *tf)
             /* 先看是不是可以處理的 page fault(寫入時複製、stack 成長)。
                錯誤碼的 bit 1 為 1 表示是寫入。處理成功就返回,CPU 會重新執行同一條指令 */
             if (proc_page_fault(addr, (tf->err & 2) != 0) == 0) {
-                user_return_check();
+                user_return_check(tf);
                 return;
             }
         }

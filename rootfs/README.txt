@@ -3,10 +3,13 @@ WElyOS root file system
 /bin/init      the test program (built from user/init.c)
 /bin/echo      prints its arguments
 /bin/cat       prints files
-/bin/ls        lists a directory
+/bin/ls        lists a directory (ls -l shows type, size and modification time)
+/bin/date      shows the date and time (UTC; "date +8" adds a time-zone offset)
 /bin/mkdir     creates directories
 /bin/rm        removes files and empty directories
+/bin/mv        renames or moves a file or directory (same file system only)
 /bin/wc        counts lines, words and bytes
+/bin/sort      sorts lines (sort FILE, or at the end of a pipe; -r reverses)
 /bin/sleep     waits (sleep 3, sleep 200ms)
 /bin/kill      sends a signal (kill PID, kill -9 PID, kill -STOP PID, kill -CONT PID)
 /bin/ps        lists the processes
@@ -14,9 +17,13 @@ WElyOS root file system
 /bin/cp        copies a file (cp /bin/echo /disk/echo)
 /bin/df        shows how full the file systems are
 /bin/sync      writes pending changes to the disk now
+/bin/id        shows who you are (uid, gid) and which privileges you hold
+/bin/su        starts a shell as another user (su alice); exit returns
+/bin/chmod     changes permissions (chmod 755 FILE); chown changes the owner (root only)
 /bin/sh        the shell (pipes, redirection, background jobs with &, Ctrl-Z, fg, bg)
 /etc/test.sh   shell script used by the self-test
 /etc/motd      message shown by the file system self-test
+/etc/passwd    user names and numbers (name:uid:gid); there are no passwords
 /dev/console   the console, as a device node (created by the kernel at boot)
 /dev/null      reads as empty, discards whatever is written to it
 /disk          the disk, if one is attached: files here are kept across reboots

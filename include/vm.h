@@ -51,6 +51,7 @@ int vm_query(uintptr_t va, uintptr_t *pa, unsigned *flags);
 
 unsigned long vm_table_pages(void);    /* 頁表本身用掉的頁數 */
 struct vm_space;
+int vm_space_unmap(struct vm_space *vs, uintptr_t va);   /* 移除一個使用者頁的對映並放棄那一頁 */
 unsigned long vm_space_pages(struct vm_space *vs);   /* 這個位址空間目前對映了幾頁(含和別人共用的) */
 
 /*

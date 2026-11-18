@@ -7,7 +7,7 @@
 #   -a "架構..."  只測指定的架構,例如 -a "riscv64"
 #   -q            只跑最基本的三個情境(只開機、selftest、全部測試)
 # 環境變數 QEMU_SMP 決定 20 個情境使用的 CPU 數(預設 4)。
-# 另外每個架構做一次「磁碟跨開機測試」(三次開機,使用獨立的映像檔;-q 時略過)。
+# 另外每個架構做一次「磁碟跨開機測試」(五次開機,使用獨立的映像檔;-q 時略過)。
 # 20 個情境使用預設的磁碟映像 build/<架構>/disk.img(測試結束時會把自己建立的東西刪掉)。
 #
 # 預期的結束碼:
@@ -64,11 +64,12 @@ for a in $ARCHS; do
   done
   echo "$a: ${ok}/${#cases[@]} 個情境符合預期"
 
-  # 磁碟:用一個全新的映像檔連續開機三次(寫入 -> 重開機確認還在並故意弄壞 -> 確認開機時修復了)。
+  # 磁碟:用一個全新的映像檔連續開機五次(寫入 -> 重開機確認還在並故意弄壞 -> 確認開機時修復了
+  # -> 故意讓磁碟讀寫失敗 -> 確認之後的開機檢查過、資料完好)。
   # 見 kernel/main.c 的 disk_stage_test
   if [ "$QUICK" -eq 0 ]; then
     img="$OUT/disk-$a.img"; rm -f "$img"; dok=0
-    for s in 1 2 3; do
+    for s in 1 2 3 4 5; do
       log="$OUT/$a-disktest$s.txt"
       if QEMU_DISK="$img" timeout 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
            -append "autoexit disktest=$s" > "$log" 2>&1 < /dev/null; then
@@ -78,7 +79,7 @@ for a in $ARCHS; do
       fi
     done
     rm -f "$img"
-    echo "$a: 磁碟跨開機測試 ${dok}/3 個階段通過"
+    echo "$a: 磁碟跨開機測試 ${dok}/5 個階段通過"
   fi
 
   if [ "$REPEAT" -gt 0 ]; then

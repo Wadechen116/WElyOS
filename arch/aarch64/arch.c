@@ -231,3 +231,9 @@ struct blkdev *arch_blk_probe(void)
 {
     return virtio_blk_probe(0x0a000000UL, 0x200, 32);
 }
+
+/* 即時時鐘:QEMU virt 機器的 PL031 在 0x09010000。位移 0 的資料暫存器就是「1970 年至今的秒數」 */
+uint64_t arch_rtc_read(void)
+{
+    return *(volatile uint32_t *)0x09010000UL;
+}

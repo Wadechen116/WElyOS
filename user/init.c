@@ -10,6 +10,7 @@
  */
 #include "usys.h"
 #include "ulib.h"
+#include "libc.h"
 
 enum {
     UMODE_HELLO = 0,     /* 正常執行:輸出、多執行緒、結束碼 */
@@ -35,6 +36,12 @@ enum {
     UMODE_STOP,          /* 暫停與繼續(SIGSTOP、SIGCONT、waitpid 的 WUNTRACED) */
     UMODE_DISK,          /* 磁碟:把程式複製到 /disk 再執行、statfs、sync(有磁碟時才執行) */
     UMODE_SYSINFO,       /* top 用到的東西:系統狀態、行程的記憶體用量、主控台的輸入模式 */
+    UMODE_FILEOPS,       /* lseek、rename、硬連結、目前的工作目錄 */
+    UMODE_HEAP,          /* 使用者 heap(sbrk)與函式庫:malloc、printf、字串函式 */
+    UMODE_SIGHANDLER,    /* 訊號處理函式:登記、執行、還原、忽略、打斷等待中的系統呼叫 */
+    UMODE_TIME,          /* 日期時間:sys_time、秒數與年月日的換算、檔案的修改時間 */
+    UMODE_PERM,          /* 使用者與權限:檔案的擁有者與權限位元、特權只能減少、誰可以對誰送訊號 */
+    UMODE_MEMQUOTA,      /* 記憶體配額(要求當場成功或失敗,不會事後被終止)與匿名對映 */
 };
 
 /* 各架構 kernel 映像所在的位址(使用者模式不應該讀得到) */
@@ -246,11 +253,15 @@ static int mode_proc(void)
     /* 4. 應該失敗的情況:每一種都只是回傳錯誤,自己照常繼續執行 */
     if (sys_spawn("/bin/nope", echo_argv) != -E_NOENT)
         return 220;
-    if (sys_spawn("/etc/motd", echo_argv) != -E_NOEXEC)              /* 不是程式 */
+    if (sys_spawn("/etc/motd", echo_argv) != -E_ACCES)               /* 沒有執行權限 */
         return 221;
+    /* 加上執行權限之後,才輪到內容的檢查:它不是合法的程式 */
+    if (sys_chmod("/etc/motd", 0755) != 0 || sys_spawn("/etc/motd", echo_argv) != -E_NOEXEC ||
+        sys_chmod("/etc/motd", 0644) != 0)
+        return 226;
     if (sys_exec("/bin/nope", echo_argv) != -E_NOENT)                /* exec 失敗:原程式不受影響 */
         return 222;
-    if (sys_exec("/etc/motd", echo_argv) != -E_NOEXEC)
+    if (sys_exec("/etc/motd", echo_argv) != -E_ACCES)
         return 223;
     if (sys_spawn((const char *)KERNEL_ADDR, echo_argv) != -E_FAULT) /* 路徑指向 kernel */
         return 224;
@@ -509,6 +520,1014 @@ static int mode_signal(void)
     return 17;
 }
 
+/* ---- UMODE_MEMQUOTA ---- */
+
+static unsigned self_mem_kb(void);
+
+/* 在子行程裡執行 fn,回傳它的結束碼(被終止時是負值或 128 以上) */
+static int in_child(int (*fn)(void))
+{
+    int st = 0;
+    long pid = sys_fork();
+
+    if (pid == 0)
+        sys_exit(fn());
+    if (pid < 0 || sys_waitpid(pid, &st, 0) != pid)
+        return 97;
+    return st;
+}
+
+/* 配額 2MB:超過的要求當場失敗,行程照常繼續;答應過的每一頁都真的能用 */
+static int memq_limit_checks(void)
+{
+    static char *blk[64];
+    int n = 0;
+
+    if (sys_memlimit(2048) != 2048 || sys_memlimit(0) != 2048)
+        return 1;
+    if (sys_memlimit(4096) != -E_PERM)                   /* 調高需要特權(這個子行程已經放棄了) */
+        return 2;
+    long base = sys_sbrk(0);
+    if (sys_sbrk(1 << 20) != base)                       /* 1MB:在配額內 */
+        return 3;
+    if (sys_sbrk(2 << 20) != -E_NOMEM || sys_sbrk(0) != base + (1 << 20))
+        return 4;                                        /* 再要 2MB:拒絕,結尾不變 */
+    for (long i = 0; i < (1 << 20); i += 4096)           /* 答應過的 1MB 每一頁都寫得進去 */
+        ((char *)base)[i] = (char)i;
+    if (sys_sbrk(-(1 << 20)) != base + (1 << 20))
+        return 5;
+
+    /* malloc 一直要到失敗為止:得到 NULL 而不是被終止;釋放之後又可以要 */
+    while (n < 64 && (blk[n] = malloc(100 * 1024)) != 0) {
+        memset(blk[n], n, 100 * 1024);
+        n++;
+    }
+    if (n < 10 || n >= 21)                               /* 2MB 的配額大約放得下 19 塊 100KB */
+        return 6;
+    for (int i = 0; i < n; i++) {
+        if (blk[i][0] != (char)i || blk[i][100 * 1024 - 1] != (char)i)
+            return 7;
+        free(blk[i]);
+    }
+    char *again = malloc(500 * 1024);
+    if (!again)
+        return 8;
+    free(again);
+
+    /* fork 需要和自己一樣多的承諾:配額沿用,子行程同樣受限 */
+    long pid = sys_fork();
+    if (pid == 0)
+        sys_exit(sys_memlimit(0) == 2048 && sys_sbrk(4 << 20) == -E_NOMEM ? 0 : 1);
+    int st = 1;
+    if (pid < 0 || sys_waitpid(pid, &st, 0) != pid || st != 0)
+        return 9;
+    return 0;
+}
+
+static int memq_touch_unmapped(void)
+{
+    char *m = sys_mmap(8192);
+
+    if ((long)m < 0 || sys_munmap(m) != 0)
+        return 1;
+    m[0] = 1;                                            /* 已經歸還:不再屬於行程 */
+    return 0;
+}
+
+static int memq_touch_gap(void)
+{
+    char *m = sys_mmap(4096);
+
+    if ((long)m < 0)
+        return 1;
+    m[4096] = 1;                                         /* 這一塊之後留著一頁不對映:越界立刻出錯 */
+    return 0;
+}
+
+static int mode_memquota(void)
+{
+    long def = sys_memlimit(0);
+    int rc;
+
+    if (def != 32 * 1024 || sys_memlimit(-1) != -E_INVAL)
+        return 1501;
+
+    /* 1. 配額(在子行程裡把自己的配額調低、放棄特權) */
+    long pid = sys_fork();
+    int st = 0;
+    if (pid == 0) {
+        sys_capdrop(CAP_ADMIN);
+        sys_exit(memq_limit_checks());
+    }
+    if (pid < 0 || sys_waitpid(pid, &st, 0) != pid || st != 0)
+        return 1510 + st;
+    if (sys_memlimit(0) != def)                          /* 子行程調低的是它自己的 */
+        return 1509;
+
+    /* 2. 整個系統的上限:有特權的行程把配額調到 1GB,要 200MB — 這台機器沒有那麼多,
+          當場拒絕(以前會先答應,等用到時才終止行程) */
+    pid = sys_fork();
+    if (pid == 0) {
+        if (sys_memlimit(1 << 20) != (1 << 20))
+            sys_exit(1);
+        sys_exit(sys_sbrk(200 << 20) == -E_NOMEM && (long)sys_mmap(200 << 20) == -E_NOMEM ? 0 : 2);
+    }
+    if (pid < 0 || sys_waitpid(pid, &st, 0) != pid || st != 0)
+        return 1520 + st;
+
+    /* 3. 匿名對映 */
+    unsigned kb0 = self_mem_kb();
+    char *a = sys_mmap(64 * 1024), *b = sys_mmap(1);
+    if ((long)a < 0 || (long)b < 0 || a == b || ((unsigned long)a & 4095))
+        return 1530;
+    if (self_mem_kb() != kb0)                            /* 還沒碰:沒有配置 */
+        return 1531;
+    for (int i = 0; i < 64 * 1024; i++)
+        if (a[i] != 0)
+            return 1532;                                 /* 內容是 0 */
+    memset(a, 0x5A, 64 * 1024);
+    b[0] = 7;
+    if (self_mem_kb() != kb0 + 64 + 4)
+        return 1533;
+    /* fork:子行程看到同樣的內容,改了不影響我們;它也可以歸還自己那一份 */
+    pid = sys_fork();
+    if (pid == 0) {
+        int ok = a[100] == 0x5A && b[0] == 7;
+        a[100] = 1;
+        sys_exit(ok && sys_munmap(a) == 0 ? 0 : 1);
+    }
+    if (pid < 0 || sys_waitpid(pid, &st, 0) != pid || st != 0 || a[100] != 0x5A)
+        return 1534;
+    if (sys_munmap(a + 4096) != -E_INVAL || sys_munmap((void *)KERNEL_ADDR) != -E_INVAL)
+        return 1535;                                     /* 只能整塊歸還,而且必須是自己的 */
+    if (sys_munmap(a) != 0 || sys_munmap(a) != -E_INVAL || self_mem_kb() != kb0 + 4)
+        return 1536;                                     /* 歸還後記憶體立刻減少;不能歸還兩次 */
+    if (sys_munmap(b) != 0)
+        return 1537;
+    if ((long)sys_mmap(0) != -E_INVAL || (long)sys_mmap(1ul << 30) != -E_INVAL ||
+        (long)sys_mmap(40 << 20) != -E_NOMEM)            /* 超過配額(32MB) */
+        return 1538;
+    /* 同時最多 16 塊 */
+    void *many[17];
+    int got = 0;
+    for (; got < 17; got++)
+        if ((long)(many[got] = sys_mmap(4096)) < 0)
+            break;
+    if (got != 16)
+        return 1539;
+    for (int i = 0; i < got; i++)
+        if (sys_munmap(many[i]) != 0)
+            return 1540;
+    /* 碰已經歸還的對映、或越過一塊的結尾:行程被終止(各在子行程裡試) */
+    if ((rc = in_child(memq_touch_unmapped)) != -1 || (rc = in_child(memq_touch_gap)) != -1)
+        return 1541;
+    if (self_mem_kb() != kb0)
+        return 1542;
+
+    puts_("  [user] memory quota: requests beyond the limit fail at once, nothing is killed later\n");
+    return 27;
+}
+
+/* ---- UMODE_PERM ---- */
+
+static int path_join(char *out, const char *dir, const char *name);
+
+/* 以使用者 uid 的身分(沒有任何特權)執行 fn(base),回傳它的結果(0 = 全部符合預期) */
+static int as_user(long uid, int (*fn)(const char *), const char *base)
+{
+    int st = 0;
+    long pid = sys_fork();
+
+    if (pid == 0) {
+        if (sys_setuid(uid, uid) != 0)
+            sys_exit(99);
+        sys_exit(fn(base));
+    }
+    if (pid < 0 || sys_waitpid(pid, &st, 0) != pid)
+        return 98;
+    return st;
+}
+
+/* 一般使用者(1000)面對 root 建立的東西 */
+static int perm_user_checks(const char *base)
+{
+    char p[96];
+    struct stat st;
+    long fd;
+
+    if (sys_getuid() != 1000 || sys_getgid() != 1000 || sys_capget() != 0)
+        return 1;
+    path_join(p, base, "/secret");                       /* 0600 root:完全不能碰 */
+    if (sys_open(p, O_RDONLY) != -E_ACCES || sys_open(p, O_WRONLY) != -E_ACCES)
+        return 2;
+    if (sys_stat(p, &st) != 0 || st.uid != 0 || st.mode != 0600)   /* 看得到它存在與屬性 */
+        return 3;
+    path_join(p, base, "/pub");                          /* 0644 root:可讀不可寫 */
+    if ((fd = sys_open(p, O_RDONLY)) < 0)
+        return 4;
+    sys_close(fd);
+    if (sys_open(p, O_WRONLY) != -E_ACCES || sys_open(p, O_RDWR) != -E_ACCES ||
+        sys_open(p, O_RDONLY | O_TRUNC) != -E_ACCES)     /* 清空也算寫入 */
+        return 5;
+    if (sys_chmod(p, 0666) != -E_PERM || sys_chown(p, 1000, 1000) != -E_PERM)
+        return 6;                                        /* 不是擁有者;沒有特權 */
+    if (sys_unlink(p) != -E_ACCES)                       /* 刪除看的是目錄的權限(0755 root) */
+        return 7;
+    path_join(p, base, "/mine");
+    if (sys_open(p, O_CREAT | O_WRONLY) != -E_ACCES || sys_mkdir(p) != -E_ACCES)
+        return 8;                                        /* 不能在別人的目錄裡建立東西 */
+    path_join(p, base, "/priv/inside");                  /* priv 是 0700 root:連經過都不行 */
+    if (sys_stat(p, &st) != -E_ACCES || sys_open(p, O_RDONLY) != -E_ACCES)
+        return 9;
+    path_join(p, base, "/priv");
+    if (sys_chdir(p) != -E_ACCES || sys_open(p, O_RDONLY) != -E_ACCES)
+        return 10;
+    {
+        char q[96];
+        path_join(p, base, "/pub");
+        path_join(q, base, "/pub2");
+        if (sys_rename(p, q) != -E_ACCES || sys_link(p, q) != -E_ACCES)
+            return 11;
+    }
+
+    /* open 是共用的目錄(0777):可以建立自己的檔案,它屬於自己,預設 0644 */
+    path_join(p, base, "/open/note");
+    if ((fd = sys_open(p, O_CREAT | O_RDWR)) < 0 || sys_write(fd, "hi", 2) != 2)
+        return 12;
+    sys_close(fd);
+    if (sys_stat(p, &st) != 0 || st.uid != 1000 || st.gid != 1000 || st.mode != 0644)
+        return 13;
+    /* 自己的檔案可以改權限;改成 0000 之後連自己也打不開(擁有者那一組位元說了算) */
+    if (sys_chmod(p, 0) != 0 || sys_open(p, O_RDONLY) != -E_ACCES || sys_chmod(p, 0600) != 0)
+        return 14;
+    if (sys_chown(p, 0, 0) != -E_PERM)                   /* 不能把檔案送給別人 */
+        return 15;
+
+    /* 沒有執行權限的檔案不能執行;加上之後才可以(內容不是程式,所以得到的是「不是程式」) */
+    {
+        char *argv[] = { "note", 0 };
+        if (sys_spawn(p, argv) != -E_ACCES || sys_chmod(p, 0700) != 0 ||
+            sys_spawn(p, argv) != -E_NOEXEC)
+            return 16;
+    }
+    return 0;
+}
+
+/* 另一個一般使用者(1001)面對 1000 留下的檔案:0700,不是擁有者也不同群組 */
+static int perm_other_checks(const char *base)
+{
+    char p[96];
+
+    path_join(p, base, "/open/note");
+    if (sys_open(p, O_RDONLY) != -E_ACCES || sys_chmod(p, 0777) != -E_PERM)
+        return 1;
+    if (sys_unlink(p) != 0)                              /* 但目錄是 0777:可以把它刪掉(沒有 sticky 位元) */
+        return 2;
+    return 0;
+}
+
+static int perm_on(const char *base)
+{
+    char p[96];
+    struct stat st;
+    long fd;
+    int rc;
+
+    path_join(p, base, "/open/note"); sys_unlink(p);     /* 上次留下的 */
+    path_join(p, base, "/priv/inside"); sys_unlink(p);
+    path_join(p, base, "/open"); sys_unlink(p);
+    path_join(p, base, "/priv"); sys_unlink(p);
+    path_join(p, base, "/secret"); sys_unlink(p);
+    path_join(p, base, "/pub"); sys_unlink(p);
+    sys_unlink(base);
+
+    /* root 建立測試用的東西 */
+    if (sys_mkdir(base) != 0 || sys_stat(base, &st) != 0 || st.mode != 0755 || st.uid != 0)
+        return 1401;
+    path_join(p, base, "/secret");
+    if ((fd = sys_open(p, O_CREAT | O_WRONLY)) < 0 || sys_chmod(p, 0600) != 0)
+        return 1402;
+    sys_close(fd);
+    path_join(p, base, "/pub");
+    if ((fd = sys_open(p, O_CREAT | O_WRONLY)) < 0)
+        return 1403;
+    sys_close(fd);
+    path_join(p, base, "/priv");
+    if (sys_mkdir(p) != 0 || sys_chmod(p, 0700) != 0)
+        return 1404;
+    path_join(p, base, "/priv/inside");
+    if ((fd = sys_open(p, O_CREAT | O_WRONLY)) < 0)
+        return 1405;
+    sys_close(fd);
+    path_join(p, base, "/open");
+    if (sys_mkdir(p) != 0 || sys_chmod(p, 0777) != 0 || sys_chmod(p, 01000) != 0 ||
+        sys_stat(p, &st) != 0 || st.mode != 0 || sys_chmod(p, 0777) != 0)
+        return 1406;                                     /* 權限以外的位元被忽略 */
+    if (sys_chown("/no/such", 1, 1) != -E_NOENT || sys_chown(base, 70000, 1) != -E_INVAL)
+        return 1407;
+
+    if ((rc = as_user(1000, perm_user_checks, base)) != 0)
+        return 1410 + rc;
+    if ((rc = as_user(1001, perm_other_checks, base)) != 0)
+        return 1440 + rc;
+
+    /* root 可以改擁有者;改完之後原本被拒絕的人就可以用了 */
+    path_join(p, base, "/secret");
+    if (sys_chown(p, 1001, 1001) != 0 || sys_stat(p, &st) != 0 || st.uid != 1001 || st.gid != 1001)
+        return 1450;
+
+    path_join(p, base, "/priv/inside"); sys_unlink(p);
+    path_join(p, base, "/open"); sys_unlink(p);
+    path_join(p, base, "/priv"); sys_unlink(p);
+    path_join(p, base, "/secret"); sys_unlink(p);
+    path_join(p, base, "/pub"); sys_unlink(p);
+    if (sys_unlink(base) != 0)
+        return 1451;
+    return 0;
+}
+
+static long perm_root_pid;                       /* 測試主行程(root)的編號,fork 之前記下 */
+
+static int perm_drop_checks(const char *unused)
+{
+    (void)unused;
+    /* 變成一般使用者之後:不能變回 root、不能變成別人;「改成自己」沒有作用但允許 */
+    if (sys_setuid(0, 0) != -E_PERM || sys_setuid(1001, 1001) != -E_PERM || sys_setuid(1000, 1000) != 0)
+        return 1;
+    if (sys_capdrop(CAP_ALL) != 0)                       /* 本來就沒有:沒有東西可以放棄 */
+        return 2;
+    /* 不能對別人(這裡是 root 的父行程)送訊號;對自己可以 */
+    if (sys_kill(perm_root_pid, SIGTERM) != -E_PERM || sys_kill(sys_getpid(), SIGCONT) != 0)
+        return 3;
+    return 0;
+}
+
+/* 行程這一側:特權只能減少、誰可以對誰送訊號 */
+static int perm_process(void)
+{
+    struct stat st;
+    int rc, status = 0;
+    long pid, fd;
+
+    if (sys_getuid() != 0 || sys_capget() != (long)CAP_ALL)
+        return 1460;
+    if (sys_setuid(70000, 0) != -E_INVAL || sys_setuid(-1, 0) != -E_INVAL)
+        return 1461;
+    perm_root_pid = sys_getpid();
+    if ((rc = as_user(1000, perm_drop_checks, "")) != 0)
+        return 1462 + rc;
+
+    /* root 只放棄 CAP_FS(最小權限):仍然是 uid 0,但檔案權限開始對它生效 */
+    sys_unlink("/pm-cap");
+    if ((fd = sys_open("/pm-cap", O_CREAT | O_WRONLY)) < 0 || sys_chown("/pm-cap", 1000, 1000) != 0 ||
+        sys_chmod("/pm-cap", 0600) != 0)
+        return 1470;
+    sys_close(fd);
+    pid = sys_fork();
+    if (pid == 0) {
+        long ok = sys_open("/pm-cap", O_RDONLY);         /* 有 CAP_FS:別人的 0600 檔案也打得開 */
+        if (ok < 0 || sys_capdrop(CAP_FS) != (long)(CAP_ALL & ~CAP_FS) || sys_getuid() != 0)
+            sys_exit(1);
+        if (sys_open("/pm-cap", O_RDONLY) != -E_ACCES || sys_chown("/pm-cap", 0, 0) != -E_PERM)
+            sys_exit(2);                                 /* 放棄之後:和一般人一樣被擋下 */
+        if (sys_capdrop(0) != (long)(CAP_ALL & ~CAP_FS))
+            sys_exit(3);                                 /* 沒有任何呼叫可以把它拿回來 */
+        sys_exit(0);
+    }
+    if (pid < 0 || sys_waitpid(pid, &status, 0) != pid || status != 0)
+        return 1471 + status;
+    if (sys_stat("/pm-cap", &st) != 0 || sys_unlink("/pm-cap") != 0)
+        return 1475;
+
+    /* 一般使用者的行程:別的使用者不能終止它,root(有 CAP_KILL)可以 */
+    pid = sys_fork();
+    if (pid == 0) {
+        sys_setuid(1000, 1000);
+        for (;;)
+            sys_sleep(1000);
+    }
+    sys_sleep(3);
+    long killer = sys_fork();
+    if (killer == 0) {
+        sys_setuid(1001, 1001);
+        sys_exit(sys_kill(pid, SIGKILL) == -E_PERM && sys_kill(-pid, SIGKILL) != 0 ? 0 : 1);
+    }
+    if (killer < 0 || sys_waitpid(killer, &status, 0) != killer || status != 0)
+        return 1480;
+    if (sys_waitpid(pid, &status, WNOHANG) != 0)         /* 還活著 */
+        return 1481;
+    if (sys_kill(pid, SIGKILL) != 0 || sys_waitpid(pid, &status, 0) != pid || status != 128 + SIGKILL)
+        return 1482;
+    return 0;
+}
+
+/* ---- UMODE_TIME ---- */
+
+static int same_date(unsigned long long epoch, int off, int y, int mo, int d, int h, int mi, int s, int wd)
+{
+    struct datetime dt;
+
+    gmtime_(epoch, off, &dt);
+    return dt.year == y && dt.mon == mo && dt.day == d && dt.hour == h && dt.min == mi &&
+           dt.sec == s && dt.wday == wd;
+}
+
+static int mode_time(void)
+{
+    struct timeval a, b;
+    struct datetime dt;
+    struct stat st;
+
+    /* 現在的時間:模擬器的時鐘跟著主機走,所以應該落在合理的範圍(2023 ~ 2100 年) */
+    if (sys_time(&a) != 0 || a.sec < 1700000000ull || a.sec > 4102444800ull || a.usec >= 1000000)
+        return 1301;
+    if (sys_time((struct timeval *)KERNEL_ADDR) != -E_FAULT)
+        return 1302;
+    sys_sleep(30);
+    if (sys_time(&b) != 0 || b.sec < a.sec || b.sec > a.sec + 5)
+        return 1303;
+    /* 30ms 之後,時間(換成微秒)往前走了至少 20ms */
+    unsigned long da = (unsigned long)(b.sec - a.sec) * 1000000ul + b.usec - a.usec;
+    if (da < 20000 || da > 3000000)
+        return 1304;
+
+    /* 秒數換成年月日:幾個知道答案的時間點,包括閏年的 2 月 29 日與世紀年 */
+    if (!same_date(0, 0, 1970, 1, 1, 0, 0, 0, 4) ||
+        !same_date(951782400, 0, 2000, 2, 29, 0, 0, 0, 2) ||          /* 2000 是閏年 */
+        !same_date(951868799, 0, 2000, 2, 29, 23, 59, 59, 2) ||
+        !same_date(951868800, 0, 2000, 3, 1, 0, 0, 0, 3) ||
+        !same_date(1700000000, 0, 2023, 11, 14, 22, 13, 20, 2) ||
+        !same_date(1700000000, 8, 2023, 11, 15, 6, 13, 20, 3) ||      /* 加 8 小時:跨到隔天 */
+        !same_date(1709164800, 0, 2024, 2, 29, 0, 0, 0, 4) ||
+        !same_date(4107542399u, 0, 2100, 2, 28, 23, 59, 59, 0) ||     /* 2100 不是閏年 */
+        !same_date(4107542400u, 0, 2100, 3, 1, 0, 0, 0, 1))
+        return 1305;
+
+    /* 檔案的修改時間:建立時是現在;之後寫入會更新 */
+    sys_unlink("/time-test");
+    long fd = sys_open("/time-test", O_CREAT | O_RDWR);
+    if (fd < 0 || sys_stat("/time-test", &st) != 0 || st.mtime < a.sec || st.mtime > b.sec + 5)
+        return 1306;
+    unsigned long long created = st.mtime;
+    /* (時間以秒為單位;為了不讓測試多等一秒,這裡只確認寫入之後時間不會倒退、也不會超過現在) */
+    if (sys_write(fd, "x", 1) != 1 || sys_stat("/time-test", &st) != 0 || st.mtime < created ||
+        sys_time(&b) != 0 || st.mtime > b.sec)
+        return 1308;
+    sys_close(fd);
+    /* 目錄的修改時間:裡面的東西增減時更新 */
+    unsigned long long file_time = st.mtime;
+    if (sys_stat("/", &st) != 0 || sys_unlink("/time-test") != 0)
+        return 1309;
+    if (sys_stat("/", &st) != 0 || st.mtime < file_time)
+        return 1310;
+
+    gmtime_(b.sec, 0, &dt);
+    printf("  [user] the clock reads %04d-%02d-%02d %02d:%02d:%02d UTC; dates convert correctly\n",
+           dt.year, dt.mon, dt.day, dt.hour, dt.min, dt.sec);
+    return 25;
+}
+
+/* ---- UMODE_SIGHANDLER ---- */
+
+static volatile int sig_seen[32];                /* 每個訊號的處理函式被呼叫了幾次 */
+static volatile int sig_depth, sig_max_depth;
+
+static void on_signal(int sig)
+{
+    char msg[40];
+
+    /* 處理函式裡照常可以用 stack、呼叫函式、做系統呼叫 */
+    sig_depth++;
+    if (sig_depth > sig_max_depth)
+        sig_max_depth = sig_depth;
+    snprintf(msg, sizeof(msg), "x%dx", sig);
+    if (msg[0] == 'x' && sig > 0 && sig < 32)
+        sig_seen[sig]++;
+    sys_getpid();
+    sig_depth--;
+}
+
+static void on_signal_exit(int sig)
+{
+    sys_exit(70 + sig);                          /* 處理函式也可以選擇不返回 */
+}
+
+/* 一段很吃暫存器的運算:如果處理函式執行前後暫存器沒有被完整還原,結果就會錯 */
+static unsigned long churn(unsigned long seed, int rounds)
+{
+    unsigned long a = seed, b = 3, c = 5, d = 7, e = 11, f = 13, g = 17, h = 19;
+
+    for (int i = 0; i < rounds; i++) {
+        a = a * 31 + b;
+        b = b * 17 + c;
+        c ^= d + (a >> 3);
+        d = d * 5 + e;
+        e += f ^ (b << 1);
+        f = f * 7 + g;
+        g ^= h + c;
+        h = h * 3 + a;
+    }
+    return a ^ b ^ c ^ d ^ e ^ f ^ g ^ h;
+}
+
+static int mode_sighandler(void)
+{
+    long me = sys_getpid(), pid;
+    int st = 0, fds[2];
+    char buf[8];
+
+    /* 1. 登記與基本的執行:送給自己,系統呼叫返回之前處理函式就執行過了 */
+    if (sys_signal(SIGUSR1, on_signal) != 0)             /* 原本是預設(0) */
+        return 1201;
+    if (sys_signal(SIGUSR1, on_signal) != (long)on_signal)
+        return 1202;                                     /* 回傳原本的處理方式 */
+    if (sys_kill(me, SIGUSR1) != 0 || sig_seen[SIGUSR1] != 1)
+        return 1203;
+    if (sys_signal(SIGKILL, on_signal) != -E_INVAL || sys_signal(19, SIG_IGN) != -E_INVAL ||
+        sys_signal(99, on_signal) != -E_INVAL)
+        return 1204;                                     /* 不能攔截的、不存在的 */
+    if (sys_signal(SIGUSR2, (sighandler_t)KERNEL_ADDR) != -E_FAULT)
+        return 1205;                                     /* 處理函式必須是自己可以執行的位址 */
+
+    /* 2. 運算途中被打斷許多次:結果必須和沒有被打斷時完全相同(暫存器有完整還原) */
+    unsigned long want = churn(12345, 60000);
+    pid = sys_fork();
+    if (pid == 0) {
+        for (int i = 0; i < 20; i++) {                   /* 子行程不斷送訊號給我們 */
+            sys_kill(me, SIGUSR1);
+            sys_sleep(1);
+        }
+        sys_exit(0);
+    }
+    unsigned long got = 0;
+    for (int i = 0; i < 30; i++)                         /* 算很多次,讓訊號有機會落在各種位置 */
+        got ^= churn(12345, 60000) ^ (unsigned long)i;
+    unsigned long expect = 0;
+    for (int i = 0; i < 30; i++)
+        expect ^= want ^ (unsigned long)i;
+    /* 等子行程時也會被訊號打斷(-E_INTR):再等一次 */
+    while (sys_waitpid(pid, &st, 0) == -E_INTR)
+        ;
+    if (pid < 0 || got != expect || sig_seen[SIGUSR1] < 5 || sig_max_depth < 1)
+        return 1210;
+
+    /* 3. 正在睡的時候收到訊號:提早醒來,處理函式執行 */
+    int before = sig_seen[SIGUSR1];
+    pid = sys_fork();
+    if (pid == 0) {
+        sys_sleep(6);
+        sys_kill(me, SIGUSR1);
+        sys_exit(0);
+    }
+    struct sysinfo t0, t1;
+    sys_sysinfo(&t0);
+    sys_sleep(5000);
+    sys_sysinfo(&t1);
+    if (sig_seen[SIGUSR1] != before + 1 || t1.uptime_ticks - t0.uptime_ticks > 2000)
+        return 1220;
+    while (sys_waitpid(pid, &st, 0) == -E_INTR)
+        ;
+
+    /* 4. 正在等管線的資料時收到訊號:read 回傳 -E_INTR,而不是「結束」(0);之後照常可以讀 */
+    if (sys_pipe(fds) != 0)
+        return 1230;
+    pid = sys_fork();
+    if (pid == 0) {
+        sys_sleep(6);
+        sys_kill(me, SIGUSR1);
+        sys_sleep(6);
+        sys_write(fds[1], "ok", 2);
+        sys_exit(0);
+    }
+    if (sys_read(fds[0], buf, sizeof(buf)) != -E_INTR)
+        return 1231;
+    if (sys_read(fds[0], buf, sizeof(buf)) != 2 || buf[0] != 'o')
+        return 1232;
+    while (sys_waitpid(pid, &st, 0) == -E_INTR)
+        ;
+    sys_close(fds[0]);
+    sys_close(fds[1]);
+
+    /* 5. 忽略:SIGTERM 不再終止行程;改回預設之後又會 */
+    pid = sys_fork();
+    if (pid == 0) {
+        sys_signal(SIGTERM, SIG_IGN);
+        sys_write(fds[1], "", 0);
+        for (;;)
+            sys_sleep(1000);
+    }
+    sys_sleep(4);
+    sys_kill(pid, SIGTERM);
+    sys_sleep(4);
+    if (sys_waitpid(pid, &st, WNOHANG) != 0)             /* 還活著 */
+        return 1240;
+    sys_kill(pid, SIGKILL);                              /* SIGKILL 永遠有效 */
+    if (sys_waitpid(pid, &st, 0) != pid || st != 128 + SIGKILL)
+        return 1241;
+
+    /* 6. 處理函式可以不返回(直接結束);fork 的子行程沿用父行程的設定 */
+    sys_signal(SIGINT, on_signal_exit);
+    pid = sys_fork();
+    if (pid == 0) {
+        for (;;)
+            sys_sleep(1000);
+    }
+    sys_sleep(5);
+    sys_kill(pid, SIGINT);
+    if (sys_waitpid(pid, &st, 0) != pid || st != 70 + SIGINT)
+        return 1250;
+    sys_signal(SIGINT, SIG_DFL);
+
+    /* 7. exec 之後,處理函式還原成預設(那些位址是舊程式的):被 SIGUSR1 終止 */
+    pid = sys_fork();
+    if (pid == 0) {
+        char *argv[] = { "sleep", "5", 0 };
+        sys_exec("/bin/sleep", argv);
+        sys_exit(1);
+    }
+    sys_sleep(6);
+    sys_kill(pid, SIGUSR1);
+    if (sys_waitpid(pid, &st, 0) != pid || st != 128 + SIGUSR1)
+        return 1260;
+
+    /* 8. 捏造的 sigreturn:給 kernel 一份全是 0xFF 的「暫存器」。
+          kernel 不可以因此出事(特權的部分不採用);行程自己跳到不存在的位址而被終止 */
+    pid = sys_fork();
+    if (pid == 0) {
+        static unsigned char fake[1024];
+        for (unsigned i = 0; i < sizeof(fake); i++)
+            fake[i] = 0xFF;
+        syscall3(SYS_sigreturn, (long)fake, 0, 0);
+        sys_exit(0);                                     /* 不該到這裡 */
+    }
+    if (pid < 0 || sys_waitpid(pid, &st, 0) != pid || st != -1)
+        return 1270;
+    pid = sys_fork();
+    if (pid == 0) {
+        syscall3(SYS_sigreturn, (long)KERNEL_ADDR, 0, 0);    /* 位址根本不是自己的 */
+        sys_exit(0);
+    }
+    if (pid < 0 || sys_waitpid(pid, &st, 0) != pid || st != -1)
+        return 1271;
+
+    /* 9. stack 壞掉的時候收到訊號:沒有地方放暫存器,行程被終止,kernel 不受影響 */
+    pid = sys_fork();
+    if (pid == 0) {
+        sys_signal(SIGUSR2, on_signal);
+        sys_write(1, "", 0);
+#if defined(__i386__)
+        __asm__ volatile("mov $16, %esp\n mov $4, %eax\n 1: int $0x80\n jmp 1b");       /* yield 不斷 */
+#elif defined(__riscv)
+        __asm__ volatile("li sp, 16\n li a7, 4\n 1: ecall\n j 1b");
+#elif defined(__aarch64__)
+        __asm__ volatile("mov x9, #16\n mov sp, x9\n mov x8, #4\n 1: svc #0\n b 1b");
+#endif
+    }
+    sys_sleep(4);
+    sys_kill(pid, SIGUSR2);
+    if (sys_waitpid(pid, &st, 0) != pid || st != 128 + SIGUSR2)
+        return 1280;
+
+    printf("  [user] signal handlers: %d deliveries, registers intact, interrupted sleeps and reads resume\n",
+           sig_seen[SIGUSR1]);
+    return 24;
+}
+
+/* ---- UMODE_HEAP ---- */
+
+static unsigned self_mem_kb(void)
+{
+    struct procinfo pi;
+    long me = sys_getpid();
+
+    return sys_procinfo(me - 1, &pi) == 0 && pi.pid == me ? pi.mem_kb : 0;
+}
+
+static volatile int heap_threads_done, heap_threads_bad;
+
+/* 每條執行緒反覆配置、填入自己的記號、檢查、釋放:別人的資料混進來就看得出來 */
+static void heap_thread(long id)
+{
+    for (int round = 0; round < 150; round++) {
+        size_t n = 16 + (size_t)((round * 37 + id * 101) % 900);
+        unsigned char *p = malloc(n);
+        if (!p) {
+            heap_threads_bad = 1;
+            break;
+        }
+        memset(p, (int)(id + 1), n);
+        if (round % 7 == 0)
+            sys_yield();
+        for (size_t i = 0; i < n; i++)
+            if (p[i] != (unsigned char)(id + 1))
+                heap_threads_bad = 1;
+        free(p);
+    }
+    __sync_fetch_and_add(&heap_threads_done, 1);
+    sys_thread_exit();
+}
+
+static int mode_heap(void)
+{
+    char text[80];
+    static char *blk[120];
+    int st = 0;
+
+    /* ---- sbrk:kernel 這一側 ---- */
+    long base = sys_sbrk(0);
+    if (base <= 0 || sys_sbrk(0) != base)
+        return 1101;
+    unsigned kb0 = self_mem_kb();
+    if (sys_sbrk(64 * 1024) != base)                     /* 回傳移動之前的結尾 */
+        return 1102;
+    if (self_mem_kb() != kb0)                            /* 還沒碰:一頁都沒配置 */
+        return 1103;
+    char *h = (char *)base;
+    for (int i = 0; i < 64 * 1024; i += 4096)
+        if (h[i] != 0)                                   /* 新的記憶體保證是 0 */
+            return 1104;
+    if (self_mem_kb() != kb0 + 64)                       /* 碰過的 16 頁現在才配置 */
+        return 1105;
+    h[100] = 'x';
+    if (sys_sbrk(-32 * 1024) != base + 64 * 1024 || self_mem_kb() != kb0 + 32)
+        return 1106;                                     /* 縮小:後半立刻歸還 */
+    if (sys_sbrk(32 * 1024) != base + 32 * 1024 || h[32 * 1024] != 0 || h[100] != 'x')
+        return 1107;                                     /* 再長回來:歸還過的部分又是 0,前半不受影響 */
+    if (sys_sbrk(-(1L << 28)) != -E_NOMEM || sys_sbrk((1L << 28) + 4096) != -E_NOMEM)
+        return 1108;                                     /* 縮到起點之前;超過上限 */
+    /* 結尾之後的位址不屬於行程:碰了會被終止(在子行程裡試) */
+    long pid = sys_fork();
+    if (pid == 0) {
+        volatile char *beyond = (char *)sys_sbrk(0) + 8192;
+        *beyond = 1;
+        sys_exit(0);
+    }
+    if (pid < 0 || sys_waitpid(pid, &st, 0) != pid || st != -1)
+        return 1109;
+    if (sys_sbrk(-64 * 1024) != base + 64 * 1024 || self_mem_kb() != kb0)
+        return 1110;
+
+    /* ---- malloc / free ---- */
+    for (int i = 0; i < 120; i++) {
+        size_t n = 8 + (size_t)(i * 53 % 700);
+        blk[i] = malloc(n);
+        if (!blk[i] || ((unsigned long)blk[i] & 15))     /* 對齊 16 位元組 */
+            return 1120;
+        memset(blk[i], i, n);
+    }
+    for (int i = 0; i < 120; i += 2) {                   /* 釋放一半,留下許多空洞 */
+        free(blk[i]);
+        blk[i] = 0;
+    }
+    for (int i = 0; i < 120; i += 2) {                   /* 再配置:會用到那些空洞 */
+        blk[i] = malloc(8 + (size_t)(i * 31 % 300));
+        if (!blk[i])
+            return 1121;
+        memset(blk[i], i, 8);
+    }
+    for (int i = 1; i < 120; i += 2) {                   /* 沒被釋放的那一半,內容必須原封不動 */
+        size_t n = 8 + (size_t)(i * 53 % 700);
+        for (size_t k = 0; k < n; k++)
+            if (blk[i][k] != (char)i)
+                return 1122;
+    }
+    long peak = sys_sbrk(0);
+    for (int i = 0; i < 120; i++)
+        free(blk[i]);
+    /* 全部釋放後,相鄰的空塊應該併成一大塊:再要一塊和整個 heap 差不多大的,不必向 kernel 多要 */
+    char *big = malloc((size_t)(peak - base) - 4096);
+    if (!big || sys_sbrk(0) != peak)
+        return 1123;
+    free(big);
+
+    /* realloc 保留內容;calloc 清為 0;大小為 0 也給一個可以 free 的指標 */
+    char *r = malloc(10);
+    strcpy(r, "123456789");
+    r = realloc(r, 5000);
+    if (!r || strcmp(r, "123456789") != 0)
+        return 1124;
+    free(r);
+    int *z = calloc(100, sizeof(int));
+    for (int i = 0; z && i < 100; i++)
+        if (z[i] != 0)
+            return 1125;
+    void *zero = malloc(0);
+    if (!z || !zero || malloc((size_t)1 << 31) != 0 || calloc((size_t)1 << 20, (size_t)1 << 20) != 0)
+        return 1126;
+    free(z);
+    free(zero);
+    free(0);
+
+    /* 很大的一塊:釋放之後還給 kernel(heap 的結尾退回去,記憶體用量下降) */
+    long before = sys_sbrk(0);
+    char *mb = malloc(1 << 20);
+    if (!mb)
+        return 1127;
+    for (int i = 0; i < (1 << 20); i += 4096)
+        mb[i] = 1;
+    unsigned kb_big = self_mem_kb();
+    free(mb);
+    if (sys_sbrk(0) > before + 128 * 1024 || self_mem_kb() + 512 > kb_big)
+        return 1128;
+
+    /* fork:子行程改它自己的 heap,不影響我們的 */
+    char *shared = malloc(32);
+    strcpy(shared, "parent");
+    pid = sys_fork();
+    if (pid == 0) {
+        strcpy(shared, "child");
+        char *more = malloc(100000);                     /* 子行程的 malloc 照常運作 */
+        sys_exit(more && strcmp(shared, "child") == 0 ? 0 : 1);
+    }
+    if (pid < 0 || sys_wait(pid) != 0 || strcmp(shared, "parent") != 0)
+        return 1130;
+    free(shared);
+
+    /* 同一塊釋放兩次:被偵測到,程式以 134 結束(在子行程裡試) */
+    pid = sys_fork();
+    if (pid == 0) {
+        char *twice = malloc(40);
+        sys_close(2);                                    /* 錯誤訊息不必印出來 */
+        free(twice);
+        free(twice);
+        sys_exit(0);
+    }
+    if (pid < 0 || sys_wait(pid) != 134)
+        return 1131;
+
+    /* 三條執行緒同時 malloc / free */
+    for (long i = 0; i < 3; i++)
+        if (sys_thread_create(heap_thread, i) < 0)
+            return 1132;
+    for (int i = 0; i < 2000 && heap_threads_done < 3; i++)
+        sys_sleep(1);
+    if (heap_threads_done != 3 || heap_threads_bad)
+        return 1133;
+
+    /* ---- 格式化輸出與字串函式 ---- */
+    int len = snprintf(text, sizeof(text), "%d|%5d|%-5d|%05d|%x|%X|%s|%c|%%|%lu", -42, 42, 42, 42,
+                       0xbeef, 0xBEEF, "str", 'c', 4000000000ul);
+    if (strcmp(text, "-42|   42|42   |00042|beef|BEEF|str|c|%|4000000000") != 0 || len != (int)strlen(text))
+        return 1140;
+    snprintf(text, sizeof(text), "%lld %llu %llx %-6s| %6s|%*d", -1234567890123ll,
+             18446744073709551615ull, 0x123456789abcdefull, "ab", "cd", 4, 7);
+    if (strcmp(text, "-1234567890123 18446744073709551615 123456789abcdef ab    |     cd|   7") != 0)
+        return 1141;
+    if (snprintf(text, 5, "%s", "truncated") != 9 || strcmp(text, "trun") != 0)   /* 回傳完整的長度 */
+        return 1142;
+    if (strlen("abc") != 3 || strcmp("abc", "abd") >= 0 || strncmp("abcx", "abcy", 3) != 0)
+        return 1143;
+    strcpy(text, "0123456789");
+    memmove(text + 2, text, 5);                          /* 重疊的搬移 */
+    if (strcmp(text, "0101234789") != 0 || atoi("  -77x") != -77 || memcmp("ab", "ac", 2) >= 0)
+        return 1144;
+    const char *path = "/a/b/c";
+    if (strrchr(path, '/') != path + 4 || strchr(path, 'b') != path + 3 || strchr(path, 'z') != 0)
+        return 1145;
+
+    printf("  [user] heap: %d KB in use after the tests; malloc, printf and the string functions work\n",
+           (int)self_mem_kb());
+    return 23;
+}
+
+/* ---- UMODE_FILEOPS ---- */
+
+static int path_join(char *out, const char *dir, const char *name)
+{
+    unsigned n = 0;
+
+    for (; *dir; dir++)
+        out[n++] = *dir;
+    for (; *name; name++)
+        out[n++] = *name;
+    out[n] = 0;
+    return 0;
+}
+
+/* 在目錄 base(還不存在)底下測試 lseek、rename、硬連結、工作目錄;結束時全部刪除 */
+static int fileops_on(const char *base)
+{
+    char a[80], b[80], d[80], e[80], buf[16], cwd[80];
+    struct stat st;
+    long fd;
+
+    path_join(a, base, "/a");
+    path_join(b, base, "/b");
+    path_join(d, base, "/dir");
+    path_join(e, base, "/dir/sub");
+    sys_unlink(a); sys_unlink(b); sys_unlink(e); sys_unlink(d); sys_unlink(base);   /* 上次留下的 */
+    if (sys_mkdir(base) != 0)
+        return 1001;
+
+    /* ---- lseek ---- */
+    fd = sys_open(a, O_CREAT | O_RDWR);
+    if (fd < 0 || sys_write(fd, "0123456789", 10) != 10)
+        return 1002;
+    if (sys_lseek(fd, 3, SEEK_SET) != 3 || sys_read(fd, buf, 2) != 2 || buf[0] != '3' || buf[1] != '4')
+        return 1003;
+    if (sys_lseek(fd, 2, SEEK_CUR) != 7 || sys_read(fd, buf, 1) != 1 || buf[0] != '7')
+        return 1004;
+    if (sys_lseek(fd, -1, SEEK_END) != 9 || sys_read(fd, buf, 4) != 1 || buf[0] != '9')
+        return 1005;
+    if (sys_lseek(fd, -1, SEEK_SET) != -E_INVAL || sys_lseek(fd, 0, 7) != -E_INVAL)
+        return 1006;
+    /* 移到結尾之後再寫:中間沒寫過的部分讀起來是 0 */
+    if (sys_lseek(fd, 5000, SEEK_SET) != 5000 || sys_write(fd, "Z", 1) != 1)
+        return 1007;
+    if (sys_stat(a, &st) != 0 || st.size != 5001)
+        return 1008;
+    if (sys_lseek(fd, 4999, SEEK_SET) != 4999 || sys_read(fd, buf, 4) != 2 || buf[0] != 0 || buf[1] != 'Z')
+        return 1009;
+    if (sys_lseek(fd, 2, SEEK_SET) != 2 || sys_write(fd, "xy", 2) != 2 ||
+        sys_lseek(fd, 0, SEEK_SET) != 0 || sys_read(fd, buf, 6) != 6 || buf[2] != 'x' || buf[4] != '4')
+        return 1010;                                     /* 寫在中間:只蓋掉那兩個位元組 */
+    sys_close(fd);
+    if (sys_lseek(fd, 0, SEEK_SET) != -E_BADF || sys_lseek(1, 0, SEEK_SET) != -E_SPIPE)
+        return 1011;                                     /* 已關閉;主控台沒有位置 */
+
+    /* ---- rename ---- */
+    if (sys_rename(a, b) != 0 || sys_stat(a, &st) != -E_NOENT || sys_stat(b, &st) != 0 ||
+        st.size != 5001 || st.nlink != 1)
+        return 1020;
+    if (sys_rename(a, b) != -E_NOENT)                    /* 來源不存在 */
+        return 1021;
+    fd = sys_open(a, O_CREAT | O_WRONLY);
+    sys_close(fd);
+    if (sys_rename(a, b) != -E_EXIST || sys_stat(a, &st) != 0)   /* 目的已存在:不蓋掉,來源還在 */
+        return 1022;
+    if (sys_rename(b, b) != 0)                           /* 改成自己:沒有事 */
+        return 1023;
+    /* 目錄:搬進另一個目錄,".." 跟著改;不可以搬進自己底下 */
+    if (sys_mkdir(d) != 0 || sys_mkdir(e) != 0)
+        return 1024;
+    {
+        char into[80], moved[80], up[80];
+        path_join(into, e, "/a");                        /* base/dir/sub/a */
+        if (sys_rename(a, into) != 0 || sys_stat(into, &st) != 0 || sys_stat(a, &st) != -E_NOENT)
+            return 1025;
+        path_join(moved, d, "/sub/deeper");
+        if (sys_rename(d, moved) != -E_INVAL)            /* base/dir -> base/dir/sub/deeper */
+            return 1026;
+        path_join(moved, base, "/sub2");
+        if (sys_rename(e, moved) != 0)                   /* base/dir/sub -> base/sub2 */
+            return 1027;
+        path_join(up, moved, "/../b");                   /* base/sub2/../b:".." 現在是 base */
+        if (sys_stat(up, &st) != 0 || st.size != 5001)
+            return 1028;
+        path_join(into, moved, "/a");
+        if (sys_unlink(into) != 0 || sys_unlink(moved) != 0 || sys_unlink(d) != 0)
+            return 1029;
+    }
+
+    /* ---- 硬連結:同一個檔案的兩個名稱 ---- */
+    if (sys_link(b, a) != 0 || sys_stat(a, &st) != 0 || st.nlink != 2 || st.size != 5001)
+        return 1030;
+    if (sys_link(b, a) != -E_EXIST || sys_link(base, d) != -E_INVAL)     /* 已存在;目錄不行 */
+        return 1031;
+    fd = sys_open(a, O_WRONLY);
+    if (fd < 0 || sys_write(fd, "LINK", 4) != 4)
+        return 1032;
+    sys_close(fd);
+    fd = sys_open(b, O_RDONLY);                          /* 從另一個名稱讀到同樣的內容 */
+    if (fd < 0 || sys_read(fd, buf, 4) != 4 || buf[0] != 'L' || buf[3] != 'K')
+        return 1033;
+    sys_close(fd);
+    if (sys_unlink(b) != 0 || sys_stat(a, &st) != 0 || st.nlink != 1 || st.size != 5001)
+        return 1034;                                     /* 刪掉一個名稱,檔案還在 */
+
+    /* ---- 目前的工作目錄 ---- */
+    if (sys_getcwd(cwd, sizeof(cwd)) != 1 || !streq(cwd, "/"))
+        return 1040;
+    if (sys_chdir(a) != -E_NOTDIR || sys_chdir("/no/such") != -E_NOENT)
+        return 1041;
+    if (sys_chdir(base) != 0 || sys_getcwd(cwd, sizeof(cwd)) <= 0 || !streq(cwd, base))
+        return 1042;
+    if (sys_stat("a", &st) != 0 || st.size != 5001 || sys_stat("./a", &st) != 0)   /* 相對路徑 */
+        return 1043;
+    if (sys_getcwd(cwd, 2) != -E_INVAL || sys_stat("", &st) != -E_NOENT)
+        return 1044;
+    if (sys_mkdir("rel") != 0 || sys_chdir("rel") != 0 || sys_chdir("..") != 0 ||
+        sys_getcwd(cwd, sizeof(cwd)) <= 0 || !streq(cwd, base))
+        return 1045;
+    /* 子行程沿用工作目錄:fork 出來的用相對路徑建立檔案,我們用完整路徑看得到 */
+    long pid = sys_fork();
+    if (pid == 0) {
+        long f2 = sys_open("rel/child", O_CREAT | O_WRONLY);
+        sys_exit(f2 >= 0 ? 0 : 1);
+    }
+    path_join(cwd, base, "/rel/child");
+    if (pid < 0 || sys_wait(pid) != 0 || sys_stat(cwd, &st) != 0)
+        return 1046;
+    if (sys_chdir("/../../etc/../") != 0 || sys_getcwd(cwd, sizeof(cwd)) != 1)     /* 整理成 "/" */
+        return 1047;
+    path_join(cwd, base, "/rel/child");
+    sys_unlink(cwd);
+    path_join(cwd, base, "/rel");
+    if (sys_unlink(cwd) != 0 || sys_unlink(a) != 0 || sys_unlink(base) != 0)
+        return 1049;
+    return 0;
+}
+
 /* ---- UMODE_SYSINFO ---- */
 
 /* top 需要的三樣東西:整個系統的狀態、每個行程的記憶體用量、主控台的 raw 模式 */
@@ -602,6 +1621,9 @@ static int mode_disk(void)
     sys_close(out);
     if (sys_stat("/disk/echo-test", &st) != 0 || st.size != (unsigned long long)total)
         return 807;
+    /* 新建立的檔案沒有執行權限:這時還不能執行;加上之後才可以 */
+    if (sys_spawn("/disk/echo-test", argv) != -E_ACCES || sys_chmod("/disk/echo-test", 0755) != 0)
+        return 814;
     if (sys_statfs("/disk", &f1) != 0 ||
         f1.free_blocks != f0.free_blocks - (unsigned long long)((total + 4095) / 4096) ||
         f1.free_inodes != f0.free_inodes - 1)
@@ -1126,6 +2148,54 @@ static int umain(long mode)
 
     case UMODE_SYSINFO:
         return mode_sysinfo();
+
+    case UMODE_HEAP:
+        return mode_heap();
+
+    case UMODE_TIME:
+        return mode_time();
+
+    case UMODE_MEMQUOTA:
+        return mode_memquota();
+
+    case UMODE_PERM: {
+        /* 同一組測試在記憶體檔案系統與磁碟上各做一次 */
+        struct fsinfo fi;
+        int rc = perm_on("/pm");
+        if (rc == 0 && sys_statfs("/disk", &fi) == 0 && streq(fi.type, "wfs"))
+            rc = perm_on("/disk/pm");
+        if (rc == 0)
+            rc = perm_process();
+        if (rc)
+            return rc;
+        puts_("  [user] permissions: other users are refused, privileges only ever shrink\n");
+        return 26;
+    }
+
+    case UMODE_SIGHANDLER:
+        return mode_sighandler();
+
+    case UMODE_FILEOPS: {
+        /* 同一組測試在記憶體檔案系統與磁碟上各做一次(沒有磁碟時只做前者) */
+        struct fsinfo fi;
+        int rc = fileops_on("/fo");
+        if (rc == 0 && sys_statfs("/disk", &fi) == 0 && streq(fi.type, "wfs")) {
+            rc = fileops_on("/disk/fo");
+            if (rc == 0 && sys_rename("/fo-x", "/disk/fo-x") != -E_NOENT)
+                rc = 1090;
+            /* 跨檔案系統不能改名 */
+            long fd = sys_open("/fo-x", O_CREAT | O_WRONLY);
+            sys_close(fd);
+            if (rc == 0 && (sys_rename("/fo-x", "/disk/fo-x") != -E_XDEV ||
+                            sys_link("/fo-x", "/disk/fo-x") != -E_XDEV))
+                rc = 1091;
+            sys_unlink("/fo-x");
+        }
+        if (rc)
+            return rc;
+        puts_("  [user] lseek, rename, hard links and the working directory work as expected\n");
+        return 22;
+    }
 
     case UMODE_STACK_GROW: {
         /* 遞迴 600 層,每層約 300 位元組,總共約 180KB,是一開始配置的 16KB 的十倍以上 */

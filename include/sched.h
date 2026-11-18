@@ -81,6 +81,12 @@ void  thread_set_data(void *data);
 void *thread_data(void);
 int   thread_killed(void);
 void  sched_kill_group(void *data);
+/* 訊號處理函式用:sched_interrupt_group 讓行程的每條執行緒放下正在等的事情(睡眠、等輸入、
+   等管線、等子行程),thread_interrupted() 在那些等待的迴圈裡用來判斷該不該放棄
+   (被終止時也是真),thread_clear_interrupt() 在訊號處理完之後清掉標記 */
+void  sched_interrupt_group(void *data);
+int   thread_interrupted(void);
+void  thread_clear_interrupt(void);
 void  sched_group_usage(void *data, unsigned long *ticks, unsigned *runnable);
 
 /*

@@ -14,6 +14,7 @@ SECTIONS
     . = USER_BASE;
 
     .hdr : {
+        /* (連結器丟棄沒用到的區段時,由 LONG 直接產生的內容不受影響) */
         LONG(0x594C4557)                  /* magic "WELY" */
         LONG(_start - USER_BASE)          /* 進入點 */
         LONG(__text_end - USER_BASE)      /* 程式碼 + 唯讀資料的結尾 */

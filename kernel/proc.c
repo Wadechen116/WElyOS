@@ -5,6 +5,7 @@
 #include "arch.h"
 #include "console.h"
 #include "cpu.h"
+#include "cred.h"
 #include "fs.h"
 #include "kmalloc.h"
 #include "kprintf.h"
@@ -38,8 +39,25 @@ struct uimg_hdr {
 #define USER_STACK_PAGES 4u
 #define PROC_MAX_THREADS 16u
 
+/* 使用者 heap:程式的資料之後、stack 之前的一段固定範圍(程式本身最大 256MB,見 image_build)。
+   行程以 sbrk 移動「結尾」(break)來取得或歸還記憶體;範圍內的頁用到才配置 */
+#define USER_HEAP_BASE   (USER_BASE + 0x10000000u)
+#define USER_HEAP_MAX    0x10000000u            /* 最多 256MB */
+
+/* 匿名對映(mmap):heap 之後的另一段固定範圍,每次要求得到其中一塊,用完可以個別歸還 */
+#define USER_MMAP_BASE   (USER_BASE + 0x20000000u)
+#define USER_MMAP_MAX    0x0F000000u            /* 240MB;其上是各執行緒的 stack */
+#define PROC_MAX_MAPS    16u                    /* 每個行程最多同時有幾塊 */
+
+/* 記憶體配額的預設值:每個行程最多可以要 32MB(heap 加上匿名對映);可以用 memlimit 調低 */
+#define PROC_DEFAULT_LIMIT_PAGES (32u * 1024 * 1024 / PAGE_SIZE)
+
 #define FUTEX_BUCKETS 16u
 #define PROC_MAX_FD   16u            /* 每個行程最多同時開啟幾個檔案 */
+
+#define NSIG    32                   /* 訊號編號的上限(1 ~ NSIG-1) */
+#define SIG_DFL 0u                   /* 預設的處理方式(終止或暫停) */
+#define SIG_IGN 1u                   /* 忽略 */
 
 struct proc {
     int pid;
@@ -47,14 +65,24 @@ struct proc {
     int pgid;                        /* 行程群組:shell 把同一條管線的行程放在同一組,
                                         Ctrl-C 一次終止整組(見 console.c) */
     int detached;                    /* 父行程已經結束:沒有人會來 wait,結束時自動回收 */
+    struct cred cred;                /* 身分與特權(見 cred.h);受排程器的鎖保護 */
     char name[32];                   /* 程式檔的名稱(路徑的最後一段),訊息中使用 */
+    char cwd[FS_PATH_MAX + 1];       /* 目前的工作目錄(整理過的絕對路徑);受 fd_lk 保護 */
     struct vm_space *space;
     struct file *exe;                /* 正在執行的程式檔。一直開著:它的頁直接對映在行程裡 */
     unsigned nthreads;               /* 還活著的執行緒數 */
     unsigned nstacks;                /* 已分配的 stack 格數(不重複使用) */
+    unsigned long commit;            /* 已經答應給這個行程的頁數(heap 的範圍加上匿名對映);受 fd_lk 保護 */
+    unsigned long limit;             /* commit 的上限(記憶體配額,以頁計) */
+    struct { uintptr_t start; unsigned long pages; } maps[PROC_MAX_MAPS];   /* 匿名對映;pages 0 = 空位 */
+    uintptr_t mmap_next;             /* 下一塊對映要放的位址(只往上走,不重複使用) */
+    uintptr_t brk;                   /* heap 目前的結尾(0 = 還沒用過,等於 USER_HEAP_BASE);受 fd_lk 保護 */
     int exiting;                     /* 已開始結束流程 */
     int exit_code;
     int zombie;                      /* 所有執行緒都結束了,等待 proc_wait 來收 */
+    uintptr_t sig_handler[NSIG];     /* 每個訊號的處理方式:SIG_DFL、SIG_IGN 或使用者函式的位址 */
+    uintptr_t sig_restorer;          /* 處理函式返回時跳去的地方(使用者端的一小段程式,呼叫 sigreturn) */
+    uint32_t sig_pending;            /* 已經送來、還沒交給處理函式的訊號(bit n = 訊號 n) */
     int stopped;                     /* 不為 0 = 被暫停了,值是造成暫停的訊號編號(見下方「暫停與繼續」) */
     int stop_reported;               /* 這次暫停已經告訴過父行程了(waitpid 的 WUNTRACED 只回報一次) */
     struct wait_queue stop_wq;       /* 暫停期間,它的執行緒睡在這裡,等 SIGCONT */
@@ -75,6 +103,8 @@ struct proc {
 /* 訊號編號(沿用 Unix 的定義;說明見下方「訊號」) */
 #define SIGINT  2
 #define SIGKILL 9
+#define SIGUSR1 10
+#define SIGUSR2 12
 #define SIGTERM 15
 #define SIGCONT 18
 #define SIGSTOP 19
@@ -95,7 +125,19 @@ static struct proc *proc_became_zombie(struct proc *p);
 static void proc_begin_exit(struct proc *p, int code);
 static void proc_free_list(struct proc *list);
 static int proc_fault(struct proc *p, uintptr_t addr, int write);
+static int copy_from_user(struct proc *p, void *dst, uintptr_t uaddr, size_t len);
+static void proc_exit(int code);
+static void commit_release_all(struct proc *p);
 static int copy_to_user(struct proc *p, uintptr_t uaddr, const void *src, size_t len);
+
+/* 目前這條執行緒代表誰(cred.h)。kernel 自己的執行緒回傳 NULL:不受限制。
+   回傳的指標指向行程結構裡的欄位;行程在它自己的執行緒還在執行時不會消失 */
+const struct cred *cred_current(void)
+{
+    struct proc *p = thread_data();
+
+    return p ? &p->cred : NULL;
+}
 
 static struct proc *proc_find(int pid)
 {
@@ -371,6 +413,7 @@ static void proc_thread_exit(void)
     if (last) {
         /* 自己是最後一條:已經沒有執行緒屬於這個位址空間,可以在鎖外釋放 */
         vm_space_destroy(p->space);
+        commit_release_all(p);           /* 答應給它的記憶體全部歸還 */
         vfs_exec_release(p->exe);        /* 對映已經移除:程式檔不再「執行中」 */
         vfs_close(p->exe);
         fd_close_all(p);                 /* 行程結束時,它開啟的檔案由 kernel 代為關閉 */
@@ -583,6 +626,16 @@ static int proc_create(const char *path, const struct args *a, struct proc *pare
     p->space = img.space;
     p->exe = img.exe;
     p->nstacks = 1;                  /* 第 0 格 stack 已由 image_build 準備好 */
+    /* 身分沿用建立者的;kernel 建立的行程是 root,擁有全部的特權 */
+    p->cred = parent ? parent->cred : (struct cred){ 0, 0, CAP_ALL };
+    p->limit = parent ? parent->limit : PROC_DEFAULT_LIMIT_PAGES;    /* 配額沿用建立者的 */
+    if (parent) {                    /* 工作目錄沿用建立者的;kernel 建立的行程從根目錄開始 */
+        unsigned long fl = spin_lock_irqsave(&fd_lk);
+        memcpy(p->cwd, parent->cwd, sizeof(p->cwd));
+        spin_unlock_irqrestore(&fd_lk, fl);
+    } else {
+        p->cwd[0] = '/';
+    }
 
     unsigned long flags = sched_lock();
     int pid = p->pid = next_pid++;
@@ -781,7 +834,7 @@ static long proc_wait_child(struct proc *p, long pid, int *code, int nohang, int
             rc = 0;
             break;
         }
-        if (thread_killed()) {
+        if (thread_interrupted()) {              /* 被終止,或有訊號要處理 */
             rc = -E_INTR;
             break;
         }
@@ -796,12 +849,14 @@ static long proc_wait_child(struct proc *p, long pid, int *code, int nohang, int
  * ---- 訊號 ----
  *
  * 訊號(signal)是「從外面通知一個行程」的方法。編號沿用 Unix 的定義。
- * 這裡的訊號只有固定的效果,行程不能攔截或忽略(沒有訊號處理函式):
+ * 每個訊號有預設的效果;除了 SIGKILL 與 SIGSTOP,行程可以改成「忽略」或
+ * 「執行自己的處理函式」(見下方「訊號處理函式」):
  *
  *   終止   SIGINT  (2)   使用者按了 Ctrl-C
- *          SIGKILL (9)   強制終止
+ *          SIGKILL (9)   強制終止(不能攔截)
+ *          SIGUSR1 (10)、SIGUSR2 (12)  沒有固定意義,留給程式自己使用
  *          SIGTERM (15)  一般的「請結束」(kill 指令的預設)
- *   暫停   SIGSTOP (19)  暫停
+ *   暫停   SIGSTOP (19)  暫停(不能攔截)
  *          SIGTSTP (20)  使用者按了 Ctrl-Z
  *          SIGTTIN (21)  背景的行程想讀鍵盤(見 console.c)
  *   繼續   SIGCONT (18)  讓暫停中的行程繼續
@@ -826,13 +881,28 @@ static long proc_wait_child(struct proc *p, long pid, int *code, int nohang, int
  */
 static int sig_valid(long sig)
 {
-    return sig == SIGINT || sig == SIGKILL || sig == SIGTERM ||
+    return sig == SIGINT || sig == SIGKILL || sig == SIGTERM || sig == SIGUSR1 || sig == SIGUSR2 ||
            sig == SIGCONT || sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN;
+}
+
+/* 行程可以自己決定怎麼處理的訊號 */
+static int sig_catchable(long sig)
+{
+    return sig == SIGINT || sig == SIGTERM || sig == SIGUSR1 || sig == SIGUSR2 || sig == SIGTSTP;
 }
 
 /* 對一個行程送出訊號。呼叫時必須持有排程器的鎖;q 不可以是 zombie */
 static void proc_signal_locked(struct proc *q, int sig)
 {
+    if (sig_catchable(sig) && q->sig_handler[sig] != SIG_DFL && !q->exiting) {
+        if (q->sig_handler[sig] == SIG_IGN)
+            return;                              /* 行程選擇忽略 */
+        /* 行程有自己的處理函式:記下來,等它的某條執行緒要返回使用者模式時交給它
+           (user_return_check)。正在 kernel 裡等待的執行緒先叫起來,不必等到它等的事情發生 */
+        q->sig_pending |= 1u << sig;
+        sched_interrupt_group(q);
+        return;
+    }
     if (sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN) {
         if (q->exiting || q->stopped)
             return;
@@ -890,8 +960,15 @@ int proc_group_alive_locked(int pgid)
     return 0;
 }
 
-/* kill(pid, sig):pid > 0 是單一行程;pid < 0 是整個群組(編號為 -pid) */
-static long sys_kill(long pid, long sig)
+/* p 可不可以對 q 送訊號:同一個使用者的行程之間可以;對別人的行程需要 CAP_KILL */
+static int may_signal(struct proc *p, struct proc *q)
+{
+    return (p->cred.caps & CAP_KILL) || p->cred.uid == q->cred.uid;
+}
+
+/* kill(pid, sig):pid > 0 是單一行程;pid < 0 是整個群組(編號為 -pid)。
+   沒有權限回傳 -E_PERM(群組:裡面只要有一個可以送就算成功,不能送的略過) */
+static long sys_kill(struct proc *p, long pid, long sig)
 {
     long rc = -E_SRCH;
 
@@ -899,13 +976,26 @@ static long sys_kill(long pid, long sig)
         return -E_INVAL;
     unsigned long flags = sched_lock();
     if (pid < 0) {
-        if (proc_signal_group_locked((int)-pid, (int)sig) > 0)
+        for (struct proc *q = procs; q; q = q->next) {
+            if (q->pgid != (int)-pid || q->zombie)
+                continue;
+            if (!may_signal(p, q)) {
+                if (rc == -E_SRCH)
+                    rc = -E_PERM;
+                continue;
+            }
+            proc_signal_locked(q, (int)sig);
             rc = 0;
+        }
     } else {
         struct proc *q = proc_find((int)pid);
         if (q && !q->zombie) {
-            proc_signal_locked(q, (int)sig);
-            rc = 0;
+            if (may_signal(p, q)) {
+                proc_signal_locked(q, (int)sig);
+                rc = 0;
+            } else {
+                rc = -E_PERM;
+            }
         }
     }
     sched_preempt_point();
@@ -964,6 +1054,7 @@ static long sys_procinfo(struct proc *p, long after, uintptr_t uinfo)
            所以這裡讀到的指標在解鎖之前不會被釋放 */
         if (best->nthreads > 0 && best->space)
             info.mem_kb = (unsigned int)(vm_space_pages(best->space) * (PAGE_SIZE / 1024));
+        info.uid = best->cred.uid;
         memcpy(info.name, best->name, sizeof(info.name));
     }
     sched_unlock(flags);
@@ -1026,7 +1117,109 @@ void user_fault(const char *what, uintptr_t pc, uintptr_t addr)
         ;                            /* 不會到達;讓編譯器知道本函式不返回 */
 }
 
-void user_return_check(void)
+/*
+ * ---- 訊號處理函式 ----
+ *
+ * 行程可以登記「收到某個訊號時,執行我的這個函式」。困難在於:訊號隨時可能來,
+ * 程式當時正在做別的事,暫存器裡都是有用的資料。處理函式跑完之後,
+ * 程式必須從被打斷的地方、以完全相同的暫存器內容繼續。
+ *
+ * kernel 沒有另外的地方保存這些暫存器,做法是借用「使用者自己的 stack」:
+ *
+ *   1. 交付(deliver_signal):執行緒要返回使用者模式時,把它當時的暫存器(trap frame)
+ *      整份複製到使用者 stack 上,然後把 trap frame 改成「呼叫 handler(sig)」。
+ *      返回使用者模式後,CPU 執行的就是處理函式,用的是同一條 stack 的下面一段
+ *   2. 處理函式 return:返回位址被設成一小段使用者端的程式(restorer),它只做一件事 —
+ *      呼叫 sigreturn 系統呼叫,並告訴 kernel 那份暫存器放在哪裡
+ *   3. sigreturn:把那份暫存器讀回來,取代目前的 trap frame。返回使用者模式後,
+ *      程式就從當初被打斷的地方繼續,完全不知道中間發生過什麼
+ *
+ *        使用者 stack(往下長)
+ *        | 被打斷時正在用的部分 |
+ *        +----------------------+ <- 被打斷時的 sp
+ *        | 存下來的暫存器        |    <- kernel 寫入;sigreturn 時讀回
+ *        +----------------------+ <- frame
+ *        | 處理函式自己用的部分  |
+ *
+ * 安全:那份暫存器放在使用者的記憶體裡,程式可以任意改它(也可以隨便捏造一份來呼叫
+ * sigreturn)。所以讀回來的時候,「只有 kernel 能決定的部分」— 特權等級、中斷開關 —
+ * 一律不採用(arch_frame_restore)。程式能改的只有它本來就能改的一般暫存器,
+ * 最壞的結果是它自己跳到奇怪的地方而被終止。
+ *
+ * 訊號屬於整個行程:哪一條執行緒先走到返回使用者模式的檢查點,就由它執行處理函式。
+ */
+static void deliver_signal(struct proc *p, void *tf)
+{
+    _Alignas(16) char saved[512];
+    uintptr_t words[2], handler, restorer;
+    int sig = 0;
+
+    unsigned long flags = sched_lock();
+    thread_clear_interrupt();
+    for (int s = 1; s < NSIG && !sig; s++) {
+        if (p->sig_pending & (1u << s)) {
+            p->sig_pending &= ~(1u << s);
+            sig = s;
+        }
+    }
+    handler = sig ? p->sig_handler[sig] : SIG_DFL;
+    restorer = p->sig_restorer;
+    sched_unlock(flags);
+    if (!sig || handler == SIG_DFL || handler == SIG_IGN)
+        return;                                  /* 被別條執行緒拿走了,或處理方式剛被改掉 */
+
+    size_t size = arch_frame_size();
+    /* 存放位置:目前的 stack pointer 之下,留一點空隙(有些呼叫慣例允許程式使用
+       stack pointer 以下的一小段),對齊 16 */
+    uintptr_t frame = (arch_frame_user_sp(tf) - 128 - size) & ~(uintptr_t)15;
+    memcpy(saved, tf, size);
+    unsigned n = arch_frame_call(tf, frame, handler, (uintptr_t)sig, restorer, words);
+    uintptr_t new_sp = arch_frame_user_sp(tf);
+    if (size > sizeof(saved) || copy_to_user(p, frame, saved, size) != 0 ||
+        (n && copy_to_user(p, new_sp, words, n * sizeof(words[0])) != 0)) {
+        /* 使用者的 stack 壞了(或已經用完):沒有地方放,只能照預設的方式處理 — 終止 */
+        proc_exit(128 + sig);
+    }
+}
+
+/* sigreturn:處理函式結束,還原被打斷時的暫存器。回傳值會被放進「系統呼叫回傳值」的
+   暫存器,所以回傳還原之後那個暫存器原本的值,等於沒有動到它 */
+static long sys_sigreturn(struct proc *p, uintptr_t uframe, void *tf)
+{
+    _Alignas(16) char saved[512];
+    size_t size = arch_frame_size();
+
+    if (size > sizeof(saved) || copy_from_user(p, saved, uframe, size) != 0) {
+        proc_exit(PROC_KILLED_FAULT);            /* 沒有可以還原的東西:無法繼續執行 */
+        return 0;
+    }
+    arch_frame_restore(tf, saved);
+    return arch_frame_get_retval(tf);
+}
+
+/* signal(sig, handler, restorer):設定處理方式,回傳原本的 */
+static long sys_signal(struct proc *p, long sig, uintptr_t handler, uintptr_t restorer)
+{
+    if (sig <= 0 || sig >= NSIG || !sig_catchable(sig))
+        return -E_INVAL;                         /* SIGKILL 與 SIGSTOP 不能改:永遠有辦法停下一個程式 */
+    /* 處理函式必須是使用者可以執行的位址;restorer 也是 */
+    if (handler != SIG_DFL && handler != SIG_IGN &&
+        (vm_space_query(p->space, handler, NULL, NULL) != 0 ||
+         vm_space_query(p->space, restorer, NULL, NULL) != 0))
+        return -E_FAULT;
+
+    unsigned long flags = sched_lock();
+    long old = (long)p->sig_handler[sig];
+    p->sig_handler[sig] = handler;
+    if (handler != SIG_DFL && handler != SIG_IGN)
+        p->sig_restorer = restorer;
+    else
+        p->sig_pending &= ~(1u << sig);          /* 不再由函式處理:還沒交付的就不算了 */
+    sched_unlock(flags);
+    return old;
+}
+
+void user_return_check(void *tf)
 {
     struct proc *p = thread_data();
 
@@ -1043,6 +1236,10 @@ void user_return_check(void)
     }
     if (thread_killed())
         proc_thread_exit();
+    if (p->sig_pending)                          /* 不上鎖先看一眼,理由同上 */
+        deliver_signal(p, tf);
+    else if (thread_interrupted())
+        thread_clear_interrupt();                /* 訊號已經由別條執行緒處理了 */
 }
 
 /* ------------------------------------------------------------------ */
@@ -1071,6 +1268,46 @@ static int proc_fault(struct proc *p, uintptr_t addr, int write)
 {
     if (write && vm_space_fault(p->space, addr, 1) == 0)
         return 0;
+
+    /* heap:落在 [USER_HEAP_BASE, brk) 而還沒配置的頁,當場配置(內容為 0)。
+       sbrk 只是移動結尾,不配置任何東西;程式要了很大一塊卻只用一點點時,只花用到的部分 */
+    if (addr >= USER_HEAP_BASE && addr < USER_HEAP_BASE + USER_HEAP_MAX) {
+        unsigned long fl = spin_lock_irqsave(&fd_lk);
+        uintptr_t end = p->brk;
+        spin_unlock_irqrestore(&fd_lk, fl);
+        if (addr >= end)
+            return -1;                           /* 超出目前的結尾:真正的錯誤 */
+        void *hp = pmm_alloc();
+        if (!hp)
+            return -1;                           /* 記憶體用完:這個行程會被終止 */
+        memset(hp, 0, PAGE_SIZE);
+        int hrc = vm_space_map_new(p->space, addr & ~(uintptr_t)(PAGE_SIZE - 1), (uintptr_t)hp,
+                                   VM_READ | VM_WRITE);
+        if (hrc != 0)
+            pmm_free(hp);
+        return hrc < 0 ? -1 : 0;
+    }
+
+    /* 匿名對映:落在某一塊 mmap 的範圍內而還沒配置的頁,同樣當場配置 */
+    if (addr >= USER_MMAP_BASE && addr < USER_MMAP_BASE + USER_MMAP_MAX) {
+        int inside = 0;
+        unsigned long fl = spin_lock_irqsave(&fd_lk);
+        for (unsigned i = 0; i < PROC_MAX_MAPS && !inside; i++)
+            inside = p->maps[i].pages && addr >= p->maps[i].start &&
+                     addr - p->maps[i].start < p->maps[i].pages * PAGE_SIZE;
+        spin_unlock_irqrestore(&fd_lk, fl);
+        if (!inside)
+            return -1;
+        void *mp = pmm_alloc();
+        if (!mp)
+            return -1;
+        memset(mp, 0, PAGE_SIZE);
+        int mrc = vm_space_map_new(p->space, addr & ~(uintptr_t)(PAGE_SIZE - 1), (uintptr_t)mp,
+                                   VM_READ | VM_WRITE);
+        if (mrc != 0)
+            pmm_free(mp);
+        return mrc < 0 ? -1 : 0;
+    }
 
     uintptr_t lowest = USER_STACK_TOP - (uintptr_t)PROC_MAX_THREADS * USER_STACK_SLOT;
     if (addr < lowest || addr >= USER_STACK_TOP)
@@ -1165,6 +1402,301 @@ static int copy_path_from_user(struct proc *p, char *dst, uintptr_t uaddr)
     return -E_NAMETOOLONG;
 }
 
+/*
+ * ---- 目前的工作目錄 ----
+ *
+ * 每個行程記著一個目錄;使用者傳來的路徑如果不是以 "/" 開頭(相對路徑),就接在它後面。
+ * 這件事完全在系統呼叫這一層做:把相對路徑接成絕對路徑,再交給 VFS。
+ * VFS 仍然只認得從根目錄開始的路徑,不必知道「行程」是什麼。
+ *
+ * 工作目錄以「字串」保存,而不是抓著那個目錄的 inode:
+ *   - 實作簡單,fork / spawn 時直接複製
+ *   - 目錄可以照常被刪除(之後用相對路徑會得到「不存在」),不會有刪不掉的目錄
+ * 代價:目錄被改名之後,行程記著的還是舊的名稱。
+ */
+
+/* 把絕對路徑整理成標準的樣子:拿掉重複的 "/"、"." 與 ".."(".." 往上一層;根目錄的上層還是根目錄) */
+static void path_normalize(char *path)
+{
+    size_t out = 0, in = 0;
+
+    while (path[in]) {
+        while (path[in] == '/')
+            in++;
+        size_t start = in;
+        while (path[in] && path[in] != '/')
+            in++;
+        size_t n = in - start;
+        if (n == 0 || (n == 1 && path[start] == '.'))
+            continue;
+        if (n == 2 && path[start] == '.' && path[start + 1] == '.') {
+            while (out > 0 && path[--out] != '/')
+                ;                                /* 退掉最後一段 */
+            continue;
+        }
+        path[out++] = '/';                       /* out 永遠不超過 start:就地整理不會蓋到還沒讀的部分 */
+        memmove(path + out, path + start, n);
+        out += n;
+    }
+    if (out == 0)
+        path[out++] = '/';
+    path[out] = '\0';
+}
+
+/* 從使用者位址取得路徑;相對路徑接在行程的工作目錄後面。dst 至少 FS_PATH_MAX + 1 */
+static int user_path(struct proc *p, char *dst, uintptr_t uaddr)
+{
+    char rel[FS_PATH_MAX + 1];
+    int err = copy_path_from_user(p, rel, uaddr);
+
+    if (err)
+        return err;
+    if (rel[0] == '\0')
+        return -E_NOENT;                         /* 空的路徑不代表任何東西 */
+    if (rel[0] == '/') {
+        memcpy(dst, rel, strlen(rel) + 1);
+        return 0;
+    }
+    unsigned long fl = spin_lock_irqsave(&fd_lk);
+    memcpy(dst, p->cwd, sizeof(p->cwd));
+    spin_unlock_irqrestore(&fd_lk, fl);
+    size_t n = strlen(dst), m = strlen(rel);
+    if (n + 1 + m > FS_PATH_MAX)
+        return -E_NAMETOOLONG;
+    if (n > 1)
+        dst[n++] = '/';
+    memcpy(dst + n, rel, m + 1);
+    return 0;
+}
+
+static long sys_chdir(struct proc *p, uintptr_t upath)
+{
+    char path[FS_PATH_MAX + 1];
+    struct stat st;
+    int err = user_path(p, path, upath);
+
+    if (err == 0)
+        err = vfs_stat(path, &st);               /* 先確認它存在(用還沒整理的路徑:".." 由 VFS 實際去走) */
+    if (err)
+        return err;
+    if (st.type != I_DIR)
+        return -E_NOTDIR;
+    err = vfs_access(path, PERM_X);              /* 要能「經過」這個目錄才可以把它當成工作目錄 */
+    if (err)
+        return err;
+    path_normalize(path);
+    unsigned long fl = spin_lock_irqsave(&fd_lk);
+    memcpy(p->cwd, path, strlen(path) + 1);
+    spin_unlock_irqrestore(&fd_lk, fl);
+    return 0;
+}
+
+static long sys_getcwd(struct proc *p, uintptr_t ubuf, size_t len)
+{
+    char path[FS_PATH_MAX + 1];
+
+    unsigned long fl = spin_lock_irqsave(&fd_lk);
+    memcpy(path, p->cwd, sizeof(path));
+    spin_unlock_irqrestore(&fd_lk, fl);
+    size_t n = strlen(path);
+    if (n + 1 > len)
+        return -E_INVAL;                         /* 緩衝區放不下 */
+    if (copy_to_user(p, ubuf, path, n + 1) != 0)
+        return -E_FAULT;
+    return (long)n;
+}
+
+/* rename / link:兩個路徑 */
+static long sys_two_paths(struct proc *p, long num, uintptr_t uold, uintptr_t unew)
+{
+    char oldp[FS_PATH_MAX + 1], newp[FS_PATH_MAX + 1];
+    int err = user_path(p, oldp, uold);
+
+    if (err == 0)
+        err = user_path(p, newp, unew);
+    if (err)
+        return err;
+    return num == SYS_rename ? vfs_rename(oldp, newp) : vfs_link(oldp, newp);
+}
+
+/*
+ * ---- 記憶體配額:答應了就一定給得出來 ----
+ *
+ * heap 與匿名對映的頁是「用到才配置」的。如果 kernel 對每個要求都說好,等到程式真的去用、
+ * 實體記憶體卻不夠時,只剩下一個選擇:終止某個行程(第 30 步的做法,稱為過度承諾)。
+ * 被終止的程式沒有做錯任何事,也沒有機會收拾;對要求可靠的系統,這是不能接受的行為。
+ *
+ * 這裡改成記帳:kernel 記著「已經答應出去的頁數」(commit),包括還沒真的配置的。
+ * 每個要求在當下就決定成不成功:
+ *   - 行程自己的配額(p->limit):一個行程失控,最多用掉它自己的額度
+ *   - 整個系統的上限(commit_cap):答應出去的總量不超過實際有的記憶體,
+ *     而且扣掉一塊保留給 kernel 自己(頁表、kernel heap、檔案快取…)
+ * 超過就回傳 -E_NOMEM:程式在「要」的時候得到明確的答案,可以改做別的事、
+ * 釋放其他東西、或把工作有秩序地結束。之後去使用那些已經答應的頁時,不會再失敗。
+ *
+ * 配額只能調低(memlimit);調高需要 CAP_ADMIN。子行程沿用父行程的配額。
+ * fork 會讓子行程得到同樣多的承諾(寫入時複製:最壞情況下每一頁都要另外一份),
+ * 所以 fork 也可能因為配額而失敗。
+ */
+static unsigned long commit_total;           /* 所有行程的 commit 總和;受 fd_lk 保護 */
+static unsigned long commit_cap;             /* 上限;0 = 還沒算(第一次使用時依當時的空閒記憶體決定) */
+
+/* 把 p 的承諾增減 delta 頁。增加時檢查兩個上限,不行就回傳 -E_NOMEM(什麼都不變)。
+   呼叫時必須持有 fd_lk */
+static int commit_change_locked(struct proc *p, long delta)
+{
+    if (!commit_cap) {
+        /* 保留給 kernel 的部分:至少 2MB,或全部記憶體的 1/16(取大的) */
+        unsigned long freep = pmm_free_count(), reserve = pmm_total_pages() / 16;
+        if (reserve < 512)
+            reserve = 512;
+        commit_cap = freep > reserve ? freep - reserve : 1;
+    }
+    if (delta > 0) {
+        unsigned long d = (unsigned long)delta;
+        if (d > p->limit || p->commit > p->limit - d ||
+            d > commit_cap || commit_total > commit_cap - d)
+            return -E_NOMEM;
+        p->commit += d;
+        commit_total += d;
+    } else {
+        unsigned long d = (unsigned long)-delta;
+        if (d > p->commit)
+            d = p->commit;
+        p->commit -= d;
+        commit_total -= d;
+    }
+    return 0;
+}
+
+/* 行程結束或換成另一個程式:它的承諾全部歸還 */
+static void commit_release_all(struct proc *p)
+{
+    unsigned long fl = spin_lock_irqsave(&fd_lk);
+    commit_change_locked(p, -(long)p->commit);
+    spin_unlock_irqrestore(&fd_lk, fl);
+}
+
+static unsigned long pages_for(uintptr_t bytes)
+{
+    return (unsigned long)((bytes + PAGE_SIZE - 1) / PAGE_SIZE);
+}
+
+/* memlimit(kb):kb 為 0 = 查詢;否則把配額設成 kb。調低永遠允許,調高需要 CAP_ADMIN。回傳設定後的配額(KB) */
+static long sys_memlimit(struct proc *p, long kb)
+{
+    if (kb < 0)
+        return -E_INVAL;
+    unsigned long fl = spin_lock_irqsave(&fd_lk);
+    long rc = 0;
+    if (kb > 0) {
+        unsigned long pages = (unsigned long)kb / (PAGE_SIZE / 1024);
+        if (pages > p->limit && !(p->cred.caps & CAP_ADMIN))
+            rc = -E_PERM;
+        else
+            p->limit = pages;
+    }
+    if (rc == 0)
+        rc = (long)(p->limit * (PAGE_SIZE / 1024));
+    spin_unlock_irqrestore(&fd_lk, fl);
+    return rc;
+}
+
+/*
+ * mmap(len):要一塊 len 位元組(進位到整頁)、內容為 0 的記憶體,回傳它的位址。
+ * 和 heap 的差別:每一塊各自獨立,可以個別歸還(munmap),不必是「最後要的那一塊」。
+ * 頁同樣是用到才配置;承諾在這裡就記帳。只支援「匿名」的對映(不對應任何檔案)。
+ * 失敗回傳 -E_INVAL(長度為 0 或太大)、-E_NOMEM(超過配額、塊數已滿、位址範圍用完)。
+ */
+static long sys_mmap(struct proc *p, uintptr_t len)
+{
+    if (len == 0 || len > USER_MMAP_MAX)
+        return -E_INVAL;
+    unsigned long pages = pages_for(len);
+    long rc = -E_NOMEM;
+
+    unsigned long fl = spin_lock_irqsave(&fd_lk);
+    uintptr_t start = p->mmap_next ? p->mmap_next : USER_MMAP_BASE;
+    for (unsigned i = 0; i < PROC_MAX_MAPS; i++) {
+        if (p->maps[i].pages)
+            continue;
+        if (start + pages * PAGE_SIZE <= USER_MMAP_BASE + USER_MMAP_MAX &&
+            commit_change_locked(p, (long)pages) == 0) {
+            p->maps[i].start = start;
+            p->maps[i].pages = pages;
+            p->mmap_next = start + pages * PAGE_SIZE + PAGE_SIZE;   /* 兩塊之間留一頁不對映:越界會立刻被發現 */
+            rc = (long)start;
+        }
+        break;
+    }
+    spin_unlock_irqrestore(&fd_lk, fl);
+    return rc;
+}
+
+/* munmap(addr):歸還 mmap 得到的一整塊(addr 必須是 mmap 回傳的位址) */
+static long sys_munmap(struct proc *p, uintptr_t addr)
+{
+    unsigned long pages = 0;
+
+    unsigned long fl = spin_lock_irqsave(&fd_lk);
+    for (unsigned i = 0; i < PROC_MAX_MAPS; i++) {
+        if (p->maps[i].pages && p->maps[i].start == addr) {
+            pages = p->maps[i].pages;
+            p->maps[i].pages = 0;            /* 先從表格拿掉:之後碰這一塊就是錯誤,不會再被配置 */
+            commit_change_locked(p, -(long)pages);
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&fd_lk, fl);
+    if (!pages)
+        return -E_INVAL;
+    for (unsigned long i = 0; i < pages; i++)
+        vm_space_unmap(p->space, addr + i * PAGE_SIZE);
+    return 0;
+}
+
+/*
+ * sbrk(incr):把 heap 的結尾移動 incr 個位元組(可以是負的),回傳「移動之前」的結尾。
+ * 使用者端的 malloc 用它向 kernel 要記憶體。
+ *   變大:只是把結尾往後移。新的範圍在第一次被碰到時才配置(見 proc_fault),內容保證是 0
+ *   變小:結尾之後整頁落在範圍外的,立刻歸還給系統
+ * 失敗(超出配額或系統的上限、或縮到起點之前)回傳 -E_NOMEM,結尾不變。
+ */
+static long sys_sbrk(struct proc *p, long incr)
+{
+    unsigned long fl = spin_lock_irqsave(&fd_lk);
+    uintptr_t old = p->brk ? p->brk : USER_HEAP_BASE;
+    uintptr_t now = old + (uintptr_t)incr;
+    int ok = incr >= 0 ? (uintptr_t)incr <= USER_HEAP_MAX && now <= USER_HEAP_BASE + USER_HEAP_MAX
+                       : (uintptr_t)-incr <= old - USER_HEAP_BASE;
+    /* 記帳:heap 佔用的頁數改變多少,就增減多少承諾。超過配額的話整個要求失敗 */
+    if (ok && commit_change_locked(p, (long)pages_for(now - USER_HEAP_BASE) -
+                                      (long)pages_for(old - USER_HEAP_BASE)) != 0)
+        ok = 0;
+    if (ok)
+        p->brk = now;
+    spin_unlock_irqrestore(&fd_lk, fl);
+    if (!ok)
+        return -E_NOMEM;
+
+    /* 縮小:釋放不再屬於 heap 的整頁(第一個「完全在新結尾之後」的頁起) */
+    uintptr_t first = (now + PAGE_SIZE - 1) & ~(uintptr_t)(PAGE_SIZE - 1);
+    for (uintptr_t va = first; va < old; va += PAGE_SIZE)
+        vm_space_unmap(p->space, va);
+    return (long)old;
+}
+
+static long sys_lseek(struct proc *p, long fd, long off, long whence)
+{
+    struct file *f = fd_get(p, fd);
+
+    if (!f)
+        return -E_BADF;
+    long r = vfs_seek(f, off, (int)whence);
+    vfs_close(f);
+    return r;
+}
+
 #define IO_CHUNK 256u                /* 讀寫時在 kernel 與使用者之間一次搬運的大小 */
 #define IO_MAX   (1u << 20)          /* 單次讀寫的上限 */
 
@@ -1228,7 +1760,7 @@ static long sys_open(struct proc *p, uintptr_t upath, int flags)
 {
     char path[FS_PATH_MAX + 1];
     struct file *f;
-    int err = copy_path_from_user(p, path, upath);
+    int err = user_path(p, path, upath);
 
     if (err)
         return err;
@@ -1322,7 +1854,7 @@ static long sys_readdir(struct proc *p, long fd, uintptr_t uent)
 static long sys_path_op(struct proc *p, long num, uintptr_t upath, uintptr_t uarg)
 {
     char path[FS_PATH_MAX + 1];
-    int err = copy_path_from_user(p, path, upath);
+    int err = user_path(p, path, upath);
 
     if (err)
         return err;
@@ -1333,6 +1865,8 @@ static long sys_path_op(struct proc *p, long num, uintptr_t upath, uintptr_t uar
             err = -E_FAULT;
         return err;
     }
+    if (num == SYS_chmod)
+        return vfs_chmod(path, (unsigned)uarg);
     if (num == SYS_mkdir)
         return vfs_mkdir(path);
     if (num == SYS_unlink)
@@ -1372,7 +1906,7 @@ static int args_from_user(struct proc *p, struct args *a, uintptr_t uargv)
 static int get_path_and_args(struct proc *p, uintptr_t upath, uintptr_t uargv,
                              char *path, struct args **out)
 {
-    int err = copy_path_from_user(p, path, upath);
+    int err = user_path(p, path, upath);
     if (err)
         return err;
     struct args *a = kzalloc(sizeof(*a));
@@ -1396,6 +1930,8 @@ static long sys_spawn(struct proc *p, uintptr_t upath, uintptr_t uargv)
     struct args *a;
     int err = get_path_and_args(p, upath, uargv, path, &a);
 
+    if (err == 0 && (err = vfs_access(path, PERM_X)) != 0)
+        kfree(a);                    /* 沒有執行這個檔案的權限 */
     if (err)
         return err;
     long pid = proc_create(path, a, p);
@@ -1431,7 +1967,9 @@ static long sys_exec(struct proc *p, uintptr_t upath, uintptr_t uargv)
         return -E_BUSY;
     }
 
-    err = image_build(path, a, &img);
+    err = vfs_access(path, PERM_X);  /* 要有執行這個檔案的權限 */
+    if (err == 0)
+        err = image_build(path, a, &img);
     kfree(a);
     if (err)
         return err;                  /* 舊程式完全沒被動到 */
@@ -1443,6 +1981,16 @@ static long sys_exec(struct proc *p, uintptr_t upath, uintptr_t uargv)
     proc_set_name(p, path);
     flags = sched_lock();            /* 別的行程可能正透過 procinfo 讀取 p->space(見 sys_procinfo) */
     p->space = img.space;
+    sched_unlock(flags);
+    p->brk = 0;                      /* 新的程式從空的 heap 開始(舊的頁隨舊位址空間釋放) */
+    commit_release_all(p);           /* 舊程式的 heap 與匿名對映都不在了 */
+    memset(p->maps, 0, sizeof(p->maps));
+    p->mmap_next = 0;
+    flags = sched_lock();            /* 處理函式是舊程式裡的位址:全部還原成預設(「忽略」則保留) */
+    for (int s = 0; s < NSIG; s++)
+        if (p->sig_handler[s] != SIG_IGN)
+            p->sig_handler[s] = SIG_DFL;
+    p->sig_pending = 0;
     sched_unlock(flags);
     p->exe = img.exe;
     p->nstacks = 1;
@@ -1510,9 +2058,22 @@ static long sys_fork(struct proc *p, void *tf)
     void *frame = kmalloc(arch_frame_size());
     if (!c || !st || !frame)
         goto nomem;
+    /* 子行程得到和父行程一樣多的承諾(最壞情況下,共用的每一頁都要各自一份):先記帳,不夠就不 fork */
+    c->limit = p->limit;
+    {
+        unsigned long fl = spin_lock_irqsave(&fd_lk);
+        int crc = commit_change_locked(c, (long)p->commit);
+        memcpy(c->maps, p->maps, sizeof(c->maps));
+        c->mmap_next = p->mmap_next;
+        spin_unlock_irqrestore(&fd_lk, fl);
+        if (crc != 0)
+            goto nomem;
+    }
     c->space = vm_space_fork(p->space);
-    if (!c->space)
+    if (!c->space) {
+        commit_release_all(c);
         goto nomem;
+    }
 
     memcpy(frame, tf, arch_frame_size());
     arch_frame_set_retval(frame, 0);         /* 子行程看到的回傳值 */
@@ -1520,9 +2081,14 @@ static long sys_fork(struct proc *p, void *tf)
     st->frame = frame;
 
     memcpy(c->name, p->name, sizeof(c->name));
+    c->cred = p->cred;
+    memcpy(c->cwd, p->cwd, sizeof(c->cwd));  /* 只有一條執行緒(上面檢查過),沒有人同時在改 */
     c->exe = vfs_dup(p->exe);
     vfs_exec_hold(c->exe);                   /* 子行程也在執行同一個程式檔 */
     c->nstacks = p->nstacks;
+    c->brk = p->brk;                         /* heap 的內容已經隨位址空間複製(寫入時複製) */
+    memcpy(c->sig_handler, p->sig_handler, sizeof(c->sig_handler));   /* 處理方式沿用;還沒交付的不帶過去 */
+    c->sig_restorer = p->sig_restorer;
     fd_inherit(c, p, PROC_MAX_FD);
 
     flags = sched_lock();
@@ -1539,6 +2105,7 @@ static long sys_fork(struct proc *p, void *tf)
         kfree(st);
         kfree(frame);
         vm_space_destroy(c->space);
+        commit_release_all(c);
         vfs_exec_release(c->exe);
         vfs_close(c->exe);
         fd_close_all(c);
@@ -1636,9 +2203,82 @@ long syscall_dispatch(long num, long a0, long a1, long a2, void *tf)
     case SYS_unlink:
     case SYS_stat:
     case SYS_statfs:
+    case SYS_chmod:
         return sys_path_op(p, num, (uintptr_t)a0, (uintptr_t)a1);
+    case SYS_chown: {
+        char path[FS_PATH_MAX + 1];
+        int err = user_path(p, path, (uintptr_t)a0);
+        /* 磁碟上的編號只有 16 位元:超過的直接拒絕,不要悄悄截掉 */
+        if (err == 0 && (a1 < 0 || a1 > 0xFFFF || a2 < 0 || a2 > 0xFFFF))
+            err = -E_INVAL;
+        return err ? err : vfs_chown(path, (uint32_t)a1, (uint32_t)a2);
+    }
+    case SYS_getuid:
+        return (long)p->cred.uid;
+    case SYS_getgid:
+        return (long)p->cred.gid;
+    case SYS_capget:
+        return (long)p->cred.caps;
+    case SYS_setuid: {
+        /*
+         * 改變自己的身分。有 CAP_SETID 的行程可以改成任何人;其他行程只能「改成自己」(沒有作用)。
+         * 改成非 root 時,所有特權一併清除,而且拿不回來:特權只會減少。
+         * 這是整個權限模型的關鍵 — 沒有任何系統呼叫可以讓行程得到它原本沒有的特權,
+         * 所以不需要密碼這類東西來把關;代價是「切換成另一個使用者再切回來」必須靠
+         * 保留一個還有特權的父行程(su 就是這樣做的)。
+         */
+        if (a0 < 0 || a0 > 0xFFFF || a1 < 0 || a1 > 0xFFFF)
+            return -E_INVAL;
+        unsigned long flags = sched_lock();
+        long rc = 0;
+        if (p->cred.caps & CAP_SETID) {
+            p->cred.uid = (uint32_t)a0;
+            p->cred.gid = (uint32_t)a1;
+            if (a0 != 0)
+                p->cred.caps = 0;
+        } else if ((uint32_t)a0 != p->cred.uid || (uint32_t)a1 != p->cred.gid) {
+            rc = -E_PERM;
+        }
+        sched_unlock(flags);
+        return rc;
+    }
+    case SYS_capdrop: {
+        /* 永久放棄指定的特權(最小權限:只留下真正需要的)。回傳剩下的 */
+        unsigned long flags = sched_lock();
+        p->cred.caps &= ~(uint32_t)a0;
+        long rc = (long)p->cred.caps;
+        sched_unlock(flags);
+        return rc;
+    }
     case SYS_sync:
         return vfs_sync();
+    case SYS_lseek:
+        return sys_lseek(p, a0, a1, a2);
+    case SYS_sbrk:
+        return sys_sbrk(p, a0);
+    case SYS_mmap:
+        return sys_mmap(p, (uintptr_t)a0);
+    case SYS_munmap:
+        return sys_munmap(p, (uintptr_t)a0);
+    case SYS_memlimit:
+        return sys_memlimit(p, a0);
+    case SYS_time: {
+        struct timeval tv;
+        memset(&tv, 0, sizeof(tv));
+        tv.sec = timer_epoch(&tv.usec);
+        return copy_to_user(p, (uintptr_t)a0, &tv, sizeof(tv)) == 0 ? 0 : -E_FAULT;
+    }
+    case SYS_signal:
+        return sys_signal(p, a0, (uintptr_t)a1, (uintptr_t)a2);
+    case SYS_sigreturn:
+        return sys_sigreturn(p, (uintptr_t)a0, tf);
+    case SYS_rename:
+    case SYS_link:
+        return sys_two_paths(p, num, (uintptr_t)a0, (uintptr_t)a1);
+    case SYS_chdir:
+        return sys_chdir(p, (uintptr_t)a0);
+    case SYS_getcwd:
+        return sys_getcwd(p, (uintptr_t)a0, (size_t)a1);
     case SYS_sysinfo:
         return sys_sysinfo(p, (uintptr_t)a0);
     case SYS_tcsetmode: {
@@ -1694,7 +2334,7 @@ long syscall_dispatch(long num, long a0, long a1, long a2, void *tf)
     case SYS_procinfo:
         return sys_procinfo(p, a0, (uintptr_t)a1);
     case SYS_kill:
-        return sys_kill(a0, a1);
+        return sys_kill(p, a0, a1);
     case SYS_setpgid:
         return sys_setpgid(p, a0, a1);
     case SYS_tcsetfg: {              /* 設定主控台的前景群組(Ctrl-C 的對象);0 = 沒有 */

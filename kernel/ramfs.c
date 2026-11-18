@@ -108,6 +108,27 @@ static int ramfs_create(struct inode *dir, const char *name, int type, struct in
     return 0;
 }
 
+/* 加一筆紀錄指向已經存在的節點(改名、硬連結) */
+static int ramfs_link(struct inode *dir, const char *name, struct inode *in)
+{
+    struct rnode *d = rn(dir);
+    struct rdirent *e = kzalloc(sizeof(*e));
+
+    if (!e)
+        return -E_NOMEM;
+    for (size_t i = 0; i <= strlen(name); i++)
+        e->name[i] = name[i];
+    e->node = rn(in);
+    struct rdirent **pp = &d->ents;
+    while (*pp)
+        pp = &(*pp)->next;
+    *pp = e;
+    d->in.size++;
+    if (in->type == I_DIR)
+        rn(in)->parent = d;                      /* 目錄搬家:".." 改指向新的上層 */
+    return 0;
+}
+
 static int ramfs_unlink(struct inode *dir, const char *name, struct inode **victim)
 {
     struct rnode *d = rn(dir);
@@ -286,6 +307,7 @@ static const struct inode_ops ramfs_ops = {
     .lookup = ramfs_lookup,
     .create = ramfs_create,
     .unlink = ramfs_unlink,
+    .link = ramfs_link,
     .readdir = ramfs_readdir,
     .is_empty = ramfs_is_empty,
     .read = ramfs_read,

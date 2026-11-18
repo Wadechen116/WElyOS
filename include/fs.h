@@ -26,6 +26,7 @@
  */
 
 /* 錯誤碼(數值沿用 POSIX 的慣例) */
+#define E_PERM         1     /* 沒有做這件事的特權(例如更改別人的檔案的權限) */
 #define E_NOENT        2     /* 檔案或目錄不存在 */
 #define E_SRCH         3     /* 沒有這個行程 */
 #define E_INTR         4     /* 等待被打斷(等待者自己被終止了) */
@@ -34,6 +35,7 @@
 #define E_BADF         9     /* 檔案描述符無效,或開啟方式不允許這個操作 */
 #define E_CHILD        10    /* 沒有符合的子行程可以等 */
 #define E_NOMEM        12    /* 記憶體不足 */
+#define E_ACCES        13    /* 檔案的權限不允許這個操作 */
 #define E_FAULT        14    /* 使用者傳來的位址不合法 */
 #define E_BUSY         16    /* 現在不能做(例如行程還有其他執行緒時呼叫 exec;刪除掛載點) */
 #define E_EXIST        17    /* 已經存在 */
@@ -42,8 +44,10 @@
 #define E_INVAL        22    /* 參數不合法 */
 #define E_MFILE        24    /* 這個行程開啟的檔案太多 */
 #define E_TXTBSY       26    /* 檔案正被當成程式執行,不可修改 */
+#define E_XDEV         18    /* 來源與目的不在同一個檔案系統(改名、連結不能跨檔案系統) */
 #define E_FBIG         27    /* 檔案太大 */
 #define E_NOSPC        28    /* 磁碟沒有空間了 */
+#define E_SPIPE        29    /* 這種東西沒有「讀寫位置」(管線、裝置) */
 #define E_PIPE         32    /* 寫入一條已經沒有人在讀的管線 */
 #define E_NAMETOOLONG  36    /* 名稱或路徑太長 */
 #define E_NOTEMPTY     39    /* 目錄不是空的 */
@@ -63,6 +67,10 @@ enum { I_FILE = 1, I_DIR, I_DEV, I_PIPE };
 #define O_TRUNC   0x200      /* 開啟時把內容清空 */
 #define O_APPEND  0x400      /* 每次寫入都接在檔案最後 */
 
+#define SEEK_SET  0
+#define SEEK_CUR  1
+#define SEEK_END  2
+
 /* 讀取目錄得到的一筆紀錄;也是使用者程式看到的格式(固定 64 位元組) */
 struct dirent {
     char name[FS_NAME_MAX + 1];
@@ -73,7 +81,21 @@ struct stat {
     uint32_t type;
     uint32_t nlink;          /* 有幾個名稱指向它 */
     uint64_t size;
+    uint64_t mtime;          /* 最後一次修改的時間(1970-01-01 UTC 至今的秒數);0 = 不知道 */
+    uint32_t uid, gid;       /* 擁有者與所屬群組 */
+    uint32_t mode;           /* 權限位元(見下方 S_*) */
 };
+
+/*
+ * 權限位元(數值與 Unix 相同,習慣以八進位書寫):三組各三個位元,
+ * 依序是擁有者、同群組的人、其他人;每組是 讀(4)、寫(2)、執行(1)。
+ *   0644 = 擁有者可讀寫,其他人只能讀        0755 = 擁有者全部,其他人可讀與執行
+ * 對目錄而言:讀 = 列出內容,寫 = 在裡面建立或刪除東西,執行 = 可以經過它(走到裡面的東西)。
+ */
+#define S_PERM_MASK 0777u
+#define PERM_R 4
+#define PERM_W 2
+#define PERM_X 1
 
 /* 檔案系統的用量(statfs;也是使用者程式看到的格式) */
 struct fsinfo {
@@ -99,6 +121,9 @@ struct inode_ops {
     int  (*create)(struct inode *dir, const char *name, int type, struct inode **out);
     /* 目錄:移除名稱。*victim 回傳被移除的 inode(VFS 負責後續的參考計數) */
     int  (*unlink)(struct inode *dir, const char *name, struct inode **victim);
+    /* 目錄:多一個名稱 name 指向「已經存在」的 inode in(同一個檔案系統)。
+       in 是目錄時,它的上層目錄改成 dir。改名與硬連結都靠它。可以不提供(NULL) */
+    int  (*link)(struct inode *dir, const char *name, struct inode *in);
     /* 目錄:從位置 *pos 起的下一筆紀錄,並把 *pos 移到它之後。0 = 成功,1 = 已經沒有了。
        位置的意義由檔案系統自己決定(從 0 開始);呼叫者只負責原樣保存 */
     int  (*readdir)(struct inode *dir, uint64_t *pos, struct dirent *out);
@@ -118,6 +143,9 @@ struct inode_ops {
     void (*closed)(struct inode *in, int flags);
     /* 沒有任何名稱、也沒有人開啟了:釋放它佔用的一切 */
     void (*release)(struct inode *in);
+    /* uid、gid、mode 被 VFS 改過了:存放在別處(磁碟)的檔案系統在這裡把它們存起來。
+       可以不提供(NULL) */
+    int  (*setattr)(struct inode *in);
     /* 這個 inode 所在的檔案系統的用量。可以不提供(NULL) */
     int  (*statfs)(struct inode *in, struct fsinfo *out);
     /* 把還留在記憶體裡的修改寫到儲存裝置上(對掛載的根目錄呼叫)。可以不提供(NULL) */
@@ -137,6 +165,9 @@ struct inode {
     uint64_t size;
     unsigned refs;               /* 有多少「使用中的參考」(開啟、路徑解析途中);由 VFS 管理 */
     unsigned nlink;              /* 有多少名稱指向它;降到 0 且 refs 為 0 時釋放 */
+    uint32_t uid, gid;           /* 擁有者與所屬群組。和 mode 一樣由 VFS 管理,受 lock 保護 */
+    uint16_t mode;               /* 權限位元(0777 的範圍) */
+    uint64_t mtime;              /* 最後一次修改的時間(Unix 時間,秒)。由 VFS 在修改前更新;受 lock 保護 */
     unsigned exec_count;         /* 有多少行程正在執行它(頁被共用中);大於 0 時不可修改。受 lock 保護 */
     struct mutex lock;           /* 保護內容(檔案的資料、目錄的紀錄) */
     struct inode *mounted;       /* 這個目錄是掛載點:走到這裡時改走這個(另一個檔案系統的根目錄) */
@@ -158,8 +189,27 @@ uint64_t vfs_size(struct file *f);
 int  vfs_readdir(struct file *f, struct dirent *out);        /* 0 = 取得一筆,1 = 讀完了 */
 int  vfs_mkdir(const char *path);
 int  vfs_unlink(const char *path);                           /* 檔案,或空的目錄 */
+/* 改變讀寫位置。whence:SEEK_SET 從頭算、SEEK_CUR 從目前位置算、SEEK_END 從結尾算。
+   回傳新的位置。只有一般檔案可以(目錄只能回到開頭);管線與裝置回傳 -E_SPIPE */
+long vfs_seek(struct file *f, long off, int whence);
+/* 改名 / 搬移(同一個檔案系統內)。目的已經存在時回傳 -E_EXIST(不會蓋掉它) */
+int  vfs_rename(const char *oldpath, const char *newpath);
+/* 硬連結:讓 newpath 成為 oldpath 那個檔案的另一個名稱(只限一般檔案,同一個檔案系統) */
+int  vfs_link(const char *oldpath, const char *newpath);
 int  vfs_stat(const char *path, struct stat *st);
 int  vfs_mkdev(const char *path, const struct dev_ops *dev); /* 建立裝置節點 */
+
+/*
+ * 權限。每個檔案與目錄有擁有者(uid)、群組(gid)與權限位元(mode);
+ * VFS 在每個操作裡依「現在是誰在問」(cred.h 的 cred_current)檢查,不符合回傳 -E_ACCES。
+ * kernel 自己的呼叫(cred_current 為 NULL)不受限制。
+ *   vfs_access  path 是否允許 want(PERM_R / PERM_W / PERM_X 的組合)
+ *   vfs_chmod   更改權限位元:只有擁有者或有 CAP_FS 的行程可以
+ *   vfs_chown   更改擁有者與群組:只有有 CAP_FS 的行程可以(否則可以把檔案「送」給別人來規避配額或嫁禍)
+ */
+int  vfs_access(const char *path, int want);
+int  vfs_chmod(const char *path, unsigned mode);
+int  vfs_chown(const char *path, uint32_t uid, uint32_t gid);
 
 /*
  * 掛載(mount):把另一個檔案系統接到目錄樹上。path 必須是一個已經存在的空目錄(掛載點);
@@ -216,6 +266,7 @@ struct wfs_stats {
     uint32_t inodes, free_inodes;
     uint32_t mounts;             /* 這個檔案系統被掛載過幾次(含這一次) */
     unsigned repairs;            /* 這次掛載時修復了幾個問題 */
+    int failed;                  /* 寫入磁碟失敗過,檔案系統已轉為唯讀 */
     unsigned long disk_reads, disk_writes;   /* 實際對磁碟讀寫的區塊數 */
 };
 int  wfs_mount(struct blkdev *dev, struct inode **root);
@@ -223,6 +274,7 @@ void wfs_shutdown(void);
 void wfs_stats(struct wfs_stats *st);
 int  wfs_check_now(void);
 int  wfs_test_damage(const char *victim_name);
+int  wfs_test_drop_cache(void);
 
 /* initrd.c:把開機檔案包(ustar 格式的 tar)解開到檔案系統。回傳建立的檔案數,失敗回傳負值 */
 int initrd_unpack(const uint8_t *image, size_t len);

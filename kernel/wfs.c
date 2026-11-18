@@ -40,6 +40,15 @@
  *      掛載時發現記號是清掉的(上次沒有正常關機),就做一次完整的檢查與修復
  *      (wfs_check):從根目錄走過所有目錄,重新算出哪些 inode 與區塊真的有人用
  *
+ * ---- 寫入失敗之後 ----
+ *
+ * 寫回磁碟失敗時,記憶體裡的狀態(「已經建立了這個檔案」)和磁碟上的(「沒有」)就不一致了,
+ * 而且不知道是哪些區塊沒寫成功。繼續在上面修改,只會把不一致擴大。
+ * 所以一旦寫入失敗,整個檔案系統轉為「唯讀」:之後所有會修改的操作都回報 -E_IO,
+ * 讀取照常(記憶體裡的快取與磁碟上的舊內容都還能用)。關機時不記「正常卸載」,
+ * 下次掛載會做完整的檢查與修復。
+ * 讀取失敗則不影響狀態:那一次操作回報 -E_IO,磁碟恢復之後可以再試。
+ *
  * ---- 不信任磁碟上的內容 ----
  *
  * 磁碟的內容可能損壞(或被人刻意改過)。所有從磁碟讀來的編號在使用之前都檢查範圍,
@@ -58,8 +67,10 @@
 #include "fs.h"
 #include "kprintf.h"
 #include "kstring.h"
+#include "panic.h"
 #include "pmm.h"
 #include "sync.h"
+#include "timer.h"
 
 #define WFS_MAGIC   0x31534657u              /* "WFS1" */
 #define BSIZE       PAGE_SIZE
@@ -81,15 +92,29 @@ struct wsuper {
     uint32_t mounts;                         /* 被掛載過幾次 */
 };
 
-struct dinode {                              /* 磁碟上的 inode,64 位元組 */
+/*
+ * 磁碟上的 inode,64 位元組。
+ * 第 34 步加入擁有者與權限時,沒有增加大小,而是把兩個「原本太寬」的欄位切開:
+ *   parent  32 位元 -> 16(inode 最多 4096 個)+ mode 16
+ *   size    64 位元 -> 32(單一檔案最大約 4MB)+ uid 16 + gid 16
+ * 數值是 little-endian,原本的低位部分留在原位,所以舊的磁碟映像照常可讀:
+ * 新欄位在舊資料裡都是 0,即「擁有者 root、權限未記錄」。mode 的最高位元(DMODE_VALID)
+ * 用來分辨「權限是 000」與「舊資料,沒有記錄」,後者使用預設值。
+ */
+#define DMODE_VALID 0x8000u
+
+struct dinode {
     uint16_t type;                           /* 0 = 這一格沒有使用;I_FILE;I_DIR */
     uint16_t nlink;
-    uint32_t parent;                         /* 所在目錄的 inode 編號 */
-    uint64_t size;
+    uint16_t parent;                         /* 所在目錄的 inode 編號 */
+    uint16_t mode;                           /* DMODE_VALID | 權限位元;0 = 沒有記錄 */
+    uint32_t size;
+    uint16_t uid, gid;                       /* 擁有者與群組(16 位元:編號上限 65535) */
     uint32_t addr[NDIRECT];
     uint32_t indirect;
-    uint32_t pad;
+    uint32_t mtime;                          /* 最後修改的時間(Unix 時間,秒;32 位元可以用到 2106 年) */
 };
+_Static_assert(sizeof(struct dinode) == 64, "the on-disk inode must stay 64 bytes");
 #define IPB (BSIZE / sizeof(struct dinode))
 
 struct wdirent {                             /* 目錄裡的一筆紀錄,64 位元組 */
@@ -115,6 +140,7 @@ static uint32_t free_blocks, free_inodes;
 static uint32_t balloc_hint, ialloc_hint;
 static unsigned last_repairs;
 static int mounted;
+static int fs_failed;                        /* 寫入磁碟失敗過:之後拒絕所有修改(見下方「寫入失敗之後」) */
 static const struct inode_ops wfs_ops;
 
 static struct wnode *wn(struct inode *in) { return (struct wnode *)in; }
@@ -137,8 +163,12 @@ static unsigned long disk_reads, disk_writes;
 
 static int bwrite(struct buf *b)
 {
-    if (disk->rw(disk, (uint64_t)b->no * BSECT, BSECT, b->data, 1) != 0)
+    if (disk->rw(disk, (uint64_t)b->no * BSECT, BSECT, b->data, 1) != 0) {
+        if (!fs_failed)
+            kprintf("disk: write error on block %u; the file system is now read-only\n", b->no);
+        fs_failed = 1;
         return -E_IO;
+    }
     disk_writes++;
     b->dirty = 0;
     return 0;
@@ -190,6 +220,8 @@ static struct buf *bget(uint32_t no, int load)
 
 static void bput(struct buf *b)
 {
+    if (b->pins <= 0)
+        panic("wfs: buffer for block %u released more often than it was taken", b->no);
     b->pins--;
 }
 
@@ -220,7 +252,7 @@ static int bsync_opt(int barrier)
     }
     if (barrier && disk->flush && disk->flush(disk) != 0)
         rc = -E_IO;
-    return rc;
+    return fs_failed ? -E_IO : rc;
 }
 
 static int bsync(void)
@@ -315,7 +347,11 @@ static int dinode_rw(uint32_t inum, struct dinode *d, int write)
 
 static int iupdate(struct wnode *n)
 {
-    n->d.size = n->in.size;
+    n->d.size = (uint32_t)n->in.size;
+    n->d.mtime = (uint32_t)n->in.mtime;
+    n->d.mode = (uint16_t)(DMODE_VALID | (n->in.mode & S_PERM_MASK));
+    n->d.uid = (uint16_t)n->in.uid;
+    n->d.gid = (uint16_t)n->in.gid;
     return dinode_rw(n->inum, &n->d, 1);
 }
 
@@ -335,6 +371,11 @@ static struct wnode *nget(uint32_t inum)
         inode_init(&n->in, &wfs_ops, n->d.type);
         n->in.size = n->d.size;
         n->in.nlink = n->d.nlink;
+        n->in.mtime = n->d.mtime;
+        n->in.uid = n->d.uid;
+        n->in.gid = n->d.gid;
+        if (n->d.mode & DMODE_VALID)             /* 沒有記錄的(舊資料)保留 inode_init 給的預設值 */
+            n->in.mode = n->d.mode & S_PERM_MASK;
         n->inum = inum;
         n->loaded = 1;
     }
@@ -357,7 +398,9 @@ static struct wnode *ialloc(int type, uint32_t parent)
         memset(&d, 0, sizeof(d));
         d.type = (uint16_t)type;
         d.nlink = 1;
-        d.parent = parent;
+        d.parent = (uint16_t)parent;
+        d.mode = (uint16_t)(DMODE_VALID | (type == I_DIR ? 0755u : 0644u));
+        d.mtime = (uint32_t)timer_epoch(NULL);
         if (dinode_rw(inum, &d, 1) != 0)
             return NULL;
         ialloc_hint = inum + 1;
@@ -685,8 +728,10 @@ static int wfs_create(struct inode *dir, const char *name, int type, struct inod
     if (type != I_FILE && type != I_DIR)
         return -E_INVAL;                         /* 裝置節點只存在於記憶體檔案系統 */
     mutex_lock(&wfs_lk);
-    n = ialloc(type, d->inum);
-    if (!n) {
+    n = fs_failed ? NULL : ialloc(type, d->inum);
+    if (fs_failed) {
+        err = -E_IO;                             /* 唯讀:見檔頭「寫入失敗之後」 */
+    } else if (!n) {
         err = -E_NOSPC;
     } else if ((err = dir_add(d, name, n->inum)) != 0) {
         n->d.type = 0;                           /* 目錄放不下:把剛配置的 inode 還回去 */
@@ -702,12 +747,35 @@ static int wfs_create(struct inode *dir, const char *name, int type, struct inod
     return err;
 }
 
+/* 加一筆紀錄指向已經存在的 inode(改名、硬連結);磁碟上的名稱數跟著加一 */
+static int wfs_link(struct inode *dir, const char *name, struct inode *in)
+{
+    struct wnode *d = wn(dir), *n = wn(in);
+
+    mutex_lock(&wfs_lk);
+    int err = fs_failed ? -E_IO : n->d.nlink < 0xFFFF ? dir_add(d, name, n->inum) : -E_NOSPC;
+    if (err == 0) {
+        n->d.nlink++;
+        if (in->type == I_DIR)
+            n->d.parent = d->inum;               /* 目錄搬家:上層目錄改成新的 */
+        err = iupdate(n);
+    }
+    if (bsync() != 0 && err == 0)
+        err = -E_IO;
+    mutex_unlock(&wfs_lk);
+    return err;
+}
+
 static int wfs_unlink(struct inode *dir, const char *name, struct inode **victim)
 {
     struct find_arg fa = { name, 0, 1 };
     int err = 0;
 
     mutex_lock(&wfs_lk);
+    if (fs_failed) {
+        mutex_unlock(&wfs_lk);
+        return -E_IO;
+    }
     int r = dir_scan(wn(dir), 0, find_fn, &fa);
     if (r <= 0) {
         err = r < 0 ? r : -E_NOENT;
@@ -721,6 +789,7 @@ static int wfs_unlink(struct inode *dir, const char *name, struct inode **victim
             if (n->d.nlink > 0)
                 n->d.nlink--;
             iupdate(n);
+            iupdate(wn(dir));                    /* 目錄的修改時間(VFS 已經更新了) */
             *victim = &n->in;
         }
     }
@@ -783,7 +852,7 @@ static long wfs_read(struct inode *in, void *buf, size_t n, uint64_t off)
 static long wfs_write(struct inode *in, const void *buf, size_t n, uint64_t off)
 {
     mutex_lock(&wfs_lk);
-    long r = file_write(wn(in), buf, n, off);
+    long r = fs_failed ? -E_IO : file_write(wn(in), buf, n, off);
     mutex_unlock(&wfs_lk);
     return r;
 }
@@ -791,7 +860,7 @@ static long wfs_write(struct inode *in, const void *buf, size_t n, uint64_t off)
 static int wfs_truncate(struct inode *in, uint64_t size)
 {
     mutex_lock(&wfs_lk);
-    int r = size <= in->size ? file_truncate(wn(in), size) : -E_INVAL;
+    int r = fs_failed ? -E_IO : size <= in->size ? file_truncate(wn(in), size) : -E_INVAL;
     if (bsync() != 0 && r == 0)
         r = -E_IO;
     mutex_unlock(&wfs_lk);
@@ -815,6 +884,11 @@ static void wfs_release(struct inode *in)
     struct wnode *n = wn(in);
 
     mutex_lock(&wfs_lk);
+    if (fs_failed) {
+        n->loaded = 0;                           /* 唯讀:磁碟上的留給下次掛載的檢查去釋放 */
+        mutex_unlock(&wfs_lk);
+        return;
+    }
     file_truncate(n, 0);
     n->d.type = 0;
     dinode_rw(n->inum, &n->d, 1);
@@ -824,6 +898,17 @@ static void wfs_release(struct inode *in)
         ialloc_hint = n->inum;
     bsync();
     mutex_unlock(&wfs_lk);
+}
+
+/* uid、gid、mode 被 VFS 改過了:存進磁碟上的 inode */
+static int wfs_setattr(struct inode *in)
+{
+    mutex_lock(&wfs_lk);
+    int r = fs_failed ? -E_IO : iupdate(wn(in));
+    if (bsync() != 0 && r == 0)
+        r = -E_IO;
+    mutex_unlock(&wfs_lk);
+    return r;
 }
 
 static int wfs_statfs(struct inode *in, struct fsinfo *out)
@@ -854,6 +939,7 @@ static const struct inode_ops wfs_ops = {
     .lookup = wfs_lookup,
     .create = wfs_create,
     .unlink = wfs_unlink,
+    .link = wfs_link,
     .readdir = wfs_readdir,
     .is_empty = wfs_is_empty,
     .read = wfs_read,
@@ -861,6 +947,7 @@ static const struct inode_ops wfs_ops = {
     .truncate = wfs_truncate,
     .closed = wfs_closed,
     .release = wfs_release,
+    .setattr = wfs_setattr,
     .statfs = wfs_statfs,
     .sync = wfs_sync_op,
 };
@@ -938,6 +1025,10 @@ static int wfs_check(int at_mount)
     memset(c.bitmap, 0, bm_pages * BSIZE);
     memset(c.refs, 0, ref_pages * BSIZE);
     for (uint32_t no = 0; no < sb.data_start; no++)
+        c.bitmap[no / 8] |= (uint8_t)(1u << (no % 8));
+    /* 位元圖最後一個區塊中超出磁碟大小的位元,格式化時標記為使用中(見 wfs_format):
+       重新算的這一份也要照做,否則全新的磁碟第一次檢查就會被當成「位元圖不符」 */
+    for (uint32_t no = sb.nblocks; no < sb.bitmap_blocks * BSIZE * 8; no++)
         c.bitmap[no / 8] |= (uint8_t)(1u << (no % 8));
 
     for (uint32_t i = 0; at_mount && i < sb.ninodes; i++)
@@ -1090,6 +1181,7 @@ static int wfs_format(uint32_t nblocks)
     root.type = I_DIR;
     root.nlink = 1;
     root.parent = ROOT_INUM;
+    root.mode = DMODE_VALID | 0777u;             /* 磁碟的根目錄:每個使用者都可以在裡面建立自己的東西 */
     sb.clean = 1;
     if (dinode_rw(ROOT_INUM, &root, 1) != 0 || sb_write() != 0)
         return -E_IO;
@@ -1223,9 +1315,11 @@ void wfs_shutdown(void)
         return;
     mutex_lock(&wfs_lk);
     bsync();
-    sb.clean = 1;
-    sb_write();
-    bsync_opt(1);
+    if (!fs_failed) {                            /* 寫入失敗過:不記「正常卸載」,下次掛載時檢查 */
+        sb.clean = 1;
+        sb_write();
+        bsync_opt(1);
+    }
     mounted = 0;
     mutex_unlock(&wfs_lk);
 }
@@ -1243,9 +1337,24 @@ void wfs_stats(struct wfs_stats *st)
     st->free_inodes = free_inodes;
     st->mounts = sb.mounts;
     st->repairs = last_repairs;
+    st->failed = fs_failed;
     st->disk_reads = disk_reads;
     st->disk_writes = disk_writes;
     mutex_unlock(&wfs_lk);
+}
+
+/* 測試用:把快取裡的東西都寫回去,然後整個清空,讓之後的讀取一定要碰磁碟 */
+int wfs_test_drop_cache(void)
+{
+    if (!mounted)
+        return -E_INVAL;
+    mutex_lock(&wfs_lk);
+    int r = bsync();
+    for (struct buf *b = bufs; b < bufs + NBUF; b++)
+        if (b->pins == 0 && !b->dirty)
+            b->valid = 0;
+    mutex_unlock(&wfs_lk);
+    return r;
 }
 
 int wfs_check_now(void)

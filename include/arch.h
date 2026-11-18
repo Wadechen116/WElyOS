@@ -18,6 +18,8 @@ void arch_console_irq_init(void);              /* 讓序列埠在收到字元時
 void arch_halt(void) __attribute__((noreturn));/* 關閉中斷並永久停住(panic 用) */
 void arch_exit(int code) __attribute__((noreturn)); /* 結束模擬器(僅測試用) */
 const char *arch_name(void);                   /* 架構名稱字串 */
+uint64_t arch_rtc_read(void);                  /* 讀取硬體的即時時鐘(Real-Time Clock):現在是 1970-01-01 00:00:00 UTC
+                                                  之後的第幾秒。沒有這種裝置回傳 0 */
 
 /*
  * 中斷與計時器。
@@ -75,6 +77,23 @@ void *arch_stack_init(void *top, void (*entry)(void));
 size_t arch_frame_size(void);
 void arch_frame_set_retval(void *tf, long v);
 void arch_user_resume(void *tf) __attribute__((noreturn));
+
+/*
+ * 訊號處理函式用。把「使用者模式被打斷時的暫存器」(tf)改成去執行另一個函式,之後再換回來:
+ *   arch_frame_user_sp(tf)        目前的使用者 stack pointer
+ *   arch_frame_call(tf, frame, pc, arg, ret, words)
+ *                                 把 tf 改成:以 frame(已對齊 16)之下為 stack、呼叫 pc(arg)、
+ *                                 返回到 ret。呼叫慣例需要先放在 stack 上的東西(i386 的返回位址
+ *                                 與參數)填進 words[],回傳個數;它們要寫到新的 stack pointer 處
+ *   arch_frame_restore(tf, saved) 以 saved(來自使用者的記憶體,不可信任)的內容取代 tf 的暫存器,
+ *                                 但「只有 kernel 能決定的部分」(特權等級、中斷開關)保留 tf 原本的
+ *   arch_frame_get_retval(tf)     讀出「系統呼叫回傳值」那個暫存器
+ */
+uintptr_t arch_frame_user_sp(void *tf);
+unsigned  arch_frame_call(void *tf, uintptr_t frame, uintptr_t pc, uintptr_t arg, uintptr_t ret,
+                          uintptr_t words[2]);
+void      arch_frame_restore(void *tf, const void *saved);
+long      arch_frame_get_retval(void *tf);
 
 void arch_set_kstack(uintptr_t top);
 void arch_enter_user(uintptr_t entry, uintptr_t usp, uintptr_t arg) __attribute__((noreturn));

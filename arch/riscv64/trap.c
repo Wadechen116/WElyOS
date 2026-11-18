@@ -81,6 +81,38 @@ void arch_frame_set_retval(void *tf, long v)
     ((struct trap_frame *)tf)->a0 = (uint64_t)v;     /* 系統呼叫的回傳值放在 a0 */
 }
 
+uintptr_t arch_frame_user_sp(void *tf)
+{
+    return (uintptr_t)((struct trap_frame *)tf)->sp;
+}
+
+unsigned arch_frame_call(void *vtf, uintptr_t frame, uintptr_t pc, uintptr_t arg, uintptr_t ret,
+                         uintptr_t words[2])
+{
+    struct trap_frame *tf = vtf;
+
+    (void)words;
+    tf->sp = frame;                      /* 參數與返回位址都用暫存器傳:stack 上不必放東西 */
+    tf->a0 = arg;
+    tf->ra = ret;
+    tf->sepc = pc;
+    return 0;
+}
+
+void arch_frame_restore(void *vtf, const void *saved)
+{
+    struct trap_frame *tf = vtf;
+    uint64_t sstatus = tf->sstatus;      /* 特權等級(SPP)與中斷開關在這裡:不採用使用者給的 */
+
+    *tf = *(const struct trap_frame *)saved;
+    tf->sstatus = sstatus;
+}
+
+long arch_frame_get_retval(void *tf)
+{
+    return (long)((struct trap_frame *)tf)->a0;
+}
+
 void arch_user_resume_asm(struct trap_frame *tf) __attribute__((noreturn));   /* switch.S */
 
 void arch_user_resume(void *tf)
@@ -111,7 +143,7 @@ void trap_handler(struct trap_frame *tf)
         if ((cause & ~SCAUSE_INTERRUPT) == IRQ_S_TIMER) {
             timer_interrupt();
             if (from_user)
-                user_return_check();
+                user_return_check(tf);
             return;
         }
         /* S-mode 軟體中斷:別顆 hart 透過 SBI 發來的處理器間中斷(見 smp.c) */
@@ -121,14 +153,14 @@ void trap_handler(struct trap_frame *tf)
             smp_ipi_handler();
             sched_irq_exit();                /* 被要求重新排程的話,在這裡切換 */
             if (from_user)
-                user_return_check();
+                user_return_check(tf);
             return;
         }
         /* S-mode 外部中斷:週邊裝置(序列埠)經由 PLIC 送來的(見 arch.c) */
         if ((cause & ~SCAUSE_INTERRUPT) == IRQ_S_EXT) {
             external_interrupt();
             if (from_user)
-                user_return_check();
+                user_return_check(tf);
             return;
         }
         panic("unexpected interrupt, scause=0x%llx", (unsigned long long)cause);
@@ -140,7 +172,7 @@ void trap_handler(struct trap_frame *tf)
         tf->sepc += 4;
         tf->a0 = (uint64_t)syscall_dispatch((long)tf->a7, (long)tf->a0,
                                             (long)tf->a1, (long)tf->a2, tf);
-        user_return_check();
+        user_return_check(tf);
         return;
     }
 
@@ -148,7 +180,7 @@ void trap_handler(struct trap_frame *tf)
        不是的話只終止那個行程,kernel 繼續運作 */
     if (from_user) {
         if (user_page_fault(tf, cause)) {
-            user_return_check();
+            user_return_check(tf);
             return;
         }
         const char *uname = "Unknown exception";

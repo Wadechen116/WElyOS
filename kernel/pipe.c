@@ -50,8 +50,12 @@ static long pipe_read(struct inode *in, void *buf, size_t n, uint64_t off)
     (void)off;
     unsigned long flags = sched_lock();
     /* 沒有資料時:還有寫端開著就等;都關了就是結束。被終止的行程不再等 */
-    while (p->count == 0 && p->writers > 0 && !thread_killed())
+    while (p->count == 0 && p->writers > 0 && !thread_interrupted())
         wq_sleep(&p->readers_wq);
+    if (p->count == 0 && p->writers > 0 && !thread_killed()) {
+        sched_unlock(flags);
+        return -E_INTR;                      /* 被訊號打斷:不是「結束」,呼叫者可以再讀一次 */
+    }
 
     while (got < n && p->count > 0) {
         size_t k = PIPE_SIZE - p->head;      /* 到緩衝區尾端為止連續的一段 */
@@ -86,8 +90,11 @@ static long pipe_write(struct inode *in, const void *buf, size_t n, uint64_t off
             err = -E_PIPE;
             break;
         }
-        if (thread_killed())
+        if (thread_interrupted()) {
+            if (!thread_killed())
+                err = -E_INTR;               /* 被訊號打斷;已經寫入的部分照常回報 */
             break;
+        }
         if (p->count == PIPE_SIZE) {
             wq_sleep(&p->writers_wq);        /* 滿了:等讀取者拿走一些 */
             continue;

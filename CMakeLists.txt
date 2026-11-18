@@ -45,12 +45,15 @@ set(COMMON_LINK_FLAGS ${ARCH_LINK_FLAGS} -ffreestanding -nostdlib -static -no-pi
 # ---- 使用者程式 ----
 # 每個程式(user/<名稱>.c)與共用的啟動程式 crt0.c 一起,獨立連結在 USER_BASE
 # (各架構的使用者位址範圍起點),再轉成原始二進位,放進開機檔案包的 /bin/<名稱>。
-set(USER_PROGRAMS init echo cat ls mkdir rm wc sleep kill ps cp df sync top sh)
+set(USER_PROGRAMS init echo cat ls mkdir rm mv wc sort date sleep kill ps cp df sync top id su chmod chown sh)
 set(USER_BINS "")
 foreach(prog ${USER_PROGRAMS})
-    add_executable(${prog}.elf user/${prog}.c user/crt0.c)
+    # libc.c 是共用的小型函式庫。-ffunction-sections 讓每個函式各自一個區段,
+    # --gc-sections 讓連結器丟掉沒有被用到的:不用 printf 的程式不會因此變大
+    add_executable(${prog}.elf user/${prog}.c user/crt0.c user/libc.c)
     target_include_directories(${prog}.elf PRIVATE user)
-    target_link_options(${prog}.elf PRIVATE ${COMMON_LINK_FLAGS}
+    target_compile_options(${prog}.elf PRIVATE -ffunction-sections -fdata-sections)
+    target_link_options(${prog}.elf PRIVATE ${COMMON_LINK_FLAGS} -Wl,--gc-sections
         -T ${CMAKE_SOURCE_DIR}/user/user.ld -Wl,--defsym=USER_BASE=${ARCH_USER_BASE})
     set_target_properties(${prog}.elf PROPERTIES LINK_DEPENDS ${CMAKE_SOURCE_DIR}/user/user.ld)
     set(bin ${CMAKE_BINARY_DIR}/userbin/${prog})
@@ -100,6 +103,7 @@ add_executable(welyos.elf
     kernel/pipe.c
     kernel/ramfs.c
     kernel/wfs.c
+    kernel/blkfault.c
     kernel/initrd.c
     kernel/rootfs.S
     lib/string.c)
