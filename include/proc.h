@@ -128,6 +128,8 @@ enum {
     /* ---- 週期性的即時工作(見 sched.h) ---- */
     SYS_rt_set,             /* (period_ms, budget_ms)  把自己宣告為週期性工作(需要 CAP_ADMIN);period 為 0 = 取消 */
     SYS_rt_wait,            /* (stats)         這一次做完了,睡到下一個週期;stats 不是 0 時填入 struct rt_stats */
+    /* ---- 故障注入 ---- */
+    SYS_seu,                /* (pid, addr, bit) 把行程 pid 的記憶體 addr 處的一個位元翻轉(測試用;需要 CAP_ADMIN) */
 };
 
 /* SYS_waitpid 的選項 */

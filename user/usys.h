@@ -27,7 +27,7 @@ enum {
     SYS_getuid, SYS_getgid, SYS_setuid, SYS_capget, SYS_capdrop, SYS_chmod, SYS_chown,
     SYS_mmap, SYS_munmap, SYS_memlimit,
     SYS_ping, SYS_udp_open, SYS_udp_send, SYS_udp_recv, SYS_netinfo,
-    SYS_bbread, SYS_bblog, SYS_scrub, SYS_rt_set, SYS_rt_wait,
+    SYS_bbread, SYS_bblog, SYS_scrub, SYS_rt_set, SYS_rt_wait, SYS_seu,
 };
 #define SYS_SIGRETURN_NUM 40 /* SYS_sigreturn 的數值:crt0.c 裡的組合語言要用(下面有檢查) */
 _Static_assert(SYS_sigreturn == SYS_SIGRETURN_NUM, "update SYS_SIGRETURN_NUM");
@@ -348,6 +348,12 @@ static inline long sys_rt_set(unsigned period_ms, unsigned budget_ms)
     return syscall3(SYS_rt_set, (long)period_ms, (long)budget_ms, 0);
 }
 static inline long sys_rt_wait(struct rt_stats *st) { return syscall3(SYS_rt_wait, (long)st, 0, 0); }
+/* 故障注入(測試用,需要 CAP_ADMIN):把行程 pid 的記憶體 addr 處那個位元組的第 bit 個位元翻轉,
+   模擬宇宙射線造成的單一位元錯誤。在對方下一次返回使用者模式之前生效 */
+static inline long sys_seu(long pid, const volatile void *addr, int bit)
+{
+    return syscall3(SYS_seu, pid, (long)addr, bit);
+}
 /* 現在的日期時間:1970-01-01 00:00:00 UTC 至今的秒數與微秒(換成年月日見 libc.h 的 gmtime_) */
 static inline long sys_time(struct timeval *tv)   { return syscall3(SYS_time, (long)tv, 0, 0); }
 /* 把還留在記憶體裡的修改寫到磁碟上 */

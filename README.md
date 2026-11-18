@@ -58,12 +58,12 @@
 - [x] 靜態檢查(由 Codex 實作):`scripts/static-check.sh` — 快速的規則掃描(遞迴、未檢查的錯誤回傳、禁用函式等)與按需的 GCC `-fanalyzer`;已據此修正 `printf` 寬度的溢位等缺陷
 - [x] 可靠性之三:開機失敗計數(黑盒子記錄每次開機是否順利完成)與安全模式(連續 3 次失敗後只啟動最少的功能:不掛載磁碟、不啟動網路、單一 CPU,但仍可用 `faultlog` 診斷)
 - [x] 可靠性之四:期限排程 — 週期性的即時工作(`periodic` 命令、`sys_rt_set`/`sys_rt_wait`):接受前先檢查負載(合計不超過 CPU 的 70%)、超出預算就降級、每個 tick 監控有沒有錯過期限
+- [x] 可靠性之五:三重執行加投票(`vote 命令`:執行三份,多數決;出錯的那一份被否決並記入黑盒子;沒有多數就不給結果)與位元翻轉的故障注入(`sys_seu`)
 
 ## 規劃中
 
 - [ ] 多核心(Symmetric Multiprocessing,SMP)效能:縮小排程器的大鎖、喚醒時考慮上次執行的 CPU、mutex 先自旋再睡
 - [ ] TCP;i386 的 PS/2 鍵盤;檔案系統的日誌(journaling)、以磁碟為根目錄
-- [ ] 可靠性(參考航太飛行軟體的做法):三重執行加投票
 - [ ] 結構整理:中斷與裝置的註冊介面、kernel 與使用者共用的定義檔、拆分 `proc.c` / `main.c`、區塊快取獨立成一層
 
 ## 需求
@@ -115,7 +115,7 @@ include/      與架構無關的標頭(arch.h 為架構介面;cred.h 為身分�
 kernel/       kernel 主體(main、kprintf、fdt、panic、timer、pmm、kmalloc、sched、runq_ring / runq_list、spinlock、smp、sync、vm、proc、vfs、ramfs、wfs、virtio_blk、virtio_net、blkfault、netif、blackbox、watchdog、initrd、console、pipe;net/ 為網路的協定堆疊)
 lib/          最小字串函式庫、CRC-32
 cmake/        各架構的 toolchain 檔
-user/         使用者程式(各自獨立連結後放進開機檔案包的 /bin/):init(測試)、sh(shell)、echo、cat、ls、wc、sort、date、mkdir、rm、cp、mv、sleep、kill、ps、top、df、sync、id、su、chmod、chown、ping、net、tftp、host、faultlog、supervise、scrub、periodic;crt0.c 為共用的啟動程式,libc.c / libc.h 為小型 C 函式庫,ulib.h 為較早的小工具
+user/         使用者程式(各自獨立連結後放進開機檔案包的 /bin/):init(測試)、sh(shell)、echo、cat、ls、wc、sort、date、mkdir、rm、cp、mv、sleep、kill、ps、top、df、sync、id、su、chmod、chown、ping、net、tftp、host、faultlog、supervise、scrub、periodic、vote;tmr.h 為三重執行加投票的函式庫,crt0.c 為共用的啟動程式,libc.c / libc.h 為小型 C 函式庫,ulib.h 為較早的小工具
 firmware/     RISC-V 的開機韌體(拿掉自己標誌的 OpenSBI;說明見 firmware/README.md)
 rootfs/       開機檔案包的內容(建置時打包成 tar 嵌入 kernel,開機時解開到檔案系統)
 tests/host/   在主機上執行的測試(執行佇列的並行測試;net/ 為網路堆疊的測試)

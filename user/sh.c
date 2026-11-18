@@ -566,7 +566,8 @@ int main(int argc, char **argv)
                   "programs: anything in /bin (try: ls /bin), e.g. echo, cat, ls, wc, sort, date, mkdir, rm, cp, mv, sleep, kill, ps, top, df, sync\n"
                   "network: net, ping 10.0.2.2, host NAME, tftp REMOTE-FILE [LOCAL-FILE] (files come from the host)\n"
                   "reliability: faultlog (events kept across reboots), supervise COMMAND (restart on failure), scrub (verify the disk),\n"
-                  "             periodic [PERIOD_MS BUDGET_MS COUNT WORK_MS] (run as a real-time periodic task)\n"
+                  "             periodic [PERIOD_MS BUDGET_MS COUNT WORK_MS] (run as a real-time periodic task),\n"
+                  "             vote COMMAND (run three copies and take the majority result)\n"
                   "users: id, su USER (exit returns), chmod MODE FILE, chown USER FILE; ls -l shows owners\n"
                   "redirection: command > file, command >> file, command < file\n"
                   "pipes: command | command | ...\n"
@@ -605,9 +606,13 @@ int main(int argc, char **argv)
                 status = 1;
             } else {
                 j->stopped = 0;
-                sys_kill(-j->pgid, SIGCONT);
-                job_report(j, "continued", -1);
-                status = 0;
+                if (sys_kill(-j->pgid, SIGCONT) != 0) {
+                    puts_("sh: bg: the job is gone\n");     /* 剛好已經結束了:下一輪會回報 */
+                    status = 1;
+                } else {
+                    job_report(j, "continued", -1);
+                    status = 0;
+                }
             }
         } else if (streq(words[0], "wait")) {
             /* 暫停中的工作不會自己結束,不等它們 */

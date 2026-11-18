@@ -86,6 +86,11 @@ struct proc {
     uintptr_t sig_handler[NSIG];     /* 每個訊號的處理方式:SIG_DFL、SIG_IGN 或使用者函式的位址 */
     uintptr_t sig_restorer;          /* 處理函式返回時跳去的地方(使用者端的一小段程式,呼叫 sigreturn) */
     uint32_t sig_pending;            /* 已經送來、還沒交給處理函式的訊號(bit n = 訊號 n) */
+    /* 故障注入(SYS_seu):等著在這個行程的記憶體裡翻轉的一個位元。由行程自己在返回使用者模式前
+       動手 — 別的行程不直接碰它的位址空間,所以不必處理「對方同時在結束、在 fork」這些情況 */
+    volatile int seu_pending;
+    uintptr_t seu_addr;
+    uint8_t seu_mask;
     int stopped;                     /* 不為 0 = 被暫停了,值是造成暫停的訊號編號(見下方「暫停與繼續」) */
     int stop_reported;               /* 這次暫停已經告訴過父行程了(waitpid 的 WUNTRACED 只回報一次) */
     struct wait_queue stop_wq;       /* 暫停期間,它的執行緒睡在這裡,等 SIGCONT */
@@ -1241,6 +1246,13 @@ void user_return_check(void *tf)
     }
     if (thread_killed())
         proc_thread_exit();
+    if (p->seu_pending && __atomic_exchange_n(&p->seu_pending, 0, __ATOMIC_SEQ_CST)) {
+        uint8_t byte;                            /* 被注入的位元翻轉:位址不合法就什麼都不做 */
+        if (copy_from_user(p, &byte, p->seu_addr, 1) == 0) {
+            byte ^= p->seu_mask;
+            (void)!copy_to_user(p, p->seu_addr, &byte, 1);
+        }
+    }
     if (p->sig_pending)                          /* 不上鎖先看一眼,理由同上 */
         deliver_signal(p, tf);
     else if (thread_interrupted())
@@ -2335,6 +2347,23 @@ long syscall_dispatch(long num, long a0, long a1, long a2, void *tf)
         return sys_munmap(p, (uintptr_t)a0);
     case SYS_memlimit:
         return sys_memlimit(p, a0);
+    case SYS_seu: {                  /* 故障注入:只給有特權的行程 */
+        long rc = -E_SRCH;
+        if (!(p->cred.caps & CAP_ADMIN))
+            return -E_PERM;
+        if (a2 < 0 || a2 > 7)
+            return -E_INVAL;
+        unsigned long flags = sched_lock();
+        struct proc *q = proc_find((int)a0);
+        if (q && !q->zombie) {
+            q->seu_addr = (uintptr_t)a1;
+            q->seu_mask = (uint8_t)(1u << a2);
+            q->seu_pending = 1;
+            rc = 0;
+        }
+        sched_unlock(flags);
+        return rc;
+    }
     case SYS_rt_set:                 /* 即時工作優先於所有人:只給有特權的行程(而且仍受預算與總量的限制) */
         if (!(p->cred.caps & CAP_ADMIN))
             return -E_PERM;

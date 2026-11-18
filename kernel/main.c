@@ -1543,7 +1543,7 @@ enum {
     UMODE_FORK, UMODE_STACK_GROW, UMODE_PIPE, UMODE_SIGNAL, UMODE_JOBS,
     UMODE_STOP, UMODE_DISK, UMODE_SYSINFO, UMODE_FILEOPS, UMODE_HEAP,
     UMODE_SIGHANDLER, UMODE_TIME, UMODE_PERM,
-    UMODE_MEMQUOTA, UMODE_NET, UMODE_RT,
+    UMODE_MEMQUOTA, UMODE_NET, UMODE_RT, UMODE_TMR,
 };
 
 /* 以測試編號 mode 啟動 /bin/init:編號轉成字串,當作 argv[1] 傳給它 */
@@ -1645,6 +1645,8 @@ static void user_demo(void)
     run_user("memory quota and mmap", UMODE_MEMQUOTA, 27);
     /* 週期性的即時工作:參數檢查、負載上限、需要特權、準時 */
     run_user("periodic real-time tasks", UMODE_RT, 29);
+    /* 三重執行加投票:對其中一份注入位元翻轉、讓一份卡住、讓兩份都出錯 */
+    run_user("triple execution with voting", UMODE_TMR, 30);
     /* 網路(有網路卡的話):ping、UDP socket、以 TFTP 實際收送一個檔案 */
     if (boot_nic)
         run_user("network: ping and UDP", UMODE_NET, 28);

@@ -44,6 +44,7 @@ enum {
     UMODE_MEMQUOTA,      /* 記憶體配額(要求當場成功或失敗,不會事後被終止)與匿名對映 */
     UMODE_NET,           /* 網路:ping、UDP socket(以模擬器內建的 TFTP 伺服器驗證收送) */
     UMODE_RT,            /* 週期性的即時工作:準時、負載檢查、需要特權 */
+    UMODE_TMR,           /* 三重執行加投票:注入位元翻轉、卡住的那一份、兩份都錯 */
 };
 
 /* 各架構 kernel 映像所在的位址(使用者模式不應該讀得到) */
@@ -520,6 +521,104 @@ static int mode_signal(void)
 
     puts_("  [user] process relationships and signals work as expected\n");
     return 17;
+}
+
+/* ---- UMODE_TMR ---- */
+
+#include "tmr.h"
+
+static volatile unsigned char tmr_data[64];      /* 「計算」用到的資料:故障就注入在這裡 */
+static volatile int tmr_hang;                    /* 被翻轉成非 0 的那一份會卡住不動 */
+
+static int tmr_work(void *arg)
+{
+    char line[32];
+    unsigned sum = 0;
+
+    (void)arg;
+    while (tmr_hang)
+        ;
+    for (unsigned i = 0; i < sizeof(tmr_data); i++)
+        sum = sum * 31 + tmr_data[i];
+    int n = snprintf(line, sizeof(line), "sum=%u\n", sum);
+    return sys_write(1, line, (unsigned long)n) == n ? 7 : 1;
+}
+
+static int tmr_case;
+
+static void tmr_inject(const long pid[TMR_N], void *arg)
+{
+    int *bad = arg;
+
+    *bad = 0;
+    if (tmr_case == 1)                           /* 第 2 份:資料裡翻轉一個位元 */
+        *bad |= sys_seu(pid[1], &tmr_data[5], 3) != 0;
+    if (tmr_case == 2)                           /* 第 3 份:卡住 */
+        *bad |= sys_seu(pid[2], &tmr_hang, 0) != 0;
+    if (tmr_case == 3) {                         /* 兩份各壞在不同的地方:三份都不一樣 */
+        *bad |= sys_seu(pid[0], &tmr_data[1], 0) != 0;
+        *bad |= sys_seu(pid[2], &tmr_data[9], 7) != 0;
+    }
+}
+
+static int mode_tmr(void)
+{
+    struct tmr_result res[TMR_N];
+    struct tmr_report rep;
+    char want[32];
+    unsigned sum = 0;
+    int bad = 0, len, status = -1;
+
+    for (unsigned i = 0; i < sizeof(tmr_data); i++) {
+        tmr_data[i] = (unsigned char)(i * 7 + 3);
+        sum = sum * 31 + tmr_data[i];
+    }
+    len = snprintf(want, sizeof(want), "sum=%u\n", sum);
+
+    for (tmr_case = 0; tmr_case <= 3; tmr_case++) {
+        int rc = tmr_run(tmr_work, 0, tmr_case == 2 ? 60 : 2000, tmr_inject, &bad, res, &rep);
+        int base = 1200 + tmr_case * 10;
+        const struct tmr_result *w = rep.winner >= 0 ? &res[rep.winner] : 0;
+        int ok = !bad;
+
+        if (tmr_case == 0)                       /* 沒有故障:三份相同 */
+            ok = ok && rc == 0 && rep.agree == 3 && rep.odd == -1 && !rep.timed_out;
+        if (tmr_case == 1)                       /* 一份算錯:被另外兩份否決,而且指得出是哪一份 */
+            ok = ok && rc == 0 && rep.agree == 2 && rep.odd == 1 && !rep.timed_out &&
+                 res[1].status == 7 && res[1].len > 0 && memcmp(res[1].out, want, (size_t)len) != 0;
+        if (tmr_case == 2)                       /* 一份卡住:逾時被終止,結果仍然正確 */
+            ok = ok && rc == 0 && rep.agree == 2 && rep.odd == 2 && rep.timed_out &&
+                 res[2].status == 128 + SIGKILL;
+        if (tmr_case == 3)                       /* 沒有兩份相同:拒絕給出結果 */
+            ok = ok && rc == -1 && rep.agree == 0 && rep.winner == -1;
+        if (tmr_case != 3)                       /* 有結果的話,一定是正確的那個 */
+            ok = ok && w && w->status == 7 && w->len == (unsigned)len && memcmp(w->out, want, (size_t)len) == 0;
+        for (int i = 0; i < TMR_N; i++)
+            free(res[i].out);
+        if (!ok)
+            return base;
+    }
+    /* 注入只影響被指定的行程:我們自己的資料沒有變 */
+    unsigned again = 0;
+    for (unsigned i = 0; i < sizeof(tmr_data); i++)
+        again = again * 31 + tmr_data[i];
+    if (again != sum || tmr_hang)
+        return 1250;
+    /* 參數檢查與特權 */
+    if (sys_seu(99999, &tmr_data[0], 0) != -E_SRCH || sys_seu(sys_getpid(), &tmr_data[0], 8) != -E_INVAL)
+        return 1251;
+    if (sys_seu(sys_getpid(), (void *)8, 0) != 0 || tmr_data[0] != 3)    /* 不合法的位址:什麼都不發生 */
+        return 1252;
+    if (sys_seu(sys_getpid(), &tmr_data[0], 2) != 0 || tmr_data[0] != (3 ^ 4))   /* 對自己:立刻生效 */
+        return 1253;
+    long pid = sys_fork();
+    if (pid == 0) {
+        sys_capdrop(CAP_ADMIN);
+        sys_exit(sys_seu(sys_getpid(), &tmr_data[0], 0) == -E_PERM ? 0 : 1);
+    }
+    if (sys_waitpid(pid, &status, 0) != pid || status != 0)
+        return 1254;
+    return 30;
 }
 
 /* ---- UMODE_RT ---- */
@@ -2332,6 +2431,9 @@ static int umain(long mode)
 
     case UMODE_RT:
         return mode_rt();
+
+    case UMODE_TMR:
+        return mode_tmr();
 
     case UMODE_PERM: {
         /* 同一組測試在記憶體檔案系統與磁碟上各做一次 */
