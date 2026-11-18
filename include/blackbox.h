@@ -1,6 +1,7 @@
 #ifndef WELYOS_BLACKBOX_H
 #define WELYOS_BLACKBOX_H
 #include <stdint.h>
+#include "uapi/blackbox.h"    /* BB_*、struct bb_record */
 
 /*
  * 黑盒子(flight recorder):把重要的事件寫到磁碟上固定的一小塊區域,重新開機後還讀得到。
@@ -15,32 +16,6 @@
  * 格式:64 筆固定 128 位元組的紀錄,環狀使用(寫滿了就蓋掉最舊的)。
  * 每筆有序號與檢查碼(CRC-32):寫到一半斷電、或內容損壞的紀錄,讀取時會被認出來並略過。
  */
-enum {
-    BB_BOOT = 1,             /* 開機 */
-    BB_SHUTDOWN,             /* 正常關機 */
-    BB_PANIC,                /* kernel panic */
-    BB_WATCHDOG,             /* 看門狗:某顆 CPU 沒有回應 */
-    BB_FAULT,                /* 使用者程式因為例外(非法存取等)被終止 */
-    BB_DISK,                 /* 磁碟寫入失敗,檔案系統轉為唯讀 */
-    BB_RESTART,              /* 受監督的程式結束,被重新啟動(或放棄) */
-    BB_NOTE,                 /* 其他註記 */
-    BB_HEALTHY,              /* 這一次開機順利完成(安全模式用它判斷「連續幾次開機失敗」) */
-};
-
-#define BB_TEXT_MAX 100
-
-/* 一筆紀錄(磁碟上與交給使用者程式的格式相同;使用者端的定義在 user/usys.h) */
-struct bb_record {
-    uint32_t magic;
-    uint32_t seq;            /* 序號:越大越新 */
-    uint64_t time;           /* 當時的日期時間(1970-01-01 UTC 至今的秒數) */
-    uint32_t boot;           /* 第幾次開機(檔案系統被掛載的次數) */
-    uint16_t type;           /* BB_* */
-    uint16_t len;            /* text 的長度 */
-    char text[BB_TEXT_MAX];
-    uint32_t crc;            /* 前面所有欄位的 CRC-32 */
-};
-
 struct blkdev;
 
 /* 啟用:dev 是磁碟,fs_blocks 是檔案系統使用的區塊數(每塊 4KB)。

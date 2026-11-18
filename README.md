@@ -59,6 +59,7 @@
 - [x] 可靠性之三:開機失敗計數(黑盒子記錄每次開機是否順利完成)與安全模式(連續 3 次失敗後只啟動最少的功能:不掛載磁碟、不啟動網路、單一 CPU,但仍可用 `faultlog` 診斷)
 - [x] 可靠性之四:期限排程 — 週期性的即時工作(`periodic` 命令、`sys_rt_set`/`sys_rt_wait`):接受前先檢查負載(合計不超過 CPU 的 70%)、超出預算就降級、每個 tick 監控有沒有錯過期限
 - [x] 可靠性之五:三重執行加投票(`vote 命令`:執行三份,多數決;出錯的那一份被否決並記入黑盒子;沒有多數就不給結果)與位元翻轉的故障注入(`sys_seu`)
+- [x] 結構整理之一:kernel 與使用者程式共用的定義集中到 `include/uapi/`(原本兩邊各寫一份、靠人工保持一致),並以編譯期檢查確保結構在三個架構上大小相同
 
 ## 規劃中
 
@@ -112,6 +113,7 @@ QEMU_DISK=none bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf            
 ```
 arch/<名稱>/  各架構的開機程式、linker script、驅動(i386 / riscv64 / aarch64)
 include/      與架構無關的標頭(arch.h 為架構介面;cred.h 為身分與特權;net.h 為網路的介面)
+include/uapi/ kernel 與使用者程式共用的定義:系統呼叫編號、傳遞的結構、錯誤碼、訊號編號(兩邊引入同一份檔案)
 kernel/       kernel 主體(main、kprintf、fdt、panic、timer、pmm、kmalloc、sched、runq_ring / runq_list、spinlock、smp、sync、vm、proc、vfs、ramfs、wfs、virtio_blk、virtio_net、blkfault、netif、blackbox、watchdog、initrd、console、pipe;net/ 為網路的協定堆疊)
 lib/          最小字串函式庫、CRC-32
 cmake/        各架構的 toolchain 檔

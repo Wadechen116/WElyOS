@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# 更新靜態檢查的參考報告(tests/static/findings-fast.json 與 snapshot-fast.json)。
-# 回歸測試只回報「相對於參考報告新增的」提示;新增的提示處理完(修正,或逐筆審查後寫進
-# tests/static/baseline.txt)之後執行這個腳本,再把更新後的參考報告一起提交。
+# 更新靜態檢查的參考報告(tests/static/findings-fast.json 與 snapshot-fast.json),和程式碼一起提交。
+# 下一次提交之後,scripts/static-gate.sh 就以這一份為基準。
+# 還有「需要處理的新提示」時拒絕更新:否則只要更新一下報告,新的問題就變成「既有的」而被放過。
 # 注意:這不是「接受」任何提示 — 參考報告只是比較的起點,未審查的仍然標為未審查。
-set -euo pipefail
+set -uo pipefail
 cd "$(dirname "$0")/.."
+if ! bash scripts/static-gate.sh; then
+  echo "還有需要處理的新提示(或檢查無法完成),參考報告沒有更新"
+  exit 1
+fi
 dir=$(mktemp -d)
 trap 'rm -rf "$dir"' EXIT
 rc=0

@@ -126,33 +126,9 @@ if [ "$QUICK" -eq 0 ] && [ -f scripts/host-test-net.sh ]; then
   fi
 fi
 
-# 靜態檢查(約 2 秒):和已提交的參考報告(tests/static/findings-fast.json)比較,只看「新增的」提示。
-#   - 新增的遞迴、禁用函式、未檢查的錯誤回傳:視為失敗(修掉,或逐筆審查後寫進 tests/static/baseline.txt)
-#   - 新增的風格提示(沒有參數檢查、函式過長):只列出數量,不算失敗
-#   - 檢查本身不完整(工具錯誤、參考報告與規則不相容):視為失敗
-# 處理完之後以 scripts/static-refresh.sh 更新參考報告。既有尚未審查的提示不會因此被當成「已接受」。
-if [ -f scripts/static-check.sh ] && [ -f tests/static/findings-fast.json ]; then
-  sdir=$(mktemp -d)
-  bash scripts/static-check.sh --compare tests/static/findings-fast.json --gate delta --out "$sdir/out" \
-       > "$sdir/log.txt" 2>&1
-  src=$?
-  if [ "$src" -ge 2 ]; then
-    fail=1; echo "  靜態檢查無法完成:"; tail -3 "$sdir/log.txt" | sed 's/^/    /'
-  else
-    python3 - "$sdir/out/findings.json" <<'PYEOF'
-import json, sys
-d = json.load(open(sys.argv[1]))
-new = set(d['comparison']['newly_unreviewed_ids'])
-hard = [f for f in d['findings'] if f['id'] in new and f['rule'] in ('recursion', 'banned-call', 'unchecked-error')]
-print(f"靜態檢查:新增 {len(hard)} 個需要處理的提示、{len(new) - len(hard)} 個風格提示"
-      f"(既有尚未審查 {len(d['comparison']['existing_unreviewed_ids'])} 個)")
-for f in hard:
-    print(f"  {f['path']}:{f['line']} [{f['rule']}] {f['symbol']}: {f['message'][:100]}")
-sys.exit(1 if hard else 0)
-PYEOF
-    [ "$?" -eq 0 ] || fail=1
-  fi
-  rm -rf "$sdir"
+# 靜態檢查(約 2 秒):只看相對於「上一次提交」新增的提示,見 scripts/static-gate.sh
+if [ -f scripts/static-gate.sh ]; then
+  bash scripts/static-gate.sh || fail=1
 fi
 
 # Windows 版 QEMU 逾時被中止時可能殘留行程

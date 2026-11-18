@@ -2,6 +2,7 @@
 #define WELYOS_NETIF_H
 #include <stddef.h>
 #include <stdint.h>
+#include "uapi/net.h"         /* struct netinfo、struct udpmsg */
 
 /*
  * netif.h - 把網路卡驅動程式(netdev.h)與協定堆疊(net.h)接進 kernel 的那一層。
@@ -32,17 +33,5 @@ long netif_udp_send(struct file *f, uint32_t ip, uint16_t port, const void *data
 long netif_udp_recv(struct file *f, uint32_t *ip, uint16_t *port, void *buf, size_t cap,
                     unsigned timeout_ms);
 
-/* 目前的設定與統計(使用者端的定義在 user/usys.h,必須一致) */
-struct netinfo {
-    uint32_t up;                 /* 1 = 有網路卡而且已啟動 */
-    uint8_t  mac[6];
-    uint16_t pad;
-    uint32_t ip, netmask, gateway;
-    uint32_t rx_frames, tx_frames, rx_dropped;
-    uint32_t rx_bad_length, rx_bad_checksum, rx_filtered, rx_unbound;
-    uint32_t tx_errors, tx_queue_full, arp_timeouts, arp_cache_entries;
-    uint32_t icmp_echo_replied, udp_delivered;
-    uint32_t sock_dropped;       /* socket 的佇列滿了而丟掉的封包 */
-};
 void netif_info(struct netinfo *out);
 #endif

@@ -1,6 +1,7 @@
 #ifndef WELYOS_SCHED_H
 #define WELYOS_SCHED_H
 #include <stddef.h>
+#include "uapi/proc.h"        /* struct rt_stats */
 #include <stdint.h>
 
 /*
@@ -72,15 +73,6 @@ void thread_join(int tid);
  *   misses   錯過期限 — 新的週期開始時,上一次的工作還沒做完
  *   overruns 超出預算 — 那一次剩下的時間被降回一般的優先權,不讓它拖累別人
  */
-struct rt_stats {
-    uint32_t period_ms, budget_ms;
-    uint32_t releases;       /* 準時開始了幾個週期 */
-    uint32_t misses;         /* 錯過了幾次期限 */
-    uint32_t overruns;       /* 超出預算幾次 */
-    uint32_t max_used_ms;    /* 單一週期用掉最多的 CPU 時間 */
-    uint32_t throttled;      /* 1 = 目前因超出預算而被降級中 */
-    uint32_t total_util;     /* 全系統已接受的即時工作合計佔 CPU 的千分比 */
-};
 int thread_set_periodic(unsigned period_ms, unsigned budget_ms);
 int thread_wait_period(struct rt_stats *st);
 

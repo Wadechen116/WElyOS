@@ -108,17 +108,6 @@ struct proc {
  * 需要把「檢查狀態」與「睡下去」做成不可分割的一步。
  * 會花時間或需要其他鎖的工作(配置記憶體、建立執行緒、釋放位址空間)一律放在鎖外。
  */
-/* 訊號編號(沿用 Unix 的定義;說明見下方「訊號」) */
-#define SIGINT  2
-#define SIGKILL 9
-#define SIGUSR1 10
-#define SIGUSR2 12
-#define SIGTERM 15
-#define SIGCONT 18
-#define SIGSTOP 19
-#define SIGTSTP 20
-#define SIGTTIN 21
-
 static struct proc *procs;           /* 所有行程(含 zombie) */
 static int next_pid = 1;
 

@@ -14,131 +14,16 @@
  *   AArch64   svc #0       x8     x0  x1  x2       x0
  */
 
-/* 編號必須與 kernel 的 include/proc.h 一致 */
-enum {
-    SYS_write = 1, SYS_exit, SYS_getpid, SYS_yield, SYS_sleep,
-    SYS_thread_create, SYS_thread_exit, SYS_gettid, SYS_futex_wait, SYS_futex_wake,
-    SYS_open, SYS_close, SYS_read, SYS_readdir, SYS_mkdir, SYS_unlink, SYS_stat,
-    SYS_spawn, SYS_exec, SYS_wait, SYS_dup2, SYS_fork, SYS_pipe,
-    SYS_waitpid, SYS_kill, SYS_setpgid, SYS_tcsetfg, SYS_procinfo,
-    SYS_sync, SYS_statfs, SYS_sysinfo, SYS_tcsetmode,
-    SYS_lseek, SYS_rename, SYS_link, SYS_chdir, SYS_getcwd, SYS_sbrk,
-    SYS_signal, SYS_sigreturn, SYS_time,
-    SYS_getuid, SYS_getgid, SYS_setuid, SYS_capget, SYS_capdrop, SYS_chmod, SYS_chown,
-    SYS_mmap, SYS_munmap, SYS_memlimit,
-    SYS_ping, SYS_udp_open, SYS_udp_send, SYS_udp_recv, SYS_netinfo,
-    SYS_bbread, SYS_bblog, SYS_scrub, SYS_rt_set, SYS_rt_wait, SYS_seu,
-};
-#define SYS_SIGRETURN_NUM 40 /* SYS_sigreturn 的數值:crt0.c 裡的組合語言要用(下面有檢查) */
-_Static_assert(SYS_sigreturn == SYS_SIGRETURN_NUM, "update SYS_SIGRETURN_NUM");
-
-/* sys_waitpid 的選項 */
-#define WNOHANG   1          /* 不等待:還沒有子行程結束就立刻回傳 0 */
-#define WUNTRACED 2          /* 子行程「被暫停」也回報:*status 會符合 WIFSTOPPED,行程不會被回收 */
-#define WSTOPPED_BASE  0x80000000u
-#define WIFSTOPPED(s)  (((unsigned)(s) & 0xFFFFFF00u) == WSTOPPED_BASE)
-#define WSTOPSIG(s)    ((int)((unsigned)(s) & 0xFFu))
-
-/* sys_procinfo 回報的內容,必須與 kernel 的 include/proc.h 一致 */
-enum { PROC_RUNNING = 1, PROC_SLEEPING, PROC_ZOMBIE, PROC_STOPPED };
-struct procinfo {
-    int pid, ppid, pgid;
-    int state;               /* PROC_RUNNING / PROC_SLEEPING / PROC_ZOMBIE / PROC_STOPPED */
-    int nthreads;
-    unsigned int cpu_ticks;  /* 累計用掉的 CPU 時間(tick,1 tick = 1ms) */
-    unsigned int mem_kb;     /* 對映的記憶體(KB;含和其他行程共用的程式碼與尚未複製的頁) */
-    unsigned int uid;        /* 行程的使用者編號 */
-    char name[32];
-};
-
-/* sys_sysinfo 回報的內容,必須與 kernel 的 include/proc.h 一致 */
-#define SYSINFO_MAX_CPUS 8
-struct sysinfo {
-    unsigned long long uptime_ticks;         /* 開機至今的 tick 數 */
-    unsigned int hz;                         /* 每秒幾個 tick */
-    unsigned int ncpu;
-    unsigned int nprocs, nthreads;
-    unsigned long long mem_total_kb, mem_free_kb;
-    unsigned long long ctx_switches;         /* 累計的執行緒切換次數 */
-    struct {
-        unsigned long long busy, idle;       /* 這顆 CPU 忙碌 / 閒置的 tick 數(累計) */
-    } cpu[SYSINFO_MAX_CPUS];
-};
-
-/* sys_tcsetmode 的模式(可以相加) */
-#define CON_RAW    1         /* 不等整行:每個按鍵立刻交給讀取者,不做行編輯 */
-#define CON_NOECHO 2         /* 不把打的字顯示出來 */
-
-/* 訊號編號。終止:INT、KILL、TERM(被終止的行程結束碼為 128 + 編號);
-   暫停:STOP、TSTP(Ctrl-Z)、TTIN(背景行程想讀鍵盤);繼續:CONT */
-#define SIGINT  2
-#define SIGKILL 9
-#define SIGUSR1 10
-#define SIGUSR2 12
-#define SIGTERM 15
-#define SIGCONT 18
-#define SIGSTOP 19
-#define SIGTSTP 20
-#define SIGTTIN 21
-
-/* 檔案相關的定義,必須與 kernel 的 include/fs.h 一致 */
-#define O_RDONLY  0x000
-#define O_WRONLY  0x001
-#define O_RDWR    0x002
-#define O_CREAT   0x040
-#define O_TRUNC   0x200
-#define O_APPEND  0x400
-#define E_PERM    1          /* 沒有這個特權 */
-#define E_NOENT   2
-#define E_ACCES   13         /* 檔案的權限不允許 */
-#define E_INTR    4          /* 系統呼叫被訊號打斷(行程有登記處理函式時才會發生);通常再呼叫一次即可 */
-#define E_SRCH    3
-#define E_NOEXEC  8
-#define E_BADF    9
-#define E_CHILD   10
-#define E_NOMEM   12
-#define E_FAULT   14
-#define E_INVAL   22
-#define E_BUSY    16
-#define E_EXIST   17
-#define E_XDEV    18
-#define E_NOTDIR  20
-#define E_ISDIR   21
-#define E_SPIPE   29
-#define E_NAMETOOLONG 36
-#define E_NETDOWN 100        /* 沒有網路 */
-#define E_TIMEDOUT 110       /* 等了指定的時間,沒有等到 */
-#define SEEK_SET  0
-#define SEEK_CUR  1
-#define SEEK_END  2
-#define E_TXTBSY  26
-#define E_FBIG    27
-#define E_NOSPC   28
-#define E_PIPE    32
-#define E_NOTEMPTY 39
-enum { I_FILE = 1, I_DIR, I_DEV };
-struct dirent { char name[60]; unsigned int type; };
-struct stat {
-    unsigned int type; unsigned int nlink; unsigned long long size;
-    unsigned long long mtime;                /* 最後修改的時間(1970-01-01 UTC 至今的秒數);0 = 不知道 */
-    unsigned int uid, gid;                   /* 擁有者與群組 */
-    unsigned int mode;                       /* 權限位元,例如 0644(擁有者讀寫,其他人唯讀) */
-};
-/* 特權(sys_capget / sys_capdrop);說明見 kernel 的 include/cred.h */
-#define CAP_FS     1u        /* 不受檔案權限限制;可以改任何檔案的擁有者與權限 */
-#define CAP_KILL   2u        /* 可以對別人的行程送訊號 */
-#define CAP_SETID  4u        /* 可以改變自己的 uid / gid */
-#define CAP_ADMIN  8u        /* 系統管理(保留) */
-#define CAP_ALL    15u
-/* 現在的日期時間(sys_time) */
-struct timeval { unsigned long long sec; unsigned int usec, pad; };
-/* 檔案系統的用量(sys_statfs) */
-struct fsinfo {
-    unsigned int block_size, pad;            /* 一個區塊的位元組數 */
-    unsigned long long blocks, free_blocks;  /* 可以放資料的區塊總數 / 還空著的 */
-    unsigned long long inodes, free_inodes;  /* 檔案數的上限(0 = 沒有固定上限)/ 還可以建立幾個 */
-    char type[8];                            /* "ramfs"、"wfs" */
-};
+/*
+ * 系統呼叫的編號、傳遞的結構、錯誤碼、訊號編號…都和 kernel 引入同一份檔案(include/uapi/)。
+ * 以相對路徑引入:使用者程式的編譯因此不需要、也看不到 kernel 內部的標頭。
+ */
+#include "../include/uapi/errno.h"
+#include "../include/uapi/syscall.h"
+#include "../include/uapi/fs.h"
+#include "../include/uapi/proc.h"
+#include "../include/uapi/net.h"
+#include "../include/uapi/blackbox.h"
 
 static inline long syscall3(long num, long a0, long a1, long a2)
 {
@@ -275,23 +160,6 @@ static inline long sys_chown(const char *path, long uid, long gid)
  * 這台機器固定是 10.0.2.15,閘道 10.0.2.2,名稱伺服器 10.0.2.3(模擬器提供的私有網路)。
  */
 #define NET_IP(a, b, c, d) (((unsigned)(a) << 24) | ((unsigned)(b) << 16) | ((unsigned)(c) << 8) | (unsigned)(d))
-struct udpmsg {
-    unsigned int ip;                         /* 送出:目的位址;接收後:來源位址 */
-    unsigned short port, pad;                /* 同上,埠號 */
-    unsigned int len, pad2;                  /* 送出:資料長度;接收前:緩衝區大小,接收後:實際長度 */
-    unsigned long long data;                 /* 資料 / 緩衝區的位址 */
-};
-struct netinfo {
-    unsigned int up;                         /* 1 = 網路可用 */
-    unsigned char mac[6];
-    unsigned short pad;
-    unsigned int ip, netmask, gateway;
-    unsigned int rx_frames, tx_frames, rx_dropped;
-    unsigned int rx_bad_length, rx_bad_checksum, rx_filtered, rx_unbound;
-    unsigned int tx_errors, tx_queue_full, arp_timeouts, arp_cache_entries;
-    unsigned int icmp_echo_replied, udp_delivered;
-    unsigned int sock_dropped;
-};
 /* ping:回傳來回的毫秒數;逾時回傳 -E_TIMEDOUT;沒有網路回傳 -E_NETDOWN */
 static inline long sys_ping(unsigned ip, long timeout_ms) { return syscall3(SYS_ping, (long)ip, timeout_ms, 0); }
 /* UDP:先以 sys_udp_open 取得一個描述符(port 0 = 自動挑一個),用完以 sys_close 關閉 */
@@ -320,21 +188,11 @@ static inline long sys_netinfo(struct netinfo *info) { return syscall3(SYS_netin
  * 黑盒子:kernel 記在磁碟上、重新開機後還在的事件紀錄(開機、關機、panic、看門狗、
  * 程式因例外被終止、磁碟錯誤、受監督的程式被重新啟動、註記)。
  */
-enum { BB_BOOT = 1, BB_SHUTDOWN, BB_PANIC, BB_WATCHDOG, BB_FAULT, BB_DISK, BB_RESTART, BB_NOTE, BB_HEALTHY };
-struct bb_record {
-    unsigned int magic, seq;                 /* seq:序號,越大越新 */
-    unsigned long long time;                 /* 1970-01-01 UTC 至今的秒數 */
-    unsigned int boot;                       /* 第幾次開機 */
-    unsigned short type, len;                /* BB_*;text 的長度 */
-    char text[100];
-    unsigned int crc;
-};
 /* 讀取第 index 筆(0 = 最新的)。0 = 取得,1 = 沒有這麼多筆 */
 static inline long sys_bbread(long index, struct bb_record *r) { return syscall3(SYS_bbread, index, (long)r, 0); }
 /* 留下一筆紀錄(type 為 BB_NOTE 或 BB_RESTART);需要系統管理的特權 */
 static inline long sys_bblog(long type, const char *text) { return syscall3(SYS_bblog, type, (long)text, 0); }
 /* 立刻把整顆磁碟巡檢一遍:直接從磁碟讀每個區塊,核對檢查碼。需要系統管理的特權 */
-struct scrubinfo { unsigned int checksums, blocks, bad, read_errors, sb_restored, pad; };
 static inline long sys_scrub(struct scrubinfo *info) { return syscall3(SYS_scrub, (long)info, 0, 0); }
 /*
  * 週期性的即時工作(需要 CAP_ADMIN)。
@@ -342,7 +200,6 @@ static inline long sys_scrub(struct scrubinfo *info) { return syscall3(SYS_scrub
  *   -E_BUSY = 全系統的即時工作合計會超過 CPU 的 70%,不接受;period_ms 為 0 = 取消。
  * sys_rt_wait:這一次做完了,睡到下一個週期。錯過期限、超出預算都會被計數(見 struct rt_stats)。
  */
-struct rt_stats { unsigned int period_ms, budget_ms, releases, misses, overruns, max_used_ms, throttled, total_util; };
 static inline long sys_rt_set(unsigned period_ms, unsigned budget_ms)
 {
     return syscall3(SYS_rt_set, (long)period_ms, (long)budget_ms, 0);

@@ -1,13 +1,14 @@
-#ifndef WELYOS_KERRNO_H
-#define WELYOS_KERRNO_H
-
+#ifndef WELYOS_UAPI_ERRNO_H
+#define WELYOS_UAPI_ERRNO_H
 /*
- * kerrno.h - kernel 各部分共用的錯誤碼
+ * uapi/errno.h - 錯誤碼。函式失敗時回傳負的錯誤碼(-E_*),成功回傳 0 或非負的結果
  *
- * 函式失敗時回傳負的錯誤碼(-E_*),成功回傳 0 或非負的結果。
- * 原本定義在 fs.h;獨立出來是為了讓與檔案系統無關的部分(例如排程器)
- * 不必為了幾個錯誤碼而引入整個檔案系統的介面。
- * (檔名不叫 errno.h:在主機上編譯測試時會和 C 函式庫的同名標頭衝突。)
+ * 這個目錄(uapi = user API)放的是 kernel 與使用者程式「共用」的定義:系統呼叫的編號、
+ * 經由系統呼叫傳遞的結構、兩邊都要認得的常數。兩邊引入的是同一個檔案,
+ * 所以不會再有「kernel 改了、使用者端忘了跟著改」的問題。
+ * 規則:這裡的檔案只能引入 <stdint.h> / <stddef.h> 與同目錄的檔案,不能依賴 kernel 內部的任何東西;
+ * 結構一律用固定寬度的型別,三個架構(32 與 64 位元)的佈局才會相同。
+ * 已經公開的編號與欄位只增不改。
  */
 
 /* 錯誤碼(數值沿用 POSIX 的慣例) */
@@ -38,5 +39,4 @@
 #define E_NETDOWN      100   /* 沒有網路(沒有網路卡) */
 #define E_TIMEDOUT     110   /* 等了指定的時間,沒有等到 */
 #define E_NOTEMPTY     39    /* 目錄不是空的 */
-
 #endif

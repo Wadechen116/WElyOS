@@ -73,7 +73,7 @@ static int tmr_same(const struct tmr_result *a, const struct tmr_result *b)
 static int tmr_run(tmr_fn fn, void *arg, unsigned timeout_ms, tmr_hook hook, void *hook_arg,
                    struct tmr_result res[TMR_N], struct tmr_report *rep)
 {
-    int out[TMR_N][2], gate[2], started = 0, rc = -1, st = 0;
+    int out[TMR_N][2], gate[2], started = 0, released = 0, rc = -1, st = 0;
     long timer = -1;
     char go = 'g';
 
@@ -91,8 +91,14 @@ static int tmr_run(tmr_fn fn, void *arg, unsigned timeout_ms, tmr_hook hook, voi
         if (!(res[i].out = malloc(TMR_OUT_MAX)) || sys_pipe(out[i]) != 0)
             break;
         long pid = sys_fork();
-        if (pid < 0)
+        if (pid < 0) {
+            /* 這一份沒有建立成功:它的管線兩端都要關掉。留著寫入端的話,
+               下面讀這條管線時永遠等不到結尾(寫入端在我們自己手上) */
+            tmr_close(out[i][0]);
+            tmr_close(out[i][1]);
+            out[i][0] = out[i][1] = -1;
             break;
+        }
         if (pid == 0) {
             for (int j = 0; j <= i; j++)             /* 別份的讀取端、自己的讀取端:都不是這一份該拿著的 */
                 tmr_close(out[j][0]);
@@ -124,8 +130,10 @@ static int tmr_run(tmr_fn fn, void *arg, unsigned timeout_ms, tmr_hook hook, voi
                 tmr_kill(rep->pid[i], SIGKILL);
             sys_exit(0);
         }
-        if (sys_write(gate[1], "ggg", TMR_N) != TMR_N)   /* 放行 */
-            started = 0;
+        /* 計時的行程建立成功才放行。沒有它的話,一份卡住就會讓我們永遠讀不完:
+           寧可這一次完全不執行(三份都會在起跑線上讀到結尾而結束) */
+        if (timer > 0 && sys_write(gate[1], "ggg", TMR_N) == TMR_N)
+            released = 1;
     }
     tmr_close(gate[1]);                       /* 沒有放行就關閉:等在起跑線上的會讀到結尾而結束 */
 
@@ -150,8 +158,8 @@ static int tmr_run(tmr_fn fn, void *arg, unsigned timeout_ms, tmr_hook hook, voi
         if (sys_waitpid(timer, &st, 0) == timer && st == 0)
             rep->timed_out = 1;                      /* 它是自己結束的:表示時間到了、動過手 */
     }
-    if (started != TMR_N || timer < 0)
-        return -1;
+    if (!released)
+        return -1;                                   /* 沒有執行:已建立的幾份都回收了 */
 
     /* 投票 */
     int ab = tmr_same(&res[0], &res[1]), ac = tmr_same(&res[0], &res[2]), bc = tmr_same(&res[1], &res[2]);

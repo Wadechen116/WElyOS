@@ -421,8 +421,12 @@ static void bfree(uint32_t no)
 {
     if (no < sb.data_start || no >= sb.nblocks)
         return;                              /* 磁碟上的編號不合理:不理它 */
-    if (bitmap_op(no, 1, 0) == 1)
+    int was = bitmap_op(no, 1, 0);
+    if (was == 1)
         free_blocks++;
+    else if (was < 0)
+        fs_failed = 1;                       /* 位元圖讀不到:這個區塊沒有真的被釋放,而呼叫者接著會忘掉它。
+                                                轉為唯讀,讓下次掛載的檢查把它收回來 */
     if (covered(no))
         csum_set(no, 0);                     /* 不再有內容:之後的巡檢不必核對它 */
     /* 快取裡若還有這個區塊的髒內容,不必寫回了 */
@@ -653,6 +657,22 @@ static int file_truncate(struct wnode *n, uint64_t size)
        這時候把它本身釋放掉,那些資料區塊就永遠沒有人記得了。寧可整個操作失敗、什麼都不改 */
     if (n->d.indirect && !(ib = bget(n->d.indirect, 1)))
         return -E_IO;
+    /* 留下的最後一個區塊中,超出新大小的部分清 0:之後檔案再變大時,那裡應該讀到 0。
+       這也要在釋放任何東西之前做:讀不到那個區塊就整個失敗,不能留下「縮短了、但尾巴還是舊資料」 */
+    if (size % BSIZE) {
+        uint32_t no = bmap(n, keep - 1, 0);
+        struct buf *b = no ? bget(no, 1) : NULL;
+        if (no && !b) {
+            if (ib)
+                bput(ib);
+            return -E_IO;
+        }
+        if (b) {
+            memset(b->data + size % BSIZE, 0, BSIZE - (size_t)(size % BSIZE));
+            b->dirty = 1;
+            bput(b);
+        }
+    }
     for (uint32_t fb = keep; fb < NDIRECT; fb++) {
         if (n->d.addr[fb]) {
             bfree(n->d.addr[fb]);
@@ -672,16 +692,6 @@ static int file_truncate(struct wnode *n, uint64_t size)
         if (keep <= NDIRECT) {
             bfree(n->d.indirect);
             n->d.indirect = 0;
-        }
-    }
-    /* 留下的最後一個區塊中,超出新大小的部分清 0:之後檔案再變大時,那裡應該讀到 0 */
-    if (size % BSIZE) {
-        uint32_t no = bmap(n, keep - 1, 0);
-        struct buf *b = no ? bget(no, 1) : NULL;
-        if (b) {
-            memset(b->data + size % BSIZE, 0, BSIZE - (size_t)(size % BSIZE));
-            b->dirty = 1;
-            bput(b);
         }
     }
     n->in.size = size;

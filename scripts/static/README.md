@@ -38,8 +38,9 @@ bash scripts/static-refresh.sh        # 處理完新增的提示之後,更新參
   不會變成已接受;delta 通過不代表專案沒有問題。
 - 提示的 ID 含有函式內容的雜湊:修改一個本來就有提示的函式,那個提示會以新的 ID 重新出現,算作新增。
 
-`scripts/regress.sh` 的最後一步就是這個比較:新增的遞迴、禁用函式、未檢查的錯誤回傳會讓回歸失敗;
-新增的風格提示(missing-check、function-length)只列出數量。
+`scripts/regress.sh` 的最後一步(`scripts/static-gate.sh`)就是這個比較:新增的遞迴、禁用函式、
+未檢查的錯誤回傳會讓回歸失敗;新增的風格提示(missing-check、function-length)只列出數量。
+比較的對象固定是 `HEAD` 裡的報告;`scripts/static-refresh.sh` 在還有需要處理的新提示時拒絕更新參考報告。
 
 ## 快速模式的明確界線
 

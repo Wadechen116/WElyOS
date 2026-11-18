@@ -33,7 +33,7 @@
 #include <stddef.h>
 #include "arch.h"
 #include "cpu.h"
-#include "kerrno.h"
+#include "uapi/errno.h"
 #include "kmalloc.h"
 #include "kprintf.h"
 #include "kstring.h"

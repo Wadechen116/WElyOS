@@ -1536,15 +1536,7 @@ static void pipe_demo(void)
 }
 
 /* 傳給使用者程式的 mode;數值必須與 user/init.c 一致 */
-enum {
-    UMODE_HELLO = 0, UMODE_READ_KERNEL, UMODE_WRITE_TEXT, UMODE_PRIVILEGED, UMODE_NULL,
-    UMODE_BAD_POINTER, UMODE_SPIN, UMODE_STACK, UMODE_ISOLATION, UMODE_BAD_SYSCALL,
-    UMODE_FUTEX, UMODE_FS, UMODE_PROC, UMODE_EXEC, UMODE_EXEC_THREADS,
-    UMODE_FORK, UMODE_STACK_GROW, UMODE_PIPE, UMODE_SIGNAL, UMODE_JOBS,
-    UMODE_STOP, UMODE_DISK, UMODE_SYSINFO, UMODE_FILEOPS, UMODE_HEAP,
-    UMODE_SIGHANDLER, UMODE_TIME, UMODE_PERM,
-    UMODE_MEMQUOTA, UMODE_NET, UMODE_RT, UMODE_TMR,
-};
+#include "uapi/selftest.h"       /* 測試模式的編號:和 user/init.c 共用同一份定義 */
 
 /* 以測試編號 mode 啟動 /bin/init:編號轉成字串,當作 argv[1] 傳給它 */
 static int spawn_init(long mode)

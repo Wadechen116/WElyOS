@@ -1,6 +1,7 @@
 #ifndef WELYOS_CRED_H
 #define WELYOS_CRED_H
 #include <stdint.h>
+#include "uapi/proc.h"        /* CAP_*:特權的位元 */
 
 /*
  * 身分與特權(credentials)。
@@ -19,12 +20,6 @@ struct cred {
     uint32_t gid;                /* 群組編號 */
     uint32_t caps;               /* 特權(CAP_* 的組合) */
 };
-
-#define CAP_FS     1u            /* 不受檔案權限限制;可以更改任何檔案的擁有者與權限 */
-#define CAP_KILL   2u            /* 可以對別人的行程送訊號 */
-#define CAP_SETID  4u            /* 可以把自己的 uid / gid 改成任何值 */
-#define CAP_ADMIN  8u            /* 系統管理(保留給之後的功能,例如設定網路) */
-#define CAP_ALL    15u
 
 /* 目前這條執行緒的身分。NULL = kernel 自己(不受任何限制) */
 const struct cred *cred_current(void);

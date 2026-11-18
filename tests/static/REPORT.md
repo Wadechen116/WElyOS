@@ -110,3 +110,34 @@ Codex 在完成比較功能(`--compare`、`--compare-ref`、`--gate delta`、`--
 `wfs_release` 與 `dinode_rw` 在讀取失敗時未轉為唯讀;測試中 `malloc` 之後沒有檢查。
 
 尚未做的:125 個 unchecked-error(大多在 `user/init.c`、`user/sh.c`、`user/top.c`)與 GCC 分析器的 69 個診斷仍未逐筆審查。
+
+## 2026-11-18 Codex 獨立複核（回覆 106）
+
+- 核對目前函式 hash 與八筆 baseline 的 reviewed_function_sha256 全部相符，逐筆加入 cross_checked_by。
+  mode_heap 四次 strcpy 的來源都是固定字串，目的容量為 10、32、32、80，配置結果先檢查；
+  disk_stage_test 四次 unlink 是測試前清理，後續 open/write/assertions 驗證建立成功。
+  接受範圍只涵蓋這八個精確 ID，不表示所有忽略回傳值皆合理。
+- WFS 指定四條路徑已人工重審：file_truncate 先取得間接區塊才釋放資料；wfs_release 失敗後
+  標記唯讀且不增加 free_inodes；dinode_rw 寫入前讀取失敗會標記 fs_failed；wfs_test_damage
+  檢查 iupdate。這些修正解決先前提出的具體問題，沒有執行 QEMU 或獨立驗證重開機回收。
+  尚需另審 bfree/bitmap_op 錯誤傳遞，以及非對齊截斷讀不到尾端區塊時仍回報成功的策略。
+- Gate：函式 token 改動讓 ID 更新並要求重新審查，符合原設計。工作目錄 reference 可作本地比較，
+  但 refresh 可在未處理新增 hard finding 時直接覆寫參考，因此不是獨立 CI 防線；CI 應固定到可信
+  base commit 的報告並禁止 job 自動刷新。未審查項目永遠不等同接受。
+- 實跑 python3 tests/static/test_checks.py：21/21；probe_format_width.py 三模式 returncode 0，
+  無 UBSan 訊息。fast delta：142 files、1117 functions，0 newly-unreviewed、898 existing-unreviewed，
+  exit 0。完整輸出 /tmp/welyos-codex-107-fast。尚未重跑 GCC analyzer。
+
+### TMR 兩個已重現的阻塞問題（交 Claude 修正產品程式）
+
+1. user/tmr.h:93，副本 sys_fork 失敗後直接 break，父行程保留 out[i][1]；其後讀取 out[i][0]
+   永遠等不到 EOF。應在失敗清理路徑關閉所有父行程持有的寫入端，再回收已建立的子行程。
+2. user/tmr.h:117，計時器 sys_fork 回傳負值時仍在 line 127 放行三個副本，再阻塞讀取輸出；
+   副本若卡住便沒有計時器終止它，line 153 的錯誤判斷永遠到不了。計時器建立失敗必須停止放行，
+   關閉 gate、清理及回收子行程後回傳失敗。
+
+重現：python3 tests/static/probe_tmr_failures.py（需 Linux/POSIX 與既有 gcc；不執行 WElyOS syscall）。
+複製當前原始 tmr.h，不改函式，僅以 POSIX wrapper 替換 libc.h 及注入 fork 失敗。
+正常模式 rc=0；第一次 fork 失敗，以及第四次（timer）fork 失敗搭配停滯 worker，皆超過外部 1 秒期限。
+探針超時後終止獨立 process group，避免殘留子行程。結果 /tmp/welyos-tmr-107-5hnz9548/results.json。
+這是主機模型重現，尚待 Claude 修正後在真實系統驗證；此探針目前記錄缺陷，不是通過型回歸測試。

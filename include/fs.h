@@ -3,6 +3,8 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "sync.h"
+#include "uapi/errno.h"       /* 錯誤碼 E_* */
+#include "uapi/fs.h"          /* 開啟方式、struct stat / dirent / fsinfo、權限位元 */
 
 /*
  * 檔案系統。分成三層,每一層只認得下一層的介面,可以各自替換:
@@ -24,65 +26,6 @@
  *
  * 所有函式失敗時回傳負的錯誤碼(-E_*),成功回傳 0 或非負的結果。
  */
-
-/* 錯誤碼:見 kerrno.h(獨立出來,排程器等不屬於檔案系統的部分也用得到) */
-#include "kerrno.h"
-
-#define FS_NAME_MAX    59    /* 單一名稱的最大長度(不含結尾的 0) */
-#define FS_PATH_MAX    255   /* 整條路徑的最大長度 */
-
-/* inode 的類型 */
-enum { I_FILE = 1, I_DIR, I_DEV, I_PIPE, I_SOCK };   /* I_SOCK:網路的 socket(沒有名稱,只以描述符存在) */
-
-/* 開啟方式(數值沿用 Linux 的定義) */
-#define O_RDONLY  0x000
-#define O_WRONLY  0x001
-#define O_RDWR    0x002
-#define O_ACCMODE 0x003
-#define O_CREAT   0x040      /* 不存在就建立 */
-#define O_TRUNC   0x200      /* 開啟時把內容清空 */
-#define O_APPEND  0x400      /* 每次寫入都接在檔案最後 */
-
-#define SEEK_SET  0
-#define SEEK_CUR  1
-#define SEEK_END  2
-
-/* 讀取目錄得到的一筆紀錄;也是使用者程式看到的格式(固定 64 位元組) */
-struct dirent {
-    char name[FS_NAME_MAX + 1];
-    uint32_t type;           /* I_FILE / I_DIR / I_DEV */
-};
-
-struct stat {
-    uint32_t type;
-    uint32_t nlink;          /* 有幾個名稱指向它 */
-    uint64_t size;
-    uint64_t mtime;          /* 最後一次修改的時間(1970-01-01 UTC 至今的秒數);0 = 不知道 */
-    uint32_t uid, gid;       /* 擁有者與所屬群組 */
-    uint32_t mode;           /* 權限位元(見下方 S_*) */
-};
-
-/*
- * 權限位元(數值與 Unix 相同,習慣以八進位書寫):三組各三個位元,
- * 依序是擁有者、同群組的人、其他人;每組是 讀(4)、寫(2)、執行(1)。
- *   0644 = 擁有者可讀寫,其他人只能讀        0755 = 擁有者全部,其他人可讀與執行
- * 對目錄而言:讀 = 列出內容,寫 = 在裡面建立或刪除東西,執行 = 可以經過它(走到裡面的東西)。
- */
-#define S_PERM_MASK 0777u
-#define PERM_R 4
-#define PERM_W 2
-#define PERM_X 1
-
-/* 檔案系統的用量(statfs;也是使用者程式看到的格式) */
-struct fsinfo {
-    uint32_t block_size;     /* 一個區塊的位元組數 */
-    uint32_t pad;
-    uint64_t blocks;         /* 可以放資料的區塊總數 */
-    uint64_t free_blocks;
-    uint64_t inodes;         /* 最多可以有幾個檔案與目錄;0 = 沒有固定的上限 */
-    uint64_t free_inodes;
-    char type[8];            /* 檔案系統的名稱,例如 "ramfs"、"wfs" */
-};
 
 struct inode;
 
