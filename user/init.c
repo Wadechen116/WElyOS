@@ -29,6 +29,12 @@ enum {
     UMODE_EXEC_THREADS,  /* 還有其他執行緒時呼叫 exec / fork:應被拒絕 */
     UMODE_FORK,          /* fork:複製行程,父子各自修改資料互不影響(寫入時複製) */
     UMODE_STACK_GROW,    /* 用掉遠超過 16KB 的 stack:應該自動成長而不是被終止 */
+    UMODE_PIPE,          /* 管線:父子行程之間傳資料、把別的程式的輸出接進管線 */
+    UMODE_SIGNAL,        /* 父子關係與訊號:終止子行程、等任何一個子行程、行程群組、孤兒行程 */
+    UMODE_JOBS,          /* 不等待的 waitpid、列出行程、/dev/null(背景執行與 ps 的基礎) */
+    UMODE_STOP,          /* 暫停與繼續(SIGSTOP、SIGCONT、waitpid 的 WUNTRACED) */
+    UMODE_DISK,          /* 磁碟:把程式複製到 /disk 再執行、statfs、sync(有磁碟時才執行) */
+    UMODE_SYSINFO,       /* top 用到的東西:系統狀態、行程的記憶體用量、主控台的輸入模式 */
 };
 
 /* 各架構 kernel 映像所在的位址(使用者模式不應該讀得到) */
@@ -409,6 +415,507 @@ static int mode_fork(void)
     return 14;
 }
 
+/* ---- UMODE_SIGNAL ---- */
+
+/* 建立一個永遠不會自己結束的子行程,回傳它的 pid */
+static long fork_sleeper(void)
+{
+    long pid = sys_fork();
+    if (pid == 0) {
+        for (;;)
+            sys_sleep(1000);
+    }
+    return pid;
+}
+
+static int mode_signal(void)
+{
+    struct line l = { .len = 0 };
+    int st = 0;
+    long a, b, pid;
+
+    /* 1. 終止一個不會自己結束的子行程。它的結束碼是 128 + 訊號編號 */
+    a = fork_sleeper();
+    if (a <= 0)
+        return 501;
+    if (sys_kill(a, SIGKILL) != 0)
+        return 502;
+    if (sys_waitpid(a, &st, 0) != a || st != 128 + SIGKILL)
+        return 503;
+    line_str(&l, "  [user] killed child ");
+    line_num(&l, a);
+    line_str(&l, ", its exit status is ");
+    line_num(&l, st);
+    line_str(&l, " (128 + signal 9)\n");
+    line_out(&l);
+
+    /* 2. 等「任何一個」子行程:兩個子行程各自結束,兩次 waitpid(-1) 各收到一個 */
+    a = sys_fork();
+    if (a == 0)
+        sys_exit(31);
+    b = sys_fork();
+    if (b == 0)
+        sys_exit(32);
+    long sum = 0;
+    for (int i = 0; i < 2; i++) {
+        pid = sys_waitpid(-1, &st, 0);
+        if (!((pid == a && st == 31) || (pid == b && st == 32)))
+            return 510;
+        sum += pid;
+    }
+    if (sum != a + b)                            /* 同一個不能收到兩次 */
+        return 511;
+    if (sys_waitpid(-1, &st, 0) != -E_CHILD)        /* 已經沒有子行程了 */
+        return 512;
+
+    /* 3. 行程群組:把兩個子行程放進同一組,一次終止整組 */
+    a = fork_sleeper();
+    b = fork_sleeper();
+    if (sys_setpgid(a, a) != 0 || sys_setpgid(b, a) != 0)
+        return 520;
+    if (sys_kill(-a, SIGTERM) != 0)
+        return 521;
+    if (sys_waitpid(a, &st, 0) != a || st != 128 + SIGTERM)
+        return 522;
+    if (sys_waitpid(b, &st, 0) != b || st != 128 + SIGTERM)
+        return 523;
+
+    /* 4. 孤兒行程:子行程建立孫行程後自己先結束。沒有人會 wait 那個孫行程,
+          它結束時 kernel 要自動回收(測試最後的記憶體核對會確認這一點) */
+    a = sys_fork();
+    if (a == 0) {
+        if (sys_fork() == 0) {
+            sys_sleep(5);
+            sys_exit(0);
+        }
+        sys_exit(33);
+    }
+    if (sys_waitpid(a, &st, 0) != a || st != 33)
+        return 530;
+
+    /* 5. 應該被拒絕的情況 */
+    if (sys_kill(99999, SIGKILL) != -E_SRCH)     /* 沒有這個行程 */
+        return 540;
+    if (sys_kill(sys_getpid(), 7) >= 0)          /* 不支援的訊號編號 */
+        return 541;
+    if (sys_wait(1) != -E_CHILD)                 /* 不是自己的子行程:不能 wait */
+        return 542;
+    a = fork_sleeper();
+    sys_kill(a, SIGKILL);
+    if (sys_waitpid(a, (int *)KERNEL_ADDR, 0) != -E_FAULT)     /* 要求把結束碼寫到 kernel 的位址 */
+        return 543;
+
+    puts_("  [user] process relationships and signals work as expected\n");
+    return 17;
+}
+
+/* ---- UMODE_SYSINFO ---- */
+
+/* top 需要的三樣東西:整個系統的狀態、每個行程的記憶體用量、主控台的 raw 模式 */
+static int mode_sysinfo(void)
+{
+    struct sysinfo a, b;
+    struct procinfo pi;
+    unsigned long long ticks_a = 0, ticks_b = 0;
+    long me = sys_getpid();
+
+    if (sys_sysinfo(&a) != 0)
+        return 901;
+    if (a.hz != 1000 || a.ncpu < 1 || a.ncpu > SYSINFO_MAX_CPUS || a.nprocs < 1 || a.nthreads < 1)
+        return 902;
+    if (a.mem_total_kb == 0 || a.mem_free_kb == 0 || a.mem_free_kb >= a.mem_total_kb)
+        return 903;
+    if (sys_sysinfo((struct sysinfo *)KERNEL_ADDR) != -E_FAULT)
+        return 904;
+
+    /* 空轉 20ms:時間往前走,而且至少有一顆 CPU 記到忙碌的 tick。
+       沒有在使用的 CPU 欄位必須是 0(不可以帶出 kernel 的資料) */
+    for (unsigned long long t0 = a.uptime_ticks; ; ) {
+        if (sys_sysinfo(&b) != 0)
+            return 905;
+        if (b.uptime_ticks - t0 >= 20)
+            break;
+    }
+    for (unsigned i = 0; i < SYSINFO_MAX_CPUS; i++) {
+        if (b.cpu[i].busy < a.cpu[i].busy || b.cpu[i].idle < a.cpu[i].idle)
+            return 906;                                  /* 累計值只會增加 */
+        if (i >= b.ncpu && (b.cpu[i].busy || b.cpu[i].idle))
+            return 907;
+        ticks_a += a.cpu[i].busy;
+        ticks_b += b.cpu[i].busy;
+    }
+    if (ticks_b <= ticks_a || b.ctx_switches < a.ctx_switches)
+        return 908;
+
+    /* 自己的記憶體用量:至少有程式碼、資料與 stack 的幾頁;多用一些 stack 之後會增加 */
+    if (sys_procinfo(me - 1, &pi) != 0 || pi.pid != me || pi.mem_kb < 16)
+        return 910;
+    unsigned before = pi.mem_kb;
+    if (recurse_limited(0, 200) != 200)                  /* 約 60KB 的 stack */
+        return 911;
+    if (sys_procinfo(me - 1, &pi) != 0 || pi.mem_kb < before + 32)
+        return 912;
+
+    /* 主控台的輸入模式:不認得的位元被拒絕;設定與還原都成功 */
+    if (sys_tcsetmode(64) != -E_INVAL)
+        return 920;
+    if (sys_tcsetmode(CON_RAW | CON_NOECHO) != 0 || sys_tcsetmode(0) != 0)
+        return 921;
+
+    puts_("  [user] system information, per-process memory and the console input mode work\n");
+    return 21;
+}
+
+/* ---- UMODE_DISK ---- */
+
+/* 磁碟上的檔案系統,從使用者程式這一側看:和記憶體裡的檔案用法完全相同 */
+static int mode_disk(void)
+{
+    static char buf[512];
+    struct fsinfo f0, f1, fr;
+    struct stat st;
+    char *argv[] = { "echo", "  [disk] this program was loaded from the disk", 0 };
+    long in, out, n, total = 0;
+
+    if (sys_statfs("/disk", &f0) != 0 || !streq(f0.type, "wfs") || f0.block_size != 4096)
+        return 801;
+    if (sys_statfs("/", &fr) != 0 || !streq(fr.type, "ramfs"))
+        return 802;
+    if (sys_statfs("/disk", (struct fsinfo *)KERNEL_ADDR) != -E_FAULT ||
+        sys_statfs("/nope", &fr) != -E_NOENT)
+        return 803;
+
+    /* 把 /bin/echo 複製到磁碟上 */
+    sys_unlink("/disk/echo-test");                       /* 上次測試被打斷時留下的 */
+    if (sys_statfs("/disk", &f0) != 0)
+        return 804;
+    in = sys_open("/bin/echo", O_RDONLY);
+    out = sys_open("/disk/echo-test", O_CREAT | O_WRONLY | O_TRUNC);
+    if (in < 0 || out < 0)
+        return 805;
+    while ((n = sys_read(in, buf, sizeof(buf))) > 0) {
+        if (sys_write(out, buf, (unsigned long)n) != n)
+            return 806;
+        total += n;
+    }
+    sys_close(in);
+    sys_close(out);
+    if (sys_stat("/disk/echo-test", &st) != 0 || st.size != (unsigned long long)total)
+        return 807;
+    if (sys_statfs("/disk", &f1) != 0 ||
+        f1.free_blocks != f0.free_blocks - (unsigned long long)((total + 4095) / 4096) ||
+        f1.free_inodes != f0.free_inodes - 1)
+        return 808;
+
+    /* 從磁碟執行它 */
+    long pid = sys_spawn("/disk/echo-test", argv);
+    if (pid <= 0 || sys_wait(pid) != 2)                  /* echo 的結束碼是它收到的參數個數 */
+        return 809;
+    /* 正在執行的程式檔不可修改的規則,在磁碟上也一樣(這裡它已經結束,所以可以刪除) */
+    if (sys_sync() != 0)
+        return 810;
+    if (sys_unlink("/disk/echo-test") != 0 || sys_stat("/disk/echo-test", &st) != -E_NOENT)
+        return 811;
+    if (sys_statfs("/disk", &f1) != 0 || f1.free_blocks != f0.free_blocks ||
+        f1.free_inodes != f0.free_inodes)
+        return 812;
+    if (sys_unlink("/disk") != -E_BUSY)                  /* 掛載點不可以刪除 */
+        return 813;
+
+    puts_("  [user] copied a program to the disk, ran it from there, and removed it\n");
+    return 20;
+}
+
+/* ---- UMODE_STOP ---- */
+
+/* 行程 pid 目前的狀態與用掉的 CPU 時間;找不到回傳 -1 */
+static int proc_state(long pid, unsigned *ticks)
+{
+    struct procinfo pi;
+
+    if (sys_procinfo(pid - 1, &pi) != 0 || pi.pid != pid)
+        return -1;
+    if (ticks)
+        *ticks = pi.cpu_ticks;
+    return pi.state;
+}
+
+/* 暫停與繼續:工作控制(Ctrl-Z、fg、bg)在 kernel 這一側的基礎 */
+static int mode_stop(void)
+{
+    unsigned t0 = 0, t1 = 0, t2 = 0;
+    int st = 0, fds[2];
+    long a, b, g = 0;
+
+    /* 1. 一個不停空轉的子行程:暫停之後不再用掉任何 CPU 時間,繼續之後又開始用 */
+    a = sys_fork();
+    if (a == 0) {
+        for (;;)
+            ;
+    }
+    if (a < 0)
+        return 701;
+    sys_sleep(3);
+    if (sys_waitpid(a, &st, WNOHANG | WUNTRACED) != 0)   /* 還在執行:沒有事件 */
+        return 702;
+    if (sys_kill(a, SIGSTOP) != 0)
+        return 703;
+    if (sys_waitpid(a, &st, WUNTRACED) != a || !WIFSTOPPED(st) || WSTOPSIG(st) != SIGSTOP)
+        return 704;
+    if (sys_waitpid(a, &st, WNOHANG | WUNTRACED) != 0)   /* 同一次暫停只回報一次 */
+        return 705;
+    sys_sleep(5);                                        /* 它最晚在下一個 tick 真的停下 */
+    if (proc_state(a, &t0) != PROC_STOPPED)
+        return 706;
+    sys_sleep(12);
+    if (proc_state(a, &t1) != PROC_STOPPED || t1 != t0)  /* 暫停期間完全沒有執行 */
+        return 707;
+    if (sys_kill(a, SIGSTOP) != 0 ||                     /* 已經暫停:再暫停一次沒有作用 */
+        sys_waitpid(a, &st, WNOHANG | WUNTRACED) != 0)
+        return 708;
+    if (sys_kill(a, SIGCONT) != 0)
+        return 709;
+    sys_sleep(12);
+    if (proc_state(a, &t2) == PROC_STOPPED || t2 <= t1)  /* 繼續之後又在執行了 */
+        return 710;
+
+    /* 2. 暫停中的行程可以直接終止,不必先讓它繼續 */
+    if (sys_kill(a, SIGTSTP) != 0)
+        return 711;
+    if (sys_waitpid(a, &st, WUNTRACED) != a || !WIFSTOPPED(st) || WSTOPSIG(st) != SIGTSTP)
+        return 712;
+    if (sys_kill(a, SIGKILL) != 0 || sys_waitpid(a, &st, WUNTRACED) != a || st != 128 + SIGKILL)
+        return 713;
+
+    /* 3. 沒有 WUNTRACED 的 waitpid 不會因為暫停而返回:它等的是「結束」。
+          子行程先把自己暫停;我們 5ms 後讓它繼續,它才以 5 結束 */
+    b = sys_fork();
+    if (b == 0) {
+        sys_kill(sys_getpid(), SIGSTOP);                 /* 返回使用者模式之前就停在這裡 */
+        sys_exit(5);
+    }
+    if (b < 0)
+        return 720;
+    sys_sleep(5);
+    if (proc_state(b, 0) != PROC_STOPPED || sys_waitpid(b, &st, WNOHANG) != 0)
+        return 721;
+    sys_kill(b, SIGCONT);
+    if (sys_waitpid(b, &st, 0) != b || st != 5)
+        return 722;
+
+    /* 4. 結束碼落在「暫停回報」用的那一段數值:只留下最低 8 個位元,不會被誤認成暫停 */
+    b = sys_fork();
+    if (b == 0)
+        sys_exit((int)(WSTOPPED_BASE | 20));
+    if (b < 0 || sys_waitpid(b, &st, WUNTRACED) != b || WIFSTOPPED(st) || st != 20)
+        return 730;
+
+    /* 5. 暫停中的行程失去父行程:沒有人能讓它繼續了,kernel 會終止它。
+          中間的子行程建立一個孫行程、暫停它、把它的編號告訴我們,然後自己結束 */
+    if (sys_pipe(fds) != 0)
+        return 740;
+    b = sys_fork();
+    if (b == 0) {
+        long gc = sys_fork();
+        if (gc == 0) {
+            for (;;)
+                sys_sleep(1000);
+        }
+        sys_kill(gc, SIGSTOP);
+        sys_waitpid(gc, &st, WUNTRACED);
+        sys_write(fds[1], &gc, sizeof(gc));
+        sys_exit(0);
+    }
+    sys_close(fds[1]);
+    if (b < 0 || sys_read(fds[0], &g, sizeof(g)) != (long)sizeof(g) || g <= 0)
+        return 741;
+    sys_close(fds[0]);
+    if (sys_waitpid(b, &st, 0) != b || st != 0)
+        return 742;
+    for (int i = 0; i < 200 && proc_state(g, 0) != -1; i++)
+        sys_sleep(1);
+    if (proc_state(g, 0) != -1)                          /* 孫行程應該已經消失 */
+        return 743;
+
+    /* 6. 不合法的訊號編號 */
+    if (sys_kill(sys_getpid(), 99) != -E_INVAL)
+        return 750;
+
+    puts_("  [user] a stopped process uses no CPU time, continues on SIGCONT, and can be killed\n");
+    return 19;
+}
+
+/* ---- UMODE_JOBS ---- */
+
+/* 背景執行與 ps 需要的三樣東西:不等待的 waitpid、列出行程、/dev/null */
+static int mode_jobs(void)
+{
+    struct procinfo pi;
+    char buf[8];
+    int st = -1;
+    long me = sys_getpid();
+
+    /* 1. 不等待的 waitpid:子行程還在執行時立刻回傳 0,不會卡住 */
+    if (sys_waitpid(-1, &st, WNOHANG) != -E_CHILD)       /* 沒有子行程:和一般的 waitpid 相同 */
+        return 601;
+    long a = fork_sleeper();
+    if (a <= 0)
+        return 602;
+    if (sys_waitpid(-1, &st, WNOHANG) != 0 || st != -1)  /* 還沒結束:回傳 0,*status 不動 */
+        return 603;
+    if (sys_waitpid(a, &st, 8) != -E_INVAL)              /* 不認得的選項 */
+        return 604;
+
+    /* 2. 列出行程:應該找得到自己與那個子行程,而且編號是遞增的 */
+    int saw_me = 0, saw_child = 0, count = 0;
+    long after = 0;
+    while (sys_procinfo(after, &pi) == 0) {
+        if (pi.pid <= after)
+            return 610;
+        after = pi.pid;
+        count++;
+        if (pi.pid == me) {
+            /* 自己:正在執行、一條執行緒、名稱是 init */
+            if (pi.state != PROC_RUNNING || pi.nthreads != 1 || !streq(pi.name, "init"))
+                return 611;
+            saw_me = 1;
+        }
+        if (pi.pid == a) {
+            if (pi.ppid != me || pi.state == PROC_ZOMBIE)
+                return 612;
+            saw_child = 1;
+        }
+    }
+    if (!saw_me || !saw_child)
+        return 613;
+    if (sys_procinfo(after, &pi) != 1)                   /* 最後一個之後:沒有更多了 */
+        return 614;
+    if (sys_procinfo(0, (struct procinfo *)KERNEL_ADDR) != -E_FAULT)
+        return 615;
+
+    /* 3. 子行程結束後、還沒被 wait 之前,列表中它是 zombie;wait 之後就不在列表中了 */
+    sys_kill(a, SIGKILL);
+    for (int i = 0; i < 200; i++) {                      /* 終止不是立即的:最多等 200ms */
+        if (sys_procinfo(a - 1, &pi) == 0 && pi.pid == a && pi.state == PROC_ZOMBIE)
+            break;
+        sys_sleep(1);
+    }
+    if (pi.pid != a || pi.state != PROC_ZOMBIE)
+        return 620;
+    if (sys_waitpid(-1, &st, WNOHANG) != a || st != 128 + SIGKILL)   /* 已經結束:WNOHANG 也收得到 */
+        return 621;
+    if (sys_procinfo(a - 1, &pi) == 0 && pi.pid == a)
+        return 622;
+
+    /* 4. /dev/null:讀取立刻得到「結束」,寫入的內容被丟掉 */
+    long fd = sys_open("/dev/null", O_RDWR);
+    if (fd < 0)
+        return 630;
+    if (sys_read(fd, buf, sizeof(buf)) != 0 || sys_write(fd, "gone", 4) != 4)
+        return 631;
+    if (sys_read(fd, buf, sizeof(buf)) != 0)
+        return 632;
+    sys_close(fd);
+
+    struct line l = { .len = 0 };
+    line_str(&l, "  [user] listed ");
+    line_num(&l, count);
+    line_str(&l, " processes; waitpid without waiting and /dev/null work as expected\n");
+    line_out(&l);
+    return 18;
+}
+
+/* ---- UMODE_PIPE ---- */
+
+static int mode_pipe(void)
+{
+    char buf[200];
+    int fds[2];
+    long pid, n;
+
+    /* 1. fork 之後,子行程寫、父行程讀。兩邊各自關掉用不到的那一端:
+          父行程若不關掉自己的寫端,就永遠讀不到「結束」(還有人開著寫端) */
+    if (sys_pipe(fds) != 0)
+        return 401;
+    pid = sys_fork();
+    if (pid == 0) {
+        sys_close(fds[0]);
+        sys_write(fds[1], "hello ", 6);
+        sys_write(fds[1], "through a pipe", 14);
+        sys_exit(21);                            /* 結束時 kernel 會關掉它的寫端 */
+    }
+    sys_close(fds[1]);
+    long total = 0;
+    while ((n = sys_read(fds[0], buf + total, sizeof(buf) - 1 - (unsigned long)total)) > 0)
+        total += n;
+    buf[total] = 0;
+    sys_close(fds[0]);
+    if (sys_wait(pid) != 21 || !streq(buf, "hello through a pipe"))
+        return 402;
+
+    /* 2. 大量資料:子行程寫 40000 位元組(管線只有 4KB,它會被擋下來好幾次),
+          父行程邊讀邊核對內容 */
+    if (sys_pipe(fds) != 0)
+        return 410;
+    pid = sys_fork();
+    if (pid == 0) {
+        char out[250];
+        sys_close(fds[0]);
+        for (long done = 0; done < 40000; done += (long)sizeof(out)) {
+            for (unsigned i = 0; i < sizeof(out); i++)
+                out[i] = (char)((done + i) * 3 + 1);
+            if (sys_write(fds[1], out, sizeof(out)) != (long)sizeof(out))
+                sys_exit(53);
+        }
+        sys_exit(22);
+    }
+    sys_close(fds[1]);
+    total = 0;
+    while ((n = sys_read(fds[0], buf, sizeof(buf))) > 0) {
+        for (long i = 0; i < n; i++)
+            if (buf[i] != (char)((total + i) * 3 + 1))
+                return 411;
+        total += n;
+    }
+    sys_close(fds[0]);
+    if (total != 40000 || sys_wait(pid) != 22)
+        return 412;
+
+    /* 3. 把另一個程式的輸出接進管線:先把自己的標準輸出換成寫端再建立它
+          (新行程繼承 0、1、2 號),然後換回來,從讀端讀出它印的東西 */
+    if (sys_pipe(fds) != 0)
+        return 420;
+    sys_dup2(1, 10);                             /* 記住原本的標準輸出 */
+    sys_dup2(fds[1], 1);
+    sys_close(fds[1]);
+    char *argv[] = { "echo", "captured", "by", "a", "pipe", 0 };
+    pid = sys_spawn("/bin/echo", argv);
+    sys_dup2(10, 1);                             /* 換回來;同時也關掉了我們手上的寫端 */
+    sys_close(10);
+    total = 0;
+    while ((n = sys_read(fds[0], buf + total, sizeof(buf) - 1 - (unsigned long)total)) > 0)
+        total += n;
+    buf[total] = 0;
+    sys_close(fds[0]);
+    if (sys_wait(pid) != 5 || !streq(buf, "captured by a pipe\n"))
+        return 421;
+
+    /* 4. 沒有人讀的管線:寫入要得到錯誤 */
+    if (sys_pipe(fds) != 0)
+        return 430;
+    sys_close(fds[0]);
+    if (sys_write(fds[1], "x", 1) != -E_PIPE)
+        return 431;
+    sys_close(fds[1]);
+
+    /* 5. 位址檢查:把 kernel 的位址交給 pipe() */
+    if (sys_pipe((int *)KERNEL_ADDR) != -E_FAULT)
+        return 440;
+
+    puts_("  [user] pipes work as expected\n");
+    return 16;
+}
+
 /* ---- UMODE_FS ---- */
 
 /* 每一項檢查失敗就回傳一個不同的數字,從結束碼可以看出是哪一步出錯 */
@@ -601,6 +1108,24 @@ static int umain(long mode)
 
     case UMODE_FORK:
         return mode_fork();
+
+    case UMODE_PIPE:
+        return mode_pipe();
+
+    case UMODE_SIGNAL:
+        return mode_signal();
+
+    case UMODE_JOBS:
+        return mode_jobs();
+
+    case UMODE_STOP:
+        return mode_stop();
+
+    case UMODE_DISK:
+        return mode_disk();
+
+    case UMODE_SYSINFO:
+        return mode_sysinfo();
 
     case UMODE_STACK_GROW: {
         /* 遞迴 600 層,每層約 300 位元組,總共約 180KB,是一開始配置的 16KB 的十倍以上 */

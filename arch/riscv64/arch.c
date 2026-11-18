@@ -6,6 +6,8 @@
  */
 #include <stdint.h>
 #include "arch.h"
+#include "console.h"
+#include "trap.h"
 #include "cpu.h"
 #include "kprintf.h"
 #include "sched.h"
@@ -39,11 +41,73 @@ void arch_putc(char c)
 }
 
 /* 線路狀態暫存器 bit 0(DR,data ready):為 1 表示接收到的資料還沒被讀走 */
+/* 序列埠沒有需要在輸出結束時補做的事 */
+void arch_console_flush(void)
+{
+}
+
 int arch_console_getc(void)
 {
     if (!(uart[UART_LSR] & 0x01))
         return -1;
     return uart[UART_THR];                   /* 讀取時同一個位址是接收暫存器 */
+}
+
+/*
+ * ---- 序列埠的中斷:PLIC ----
+ *
+ * RISC-V 的 CPU 本身只有三條中斷線(計時器、軟體、外部)。所有週邊裝置的中斷
+ * 都先接到一個中斷控制器 PLIC(Platform-Level Interrupt Controller,平台層級中斷控制器),
+ * 由它彙整後拉起 CPU 的「外部中斷」那一條:
+ *
+ *   序列埠 --(來源 10)--> PLIC --(S-mode 外部中斷,scause 中斷碼 9)--> hart
+ *
+ * PLIC 把「某顆 hart 的某個權限模式」稱為一個 context:QEMU virt 上
+ * hart N 的 M-mode 是 context 2N、S-mode 是 context 2N+1。每個 context 各有:
+ *   啟用位元    哪些來源的中斷要送給它
+ *   門檻        優先權高於門檻的才會送達(0 = 全部接受)
+ *   認領 / 完成  讀取 = 取得是哪個來源(同時標記為處理中);
+ *                處理完把同一個編號寫回去,PLIC 才會再送下一次
+ * 我們只讓「開機的那顆 hart」接收序列埠的中斷:輸入的量很小,不需要分散到多顆。
+ */
+#define PLIC_BASE         0x0c000000UL
+#define PLIC_PRIORITY(n)  (PLIC_BASE + 4UL * (n))                 /* 來源 n 的優先權(0 = 關閉) */
+#define PLIC_ENABLE(ctx)  (PLIC_BASE + 0x2000UL + 0x80UL * (ctx)) /* 啟用位元,每個來源 1 位元 */
+#define PLIC_THRESHOLD(ctx) (PLIC_BASE + 0x200000UL + 0x1000UL * (ctx))
+#define PLIC_CLAIM(ctx)   (PLIC_THRESHOLD(ctx) + 4)
+#define IRQ_UART0         10                                      /* virt 機器上序列埠的來源編號 */
+#define SIE_SEIE          (1UL << 9)                              /* sie:允許 S-mode 外部中斷 */
+
+static unsigned long plic_ctx;               /* 開機那顆 hart 的 S-mode context */
+
+static inline uint32_t plic_r(uintptr_t a)             { return *(volatile uint32_t *)a; }
+static inline void     plic_w(uintptr_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
+
+void arch_console_irq_init(void)
+{
+    plic_ctx = 2 * (unsigned long)this_cpu()->arch_id + 1;
+    plic_w(PLIC_PRIORITY(IRQ_UART0), 1);
+    plic_w(PLIC_ENABLE(plic_ctx), 1u << IRQ_UART0);
+    plic_w(PLIC_THRESHOLD(plic_ctx), 0);
+    uart[1] = 0x01;                          /* UART 的中斷致能暫存器:bit 0 = 收到資料 */
+    __asm__ volatile("csrs sie, %0" : : "r"(SIE_SEIE));
+}
+
+/* 由 trap_handler 在收到 S-mode 外部中斷時呼叫 */
+void external_interrupt(void)
+{
+    uint32_t irq;
+
+    sched_irq_enter();
+    /* 一直認領到沒有為止(讀到 0):處理期間若又有新的中斷,不必再進出一次 */
+    while ((irq = plic_r(PLIC_CLAIM(plic_ctx))) != 0) {
+        if (irq == IRQ_UART0)
+            console_rx();
+        else
+            kprintf("[irq] unexpected PLIC interrupt %u\n", irq);
+        plic_w(PLIC_CLAIM(plic_ctx), irq);   /* 完成 */
+    }
+    sched_irq_exit();                        /* 讀取者被叫醒的話,在這裡切換 */
 }
 
 void arch_halt(void)
@@ -174,4 +238,11 @@ void arch_enter_user(uintptr_t entry, uintptr_t usp, uintptr_t arg)
 {
     arch_irq_disable();                  /* 設定 sscratch 到 sret 之間不可被中斷 */
     arch_user_return(entry, usp, arg);
+}
+
+/* 磁碟:QEMU virt 機器的 virtio-mmio 裝置在 0x10001000 起的 8 個位置,每個 4KB */
+#include "blk.h"
+struct blkdev *arch_blk_probe(void)
+{
+    return virtio_blk_probe(0x10001000UL, 0x1000, 8);
 }

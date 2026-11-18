@@ -12,19 +12,31 @@
  *   命令 參數...            名稱不含 "/" 時到 /bin 底下找
  *   命令 > 檔案             輸出寫入檔案(檔案原本的內容清掉)
  *   命令 >> 檔案            輸出接在檔案最後
+ *   命令 < 檔案             輸入來自檔案
+ *   命令1 | 命令2 | ...     管線:前一個命令的輸出成為後一個命令的輸入
+ *   命令 &                  背景執行:不等它結束,立刻回到提示符號(見下方「背景工作」)
  *   "含 空白 的 參數"       雙引號內的空白不拆開
  *   # 註解                  這一行從 # 起到結尾都忽略
  * 內建命令(由 shell 自己處理,不建立行程):
  *   exit [數字]             結束 shell;沒有給數字時以上一個命令的結束碼結束
  *   status                  印出上一個命令的結束碼
  *   help                    列出可用的命令
+ *   jobs                    列出背景工作
+ *   fg [編號]               把背景(或暫停中)的工作帶回前景並等它結束(沒有給編號:最後建立的那個)
+ *   bg [編號]               讓暫停中的工作在背景繼續執行(沒有給編號:最後暫停的那個)
+ *   wait                    等所有執行中的背景工作結束
+ * 按鍵(由 kernel 的主控台處理,見 kernel/console.c):
+ *   Ctrl-C                  終止前景的命令
+ *   Ctrl-Z                  暫停前景的命令,回到提示符號;之後用 fg 或 bg 讓它繼續
  *
  * shell 的結束碼:exit 指定的值,或(輸入結束時)最後一個命令的結束碼。
  */
 #include "ulib.h"
 
-#define MAX_ARGS 15
-#define SAVED_FD 15                              /* 重新導向時暫存原本標準輸出的描述符編號 */
+#define MAX_ARGS   15
+#define MAX_STAGES 6                             /* 一條管線最多由幾個命令組成 */
+#define SAVE_IN    14                            /* 重新導向時暫存原本標準輸入 / 輸出的描述符編號 */
+#define SAVE_OUT   15
 
 /* 從檔案描述符一次讀一塊,再一行一行交出去。
    直接一次讀一個位元組也可以,但每個位元組都要一次系統呼叫,慢很多 */
@@ -59,11 +71,11 @@ static int read_line(struct reader *r, char *out, unsigned cap)
 }
 
 /* 把一行就地切成參數:在每個字的結尾寫入 0,argv 指向各個字的開頭。回傳參數個數 */
-static int split(char *s, char **argv)
+static int split(char *s, char **argv, int max)
 {
     int argc = 0;
 
-    while (*s && argc < MAX_ARGS) {
+    while (*s && argc < max) {
         while (*s == ' ' || *s == '\t')
             s++;
         if (!*s || *s == '#')                    /* 行尾,或註解的開頭 */
@@ -94,54 +106,378 @@ static void print_num(const char *before, long v, const char *after)
     line_out(&l);
 }
 
-/* 執行一個外部命令,回傳它的結束碼(找不到程式回傳 127,和 Unix 的慣例相同) */
-static long run(char **argv, const char *out_path, int append)
+/* 一條管線中的一個命令 */
+struct stage {
+    char *argv[MAX_ARGS + 1];
+    int argc;
+    const char *in_path;                         /* "< 檔案";沒有則為 0 */
+    const char *out_path;                        /* "> 檔案" 或 ">> 檔案" */
+    int append;
+};
+
+/* 把切好的字分配到各個命令:遇到 "|" 換下一個命令,遇到重新導向記下檔名。
+   回傳命令的個數;語法錯誤回傳 -1 */
+static int parse(char **words, int n, struct stage *st)
 {
-    char path[128] = "/bin/";
-    const char *prog = argv[0];
-    int has_slash = 0;
+    int ns = 1;
 
-    for (const char *c = prog; *c; c++)
-        has_slash |= *c == '/';
-    if (!has_slash) {
-        unsigned n = 5;
-        for (const char *c = prog; *c && n < sizeof(path) - 1; c++)
-            path[n++] = *c;
-        path[n] = 0;
-        prog = path;
+    st[0] = (struct stage){ .argc = 0 };
+    for (int i = 0; i < n; i++) {
+        struct stage *cur = &st[ns - 1];
+        int out = streq(words[i], ">"), app = streq(words[i], ">>"), in = streq(words[i], "<");
+
+        if (streq(words[i], "|")) {
+            if (cur->argc == 0 || ns >= MAX_STAGES || i + 1 >= n)
+                return -1;                       /* "|" 的前後都要有命令 */
+            st[ns++] = (struct stage){ .argc = 0 };
+        } else if (out || app || in) {
+            if (i + 1 >= n)
+                return -1;                       /* 後面要接檔名 */
+            if (in) {
+                cur->in_path = words[++i];
+            } else {
+                cur->out_path = words[++i];
+                cur->append = app;
+            }
+        } else if (cur->argc < MAX_ARGS) {
+            cur->argv[cur->argc++] = words[i];
+            cur->argv[cur->argc] = 0;
+        }
     }
+    return st[ns - 1].argc ? ns : -1;
+}
 
-    /*
-     * 重新導向:新行程會繼承我們開啟的檔案,所以只要在建立它之前,
-     * 把「我們自己的」標準輸出暫時換成那個檔案,建立完再換回來。
-     * 被執行的程式完全不知道這件事,它照常寫入 1 號描述符。
-     */
-    if (out_path) {
-        long fd = sys_open(out_path, O_CREAT | O_WRONLY | (append ? O_APPEND : O_TRUNC));
-        if (fd < 0) {
-            puts_("sh: cannot open ");
-            puts_(out_path);
-            puts_("\n");
+/*
+ * ---- 背景工作 ----
+ *
+ * 命令最後加上 "&" 就在背景執行:shell 建立行程之後不等它,直接讀下一個命令。
+ * 一條在背景執行的管線稱為一個「工作」(job),shell 記住它的每個行程,給它一個小編號。
+ *
+ * 和前景的命令相比,差別只有三點:
+ *   1. 不設為主控台的前景群組,所以 Ctrl-C 不會終止它
+ *   2. 標準輸入接到 /dev/null,不然它會和 shell 搶著讀鍵盤
+ *   3. 它結束時沒有人正在等。shell 每次要讀下一個命令之前,用「不等待的 waitpid」
+ *      看看有沒有背景的行程結束了,有就回收並印出通知
+ * 輸出照常印到螢幕上(可能穿插在你正在打的字中間;不想看到就用 > 導到檔案)。
+ *
+ * 暫停:前景的命令被 Ctrl-Z 暫停時,kernel 讓等待中的 waitpid(WUNTRACED)返回,
+ * shell 把它登記成一個「暫停中」的工作,回到提示符號。之後
+ *   fg  送 SIGCONT 讓它繼續,並重新等它(回到前景)
+ *   bg  送 SIGCONT 讓它繼續,但不等它(變成背景工作)
+ * 背景工作如果去讀鍵盤,kernel 會把它暫停(SIGTTIN):鍵盤是留給前景用的。
+ */
+#define MAX_JOBS 8
+
+struct job {
+    int used;
+    long pgid;                                   /* 行程群組:fg 時設為前景 */
+    long pids[MAX_STAGES];                       /* 各個命令的行程;-1 = 已經結束 */
+    int n, left;                                 /* 行程總數、還沒結束的個數 */
+    int stopped;                                 /* 暫停中(值為造成暫停的訊號編號) */
+    long status;                                 /* 最後一個命令的結束碼 */
+    char cmd[64];                                /* 命令的文字,列表與通知時顯示 */
+};
+
+static struct job jobs[MAX_JOBS];
+
+/* 把命令的文字組回來("ls /bin | wc"),太長就截斷 */
+static void job_describe(struct job *j, struct stage *st, int ns)
+{
+    unsigned n = 0;
+
+    for (int i = 0; i < ns; i++) {
+        for (int k = 0; k < st[i].argc; k++) {
+            const char *sep = k ? " " : i ? " | " : "";
+            for (; *sep && n < sizeof(j->cmd) - 1; sep++)
+                j->cmd[n++] = *sep;
+            for (const char *c = st[i].argv[k]; *c && n < sizeof(j->cmd) - 1; c++)
+                j->cmd[n++] = *c;
+        }
+    }
+    j->cmd[n] = 0;
+}
+
+static void job_report(struct job *j, const char *what, long num)
+{
+    struct line l = { .len = 0 };
+
+    line_str(&l, "[");
+    line_num(&l, (long)(j - jobs) + 1);
+    line_str(&l, "] ");
+    line_str(&l, what);
+    if (num >= 0)
+        line_num(&l, num);
+    line_str(&l, "  ");
+    line_str(&l, j->cmd);
+    line_str(&l, "\n");
+    line_out(&l);
+}
+
+/* 記下「工作 j 的第 i 個行程結束了,結束碼 st」 */
+static void job_mark_done(struct job *j, int i, int st)
+{
+    j->pids[i] = -1;
+    j->left--;
+    if (i == j->n - 1)
+        j->status = st;                          /* 管線的結束碼 = 最後一個命令的 */
+}
+
+/* 找出行程 pid 屬於哪個工作,*idx 得到它是第幾個行程;不是任何工作的行程回傳 0 */
+static struct job *job_of(long pid, int *idx)
+{
+    for (struct job *j = jobs; j < jobs + MAX_JOBS; j++) {
+        for (int i = 0; j->used && i < j->n; i++) {
+            if (j->pids[i] == pid) {
+                *idx = i;
+                return j;
+            }
+        }
+    }
+    return 0;
+}
+
+static void job_report_stopped(struct job *j)
+{
+    job_report(j, j->stopped == SIGTTIN ? "stopped (wants input; use fg)" : "stopped", -1);
+}
+
+/* 看看背景的行程有沒有結束或被暫停的(不等待);整個工作都結束的,印出通知並把位置空出來 */
+static void jobs_reap(void)
+{
+    int st = 0, i = 0;
+    long pid;
+
+    while ((pid = sys_waitpid(-1, &st, WNOHANG | WUNTRACED)) > 0) {
+        struct job *j = job_of(pid, &i);
+        if (!j)
+            continue;
+        if (WIFSTOPPED(st)) {
+            if (!j->stopped) {                   /* 同一個工作的其他行程也會各回報一次 */
+                j->stopped = WSTOPSIG(st);
+                job_report_stopped(j);
+            }
+            continue;
+        }
+        job_mark_done(j, i, st);
+        if (j->left == 0) {
+            if (j->status == 0)
+                job_report(j, "done", -1);
+            else
+                job_report(j, "exit ", j->status);
+            j->used = 0;
+        }
+    }
+}
+
+/*
+ * 把工作放在前景,等到它「結束」或「被暫停」(此時 Ctrl-C 會終止它、Ctrl-Z 會暫停它)。
+ * 暫停中的工作會先讓它繼續。回傳 1 = 被暫停了(j->stopped 已設定),0 = 結束了(結束碼在 j->status)。
+ * j 可以是表格裡的工作,也可以是呼叫者手上暫時的一個(前景命令一開始還不算工作)。
+ */
+static int job_wait(struct job *j)
+{
+    sys_tcsetfg(j->pgid);                        /* 先設為前景再讓它繼續:它也許正等著讀鍵盤 */
+    if (j->stopped) {
+        j->stopped = 0;
+        sys_kill(-j->pgid, SIGCONT);
+    }
+    for (int i = 0; i < j->n && !j->stopped; i++) {
+        int st = 0;
+
+        if (j->pids[i] < 0)
+            continue;
+        if (sys_waitpid(j->pids[i], &st, WUNTRACED) != j->pids[i])
+            st = 1;                              /* 等不到(不該發生):當作它已經結束 */
+        if (WIFSTOPPED(st))
+            j->stopped = WSTOPSIG(st);           /* 整個群組一起被暫停,其餘的不必再等 */
+        else
+            job_mark_done(j, i, st);
+    }
+    sys_tcsetfg(0);
+    return j->stopped != 0;
+}
+
+static struct job *job_free_slot(void)
+{
+    for (struct job *j = jobs; j < jobs + MAX_JOBS; j++)
+        if (!j->used)
+            return j;
+    return 0;
+}
+
+/* 內建命令 fg / bg 的參數:指定編號,或(沒有給)編號最大的那個;
+   only_stopped 時只考慮暫停中的。找不到回傳 0 */
+static struct job *job_pick(const char *arg, int only_stopped)
+{
+    struct job *j = 0;
+
+    for (struct job *k = jobs; k < jobs + MAX_JOBS; k++) {
+        if (!k->used || (only_stopped && !k->stopped))
+            continue;
+        if (!arg || uatoi(arg) == (k - jobs) + 1)
+            j = k;
+    }
+    return j;
+}
+
+static void complain(const char *what, const char *name)
+{
+    puts_("sh: ");
+    puts_(what);
+    puts_(name);
+    puts_("\n");
+}
+
+/*
+ * 執行一條管線(只有一個命令時就是一般的執行),回傳最後一個命令的結束碼。
+ * 找不到程式時是 127,和 Unix 的慣例相同。
+ *
+ * 輸入輸出的安排靠一個性質:新行程會繼承我們的 0、1、2 號描述符。
+ * 所以在建立每個命令之前,把「我們自己的」標準輸入 / 輸出暫時換成它該用的東西
+ * (檔案,或管線的一端),建立完再換回來。被執行的程式完全不知情,
+ * 照常讀 0 號、寫 1 號。
+ *
+ * 管線的每一段:
+ *     命令 i 的輸出 ──▶ [管線 i] ──▶ 命令 i+1 的輸入
+ * 建立命令 i 之後,我們自己要立刻關掉管線 i 的寫端:只要還有人開著寫端,
+ * 讀的那一方就等不到「結束」。讀端則留到建立命令 i+1 時交給它,之後也關掉。
+ */
+static long run(struct stage *st, int ns, int background)
+{
+    long pids[MAX_STAGES];
+    long prev_rd = -1;
+    struct job *job = 0;
+
+    if (background) {
+        job = job_free_slot();
+        if (!job) {
+            puts_("sh: too many background jobs\n");
             return 1;
         }
-        sys_dup2(1, SAVED_FD);                   /* 記住原本的標準輸出 */
-        sys_dup2(fd, 1);
-        sys_close(fd);
+        if (!st[0].in_path)
+            st[0].in_path = "/dev/null";         /* 背景的命令不讀鍵盤 */
     }
 
-    long pid = sys_spawn(prog, argv);
+    for (int i = 0; i < ns; i++) {
+        char path[128] = "/bin/";
+        const char *prog = st[i].argv[0];
+        int has_slash = 0, fds[2] = { -1, -1 };
+        long fd;
 
-    if (out_path) {
-        sys_dup2(SAVED_FD, 1);                   /* 換回來 */
-        sys_close(SAVED_FD);
+        pids[i] = -1;
+        for (const char *c = prog; *c; c++)
+            has_slash |= *c == '/';
+        if (!has_slash) {
+            unsigned n = 5;
+            for (const char *c = prog; *c && n < sizeof(path) - 1; c++)
+                path[n++] = *c;
+            path[n] = 0;
+            prog = path;
+        }
+        if (i + 1 < ns && sys_pipe(fds) != 0) {
+            puts_("sh: cannot create a pipe\n");
+            break;
+        }
+
+        sys_dup2(0, SAVE_IN);                    /* 記住原本的標準輸入 / 輸出 */
+        sys_dup2(1, SAVE_OUT);
+        int ok = 1;
+
+        if (prev_rd >= 0) {                      /* 輸入:上一個命令的管線 */
+            sys_dup2(prev_rd, 0);
+            sys_close(prev_rd);
+            prev_rd = -1;
+        } else if (st[i].in_path) {              /* 或檔案 */
+            fd = sys_open(st[i].in_path, O_RDONLY);
+            if (fd < 0) {
+                complain("cannot open ", st[i].in_path);
+                ok = 0;
+            } else {
+                sys_dup2(fd, 0);
+                sys_close(fd);
+            }
+        }
+        if (fds[1] >= 0) {                       /* 輸出:接到下一個命令的管線 */
+            sys_dup2(fds[1], 1);
+            sys_close(fds[1]);                   /* 我們自己不留寫端 */
+        } else if (st[i].out_path) {             /* 或檔案 */
+            fd = sys_open(st[i].out_path,
+                          O_CREAT | O_WRONLY | (st[i].append ? O_APPEND : O_TRUNC));
+            if (fd < 0) {
+                sys_dup2(SAVE_OUT, 1);           /* 先換回來,錯誤訊息才印得出來 */
+                complain("cannot open ", st[i].out_path);
+                ok = 0;
+            } else {
+                sys_dup2(fd, 1);
+                sys_close(fd);
+            }
+        }
+
+        if (ok)
+            pids[i] = sys_spawn(prog, st[i].argv);
+
+        sys_dup2(SAVE_IN, 0);                    /* 換回來 */
+        sys_dup2(SAVE_OUT, 1);
+        sys_close(SAVE_IN);
+        sys_close(SAVE_OUT);
+        prev_rd = fds[0];                        /* 留給下一個命令當輸入 */
+
+        if (ok && pids[i] < 0)
+            complain(st[i].argv[0],
+                     pids[i] == -E_NOENT ? ": command not found" : ": cannot execute");
     }
-    if (pid < 0) {
-        puts_("sh: ");
-        puts_(argv[0]);
-        puts_(pid == -E_NOENT ? ": command not found\n" : ": cannot execute\n");
-        return 127;
+    if (prev_rd >= 0)
+        sys_close(prev_rd);
+
+    /*
+     * 把這條管線的所有行程放進同一個行程群組,並設為主控台的「前景」:
+     * 使用者按 Ctrl-C 時,kernel 會終止前景群組的所有行程 — 也就是整條管線,
+     * 而不是 shell 自己。等它們都結束後設回「沒有前景」,
+     * 所以在提示符號下按 Ctrl-C 只會放棄正在打的那一行。
+     */
+    long pgid = 0;
+    for (int i = 0; i < ns; i++) {
+        if (pids[i] < 0)
+            continue;
+        if (!pgid)
+            pgid = pids[i];                      /* 以第一個行程的編號當群組編號 */
+        sys_setpgid(pids[i], pgid);
     }
-    return sys_wait(pid);
+    /* 不論前景或背景,先整理成一個工作:記下群組與每個成功啟動的行程 */
+    struct job cur = { .used = 1, .pgid = pgid };
+    for (int i = 0; i < ns; i++) {
+        if (pids[i] < 0)
+            continue;
+        cur.pids[cur.n++] = pids[i];
+        cur.left++;
+    }
+    job_describe(&cur, st, ns);
+
+    if (background) {
+        /* 背景:記下這個工作就回去讀下一個命令。一個行程都沒啟動成功的話不算工作 */
+        if (!pgid)
+            return 127;
+        *job = cur;
+        job_report(job, "started, pid ", job->pids[job->n - 1]);
+        return 0;
+    }
+
+    /* 前景:全部建立完才開始等(它們是同時在執行的) */
+    while (pgid && job_wait(&cur)) {
+        /* 被 Ctrl-Z 暫停了:登記成工作,回到提示符號。表格滿了就沒辦法記住它,
+           只好讓它繼續、接著等(否則它會停在那裡,再也沒有人能讓它繼續) */
+        job = job_free_slot();
+        if (job) {
+            *job = cur;
+            job_report_stopped(job);
+            return 128 + cur.stopped;
+        }
+        puts_("sh: too many jobs; cannot stop this one\n");
+    }
+    /* 最後一個命令沒有啟動:重新導向失敗 1、找不到程式 127;否則是它的結束碼 */
+    if (pids[ns - 1] < 0)
+        return pids[ns - 1] == -1 ? 1 : 127;
+    return cur.status;
 }
 
 int main(int argc, char **argv)
@@ -149,64 +485,113 @@ int main(int argc, char **argv)
     struct reader in = { .fd = 0 };
     int interactive = argc < 2;
     char linebuf[256];
-    char *args[MAX_ARGS + 1];
+    char *words[MAX_ARGS * MAX_STAGES + 1];
+    static struct stage stages[MAX_STAGES];
     long status = 0;
 
     if (!interactive) {
         in.fd = sys_open(argv[1], O_RDONLY);
         if (in.fd < 0) {
-            puts_("sh: cannot open ");
-            puts_(argv[1]);
-            puts_("\n");
+            complain("cannot open ", argv[1]);
             return 127;
         }
     }
 
     for (;;) {
+        jobs_reap();                             /* 有背景工作結束了的話,在提示符號之前通知 */
         if (interactive)
             puts_("$ ");
         if (!read_line(&in, linebuf, sizeof(linebuf)))
             break;                               /* 輸入結束 */
-        int n = split(linebuf, args);
+        int n = split(linebuf, words, MAX_ARGS * MAX_STAGES);
         if (n == 0)
             continue;                            /* 空行或只有註解 */
 
-        /* 找出重新導向:"> 檔案" 或 ">> 檔案",並把它們從參數中拿掉 */
-        const char *out_path = 0;
-        int append = 0, bad = 0;
-        for (int i = 0; i < n; i++) {
-            int app = streq(args[i], ">>");
-            if (!app && !streq(args[i], ">"))
+        /* 最後是 "&"(單獨一個字,或黏在最後一個字後面):背景執行 */
+        int background = 0;
+        char *last = words[n - 1];
+        unsigned long ll = ustrlen(last);
+        if (last[ll - 1] == '&') {
+            background = 1;
+            last[ll - 1] = 0;
+            if (ll == 1)
+                words[--n] = 0;
+            if (n == 0) {
+                puts_("sh: syntax error\n");
+                status = 2;
                 continue;
-            if (i + 1 >= n) {
-                puts_("sh: missing file name after redirection\n");
-                bad = 1;
-                break;
             }
-            out_path = args[i + 1];
-            append = app;
-            for (int k = i; k + 2 <= n; k++)     /* 後面的往前移兩格(含結尾的 NULL) */
-                args[k] = args[k + 2];
-            n -= 2;
-            i--;
-        }
-        if (bad || n == 0) {
-            status = 2;
-            continue;
         }
 
-        if (streq(args[0], "exit")) {
-            return n > 1 ? (int)uatoi(args[1]) : (int)status;
-        } else if (streq(args[0], "status")) {
+        if (streq(words[0], "exit")) {
+            return n > 1 ? (int)uatoi(words[1]) : (int)status;
+        } else if (streq(words[0], "status")) {
             print_num("", status, "\n");
             status = 0;
-        } else if (streq(args[0], "help")) {
-            puts_("built-in: exit [code], status, help\n"
-                  "programs: anything in /bin (try: ls /bin), e.g. echo, cat, ls, mkdir, rm\n"
-                  "redirection: command > file, command >> file\n");
+        } else if (streq(words[0], "help")) {
+            puts_("built-in: exit [code], status, help, jobs, fg [n], bg [n], wait\n"
+                  "programs: anything in /bin (try: ls /bin), e.g. echo, cat, ls, wc, mkdir, rm, cp, sleep, kill, ps, top, df, sync\n"
+                  "redirection: command > file, command >> file, command < file\n"
+                  "pipes: command | command | ...\n"
+                  "background: command &   then: jobs, fg [n], wait; ps lists all processes\n"
+                  "Ctrl-C ends the running command; Ctrl-Z stops it (then: fg to resume, bg to resume in background)\n"
+                  "Ctrl-D at an empty prompt ends the shell\n"
+                  "disk: files under /disk are kept across reboots (try: df, cp /bin/echo /disk/echo)\n");
             status = 0;
+        } else if (streq(words[0], "jobs")) {
+            for (struct job *j = jobs; j < jobs + MAX_JOBS; j++) {
+                if (j->used && j->stopped)
+                    job_report_stopped(j);
+                else if (j->used)
+                    job_report(j, "running", -1);
+            }
+            status = 0;
+        } else if (streq(words[0], "fg")) {
+            struct job *j = job_pick(n > 1 ? words[1] : 0, 0);
+            if (!j) {
+                puts_("sh: fg: no such job\n");
+                status = 1;
+            } else {
+                job_report(j, "foreground", -1);
+                if (job_wait(j)) {               /* 又被暫停了:留在表格裡 */
+                    job_report_stopped(j);
+                    status = 128 + j->stopped;
+                } else {
+                    status = j->status;
+                    j->used = 0;
+                }
+            }
+        } else if (streq(words[0], "bg")) {
+            struct job *j = job_pick(n > 1 ? words[1] : 0, 1);
+            if (!j) {
+                puts_("sh: bg: no stopped job\n");
+                status = 1;
+            } else {
+                j->stopped = 0;
+                sys_kill(-j->pgid, SIGCONT);
+                job_report(j, "continued", -1);
+                status = 0;
+            }
+        } else if (streq(words[0], "wait")) {
+            /* 暫停中的工作不會自己結束,不等它們 */
+            for (struct job *j = jobs; j < jobs + MAX_JOBS; j++) {
+                if (!j->used || j->stopped)
+                    continue;
+                if (job_wait(j)) {
+                    job_report_stopped(j);
+                } else {
+                    status = j->status;
+                    j->used = 0;
+                }
+            }
         } else {
-            status = run(args, out_path, append);
+            int ns = parse(words, n, stages);
+            if (ns < 0) {
+                puts_("sh: syntax error\n");
+                status = 2;
+            } else {
+                status = run(stages, ns, background);
+            }
         }
     }
     return (int)status;

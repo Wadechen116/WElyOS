@@ -81,6 +81,7 @@ void  thread_set_data(void *data);
 void *thread_data(void);
 int   thread_killed(void);
 void  sched_kill_group(void *data);
+void  sched_group_usage(void *data, unsigned long *ticks, unsigned *runnable);
 
 /*
  * 等待佇列(wait queue):「在等某件事發生」的執行緒排隊的地方。

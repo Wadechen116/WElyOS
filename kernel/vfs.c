@@ -42,6 +42,8 @@ void inode_init(struct inode *in, const struct inode_ops *ops, int type)
     in->refs = 0;
     in->nlink = 0;
     in->exec_count = 0;
+    in->mounted = NULL;
+    in->covered = NULL;
     mutex_init(&in->lock);
 }
 
@@ -138,10 +140,19 @@ static int walk(const char *path, int want_parent, char *last, struct inode **ou
             continue;                        /* "." 就是目前的目錄 */
 
         struct inode *next;
+        /* 掛載的根目錄往上走(".."):先回到它蓋住的那個目錄,再從那裡往上 */
+        if (cur->covered && name[0] == '.' && name[1] == '.' && name[2] == '\0') {
+            struct inode *under = iget(cur->covered);
+            iput(cur);
+            cur = under;
+        }
         mutex_lock(&cur->lock);
         err = cur->ops->lookup(cur, name, &next);
-        if (err == 0)
+        if (err == 0) {
+            if (next->mounted)
+                next = next->mounted;        /* 掛載點:改走掛在上面的那個檔案系統 */
             iget(next);                      /* 還鎖著目錄:它不可能在這一瞬間被刪掉 */
+        }
         mutex_unlock(&cur->lock);
         iput(cur);
         if (err)
@@ -171,6 +182,8 @@ static int create_at(const char *path, int type, int excl, struct inode **out)
     mutex_lock(&dir->lock);
     err = dir->ops->lookup(dir, last, &in);
     if (err == 0) {
+        if (in->mounted)
+            in = in->mounted;
         if (excl)
             err = -E_EXIST;
         else
@@ -217,17 +230,25 @@ int vfs_open(const char *path, int flags, struct file **out)
         }
     }
 
-    struct file *f = kzalloc(sizeof(*f));
-    if (!f) {
-        iput(in);
+    struct file *f = vfs_file_new(in, flags);
+    iput(in);                                /* vfs_file_new 自己拿了一個參考 */
+    if (!f)
         return -E_NOMEM;
-    }
-    f->in = in;
+    *out = f;
+    return 0;
+}
+
+struct file *vfs_file_new(struct inode *in, int flags)
+{
+    struct file *f = kzalloc(sizeof(*f));
+
+    if (!f)
+        return NULL;
+    f->in = iget(in);
     f->flags = flags;
     f->refs = 1;
     mutex_init(&f->lock);
-    *out = f;
-    return 0;
+    return f;
 }
 
 struct file *vfs_dup(struct file *f)
@@ -244,6 +265,8 @@ void vfs_close(struct file *f)
     int last = --f->refs == 0;
     spin_unlock_irqrestore(&inode_lk, fl);
     if (last) {
+        if (f->in->ops->closed)
+            f->in->ops->closed(f->in, f->flags);
         iput(f->in);
         kfree(f);
     }
@@ -264,6 +287,10 @@ long vfs_pread(struct file *f, void *buf, size_t n, uint64_t off)
         return -E_ISDIR;
     if (in->type == I_DEV)
         return in->dev->read ? in->dev->read(buf, n) : -E_INVAL;
+    /* 管線的讀取可能要等對方寫入,不能拿著 inode 的鎖等(對方寫入時也要這把鎖)。
+       管線自己負責上鎖 */
+    if (in->type == I_PIPE)
+        return in->ops->read(in, buf, n, 0);
     mutex_lock(&in->lock);
     long r = in->ops->read(in, buf, n, off);
     mutex_unlock(&in->lock);
@@ -272,6 +299,11 @@ long vfs_pread(struct file *f, void *buf, size_t n, uint64_t off)
 
 long vfs_read(struct file *f, void *buf, size_t n)
 {
+    /* 裝置與管線沒有「讀寫位置」,而且讀取可能要等很久(等鍵盤、等對方寫入):
+       不可以拿著這次開啟的鎖等。同一次開啟常常由好幾個行程共用(shell 和它啟動的命令
+       共用同一個標準輸入),其中一個被暫停在讀取裡的話,其他人就全都讀不到了 */
+    if (f->in->type == I_DEV || f->in->type == I_PIPE)
+        return vfs_pread(f, buf, n, 0);
     mutex_lock(&f->lock);
     long r = vfs_pread(f, buf, n, f->off);
     if (r > 0)
@@ -291,6 +323,8 @@ long vfs_write(struct file *f, const void *buf, size_t n)
         return -E_ISDIR;
     if (in->type == I_DEV)
         return in->dev->write ? in->dev->write(buf, n) : -E_INVAL;
+    if (in->type == I_PIPE)
+        return in->ops->write(in, buf, n, 0);
 
     mutex_lock(&f->lock);
     mutex_lock(&in->lock);
@@ -348,10 +382,8 @@ int vfs_readdir(struct file *f, struct dirent *out)
         return -E_NOTDIR;
     mutex_lock(&f->lock);
     mutex_lock(&in->lock);
-    int r = in->ops->readdir(in, f->off, out);
+    int r = in->ops->readdir(in, &f->off, out);  /* 位置由檔案系統自己往後移 */
     mutex_unlock(&in->lock);
-    if (r == 0)
-        f->off++;
     mutex_unlock(&f->lock);
     return r;
 }
@@ -392,6 +424,8 @@ int vfs_unlink(const char *path)
     }
     mutex_lock(&dir->lock);
     err = dir->ops->lookup(dir, last, &in);
+    if (err == 0 && in->mounted)
+        err = -E_BUSY;                       /* 掛載點不可以刪除 */
     if (err == 0) {
         /* 先鎖上層、再鎖下層。鎖著要刪除的目錄檢查它是不是空的,
            並一直鎖到名稱移除為止:這段期間沒有人能在裡面建立新的東西 */
@@ -431,6 +465,77 @@ int vfs_stat(const char *path, struct stat *st)
     return 0;
 }
 
+/* ---- 掛載 ---- */
+
+#define MAX_MOUNTS 4
+static struct inode *mounts[MAX_MOUNTS];     /* 掛載上來的檔案系統的根目錄 */
+static unsigned nmounts;
+
+int vfs_mount(const char *path, struct inode *fsroot)
+{
+    struct inode *at;
+    int err = walk(path, 0, NULL, &at);
+
+    if (err)
+        return err;
+    mutex_lock(&at->lock);
+    if (at->type != I_DIR || fsroot->type != I_DIR)
+        err = -E_NOTDIR;
+    else if (at->mounted || at->covered || at == root || nmounts >= MAX_MOUNTS)
+        err = -E_BUSY;
+    else if (!at->ops->is_empty(at))
+        err = -E_NOTEMPTY;
+    if (err == 0) {
+        /* 兩邊各多拿一個參考,永遠不放:掛載點與掛上來的根目錄都不會消失 */
+        iget(fsroot);
+        iget(at);
+        fsroot->covered = at;
+        at->mounted = fsroot;
+        mounts[nmounts++] = fsroot;
+    }
+    mutex_unlock(&at->lock);
+    iput(at);
+    return err;
+}
+
+int vfs_statfs(const char *path, struct fsinfo *out)
+{
+    struct inode *in;
+    int err = walk(path, 0, NULL, &in);
+
+    if (err)
+        return err;
+    err = in->ops->statfs ? in->ops->statfs(in, out) : -E_INVAL;
+    iput(in);
+    return err;
+}
+
+int vfs_sync(void)
+{
+    int rc = 0;
+
+    for (unsigned i = 0; i < nmounts; i++)
+        if (mounts[i]->ops->sync && mounts[i]->ops->sync(mounts[i]) != 0)
+            rc = -E_IO;
+    return rc;
+}
+
+/* /dev/null:讀取永遠是「結束」,寫入的東西直接丟掉。
+   用途例如:背景執行的程式不該去讀鍵盤,shell 就把它的標準輸入接到這裡 */
+static long null_read(void *buf, size_t n)
+{
+    (void)buf; (void)n;
+    return 0;
+}
+
+static long null_write(const void *buf, size_t n)
+{
+    (void)buf;
+    return (long)n;
+}
+
+static const struct dev_ops null_dev = { null_read, null_write };
+
 void vfs_init(void)
 {
     root = ramfs_create_root();
@@ -439,4 +544,6 @@ void vfs_init(void)
     root->nlink = 1;                         /* 根目錄永遠存在 */
     if (vfs_mkdir("/dev") != 0 || vfs_mkdev("/dev/console", console_dev_ops()) != 0)
         panic("vfs: cannot create /dev/console");
+    if (vfs_mkdev("/dev/null", &null_dev) != 0)
+        panic("vfs: cannot create /dev/null");
 }

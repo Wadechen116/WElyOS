@@ -12,5 +12,6 @@ enum vga_color {
 
 void vga_init(void);                         /* 清除螢幕、游標歸位到左上角 */
 void vga_putc(char c);                       /* 輸出字元;支援 \n \r \b \t,滿版自動捲動 */
+void vga_sync(void);                         /* 把硬體游標移到目前位置(一次輸出結束時呼叫) */
 void vga_set_color(enum vga_color fg, enum vga_color bg);  /* 設定之後輸出的顏色 */
 #endif

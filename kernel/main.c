@@ -6,7 +6,9 @@
  */
 #include <stdint.h>
 #include "arch.h"
+#include "blk.h"
 #include "boot_info.h"
+#include "console.h"
 #include "cpu.h"
 #include "fs.h"
 #include "kmalloc.h"
@@ -674,6 +676,242 @@ static void prio_demo(void)
 /* ------------------------------------------------------------------ */
 
 /* ------------------------------------------------------------------ */
+/* 磁碟                                                                */
+/* ------------------------------------------------------------------ */
+
+/* 找出磁碟,把上面的檔案系統掛載到 /disk。沒有磁碟、或磁碟上不是我們的檔案系統時,
+   只印出訊息,系統照常使用記憶體檔案系統 */
+static void disk_init(void)
+{
+    struct blkdev *dev = arch_blk_probe();
+    struct inode *fsroot;
+    struct wfs_stats st;
+
+    if (!dev) {
+        kprintf("disk: none\n");
+        return;
+    }
+    int rc = wfs_mount(dev, &fsroot);
+    if (rc < 0) {
+        kprintf("disk: %s, %llu MB: not mounted (error %d)%s\n", dev->name,
+                (unsigned long long)(dev->sectors / 2048), rc,
+                rc == -E_INVAL ? "; it does not hold a WFS file system and was left untouched" :
+                rc == -E_NOSPC ? "; it is too small" : "");
+        return;
+    }
+    if (vfs_mkdir("/disk") != 0 || vfs_mount("/disk", fsroot) != 0)
+        panic("disk: cannot mount on /disk");
+    wfs_stats(&st);
+    kprintf("disk: %s, %llu MB, %s on /disk (mount #%u, %u KB free)\n", dev->name,
+            (unsigned long long)(dev->sectors / 2048),
+            rc == 1 ? "new file system created and mounted" : "mounted",
+            st.mounts, st.free_blocks * (unsigned)(PAGE_SIZE / 1024));
+}
+
+/* 關機(結束模擬器)。先把磁碟上的檔案系統正常卸載 */
+static void shutdown(int code)
+{
+    wfs_shutdown();
+    arch_exit(code);
+}
+
+/* 測試資料:第 i 個位元組的內容(和位置有關,讀回來時可以核對) */
+static char disk_pattern(size_t i, unsigned seed)
+{
+    return (char)('A' + (i * 7 + i / 4096 + seed) % 53);
+}
+
+static void disk_write_file(const char *path, size_t size, unsigned seed)
+{
+    static char buf[3000];
+    struct file *f;
+
+    KASSERT(vfs_open(path, O_CREAT | O_WRONLY | O_TRUNC, &f) == 0);
+    for (size_t off = 0; off < size; ) {
+        size_t n = size - off < sizeof(buf) ? size - off : sizeof(buf);
+        for (size_t i = 0; i < n; i++)
+            buf[i] = disk_pattern(off + i, seed);
+        KASSERT(vfs_write(f, buf, n) == (long)n);
+        off += n;
+    }
+    vfs_close(f);                            /* 關閉時寫回磁碟 */
+}
+
+static void disk_verify_file(const char *path, size_t size, unsigned seed)
+{
+    static char buf[3000];
+    struct file *f;
+    size_t off = 0;
+    long n;
+
+    KASSERT(vfs_open(path, O_RDONLY, &f) == 0);
+    KASSERT(vfs_size(f) == size);
+    while ((n = vfs_read(f, buf, sizeof(buf))) > 0) {
+        for (long i = 0; i < n; i++)
+            KASSERT(buf[i] == disk_pattern(off + (size_t)i, seed));
+        off += (size_t)n;
+    }
+    KASSERT(n == 0 && off == size);
+    vfs_close(f);
+}
+
+/* 多條執行緒同時在磁碟上建立、寫入、讀回、刪除各自的檔案 */
+#define DISK_WORKERS 4
+#define DISK_FILES   6
+
+static void disk_worker(void *arg)
+{
+    int id = (int)(uintptr_t)arg;
+    char path[32] = "/disk/selftest/w0-0", data[600], back[600];
+    struct file *f;
+
+    for (unsigned i = 0; i < sizeof(data); i++)
+        data[i] = (char)(id * 37 + i);
+    for (int n = 0; n < DISK_FILES; n++) {
+        path[16] = (char)('0' + id);
+        path[18] = (char)('0' + n);
+        KASSERT(vfs_open(path, O_CREAT | O_RDWR, &f) == 0);
+        KASSERT(vfs_write(f, data, sizeof(data)) == (long)sizeof(data));
+        KASSERT(vfs_pread(f, back, sizeof(back), 0) == (long)sizeof(back));
+        KASSERT(memcmp(data, back, sizeof(data)) == 0);
+        vfs_close(f);
+        KASSERT(vfs_unlink(path) == 0);
+    }
+}
+
+/* 磁碟上的檔案系統的自我測試。所有東西都放在 /disk/selftest 底下,結束時刪除,
+   所以不影響磁碟上原有的內容,空閒的空間也要回到測試之前的數量 */
+static void disk_demo(void)
+{
+    struct wfs_stats s0, s1, s2;
+    struct file *f, *g;
+    struct stat st;
+    struct dirent e;
+    char buf[16];
+
+    wfs_stats(&s0);
+    if (!s0.mounted) {
+        kprintf("disk: no file system mounted, tests skipped\n");
+        return;
+    }
+    /* 上一次測試如果中途被打斷,可能留下東西:先清掉。順便讓根目錄至少有一個區塊,
+       之後的空間核對才有固定的基準 */
+    vfs_unlink("/disk/selftest/big");
+    vfs_unlink("/disk/selftest/prog");
+    vfs_unlink("/disk/selftest");
+    KASSERT(vfs_mkdir("/disk/selftest") == 0 && vfs_unlink("/disk/selftest") == 0);
+    wfs_stats(&s0);
+
+    /* 目錄與路徑:掛載點兩邊都走得通 */
+    KASSERT(vfs_mkdir("/disk/selftest") == 0);
+    KASSERT(vfs_mkdir("/disk/selftest") == -E_EXIST);
+    KASSERT(vfs_stat("/disk/selftest/..", &st) == 0 && st.type == I_DIR);
+    KASSERT(vfs_stat("/disk/../etc/motd", &st) == 0 && st.type == I_FILE);   /* 從磁碟往上回到記憶體檔案系統 */
+    KASSERT(vfs_stat("/disk/selftest/../../disk/selftest", &st) == 0);
+    KASSERT(vfs_unlink("/disk") == -E_BUSY);                                 /* 掛載點不可以刪除 */
+    KASSERT(vfs_mkdev("/disk/selftest/dev", console_dev_ops()) == -E_INVAL); /* 裝置節點只能在記憶體裡 */
+    wfs_stats(&s1);
+    KASSERT(s1.free_inodes == s0.free_inodes - 1);
+
+    /* 一個 100000 位元組的檔案:25 個資料區塊,超過 10 個之後要用到間接區塊 */
+    disk_write_file("/disk/selftest/big", 100000, 1);
+    disk_verify_file("/disk/selftest/big", 100000, 1);
+    wfs_stats(&s2);
+    /* 25 個資料 + 1 個間接 + 1 個給 selftest 目錄放紀錄(目錄也是存在區塊裡的) */
+    KASSERT(s2.free_blocks == s1.free_blocks - 27);
+    KASSERT(s2.free_inodes == s1.free_inodes - 1);
+    KASSERT(vfs_stat("/disk/selftest/big", &st) == 0 && st.size == 100000 && st.nlink == 1);
+    KASSERT(vfs_unlink("/disk/selftest") == -E_NOTEMPTY);
+
+    /* 列出目錄:只有這一個檔案 */
+    KASSERT(vfs_open("/disk/selftest", O_RDONLY, &f) == 0);
+    KASSERT(vfs_readdir(f, &e) == 0 && !strcmp(e.name, "big") && e.type == I_FILE);
+    KASSERT(vfs_readdir(f, &e) == 1);
+    vfs_close(f);
+
+    /* 換成比較短的內容:多出來的區塊要歸還 */
+    disk_write_file("/disk/selftest/big", 5000, 2);
+    disk_verify_file("/disk/selftest/big", 5000, 2);
+    wfs_stats(&s2);
+    KASSERT(s2.free_blocks == s1.free_blocks - 3);       /* 2 個資料 + 目錄的 1 個 */
+
+    /* 附加:接在最後 */
+    KASSERT(vfs_open("/disk/selftest/big", O_WRONLY | O_APPEND, &f) == 0);
+    KASSERT(vfs_write(f, "tail", 4) == 4);
+    vfs_close(f);
+    KASSERT(vfs_open("/disk/selftest/big", O_RDONLY, &f) == 0);
+    KASSERT(vfs_size(f) == 5004 && vfs_pread(f, buf, 8, 5000) == 4 && !memcmp(buf, "tail", 4));
+
+    /* 開著的時候刪除:名稱立刻消失,內容留到關閉為止(和記憶體檔案系統相同的規則) */
+    KASSERT(vfs_unlink("/disk/selftest/big") == 0);
+    KASSERT(vfs_stat("/disk/selftest/big", &st) == -E_NOENT);
+    KASSERT(vfs_open("/disk/selftest/big", O_RDONLY, &g) == -E_NOENT);
+    KASSERT(vfs_pread(f, buf, 4, 5000) == 4 && !memcmp(buf, "tail", 4));
+    wfs_stats(&s2);
+    KASSERT(s2.free_blocks == s1.free_blocks - 3);       /* 還沒釋放 */
+    vfs_close(f);
+    wfs_stats(&s2);
+    KASSERT(s2.free_blocks == s1.free_blocks - 1 && s2.free_inodes == s1.free_inodes);
+
+    /* 多條執行緒同時使用:各自建立、寫入、讀回、刪除自己的檔案 */
+    int tid[DISK_WORKERS];
+    for (int i = 0; i < DISK_WORKERS; i++)
+        tid[i] = thread_create("disk-worker", disk_worker, (void *)(uintptr_t)i);
+    for (int i = 0; i < DISK_WORKERS; i++)
+        thread_join(tid[i]);
+    wfs_stats(&s2);
+    KASSERT(s2.free_blocks == s1.free_blocks - 1 && s2.free_inodes == s1.free_inodes);
+
+    /* 全部刪除後,空間回到測試之前;再做一次完整檢查,應該找不到任何問題 */
+    KASSERT(vfs_unlink("/disk/selftest") == 0);
+    KASSERT(vfs_sync() == 0);
+    wfs_stats(&s2);
+    KASSERT(s2.free_blocks == s0.free_blocks && s2.free_inodes == s0.free_inodes);
+    KASSERT(wfs_check_now() == 0);
+    kprintf("disk: ok (100000-byte file through an indirect block, truncate, append, unlink while "
+            "open, %d threads x %d files; %lu block reads, %lu block writes; "
+            "consistency check found nothing)\n", DISK_WORKERS, DISK_FILES,
+            s2.disk_reads - s0.disk_reads, s2.disk_writes - s0.disk_writes);
+}
+
+/*
+ * 跨開機的測試(回歸測試依序以 disktest=1、2、3 開機三次,用同一個磁碟映像):
+ *   1  寫入一個檔案,正常關機
+ *   2  確認檔案還在、內容正確(資料真的留在磁碟上);然後故意把檔案系統弄壞,不正常關機
+ *   3  確認掛載時發現並修復了問題,原本的檔案完好;刪除它
+ */
+static void disk_stage_test(const char *cmd)
+{
+    struct wfs_stats s;
+    struct stat st;
+
+    wfs_stats(&s);
+    if (cmdline_has(cmd, "disktest=1")) {
+        KASSERT(s.mounted);
+        vfs_unlink("/disk/persist");
+        disk_write_file("/disk/persist", 9000, 3);
+        kprintf("disktest 1: wrote /disk/persist (9000 bytes)\n");
+    } else if (cmdline_has(cmd, "disktest=2")) {
+        KASSERT(s.mounted && s.repairs == 0);
+        disk_verify_file("/disk/persist", 9000, 3);
+        KASSERT(wfs_test_damage("persist") == 0);
+        kprintf("disktest 2: /disk/persist survived the reboot; damaged the file system on purpose, "
+                "exiting without a clean shutdown\n");
+        arch_exit(0);
+    } else if (cmdline_has(cmd, "disktest=3")) {
+        KASSERT(s.mounted);
+        kprintf("disktest 3: the mount-time check repaired %u problem(s)\n", s.repairs);
+        KASSERT(s.repairs >= 4);
+        disk_verify_file("/disk/persist", 9000, 3);
+        KASSERT(vfs_stat("/disk/persist", &st) == 0 && st.nlink == 1);
+        KASSERT(vfs_stat("/disk/ghost", &st) == -E_NOENT);
+        KASSERT(wfs_check_now() == 0);
+        KASSERT(vfs_unlink("/disk/persist") == 0);
+        kprintf("disktest 3: /disk/persist is intact; a second check found nothing\n");
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* 檔案系統的示範與測試(kernel 內部直接呼叫 VFS)                        */
 /* ------------------------------------------------------------------ */
 
@@ -852,12 +1090,81 @@ static void fs_demo(void)
     kprintf("fs: selftest ok (all files removed, memory returned)\n");
 }
 
+/* ------------------------------------------------------------------ */
+/* 管線的測試(kernel 內部直接呼叫 VFS)                                  */
+/* ------------------------------------------------------------------ */
+#define PIPE_TOTAL 50000u                    /* 遠大於管線的緩衝區(4KB):寫入者一定會被擋下來等 */
+
+static void pipe_writer(void *arg)
+{
+    struct file *wr = arg;
+    char chunk[700];
+
+    for (unsigned done = 0; done < PIPE_TOTAL; ) {
+        unsigned n = PIPE_TOTAL - done < sizeof(chunk) ? PIPE_TOTAL - done : sizeof(chunk);
+        for (unsigned i = 0; i < n; i++)
+            chunk[i] = (char)((done + i) * 7 + 5);
+        KASSERT(vfs_write(wr, chunk, n) == (long)n);
+        done += n;
+    }
+    vfs_close(wr);                           /* 寫完就關閉寫端:讀取者會因此讀到結束 */
+}
+
+static void pipe_demo(void)
+{
+    struct file *rd, *wr;
+    char buf[300];
+    struct kheap_stats h0, h1;
+
+    sched_trim();
+    kheap_stats(&h0);
+    size_t pool0 = sched_pool_bytes();
+
+    /* 1. 一條執行緒寫、另一條讀,資料量遠大於緩衝區:順序與內容都必須正確 */
+    KASSERT(vfs_pipe(&rd, &wr) == 0);
+    KASSERT(vfs_read(wr, buf, 1) == -E_BADF && vfs_write(rd, buf, 1) == -E_BADF);   /* 方向固定 */
+    uint64_t t0 = timer_ticks();
+    int tid = thread_create("pipe-writer", pipe_writer, wr);
+    unsigned got = 0;
+    long n;
+    while ((n = vfs_read(rd, buf, sizeof(buf))) > 0) {
+        for (long i = 0; i < n; i++)
+            KASSERT(buf[i] == (char)((got + (unsigned)i) * 7 + 5));
+        got += (unsigned)n;
+    }
+    KASSERT(n == 0 && got == PIPE_TOTAL);    /* 寫端關閉後讀到 0,而且一個位元組都沒少 */
+    thread_join(tid);
+    kprintf("pipe: %u bytes through a 4 KB pipe between two threads, in order, %llu ticks\n",
+            got, (unsigned long long)(timer_ticks() - t0));
+    vfs_close(rd);
+
+    /* 2. 沒有人讀的管線:寫入要回報錯誤,而不是永遠等下去 */
+    KASSERT(vfs_pipe(&rd, &wr) == 0);
+    vfs_close(rd);
+    KASSERT(vfs_write(wr, "x", 1) == -E_PIPE);
+    vfs_close(wr);
+
+    /* 3. 寫端關閉後,緩衝區裡剩下的資料仍然讀得到,讀完才是結束 */
+    KASSERT(vfs_pipe(&rd, &wr) == 0);
+    KASSERT(vfs_write(wr, "left over", 9) == 9);
+    vfs_close(wr);
+    KASSERT(vfs_read(rd, buf, sizeof(buf)) == 9 && memcmp(buf, "left over", 9) == 0);
+    KASSERT(vfs_read(rd, buf, sizeof(buf)) == 0);
+    vfs_close(rd);
+
+    sched_trim();
+    kheap_stats(&h1);
+    KASSERT(h1.free_bytes + (sched_pool_bytes() - pool0) == h0.free_bytes + (h1.heap_bytes - h0.heap_bytes));
+    kprintf("pipe: selftest ok\n");
+}
+
 /* 傳給使用者程式的 mode;數值必須與 user/init.c 一致 */
 enum {
     UMODE_HELLO = 0, UMODE_READ_KERNEL, UMODE_WRITE_TEXT, UMODE_PRIVILEGED, UMODE_NULL,
     UMODE_BAD_POINTER, UMODE_SPIN, UMODE_STACK, UMODE_ISOLATION, UMODE_BAD_SYSCALL,
     UMODE_FUTEX, UMODE_FS, UMODE_PROC, UMODE_EXEC, UMODE_EXEC_THREADS,
-    UMODE_FORK, UMODE_STACK_GROW,
+    UMODE_FORK, UMODE_STACK_GROW, UMODE_PIPE, UMODE_SIGNAL, UMODE_JOBS,
+    UMODE_STOP, UMODE_DISK, UMODE_SYSINFO,
 };
 
 /* 以測試編號 mode 啟動 /bin/init:編號轉成字串,當作 argv[1] 傳給它 */
@@ -921,6 +1228,25 @@ static void user_demo(void)
         kprintf("user: copy-on-write during that test: %lu pages copied, %lu times a page "
                 "was reused without copying\n", vm_cow_copies() - c0, vm_cow_reuses() - r0);
     }
+    /* 管線:父子行程之間傳資料、寫端全關閉後讀到結束、把別的程式的輸出接進管線 */
+    run_user("pipes between processes", UMODE_PIPE, 16);
+    /* 父子關係與訊號。其中一項會留下一個沒有人 wait 的孫行程,它要 5ms 後才結束,
+       所以多等一下,讓最後的記憶體核對能確認它被自動回收了 */
+    run_user("parent/child, signals, process groups", UMODE_SIGNAL, 17);
+    /* 背景執行與 ps 的基礎:不等待的 waitpid、列出行程、/dev/null */
+    run_user("waitpid without waiting, process list, /dev/null", UMODE_JOBS, 18);
+    /* 工作控制的基礎:暫停、繼續、暫停的回報。最後一項留下一個被 kernel 終止的孫行程 */
+    run_user("stop and continue (job control)", UMODE_STOP, 19);
+    /* 磁碟(有掛載的話):把程式複製到磁碟上再執行、查詢用量、sync */
+    {
+        struct wfs_stats ws;
+        wfs_stats(&ws);
+        if (ws.mounted)
+            run_user("run a program from the disk, statfs, sync", UMODE_DISK, 20);
+    }
+    /* top 的基礎:系統狀態、行程的記憶體用量、主控台的輸入模式 */
+    run_user("system information for top", UMODE_SYSINFO, 21);
+    thread_sleep(30);
     /* stack 自動成長:用掉約 180KB 的 stack(一開始只配置 16KB) */
     run_user("stack grows on demand", UMODE_STACK_GROW, 15);
 
@@ -930,7 +1256,8 @@ static void user_demo(void)
         const char *argv[] = { "sh", "/etc/test.sh", NULL };
         struct file *f;
         char buf[80];
-        static const char want[] = "first line\nsecond line, with  two  spaces\n";
+        /* 最後一行來自管線:cat /etc/motd | cat | wc(2 行、18 個字、104 位元組) */
+        static const char want[] = "first line\nsecond line, with  two  spaces\n2 18 104\n";
         int pid = proc_spawn("/bin/sh", argv);
         KASSERT(pid > 0);
         int code = proc_wait(pid);
@@ -998,8 +1325,11 @@ static void user_demo(void)
     sched_trim();
     kheap_stats(&h1);
     KASSERT(sched_thread_count() == 1);
-    KASSERT(pmm_free_count() + vm_table_pages() == free0);
-    KASSERT(h1.free_bytes + (sched_pool_bytes() - pool0) == h0.free_bytes);
+    /* heap 向頁面配置器要來的頁不會歸還(見 kmalloc.c),所以這段期間 heap 若長大了
+       (例如管線的緩衝區第一次配置),要把那部分算進去:那些頁現在是 heap 的空閒空間 */
+    size_t heap_grow = h1.heap_bytes - h0.heap_bytes;
+    KASSERT(pmm_free_count() + vm_table_pages() == free0 - heap_grow / PAGE_SIZE);
+    KASSERT(h1.free_bytes + (sched_pool_bytes() - pool0) == h0.free_bytes + heap_grow);
     kprintf("user: all processes exited, memory reclaimed\n");
 }
 
@@ -1423,6 +1753,7 @@ void kmain(const struct boot_info *bi)
     sched_init();
     arch_irq_enable();
     kprintf("timer: %u Hz\n", timer_hz());
+    console_init();                          /* 序列埠收到字元時發中斷(中斷控制器已由 timer_init 設定好) */
 
     /* 檔案系統:建立根目錄,把嵌在 kernel 裡的開機檔案包解開進去。
        要在排程器之後:檔案系統用 mutex 上鎖,而 mutex 需要知道「目前的執行緒」 */
@@ -1434,6 +1765,8 @@ void kmain(const struct boot_info *bi)
             panic("fs: cannot unpack the boot archive (error %d)", nfiles);
         kprintf("fs: root file system ready: %d files unpacked from a %zu KB boot archive\n",
                 nfiles, (size_t)(rootfs_end - rootfs_start) / 1024);
+        disk_init();                         /* 有磁碟的話,掛載到 /disk */
+        disk_stage_test(bi->cmdline);
     }
 
     /* 啟動其他 CPU。selftest 時所有 CPU 一起跑一輪並行測試 */
@@ -1460,6 +1793,8 @@ void kmain(const struct boot_info *bi)
     if (selftest) {
         smp_sched_demo();
         fs_demo();
+        disk_demo();
+        pipe_demo();
         user_demo();
     }
     if (cmdline_has(bi->cmdline, "stress"))
@@ -1470,12 +1805,14 @@ void kmain(const struct boot_info *bi)
 
     /*
      * 啟動 shell:從主控台讀命令並執行。
-     *   一般開機(沒有 autoexit):一定啟動,這是使用者與系統互動的地方
+     *   一般開機(沒有 autoexit):一定啟動,這是使用者與系統互動的地方;
+     *                              shell 結束(exit 或在空的提示符號下按 Ctrl-D)就關機
      *   自動化測試(autoexit)    :只有另外給了 shell 參數才啟動;shell 結束後
      *                              以它的結束碼結束模擬器
      */
     int exit_code = 0;
-    if (!autoexit || cmdline_has(bi->cmdline, "shell")) {
+    int shell = !autoexit || cmdline_has(bi->cmdline, "shell");
+    if (shell) {
         kprintf("starting /bin/sh (type \"help\" for a list of commands)\n");
         int pid = proc_spawn("/bin/sh", NULL);
         if (pid < 0)
@@ -1484,7 +1821,13 @@ void kmain(const struct boot_info *bi)
         kprintf("shell exited with code %d\n", exit_code);
     }
     if (autoexit)
-        arch_exit(exit_code);
+        shutdown(exit_code);
+    if (shell) {
+        /* 互動使用時 shell 結束了:沒有東西可以再接受命令,關機(結束模擬器)。
+           結束碼固定為 0:這是正常的離開,不是測試失敗 */
+        kprintf("powering off\n");
+        shutdown(0);
+    }
     for (;;)
         thread_sleep(1000);                  /* main 無事可做;CPU 交給 idle 執行緒休眠 */
 }

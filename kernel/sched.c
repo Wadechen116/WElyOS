@@ -80,6 +80,7 @@ struct thread {
     unsigned long cpu_ticks;   /* 累計被記了多少個 tick 的 CPU 時間 */
     uint64_t wake_tick;        /* T_SLEEPING:到這個 tick 就喚醒 */
     struct thread *next;       /* 串在休眠串列或某個等待佇列中(同時只會在一個) */
+    struct wait_queue *wq;     /* T_BLOCKED:睡在哪一個等待佇列上(被終止時要從那裡拿出來) */
     struct rq_node rq;         /* 在執行佇列中的節點(由 runq 的實作使用,見 runq.h) */
     int cpu;                   /* T_RUNNING:正在哪一顆 CPU 上執行 */
     struct thread *all_next;   /* 串在「所有執行緒」串列中,供 thread_join 以編號尋找 */
@@ -247,6 +248,7 @@ void wq_sleep(struct wait_queue *wq)
 
     KASSERT(spin_held(&sched_lk));
     t->state = T_BLOCKED;                    /* 不是 RUNNING,schedule() 就不會把它排回去 */
+    t->wq = wq;
     t->next = NULL;
     if (wq->tail)
         wq->tail->next = t;
@@ -275,6 +277,7 @@ int wq_wake_one(struct wait_queue *wq)
             wq->head = best->next;
         if (wq->tail == best)
             wq->tail = best_prev;
+        best->wq = NULL;
         make_ready(best);
     }
     return best != NULL;
@@ -716,12 +719,72 @@ int thread_killed(void)
     return t && t->killed;
 }
 
+/* 把一條正在睡的執行緒提早叫醒(不論它在等什麼)。呼叫時持有 sched_lk */
+static void wake_early(struct thread *t)
+{
+    if (t->state == T_BLOCKED && t->wq) {
+        struct wait_queue *wq = t->wq;
+        struct thread *prev = NULL;
+
+        for (struct thread *c = wq->head; c; prev = c, c = c->next) {
+            if (c != t)
+                continue;
+            if (prev)
+                prev->next = t->next;
+            else
+                wq->head = t->next;
+            if (wq->tail == t)
+                wq->tail = prev;
+            break;
+        }
+        t->wq = NULL;
+        make_ready(t);
+    } else if (t->state == T_SLEEPING) {
+        for (struct thread **pp = &sleepers; *pp; pp = &(*pp)->next) {
+            if (*pp == t) {
+                *pp = t->next;
+                break;
+            }
+        }
+        make_ready(t);
+    }
+}
+
+/*
+ * 把所有 data 相同的執行緒標記為「應終止」,並把其中正在睡的叫醒。
+ *
+ * 被標記的執行緒不會被強行中斷,而是自己在返回使用者模式前結束。但它若正睡在
+ * kernel 裡(等鍵盤輸入、等管線的資料、等另一個行程結束…),可能永遠不會醒來。
+ * 所以這裡直接把它從它睡的地方拿出來、放回執行佇列。
+ *
+ * 對被叫醒的那段程式來說,這是一次「條件還沒成立就醒來」。所有等待的寫法
+ * 本來就要求醒來後重新檢查條件(見 sync.c 開頭);會讓使用者行程等很久的地方
+ * 另外會檢查 thread_killed(),看到自己被終止就放棄等待。
+ */
 void sched_kill_group(void *data)
 {
     KASSERT(spin_held(&sched_lk));
-    for (struct thread *t = all_threads; t; t = t->all_next)
-        if (t->data == data)
-            t->killed = 1;
+    for (struct thread *t = all_threads; t; t = t->all_next) {
+        if (t->data != data)
+            continue;
+        t->killed = 1;
+        wake_early(t);
+    }
+}
+
+/* 統計屬於 data(行程)的執行緒:目前共用掉多少 tick 的 CPU 時間,
+   以及有幾條正在執行或等著執行(其餘的在睡)。呼叫時必須持有排程器的鎖 */
+void sched_group_usage(void *data, unsigned long *ticks, unsigned *runnable)
+{
+    KASSERT(spin_held(&sched_lk));
+    *ticks = 0;
+    *runnable = 0;
+    for (struct thread *t = all_threads; t; t = t->all_next) {
+        if (t->data != data)
+            continue;
+        *ticks += t->cpu_ticks;
+        *runnable += t->state == T_RUNNING || t->state == T_READY;
+    }
 }
 
 void sched_preempt_point(void)
@@ -843,6 +906,13 @@ void thread_sleep(unsigned ms)
 
     unsigned long flags = sched_lock();
     struct thread *self = cur();
+    /* 已經被要求終止的執行緒不再睡:它該盡快回到返回使用者模式的檢查點去結束。
+       「標記為終止」與這裡的檢查都在同一把鎖之下,所以不會有「剛檢查完就被標記、
+       接著照樣睡下去」的空檔 */
+    if (self->killed) {
+        sched_unlock(flags);
+        return;
+    }
     self->wake_tick = timer_ticks() + n;
     self->state = T_SLEEPING;
 
@@ -918,6 +988,10 @@ void sched_tick(void)
        只有較低優先權的在等時不換,它們本來就輪不到 */
     struct thread *t = c->current;
     t->cpu_ticks++;                          /* 這個 tick 算在正在執行的執行緒頭上 */
+    if (t == c->idle)
+        c->ticks_idle++;
+    else
+        c->ticks_busy++;
     /* 閒置中的 CPU:佇列裡(包括別顆 CPU 的)有工作就去拿。平常有工作時會被直接通知,
        這裡是保險,確保不會有「有人在排隊、卻有 CPU 閒著」的情況持續超過一個 tick */
     if (t == c->idle && rq_highest() >= 0)

@@ -38,11 +38,17 @@
 - [x] 主控台輸入(序列埠,含行編輯:退格、Ctrl-C、Ctrl-D)與 shell(`/bin/sh`):執行 `/bin` 下的程式、`>` / `>>` 重新導向、引號、script 檔;另有 `mkdir`、`rm`;`dup2` 系統呼叫。不帶 `autoexit` 開機時直接進入 shell
 - [x] 三個架構相同的 WElyOS 文字開機標誌(由 kernel 印出;RISC-V 使用拿掉自身標誌的 OpenSBI)
 - [x] 可恢復的 page fault:寫入時複製(copy-on-write,每頁有參考計數)、`fork` 系統呼叫、使用者 stack 自動成長(每條最多 1MB)
+- [x] 管線:`pipe` 系統呼叫、shell 的 `命令 | 命令` 與 `< 檔案`;新增 `wc`;終止行程時會叫醒它所有正在睡的執行緒
+- [x] 行程的父子關係(只能 `wait` 自己的子行程、`waitpid` 可等任何一個、孤兒行程自動回收)、訊號(`kill`:SIGINT / SIGKILL / SIGTERM,效果都是終止)、行程群組與主控台的前景群組;Ctrl-C 會終止執行中的命令(含整條管線);新增 `sleep`、`kill`
+- [x] 中斷驅動的主控台輸入(i386 的 PIC IRQ 4、RISC-V 的 PLIC、AArch64 的 GIC 共用中斷);i386 螢幕改用硬體捲動;shell 的背景執行(`命令 &`、`jobs`、`fg`、`wait`);`ps` 列出行程;`waitpid` 的 `WNOHANG`、`procinfo` 系統呼叫、`/dev/null`;互動使用時 shell 結束即關機
+- [x] 工作控制:暫停與繼續(`SIGSTOP` / `SIGTSTP` / `SIGCONT`)、Ctrl-Z 暫停前景的命令、shell 的 `bg` 與可繼續暫停工作的 `fg`、`waitpid` 的 `WUNTRACED`;只有前景可以讀鍵盤(背景行程讀取時被暫停);`kill -STOP` / `-CONT`
+- [x] 磁碟:區塊裝置介面與輪詢式驅動程式(i386 的 ATA PIO;RISC-V / AArch64 的 virtio-blk);磁碟上的檔案系統 WFS(位元圖、inode、間接區塊、區塊快取),掛載在 `/disk`,內容跨開機保留;VFS 的掛載;沒有正常關機時開機自動檢查並修復;`sync` / `statfs` 系統呼叫;新增 `cp`、`df`、`sync`
+- [x] `top`(類似 htop):全螢幕即時顯示各 CPU 的使用率、記憶體與磁碟用量、每個行程的 CPU% 與記憶體,可選取行程暫停、繼續、終止;`sysinfo` 系統呼叫與每顆 CPU 的忙碌 / 閒置記帳、行程的記憶體用量、主控台的 raw 輸入模式(`tcsetmode`)、i386 VGA 螢幕支援游標與顏色的控制序列
 
 ## 規劃中
 
 - [ ] 多核心(Symmetric Multiprocessing,SMP)效能:縮小排程器的大鎖、喚醒時考慮上次執行的 CPU、mutex 先自旋再睡
-- [ ] 管線;中斷驅動的輸入;行程的父子關係與訊號;磁碟驅動與磁碟上的檔案系統
+- [ ] 訊號處理函式;i386 的 PS/2 鍵盤;檔案系統的日誌(journaling)、以磁碟為根目錄
 
 ## 需求
 
@@ -72,10 +78,12 @@ bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit stress" 
 cmake --build build/i386    --target run-gui   # 僅 i386:開啟 QEMU 視窗顯示 VGA 畫面
 cmake --preset riscv64 -DWELYOS_RUNQ=list      # 換用另一種執行佇列的實作(預設 ring)
 bash scripts/host-test.sh                      # 在主機上以多條執行緒測試執行佇列(不需要 QEMU)
+bash scripts/regress.sh                        # 回歸測試:三個架構各 20 個情境加上磁碟跨開機測試,核對結束碼(-r 6 另外重複測試,-q 只跑基本情境)
 bash scripts/build-opensbi.sh                  # (選用)重新建置 RISC-V 的開機韌體;換 OpenSBI 版本時才需要
-bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf                                # 開機後進入 shell(輸入 help 看有哪些命令;以 Ctrl-C 結束 QEMU)
+bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf                                # 開機後進入 shell(輸入 help 看有哪些命令;top 看即時的系統狀態,q 離開)。Ctrl-C 終止、Ctrl-Z 暫停執行中的命令(fg / bg 繼續);輸入 exit 關機;Ctrl-] 強制結束 QEMU
 python3 scripts/type-input.py 1.5 0.01 'ls /\nexit\n' | bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit shell"   # 自動化:模擬打字餵給 shell
 QEMU_SMP=8 bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit selftest"   # 指定 CPU 數(預設 4,最多 8;1 = 單核心)
+QEMU_DISK=none bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf                 # 不接磁碟(預設接上 build/<架構>/disk.img,掛載在 /disk;QEMU_DISK=路徑 可指定別的映像檔)
 ```
 
 ## 專案結構
@@ -83,13 +91,13 @@ QEMU_SMP=8 bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoex
 ```
 arch/<名稱>/  各架構的開機程式、linker script、驅動(i386 / riscv64 / aarch64)
 include/      與架構無關的標頭(arch.h 為架構介面)
-kernel/       kernel 主體(main、kprintf、fdt、panic、timer、pmm、kmalloc、sched、runq_ring / runq_list、spinlock、smp、sync、vm、proc、vfs、ramfs、initrd、console)
+kernel/       kernel 主體(main、kprintf、fdt、panic、timer、pmm、kmalloc、sched、runq_ring / runq_list、spinlock、smp、sync、vm、proc、vfs、ramfs、wfs、virtio_blk、initrd、console、pipe)
 lib/          最小字串函式庫
 cmake/        各架構的 toolchain 檔
-user/         使用者程式(各自獨立連結後放進開機檔案包的 /bin/):init(測試)、sh(shell)、echo、cat、ls、mkdir、rm;crt0.c 為共用的啟動程式,ulib.h 為共用的小工具
+user/         使用者程式(各自獨立連結後放進開機檔案包的 /bin/):init(測試)、sh(shell)、echo、cat、ls、wc、mkdir、rm、cp、sleep、kill、ps、top、df、sync;crt0.c 為共用的啟動程式,ulib.h 為共用的小工具
 firmware/     RISC-V 的開機韌體(拿掉自己標誌的 OpenSBI;說明見 firmware/README.md)
 rootfs/       開機檔案包的內容(建置時打包成 tar 嵌入 kernel,開機時解開到檔案系統)
 tests/host/   在主機上執行的測試(執行佇列的並行測試)
-scripts/      QEMU 啟動腳本、GDB 腳本與設定、主機測試腳本
+scripts/      QEMU 啟動腳本、GDB 腳本與設定、回歸測試(regress.sh)、主機測試、模擬打字(type-input.py)
 docs/         開發紀錄
 ```

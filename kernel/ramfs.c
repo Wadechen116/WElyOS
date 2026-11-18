@@ -130,9 +130,10 @@ static int ramfs_is_empty(struct inode *dir)
     return rn(dir)->ents == NULL;
 }
 
-static int ramfs_readdir(struct inode *dir, uint64_t idx, struct dirent *out)
+static int ramfs_readdir(struct inode *dir, uint64_t *pos, struct dirent *out)
 {
     struct rdirent *e = rn(dir)->ents;
+    uint64_t idx = *pos;                         /* 位置 = 第幾筆紀錄 */
 
     while (e && idx--)
         e = e->next;
@@ -142,6 +143,19 @@ static int ramfs_readdir(struct inode *dir, uint64_t idx, struct dirent *out)
     for (size_t i = 0; i <= strlen(e->name); i++)
         out->name[i] = e->name[i];
     out->type = (uint32_t)e->node->in.type;
+    (*pos)++;
+    return 0;
+}
+
+/* 記憶體檔案系統的「容量」就是整台機器的記憶體:以頁為單位回報 */
+static int ramfs_statfs(struct inode *in, struct fsinfo *out)
+{
+    (void)in;
+    memset(out, 0, sizeof(*out));
+    out->block_size = PAGE_SIZE;
+    out->blocks = pmm_total_pages();
+    out->free_blocks = pmm_free_count();
+    memcpy(out->type, "ramfs", 6);
     return 0;
 }
 
@@ -279,4 +293,5 @@ static const struct inode_ops ramfs_ops = {
     .truncate = ramfs_truncate,
     .get_page = ramfs_get_page,
     .release = ramfs_release,
+    .statfs = ramfs_statfs,
 };

@@ -20,4 +20,16 @@ static inline uint8_t inb(uint16_t port)
     __asm__ volatile("inb %1, %0" : "=a"(v) : "Nd"(port));
     return v;
 }
+
+/* 從 I/O port 連續讀取 / 寫入 count 個 16 位元的字(ATA 硬碟的資料傳輸用)。
+   rep insw / outsw:CPU 自己重複 count 次,位址放在 edi / esi */
+static inline void insw(uint16_t port, void *buf, unsigned count)
+{
+    __asm__ volatile("cld; rep insw" : "+D"(buf), "+c"(count) : "d"(port) : "memory");
+}
+
+static inline void outsw(uint16_t port, const void *buf, unsigned count)
+{
+    __asm__ volatile("cld; rep outsw" : "+S"(buf), "+c"(count) : "d"(port) : "memory");
+}
 #endif

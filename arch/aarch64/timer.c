@@ -18,6 +18,7 @@
  * 同樣是「單次鬧鐘」,中斷處理程式中要寫入下一次的比較值。
  */
 #include <stdint.h>
+#include "console.h"
 #include "cpu.h"
 #include "smp.h"
 #include "arch.h"
@@ -32,6 +33,7 @@
 
 #define GICD_CTLR        0x000     /* distributor 總開關 */
 #define GICD_ISENABLER0  0x100     /* 中斷 0~31 的啟用位元(寫 1 啟用) */
+#define GICD_ITARGETSR   0x800     /* 每個中斷 1 位元組:送給哪些 CPU */
 #define GICD_IPRIORITYR  0x400     /* 每個中斷 1 位元組的優先權(數值越小越優先) */
 
 #define GICC_CTLR        0x000     /* CPU interface 開關 */
@@ -43,6 +45,7 @@
 
 #define IRQ_IPI          1         /* 用第 1 號 SGI 當作處理器間中斷(SGI 為 0~15) */
 #define IRQ_TIMER        30        /* EL1 實體計時器 */
+#define IRQ_UART         33        /* 序列埠 PL011(SPI 1 = 32 + 1) */
 #define IRQ_SPURIOUS     1023      /* 沒有待處理中斷時 IAR 的回傳值 */
 
 static inline void mmio_w32(uintptr_t addr, uint32_t v)
@@ -120,6 +123,22 @@ void arch_ipi_send(struct cpu *c)
     mmio_w32(GICD_BASE + GICD_SGIR, (1u << (16 + (unsigned)(c->arch_id & 7))) | IRQ_IPI);
 }
 
+/*
+ * 讓序列埠在收到字元時發出中斷。PL011 接在 GIC 的 33 號(SPI 1)。
+ * 32 號以上是「共用的週邊中斷」(SPI, Shared Peripheral Interrupt):
+ * 不屬於特定的 CPU,要另外指定送給誰。我們送給開機的這一顆。
+ */
+void arch_console_irq_init(void)
+{
+    *(volatile uint8_t *)(GICD_BASE + GICD_IPRIORITYR + IRQ_UART) = 0xA0;
+    /* ITARGETSR:每個中斷 1 位元組,內容是「送給哪些 CPU」的位元遮罩。
+       0~31 號的這個暫存器是唯讀的,讀出來就是「自己這顆 CPU」的遮罩,正好拿來用 */
+    *(volatile uint8_t *)(GICD_BASE + GICD_ITARGETSR + IRQ_UART) =
+        *(volatile uint8_t *)(GICD_BASE + GICD_ITARGETSR);
+    mmio_w32(GICD_BASE + GICD_ISENABLER0 + 4 * (IRQ_UART / 32), 1u << (IRQ_UART % 32));
+    uart_rx_irq_enable();
+}
+
 /* 由 trap_handler 在收到 IRQ 時呼叫 */
 void irq_handler(void)
 {
@@ -150,6 +169,9 @@ void irq_handler(void)
             deadline = now + interval;
         /* 寫入新的比較值:同時讓計時器的中斷訊號消失 */
         __asm__ volatile("msr cntp_cval_el0, %0" : : "r"(deadline));
+    } else if (id == IRQ_UART) {
+        console_rx();                        /* 序列埠收到字元(見 kernel/console.c) */
+        uart_rx_irq_ack();
     } else {
         kprintf("[irq] unexpected interrupt %u\n", id);
     }

@@ -4,6 +4,8 @@
 # 自動尋找 QEMU;在 WSL 下使用 Windows 版並轉換路徑。
 # 環境變數: QEMU(指定執行檔)、QEMU_DISPLAY(預設 none;i386 的 GUI 用 default)
 #           QEMU_SMP(CPU 數,預設 4;kernel 最多使用 8 顆)、QEMU_CPU(CPU 型號)
+#           QEMU_DISK(磁碟映像檔;預設 build/<arch>/disk.img,不存在時自動建立 16MB 的空白檔;
+#                     設為 none 則不接磁碟)
 set -e
 ARCH="$1"; ELF="$2"; shift 2
 
@@ -33,6 +35,16 @@ case "$ARCH" in
   *) echo "未知架構: $ARCH" >&2; exit 1 ;;
 esac
 
+# 磁碟:一個普通的檔案當作磁碟的內容(映像檔)。kernel 第一次看到全空白的磁碟時
+# 會在上面建立檔案系統,之後每次開機都掛載在 /disk,內容跨開機保留。
+#   i386             接在 IDE 第一個位置(kernel 以 ATA PIO 存取)
+#   riscv64/aarch64  virtio 區塊裝置(virtio-mmio;force-legacy=false 選用現行版本的介面)
+DISK="${QEMU_DISK:-$(dirname "$0")/../build/$ARCH/disk.img}"
+DISK_ARGS=()
+if [ "$DISK" != none ]; then
+  [ -f "$DISK" ] || { mkdir -p "$(dirname "$DISK")"; truncate -s 16M "$DISK"; }
+fi
+
 QEMU="${QEMU:-}"
 if [ -z "$QEMU" ]; then
   if command -v "$BIN" >/dev/null; then QEMU="$BIN"
@@ -47,21 +59,35 @@ case "$QEMU" in *.exe)
     if [ "${MACHINE[$i]}" = -bios ] && [ "${MACHINE[$((i+1))]}" != default ]; then
       MACHINE[$((i+1))]="$(wslpath -w "${MACHINE[$((i+1))]}")"
     fi
-  done ;;
+  done
+  [ "$DISK" != none ] && DISK="$(wslpath -w "$DISK")" ;;
 esac
+if [ "$DISK" != none ]; then
+  if [ "$ARCH" = i386 ]; then
+    DISK_ARGS=(-drive "file=$DISK,format=raw,if=ide,index=0,media=disk")
+  else
+    DISK_ARGS=(-global virtio-mmio.force-legacy=false
+               -drive "file=$DISK,format=raw,if=none,id=hd0" -device virtio-blk-device,drive=hd0)
+  fi
+fi
 
 # 從終端機直接執行時(標準輸入是終端機):關掉終端機自己的「整行緩衝」與「回顯」。
 # 否則打的字要等按下 Enter 才一次送進去(一長串同時到達,客體來不及收會掉字),
 # 而且每個字會顯示兩次(終端機顯示一次、WElyOS 自己再回顯一次)。
-# 保留 Ctrl-C 的作用(結束 QEMU)。結束時還原終端機的設定。
+#
+# 另外把終端機的「中斷鍵」從 Ctrl-C 改成 Ctrl-]:
+#   Ctrl-C  原樣送進 WElyOS(終止正在執行的命令),不再被終端機攔下來結束 QEMU
+#   Ctrl-]  結束 QEMU(WElyOS 沒有回應時的最後手段;正常的離開方式是在 shell 輸入 exit)
+# Ctrl-Z 也原樣送進 WElyOS(暫停正在執行的命令);Ctrl-\ 一併交給它(目前不處理)。
+# 結束時還原終端機的設定。
 if [ -t 0 ]; then
   STTY_SAVED="$(stty -g)"
   trap 'stty "$STTY_SAVED" 2>/dev/null' EXIT
-  stty -icanon -echo
+  stty -icanon -echo intr '^]' quit undef susp undef
 fi
 
 set +e
-"$QEMU" "${MACHINE[@]}" -kernel "$ELF" -serial stdio \
+"$QEMU" "${MACHINE[@]}" "${DISK_ARGS[@]}" -kernel "$ELF" -serial stdio \
         -display "${QEMU_DISPLAY:-none}" -no-reboot "$@"
 rc=$?
 # i386 的 isa-debug-exit 寫入 0 時,QEMU 回傳 1,視為成功

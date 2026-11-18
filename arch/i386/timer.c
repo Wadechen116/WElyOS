@@ -22,6 +22,8 @@
  */
 #include <stdint.h>
 #include "arch.h"
+#include "console.h"
+#include "serial.h"
 #include "io.h"
 #include "kprintf.h"
 #include "timer.h"
@@ -39,6 +41,7 @@
 #define PIT_HZ     1193182u
 
 #define IRQ_BASE   32          /* IRQ 0 對應的向量編號 */
+#define IRQ_COM1   4           /* 序列埠 COM1 */
 
 #define PIT_CH2    0x42        /* channel 2:原本接喇叭,輸出狀態可由 port 0x61 讀回 */
 #define PORT_SPKR  0x61        /* bit 0 = channel 2 的閘門,bit 1 = 喇叭開關,bit 5 = channel 2 輸出 */
@@ -127,6 +130,17 @@ void arch_timer_init(unsigned hz)
     }
 }
 
+/*
+ * 讓序列埠 COM1 在收到字元時發出中斷:COM1 接在主 PIC 的 IRQ 4。
+ * 多核心時這條中斷只會送到開機的那顆 CPU(PIC 的輸出只接到它),
+ * 和 PIT 的計時器中斷相同。
+ */
+void arch_console_irq_init(void)
+{
+    serial_irq_enable();
+    outb(PIC1_DATA, (uint8_t)(inb(PIC1_DATA) & ~(1u << IRQ_COM1)));   /* 遮罩位元清 0 = 開啟 */
+}
+
 /* 由 trap_handler 在向量 32~47 時呼叫 */
 void irq_handler(uint32_t irq)
 {
@@ -148,6 +162,8 @@ void irq_handler(uint32_t irq)
         } else {
             timer_tick();
         }
+    } else if (irq == IRQ_COM1) {
+        console_rx();                        /* 序列埠收到字元(見 kernel/console.c) */
     } else
         kprintf("[irq] unexpected IRQ %u\n", irq);
 

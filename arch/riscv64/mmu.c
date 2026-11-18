@@ -135,4 +135,12 @@ void arch_mmu_map_devices(void)
        計時器透過 SBI 呼叫(ecall)操作,不是記憶體對映裝置 */
     vm_map(0x10000000UL, 0x10000000UL, VM_READ | VM_WRITE | VM_DEVICE);
     vm_map(0x00100000UL, 0x00100000UL, VM_READ | VM_WRITE | VM_DEVICE);
+    /* 中斷控制器 PLIC(基底 0x0c000000,用法見 arch.c)。只對映用得到的三段:
+       各中斷來源的優先權、各 context 的啟用位元、各 context 的門檻與認領暫存器
+       (每個 context 一頁;每顆 hart 兩個 context,最多 8 顆 hart) */
+    vm_map(0x0c000000UL, 0x0c000000UL, VM_READ | VM_WRITE | VM_DEVICE);
+    vm_map(0x0c002000UL, 0x0c002000UL, VM_READ | VM_WRITE | VM_DEVICE);
+    vm_map_range(0x0c200000UL, 0x0c200000UL, 16 * 0x1000UL, VM_READ | VM_WRITE | VM_DEVICE);
+    /* virtio-mmio 裝置的 8 個位置(0x10001000 起,每個 4KB);磁碟在其中一個(見 arch_blk_probe) */
+    vm_map_range(0x10001000UL, 0x10001000UL, 8 * 0x1000UL, VM_READ | VM_WRITE | VM_DEVICE);
 }

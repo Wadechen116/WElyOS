@@ -50,6 +50,8 @@ int vm_unmap(uintptr_t va);
 int vm_query(uintptr_t va, uintptr_t *pa, unsigned *flags);
 
 unsigned long vm_table_pages(void);    /* 頁表本身用掉的頁數 */
+struct vm_space;
+unsigned long vm_space_pages(struct vm_space *vs);   /* 這個位址空間目前對映了幾頁(含和別人共用的) */
 
 /*
  * 位址空間(address space):一份獨立的頁表,每個行程一份。

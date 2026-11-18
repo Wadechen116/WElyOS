@@ -211,4 +211,6 @@ void arch_mmu_map_devices(void)
        與 PL011 序列埠 */
     vm_map_range(0x08000000UL, 0x08000000UL, 0x20000, VM_READ | VM_WRITE | VM_DEVICE);
     vm_map(0x09000000UL, 0x09000000UL, VM_READ | VM_WRITE | VM_DEVICE);
+    /* virtio-mmio 裝置的 32 個位置(0x0a000000 起,每個 0x200 位元組);磁碟在其中一個 */
+    vm_map_range(0x0a000000UL, 0x0a000000UL, 0x4000, VM_READ | VM_WRITE | VM_DEVICE);
 }

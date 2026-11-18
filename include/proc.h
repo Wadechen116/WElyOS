@@ -26,6 +26,15 @@ int proc_kill(int pid, int code);
 
 #define PROC_KILLED_FAULT (-1)
 
+/* 對行程群組 pgid 的所有行程送出訊號 sig(終止它們)。回傳送到的行程數。
+   呼叫時必須持有排程器的鎖;主控台收到 Ctrl-C 時使用 */
+int proc_signal_group_locked(int pgid, int sig);
+
+/* 主控台(console.c)判斷「誰可以讀鍵盤」時使用;呼叫時都必須持有排程器的鎖 */
+int proc_self_pgid(void);                /* 目前執行緒所屬行程的群組;kernel 執行緒為 0 */
+int proc_self_stopped(void);             /* 目前執行緒所屬的行程是否被暫停了 */
+int proc_group_alive_locked(int pgid);   /* 群組裡還有沒有活著的行程 */
+
 /* ---- 以下由各架構的例外處理程式呼叫 ---- */
 
 /* 系統呼叫的進入點:num 為呼叫編號,a0~a2 為參數;回傳值會放回使用者的暫存器。
@@ -64,10 +73,62 @@ enum {
     SYS_unlink,             /* (path)          刪除檔案或空的目錄 */
     SYS_stat,               /* (path, stat)    查詢類型與大小 */
     /* ---- 行程 ---- */
-    SYS_spawn,              /* (path, argv)    建立新行程執行 path;回傳 pid。新行程繼承開啟中的檔案 */
+    SYS_spawn,              /* (path, argv)    建立新行程執行 path;回傳 pid。新行程繼承 0、1、2 號描述符 */
     SYS_exec,               /* (path, argv)    目前的行程改為執行 path;成功則不返回 */
-    SYS_wait,               /* (pid)           等待行程結束,回傳它的結束碼 */
+    SYS_wait,               /* (pid)           等待自己的某個子行程結束,回傳它的結束碼 */
     SYS_dup2,               /* (oldfd, newfd)  讓 newfd 也指向 oldfd 的那次開啟;回傳 newfd */
     SYS_fork,               /* ()              複製目前的行程;父行程得到子行程的 pid,子行程得到 0 */
+    SYS_pipe,               /* (fds)           建立管線;fds[0] 為讀端、fds[1] 為寫端的描述符 */
+    SYS_waitpid,            /* (pid, status, options)  等子行程結束(pid = -1:任何一個);回傳它的 pid,
+                                               結束碼寫入 *status。options 可為 WNOHANG、WUNTRACED */
+    SYS_kill,               /* (pid, sig)      送訊號(終止 2、9、15;暫停 19、20、21;繼續 18);
+                                               pid < 0 表示整個群組 -pid */
+    SYS_setpgid,            /* (pid, pgid)     把自己(pid 0)或子行程放進行程群組;pgid 0 = 以它的 pid 為群組 */
+    SYS_tcsetfg,            /* (pgid)          設定主控台的前景群組:Ctrl-C 終止、Ctrl-Z 暫停這一組,
+                                               也只有這一組可以讀鍵盤。0 = 沒有(輪到呼叫者自己讀) */
+    SYS_procinfo,           /* (after, info)   查詢編號大於 after 的下一個行程;0 = 取得,1 = 沒有更多了 */
+    SYS_sync,               /* ()              把檔案系統還留在記憶體裡的修改寫到磁碟上 */
+    SYS_statfs,             /* (path, info)    path 所在的檔案系統的用量(struct fsinfo,見 fs.h) */
+    SYS_sysinfo,            /* (info)          整個系統的狀態:運作時間、各 CPU 的使用量、記憶體(struct sysinfo) */
+    SYS_tcsetmode,          /* (mode)          設定主控台的輸入模式(CON_RAW、CON_NOECHO;0 = 一般) */
+};
+
+/* SYS_waitpid 的選項 */
+#define WNOHANG   1         /* 不等待:還沒有子行程結束就立刻回傳 0 */
+#define WUNTRACED 2         /* 子行程「被暫停」也回報(它不會被回收) */
+
+/* 被暫停時寫入 *status 的值:WSTOPPED_BASE | 訊號編號。一般的結束碼不會落在這一段 */
+#define WSTOPPED_BASE  0x80000000u
+#define WIFSTOPPED(s)  (((unsigned)(s) & 0xFFFFFF00u) == WSTOPPED_BASE)
+#define WSTOPSIG(s)    ((int)((unsigned)(s) & 0xFFu))
+
+/* SYS_sysinfo 回報的內容(使用者端的定義在 user/usys.h,必須一致) */
+#define SYSINFO_MAX_CPUS 8
+struct sysinfo {
+    uint64_t uptime_ticks;      /* 開機至今的 tick 數 */
+    uint32_t hz;                /* 每秒幾個 tick */
+    uint32_t ncpu;              /* 參與排程的 CPU 數 */
+    uint32_t nprocs, nthreads;
+    uint64_t mem_total_kb, mem_free_kb;
+    uint64_t ctx_switches;      /* 累計的執行緒切換次數 */
+    struct {
+        uint64_t busy, idle;    /* 這顆 CPU 忙碌 / 閒置的 tick 數(累計) */
+    } cpu[SYSINFO_MAX_CPUS];
+};
+
+/* SYS_tcsetmode 的模式(可以相加) */
+#define CON_RAW    1            /* 不等整行:每個按鍵立刻交給讀取者,不做行編輯 */
+#define CON_NOECHO 2            /* 不把打的字顯示出來 */
+
+/* SYS_procinfo 回報的內容(使用者端的定義在 user/usys.h,必須一致) */
+enum { PROC_RUNNING = 1, PROC_SLEEPING, PROC_ZOMBIE, PROC_STOPPED };
+struct procinfo {
+    int pid, ppid, pgid;
+    int state;              /* PROC_RUNNING:有執行緒正在執行或等著執行;PROC_SLEEPING:全部在等待;
+                               PROC_ZOMBIE:已結束,等父行程來收;PROC_STOPPED:被暫停了 */
+    int nthreads;
+    unsigned int cpu_ticks; /* 累計用掉的 CPU 時間(tick,1 tick = 1ms) */
+    unsigned int mem_kb;     /* 對映的記憶體(KB;含和其他行程共用的程式碼與尚未複製的頁) */
+    char name[32];
 };
 #endif

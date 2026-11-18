@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include "arch.h"
 #include "console.h"
+#include "cpu.h"
 #include "fs.h"
 #include "kmalloc.h"
 #include "kprintf.h"
@@ -42,6 +43,10 @@ struct uimg_hdr {
 
 struct proc {
     int pid;
+    int ppid;                        /* 建立它的行程(父行程);0 = 由 kernel 建立,或父行程已經結束 */
+    int pgid;                        /* 行程群組:shell 把同一條管線的行程放在同一組,
+                                        Ctrl-C 一次終止整組(見 console.c) */
+    int detached;                    /* 父行程已經結束:沒有人會來 wait,結束時自動回收 */
     char name[32];                   /* 程式檔的名稱(路徑的最後一段),訊息中使用 */
     struct vm_space *space;
     struct file *exe;                /* 正在執行的程式檔。一直開著:它的頁直接對映在行程裡 */
@@ -50,7 +55,12 @@ struct proc {
     int exiting;                     /* 已開始結束流程 */
     int exit_code;
     int zombie;                      /* 所有執行緒都結束了,等待 proc_wait 來收 */
-    struct wait_queue waiters;       /* 正在 proc_wait 的執行緒 */
+    int stopped;                     /* 不為 0 = 被暫停了,值是造成暫停的訊號編號(見下方「暫停與繼續」) */
+    int stop_reported;               /* 這次暫停已經告訴過父行程了(waitpid 的 WUNTRACED 只回報一次) */
+    struct wait_queue stop_wq;       /* 暫停期間,它的執行緒睡在這裡,等 SIGCONT */
+    unsigned long cpu_ticks;         /* 已經結束的執行緒用掉的 CPU 時間(還活著的另外算,見 sys_procinfo) */
+    struct wait_queue waiters;       /* 正在 proc_wait 的執行緒(kernel 等特定的行程) */
+    struct wait_queue child_wq;      /* 這個行程自己的執行緒,正在等「任何一個子行程結束」 */
     struct wait_queue futex[FUTEX_BUCKETS];  /* futex 的等待者,依位址分桶 */
     struct file *fd[PROC_MAX_FD];    /* 檔案描述符表:編號 -> 開啟中的檔案;NULL = 空位 */
     struct proc *next;
@@ -62,6 +72,15 @@ struct proc {
  * 需要把「檢查狀態」與「睡下去」做成不可分割的一步。
  * 會花時間或需要其他鎖的工作(配置記憶體、建立執行緒、釋放位址空間)一律放在鎖外。
  */
+/* 訊號編號(沿用 Unix 的定義;說明見下方「訊號」) */
+#define SIGINT  2
+#define SIGKILL 9
+#define SIGTERM 15
+#define SIGCONT 18
+#define SIGSTOP 19
+#define SIGTSTP 20
+#define SIGTTIN 21
+
 static struct proc *procs;           /* 所有行程(含 zombie) */
 static int next_pid = 1;
 
@@ -72,7 +91,11 @@ struct ustart {
 };
 
 static void fd_close_all(struct proc *p);
+static struct proc *proc_became_zombie(struct proc *p);
+static void proc_begin_exit(struct proc *p, int code);
+static void proc_free_list(struct proc *list);
 static int proc_fault(struct proc *p, uintptr_t addr, int write);
+static int copy_to_user(struct proc *p, uintptr_t uaddr, const void *src, size_t len);
 
 static struct proc *proc_find(int pid)
 {
@@ -342,6 +365,7 @@ static void proc_thread_exit(void)
 
     unsigned long flags = sched_lock();
     int last = --p->nthreads == 0;
+    p->cpu_ticks += thread_cpu_ticks();  /* 這條執行緒用掉的時間記到行程頭上(ps 會顯示) */
     sched_unlock(flags);
 
     if (last) {
@@ -353,10 +377,10 @@ static void proc_thread_exit(void)
 
         flags = sched_lock();
         p->space = NULL;
-        p->zombie = 1;
-        wq_wake_all(&p->waiters);
+        struct proc *dead = proc_became_zombie(p);
         sched_unlock(flags);
-        /* 解鎖之後 proc_wait 隨時可能把 p 釋放,不可再存取 */
+        /* 解鎖之後等待者隨時可能把 p 釋放(p 也可能就在 dead 裡),不可再存取 */
+        proc_free_list(dead);
     }
     thread_set_data(NULL);
     thread_exit();
@@ -370,10 +394,7 @@ static void proc_begin_exit(struct proc *p, int code)
     p->exiting = 1;
     p->exit_code = code;
     sched_kill_group(p);
-    /* 睡在 futex 上的執行緒不會自己醒來:叫醒它們,它們返回使用者模式前就會結束 */
-    for (unsigned i = 0; i < FUTEX_BUCKETS; i++)
-        wq_wake_all(&p->futex[i]);
-    console_wake_readers();          /* 正在等主控台輸入的也一樣 */
+    /* 正睡在 kernel 裡的執行緒(等 futex、等輸入、等管線…)由 sched_kill_group 叫醒 */
 }
 
 /* 結束整個行程(由行程自己的執行緒呼叫) */
@@ -516,13 +537,22 @@ static int fd_setup_console(struct proc *p)
     return 0;
 }
 
-/* 由另一個行程建立的新行程:繼承建立者所有開啟中的檔案(同一次開啟,共用讀寫位置)。
-   這是之後做輸出入重新導向的基礎:建立者先安排好描述符,新行程照常讀寫 0、1、2 號 */
-static void fd_inherit(struct proc *p, struct proc *parent)
+/*
+ * 新行程繼承另一個行程開啟中的檔案(同一次開啟,共用讀寫位置):編號 0 ~ count-1。
+ *
+ *   fork   全部繼承(子行程是父行程的複本)
+ *   spawn  只繼承 0、1、2 號(標準輸入、輸出、錯誤)
+ *
+ * spawn 只給三個,是為了管線能正確結束:shell 手上通常還開著別的東西
+ * (下一段管線的另一端、暫存的原本輸出…),新程式若連這些也繼承了,
+ * 就會出現「管線的寫端其實還有人開著」,讀的那一方永遠等不到結束。
+ * 新程式要用的東西,建立者先接到 0、1、2 號上就可以了(見 sh.c 的重新導向)。
+ */
+static void fd_inherit(struct proc *p, struct proc *parent, unsigned count)
 {
     unsigned long fl = spin_lock_irqsave(&fd_lk);
 
-    for (unsigned i = 0; i < PROC_MAX_FD; i++)
+    for (unsigned i = 0; i < count && i < PROC_MAX_FD; i++)
         if (parent->fd[i])
             p->fd[i] = vfs_dup(parent->fd[i]);
     spin_unlock_irqrestore(&fd_lk, fl);
@@ -543,7 +573,7 @@ static int proc_create(const char *path, const struct args *a, struct proc *pare
         return err;
     }
     if (parent) {
-        fd_inherit(p, parent);
+        fd_inherit(p, parent, 3);
     } else if (fd_setup_console(p) != 0) {
         image_discard(&img);
         kfree(p);
@@ -556,6 +586,8 @@ static int proc_create(const char *path, const struct args *a, struct proc *pare
 
     unsigned long flags = sched_lock();
     int pid = p->pid = next_pid++;
+    p->ppid = parent ? parent->pid : 0;
+    p->pgid = parent ? parent->pgid : pid;   /* 沿用建立者的群組;kernel 建立的自成一組 */
     p->next = procs;
     procs = p;
     sched_unlock(flags);
@@ -567,9 +599,9 @@ static int proc_create(const char *path, const struct args *a, struct proc *pare
         flags = sched_lock();
         p->space = NULL;
         p->exit_code = PROC_KILLED_FAULT;
-        p->zombie = 1;
-        wq_wake_all(&p->waiters);
+        struct proc *dead = proc_became_zombie(p);
         sched_unlock(flags);
+        proc_free_list(dead);
     }
     return pid;
 }
@@ -606,8 +638,10 @@ int proc_wait(int pid)
 
     /* 每次醒來都重新以編號尋找:如果有另一條執行緒也在等同一個行程,
        它可能先一步把行程回收並釋放了,不能沿用睡前拿到的指標(pid 不會重複使用) */
-    while ((p = proc_find(pid)) != NULL && !p->zombie)
+    while ((p = proc_find(pid)) != NULL && !p->zombie && !thread_killed())
         wq_sleep(&p->waiters);
+    if (p && !p->zombie)
+        p = NULL;                    /* 等待者自己被終止了:放棄等待,不回收對方 */
     if (p) {
         code = p->exit_code;
         for (struct proc **pp = &procs; *pp; pp = &(*pp)->next) {
@@ -620,6 +654,351 @@ int proc_wait(int pid)
     sched_unlock(flags);
     kfree(p);                        /* 已從串列移除,別人找不到它了;在鎖外釋放(NULL 無作用) */
     return code;
+}
+
+/*
+ * ---- 父子關係 ----
+ *
+ * 行程結束後不會立刻消失:它的紀錄(結束碼)要留到「有人來問」為止,
+ * 這種已經結束、等著被回收的行程稱為 zombie。誰負責來問?建立它的那個行程(父行程)。
+ *
+ *   父行程呼叫 wait      -> 取得結束碼,紀錄被回收
+ *   父行程先結束了        -> 沒有人會來問了。子行程變成「沒有父行程」(detached),
+ *                           它結束時直接回收,不留下紀錄。已經是 zombie 的當場回收
+ * 這樣不論父行程有沒有好好 wait,紀錄都不會永遠留著。
+ * (Unix 的做法是把這些行程過繼給 1 號行程;這裡沒有那樣的行程,所以由 kernel 直接回收。)
+ */
+
+/* 把行程從串列中拿掉(呼叫時持有排程器的鎖) */
+static void proc_unlink(struct proc *p)
+{
+    for (struct proc **pp = &procs; *pp; pp = &(*pp)->next) {
+        if (*pp == p) {
+            *pp = p->next;
+            return;
+        }
+    }
+}
+
+/*
+ * p 的所有執行緒都結束了:標記為 zombie,通知等它的人,並處理它留下的子行程。
+ * 呼叫時持有排程器的鎖。回傳「現在就可以釋放」的行程(以 next 串起來),
+ * 呼叫者解鎖之後交給 proc_free_list — 釋放記憶體不在鎖內做。
+ */
+static struct proc *proc_became_zombie(struct proc *p)
+{
+    struct proc *dead = NULL;
+
+    p->zombie = 1;
+    wq_wake_all(&p->waiters);
+    struct proc *parent = p->ppid ? proc_find(p->ppid) : NULL;
+    if (parent)
+        wq_wake_all(&parent->child_wq);
+
+    /* 它的子行程從此沒有父行程 */
+    for (struct proc **pp = &procs; *pp; ) {
+        struct proc *q = *pp;
+        if (q->ppid == p->pid) {
+            q->ppid = 0;
+            q->detached = 1;
+            /* 暫停中的行程只有父行程(shell)能讓它繼續;父行程沒了,它會永遠停在那裡。
+               所以直接終止它(Unix 對「失去管理者的暫停工作」也是這樣處理) */
+            if (q->stopped && !q->zombie)
+                proc_begin_exit(q, 128 + SIGKILL);
+            if (q->zombie) {                 /* 已經結束、一直沒被 wait:現在回收 */
+                *pp = q->next;
+                q->next = dead;
+                dead = q;
+                continue;
+            }
+        }
+        pp = &q->next;
+    }
+    if (p->detached) {                       /* 自己也沒有父行程:不留紀錄 */
+        proc_unlink(p);
+        p->next = dead;
+        dead = p;
+    }
+    return dead;
+}
+
+static void proc_free_list(struct proc *list)
+{
+    while (list) {
+        struct proc *next = list->next;
+        kfree(list);
+        list = next;
+    }
+}
+
+/*
+ * 行程等待自己的子行程結束。pid 為 -1 表示任何一個子行程。
+ * 回傳被回收的子行程的 pid,它的結束碼放進 *code;
+ * 沒有符合的子行程回傳 -E_CHILD;等待者自己被終止回傳 -E_INTR。
+ * nohang 不為 0 時不等待:還沒有子行程結束就立刻回傳 0
+ * (shell 用它在每次印提示符號之前,順手回收已經結束的背景工作)。
+ * untraced 不為 0 時,子行程「被暫停」也算一個事件:回傳它的 pid,
+ * *code 為 WSTOPPED_BASE | 訊號編號(見 proc.h 的 WIFSTOPPED);行程不會被回收。
+ */
+static long proc_wait_child(struct proc *p, long pid, int *code, int nohang, int untraced)
+{
+    struct proc *z = NULL;
+    long rc;
+    unsigned long flags = sched_lock();
+
+    for (;;) {
+        int found = 0;
+        struct proc *st = NULL;
+        for (struct proc *q = procs; q; q = q->next) {
+            if (q->ppid != p->pid || (pid != -1 && q->pid != pid))
+                continue;
+            found = 1;
+            if (q->zombie) {
+                z = q;
+                break;
+            }
+            if (untraced && q->stopped && !q->stop_reported && !st)
+                st = q;
+        }
+        if (z) {
+            proc_unlink(z);
+            rc = z->pid;
+            *code = z->exit_code;
+            break;
+        }
+        if (st) {
+            /* 子行程被暫停了:回報一次,但不回收(它還活著,之後可以繼續) */
+            st->stop_reported = 1;
+            rc = st->pid;
+            *code = (int)(WSTOPPED_BASE | (unsigned)st->stopped);
+            break;
+        }
+        if (!found) {
+            rc = -E_CHILD;                   /* 只能等自己的子行程 */
+            break;
+        }
+        if (nohang) {
+            rc = 0;
+            break;
+        }
+        if (thread_killed()) {
+            rc = -E_INTR;
+            break;
+        }
+        wq_sleep(&p->child_wq);              /* 任何一個子行程結束時會被叫醒,再檢查一次 */
+    }
+    sched_unlock(flags);
+    kfree(z);
+    return rc;
+}
+
+/*
+ * ---- 訊號 ----
+ *
+ * 訊號(signal)是「從外面通知一個行程」的方法。編號沿用 Unix 的定義。
+ * 這裡的訊號只有固定的效果,行程不能攔截或忽略(沒有訊號處理函式):
+ *
+ *   終止   SIGINT  (2)   使用者按了 Ctrl-C
+ *          SIGKILL (9)   強制終止
+ *          SIGTERM (15)  一般的「請結束」(kill 指令的預設)
+ *   暫停   SIGSTOP (19)  暫停
+ *          SIGTSTP (20)  使用者按了 Ctrl-Z
+ *          SIGTTIN (21)  背景的行程想讀鍵盤(見 console.c)
+ *   繼續   SIGCONT (18)  讓暫停中的行程繼續
+ *
+ * 被訊號終止的行程,結束碼是 128 + 訊號編號(Unix shell 的慣例),
+ * 所以從結束碼看得出它是自己結束的還是被終止的。
+ *
+ * ---- 暫停與繼續 ----
+ *
+ * 暫停 = 行程還在(記憶體、開啟的檔案都保留),只是不再執行使用者模式的程式碼。
+ * 做法和「終止」用的是同一個檢查點:每條執行緒要從 kernel 返回使用者模式之前
+ * 都會經過 user_return_check,看到行程被暫停,就睡在 p->stop_wq 上,等 SIGCONT。
+ *
+ *   - 正在使用者模式執行的執行緒:最晚在下一個計時器中斷(1ms)進入 kernel 時停下
+ *   - 正睡在 kernel 裡的執行緒(等時間到、等管線…):不打斷它。它等的事情照常進行,
+ *     醒來要回使用者模式時才停下。這樣不必讓每一種等待都處理「被暫停打斷」,
+ *     系統呼叫也不會因為暫停而提早返回(程式看不出自己被暫停過)
+ *   - 行程一被標記為暫停,父行程立刻得到通知(waitpid 的 WUNTRACED),
+ *     不必等所有執行緒都真的停下:它們已經不可能再執行使用者模式的程式碼了
+ *
+ * 終止類的訊號對暫停中的行程立刻生效(不必先讓它繼續)。
+ */
+static int sig_valid(long sig)
+{
+    return sig == SIGINT || sig == SIGKILL || sig == SIGTERM ||
+           sig == SIGCONT || sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN;
+}
+
+/* 對一個行程送出訊號。呼叫時必須持有排程器的鎖;q 不可以是 zombie */
+static void proc_signal_locked(struct proc *q, int sig)
+{
+    if (sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN) {
+        if (q->exiting || q->stopped)
+            return;
+        q->stopped = sig;
+        q->stop_reported = 0;
+        struct proc *parent = q->ppid ? proc_find(q->ppid) : NULL;
+        if (parent)
+            wq_wake_all(&parent->child_wq);  /* 父行程可能正在 waitpid(WUNTRACED) */
+    } else if (sig == SIGCONT) {
+        if (!q->stopped)
+            return;
+        q->stopped = 0;
+        wq_wake_all(&q->stop_wq);
+        console_wake_readers();              /* 它可能是在等鍵盤輸入時被暫停的 */
+    } else {
+        proc_begin_exit(q, 128 + sig);
+    }
+}
+
+int proc_signal_group_locked(int pgid, int sig)
+{
+    int n = 0;
+
+    for (struct proc *q = procs; q; q = q->next) {
+        if (q->pgid == pgid && !q->zombie) {
+            proc_signal_locked(q, sig);
+            n++;
+        }
+    }
+    return n;
+}
+
+/* 目前這條執行緒所屬行程的群組;不屬於任何行程(kernel 執行緒)回傳 0。持有排程器的鎖時呼叫 */
+int proc_self_pgid(void)
+{
+    struct proc *p = thread_data();
+
+    return p ? p->pgid : 0;
+}
+
+/* 目前這條執行緒所屬的行程是不是被暫停了。持有排程器的鎖時呼叫 */
+int proc_self_stopped(void)
+{
+    struct proc *p = thread_data();
+
+    return p && p->stopped;
+}
+
+/* 群組 pgid 裡還有沒有活著的行程。持有排程器的鎖時呼叫 */
+int proc_group_alive_locked(int pgid)
+{
+    for (struct proc *q = procs; q; q = q->next)
+        if (q->pgid == pgid && !q->zombie)
+            return 1;
+    return 0;
+}
+
+/* kill(pid, sig):pid > 0 是單一行程;pid < 0 是整個群組(編號為 -pid) */
+static long sys_kill(long pid, long sig)
+{
+    long rc = -E_SRCH;
+
+    if (!sig_valid(sig) || pid == 0)
+        return -E_INVAL;
+    unsigned long flags = sched_lock();
+    if (pid < 0) {
+        if (proc_signal_group_locked((int)-pid, (int)sig) > 0)
+            rc = 0;
+    } else {
+        struct proc *q = proc_find((int)pid);
+        if (q && !q->zombie) {
+            proc_signal_locked(q, (int)sig);
+            rc = 0;
+        }
+    }
+    sched_preempt_point();
+    sched_unlock(flags);
+    return rc;
+}
+
+/* setpgid(pid, pgid):把自己(pid 為 0)或自己的子行程放進群組 pgid(0 表示以它自己的 pid 為群組) */
+static long sys_setpgid(struct proc *p, long pid, long pgid)
+{
+    long rc = -E_SRCH;
+    unsigned long flags = sched_lock();
+    struct proc *q = pid == 0 ? p : proc_find((int)pid);
+
+    if (pgid < 0) {
+        rc = -E_INVAL;
+    } else if (q && (q == p || q->ppid == p->pid)) {
+        q->pgid = pgid ? (int)pgid : q->pid;
+        rc = 0;
+    }
+    sched_unlock(flags);
+    return rc;
+}
+
+/*
+ * 查詢行程的資訊(ps 用):找出「編號大於 after 的行程中編號最小的那一個」,
+ * 把它的資訊寫到使用者的 uinfo。回傳 0 = 取得,1 = 沒有更多了。
+ *
+ * 為什麼一次只給一個、用「上一個的編號」接續:行程隨時在建立與結束,
+ * kernel 不必為了列表而記住「上次列到哪裡」,也不必一次配置一大塊記憶體;
+ * 呼叫者從 0 開始,每次傳入上一次得到的 pid 即可。列表期間新建立或結束的行程
+ * 可能出現也可能不出現,但不會重複、也不會讓 kernel 出錯。
+ */
+static long sys_procinfo(struct proc *p, long after, uintptr_t uinfo)
+{
+    struct procinfo info;
+    struct proc *best = NULL;
+    unsigned runnable = 0;
+    unsigned long ticks = 0;
+
+    memset(&info, 0, sizeof(info));          /* 含欄位之間的空隙:不把 kernel 的資料帶出去 */
+    unsigned long flags = sched_lock();
+    for (struct proc *q = procs; q; q = q->next)
+        if (q->pid > after && (!best || q->pid < best->pid))
+            best = q;
+    if (best) {
+        sched_group_usage(best, &ticks, &runnable);
+        info.pid = best->pid;
+        info.ppid = best->ppid;
+        info.pgid = best->pgid;
+        info.nthreads = (int)best->nthreads;
+        info.state = best->zombie ? PROC_ZOMBIE : best->stopped ? PROC_STOPPED :
+                     runnable ? PROC_RUNNING : PROC_SLEEPING;
+        info.cpu_ticks = (unsigned int)(best->cpu_ticks + ticks);
+        /* 位址空間只在還有執行緒時才存在;exec 更換 p->space 時也拿著同一把鎖,
+           所以這裡讀到的指標在解鎖之前不會被釋放 */
+        if (best->nthreads > 0 && best->space)
+            info.mem_kb = (unsigned int)(vm_space_pages(best->space) * (PAGE_SIZE / 1024));
+        memcpy(info.name, best->name, sizeof(info.name));
+    }
+    sched_unlock(flags);
+    if (!best)
+        return 1;
+    if (copy_to_user(p, uinfo, &info, sizeof(info)) != 0)
+        return -E_FAULT;
+    return 0;
+}
+
+/* 整個系統的狀態(top 用) */
+static long sys_sysinfo(struct proc *p, uintptr_t uinfo)
+{
+    struct sysinfo si;
+
+    memset(&si, 0, sizeof(si));
+    si.uptime_ticks = timer_ticks();
+    si.hz = timer_hz();
+    si.ncpu = (uint32_t)cpu_count;
+    si.nthreads = sched_thread_count();
+    si.mem_total_kb = (uint64_t)pmm_total_pages() * (PAGE_SIZE / 1024);
+    si.mem_free_kb = (uint64_t)pmm_free_count() * (PAGE_SIZE / 1024);
+    si.ctx_switches = sched_switch_count();
+    /* 各 CPU 的計數由它們自己在計時器中斷裡累加;這裡不上鎖直接讀,差一兩個 tick 無妨 */
+    for (int i = 0; i < cpu_count && i < SYSINFO_MAX_CPUS; i++) {
+        si.cpu[i].busy = cpus[i].ticks_busy;
+        si.cpu[i].idle = cpus[i].ticks_idle;
+    }
+    unsigned long flags = sched_lock();
+    for (struct proc *q = procs; q; q = q->next)
+        si.nprocs++;
+    sched_unlock(flags);
+    if (copy_to_user(p, uinfo, &si, sizeof(si)) != 0)
+        return -E_FAULT;
+    return 0;
 }
 
 int proc_kill(int pid, int code)
@@ -649,7 +1028,20 @@ void user_fault(const char *what, uintptr_t pc, uintptr_t addr)
 
 void user_return_check(void)
 {
-    if (thread_killed() && thread_data())
+    struct proc *p = thread_data();
+
+    if (!p)
+        return;
+    /* 行程被暫停了:睡到有人讓它繼續(或終止它)為止。
+       先不上鎖看一眼:這條路徑每次返回使用者模式都會經過,絕大多數時候沒有被暫停。
+       剛好錯過也無妨 — 最晚下一個計時器中斷又會經過這裡 */
+    if (p->stopped && !thread_killed()) {
+        unsigned long flags = sched_lock();
+        while (p->stopped && !thread_killed())
+            wq_sleep(&p->stop_wq);
+        sched_unlock(flags);
+    }
+    if (thread_killed())
         proc_thread_exit();
 }
 
@@ -884,6 +1276,35 @@ static long sys_dup2(struct proc *p, long oldfd, long newfd)
     return newfd;
 }
 
+/* pipe:建立一條管線,把讀端與寫端的描述符編號寫到使用者的 fds[0]、fds[1] */
+static long sys_pipe(struct proc *p, uintptr_t ufds)
+{
+    struct file *rd, *wr;
+    int fds[2];
+    int err = vfs_pipe(&rd, &wr);
+
+    if (err)
+        return err;
+    fds[0] = fd_install(p, rd);
+    fds[1] = fds[0] >= 0 ? fd_install(p, wr) : -E_MFILE;
+    if (fds[0] < 0 || fds[1] < 0) {
+        err = -E_MFILE;
+    } else if (copy_to_user(p, ufds, fds, sizeof(fds)) != 0) {
+        err = -E_FAULT;
+    }
+    if (err) {
+        /* 把已經放進描述符表的拿出來;沒放進去的直接關閉 */
+        if (fds[0] >= 0)
+            fd_remove(p, fds[0]);
+        if (fds[1] >= 0)
+            fd_remove(p, fds[1]);
+        vfs_close(rd);
+        vfs_close(wr);
+        return err;
+    }
+    return 0;
+}
+
 static long sys_readdir(struct proc *p, long fd, uintptr_t uent)
 {
     struct dirent d;
@@ -905,6 +1326,13 @@ static long sys_path_op(struct proc *p, long num, uintptr_t upath, uintptr_t uar
 
     if (err)
         return err;
+    if (num == SYS_statfs) {
+        struct fsinfo fi;
+        err = vfs_statfs(path, &fi);
+        if (err == 0 && copy_to_user(p, uarg, &fi, sizeof(fi)) != 0)
+            err = -E_FAULT;
+        return err;
+    }
     if (num == SYS_mkdir)
         return vfs_mkdir(path);
     if (num == SYS_unlink)
@@ -1013,7 +1441,9 @@ static long sys_exec(struct proc *p, uintptr_t upath, uintptr_t uargv)
     struct file *old_exe = p->exe;
 
     proc_set_name(p, path);
+    flags = sched_lock();            /* 別的行程可能正透過 procinfo 讀取 p->space(見 sys_procinfo) */
     p->space = img.space;
+    sched_unlock(flags);
     p->exe = img.exe;
     p->nstacks = 1;
     thread_set_space(img.space);     /* 換到新的位址空間;舊的已經沒有人使用 */
@@ -1093,10 +1523,12 @@ static long sys_fork(struct proc *p, void *tf)
     c->exe = vfs_dup(p->exe);
     vfs_exec_hold(c->exe);                   /* 子行程也在執行同一個程式檔 */
     c->nstacks = p->nstacks;
-    fd_inherit(c, p);
+    fd_inherit(c, p, PROC_MAX_FD);
 
     flags = sched_lock();
     int pid = c->pid = next_pid++;
+    c->ppid = p->pid;
+    c->pgid = p->pgid;
     c->next = procs;
     procs = c;
     c->nthreads = 1;
@@ -1114,9 +1546,9 @@ static long sys_fork(struct proc *p, void *tf)
         c->space = NULL;
         c->nthreads = 0;
         c->exit_code = PROC_KILLED_FAULT;
-        c->zombie = 1;
-        wq_wake_all(&c->waiters);
+        struct proc *dead = proc_became_zombie(c);
         sched_unlock(flags);
+        proc_free_list(dead);
     }
     return pid;
 
@@ -1196,13 +1628,32 @@ long syscall_dispatch(long num, long a0, long a1, long a2, void *tf)
         return sys_close(p, a0);
     case SYS_dup2:
         return sys_dup2(p, a0, a1);
+    case SYS_pipe:
+        return sys_pipe(p, (uintptr_t)a0);
     case SYS_readdir:
         return sys_readdir(p, a0, (uintptr_t)a1);
     case SYS_mkdir:
     case SYS_unlink:
     case SYS_stat:
+    case SYS_statfs:
         return sys_path_op(p, num, (uintptr_t)a0, (uintptr_t)a1);
+    case SYS_sync:
+        return vfs_sync();
+    case SYS_sysinfo:
+        return sys_sysinfo(p, (uintptr_t)a0);
+    case SYS_tcsetmode: {
+        if (a0 & ~(long)(CON_RAW | CON_NOECHO))
+            return -E_INVAL;
+        unsigned long flags = sched_lock();
+        long rc = console_set_mode((unsigned)a0);
+        sched_unlock(flags);
+        return rc;
+    }
     case SYS_exit:
+        /* 「被暫停」的回報借用了結束碼裡的一小段數值(見 WSTOPPED_BASE);
+           程式自己用這段數值結束的話,只留下最低 8 個位元,免得被誤認 */
+        if (WIFSTOPPED((int)a0))
+            a0 &= 0xff;
         proc_exit((int)a0);
         return 0;                    /* 不會到達 */
     case SYS_getpid:
@@ -1226,10 +1677,34 @@ long syscall_dispatch(long num, long a0, long a1, long a2, void *tf)
         return sys_exec(p, (uintptr_t)a0, (uintptr_t)a1);
     case SYS_fork:
         return sys_fork(p, tf);
-    case SYS_wait:
-        if (a0 == p->pid)
-            return -E_INVAL;         /* 等自己結束會永遠等下去 */
-        return proc_wait((int)a0);
+    case SYS_wait: {                 /* 舊的簡易介面:等指定的子行程,直接回傳它的結束碼 */
+        int code = 0;
+        long rc = proc_wait_child(p, a0, &code, 0, 0);
+        return rc < 0 ? rc : code;
+    }
+    case SYS_waitpid: {              /* 回傳子行程的 pid,結束碼寫到使用者的 *status */
+        int code = 0;
+        if (a2 & ~(long)(WNOHANG | WUNTRACED))
+            return -E_INVAL;
+        long rc = proc_wait_child(p, a0, &code, (int)(a2 & WNOHANG), (int)(a2 & WUNTRACED));
+        if (rc > 0 && a1 && copy_to_user(p, (uintptr_t)a1, &code, sizeof(code)) != 0)
+            return -E_FAULT;
+        return rc;
+    }
+    case SYS_procinfo:
+        return sys_procinfo(p, a0, (uintptr_t)a1);
+    case SYS_kill:
+        return sys_kill(a0, a1);
+    case SYS_setpgid:
+        return sys_setpgid(p, a0, a1);
+    case SYS_tcsetfg: {              /* 設定主控台的前景群組(Ctrl-C 的對象);0 = 沒有 */
+        if (a0 < 0)
+            return -E_INVAL;
+        unsigned long flags = sched_lock();
+        console_set_fg((int)a0, p->pgid);
+        sched_unlock(flags);
+        return 0;
+    }
     case SYS_thread_exit:
         proc_thread_exit();
         return 0;                    /* 不會到達 */

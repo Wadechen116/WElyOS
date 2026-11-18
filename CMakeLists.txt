@@ -45,7 +45,7 @@ set(COMMON_LINK_FLAGS ${ARCH_LINK_FLAGS} -ffreestanding -nostdlib -static -no-pi
 # ---- 使用者程式 ----
 # 每個程式(user/<名稱>.c)與共用的啟動程式 crt0.c 一起,獨立連結在 USER_BASE
 # (各架構的使用者位址範圍起點),再轉成原始二進位,放進開機檔案包的 /bin/<名稱>。
-set(USER_PROGRAMS init echo cat ls mkdir rm sh)
+set(USER_PROGRAMS init echo cat ls mkdir rm wc sleep kill ps cp df sync top sh)
 set(USER_BINS "")
 foreach(prog ${USER_PROGRAMS})
     add_executable(${prog}.elf user/${prog}.c user/crt0.c)
@@ -97,7 +97,9 @@ add_executable(welyos.elf
     kernel/proc.c
     kernel/vfs.c
     kernel/console.c
+    kernel/pipe.c
     kernel/ramfs.c
+    kernel/wfs.c
     kernel/initrd.c
     kernel/rootfs.S
     lib/string.c)

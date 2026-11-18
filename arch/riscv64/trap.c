@@ -23,6 +23,7 @@ extern void trap_entry(void);
 #define EXC_ECALL_U      8              /* 使用者模式執行 ecall:系統呼叫 */
 #define SSTATUS_SPP      (1UL << 8)     /* sstatus:被打斷時的模式,0 = 使用者模式 */
 #define IRQ_S_TIMER      5              /* 中斷碼:S-mode 計時器 */
+#define IRQ_S_EXT        9              /* S-mode 外部中斷:PLIC */
 #define IRQ_S_SOFT       1              /* S-mode 軟體中斷:處理器間中斷 */
 
 /* 例外原因表(RISC-V 特權規範,scause 低位元) */
@@ -119,6 +120,13 @@ void trap_handler(struct trap_frame *tf)
             sched_irq_enter();
             smp_ipi_handler();
             sched_irq_exit();                /* 被要求重新排程的話,在這裡切換 */
+            if (from_user)
+                user_return_check();
+            return;
+        }
+        /* S-mode 外部中斷:週邊裝置(序列埠)經由 PLIC 送來的(見 arch.c) */
+        if ((cause & ~SCAUSE_INTERRUPT) == IRQ_S_EXT) {
+            external_interrupt();
             if (from_user)
                 user_return_check();
             return;

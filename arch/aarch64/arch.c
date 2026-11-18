@@ -7,6 +7,7 @@
 #include "arch.h"
 #include "kprintf.h"
 #include "sched.h"
+#include "trap.h"
 
 /* virt 機器的 PL011 UART,基底 0x09000000 */
 #define UART0_BASE  0x09000000UL
@@ -28,11 +29,35 @@ void arch_init(void)
     uart[0x2C / 4] = 0x70;
 }
 
+/* 序列埠沒有需要在輸出結束時補做的事 */
+void arch_console_flush(void)
+{
+}
+
 int arch_console_getc(void)
 {
     if (uart[UART_FR] & UART_FR_RXFE)
         return -1;
     return (int)(uart[UART_DR] & 0xFF);
+}
+
+/*
+ * 讓 PL011 在收到字元時發出中斷。這裡只設定 UART 這一側;
+ * 中斷控制器 GIC 那一側(中斷號 33)在 timer.c 的 arch_console_irq_init。
+ *   IMSC(0x38)中斷遮罩:bit 4 = 接收(FIFO 裡的資料達到門檻)
+ *                        bit 6 = 接收逾時(FIFO 裡有資料但沒達到門檻,等了一小段時間)
+ * 兩個都開,才不會有字元留在 FIFO 裡沒人理。
+ */
+void uart_rx_irq_enable(void)
+{
+    uart[0x34 / 4] = 0;                    /* IFLS:接收門檻設為最低(FIFO 的 1/8) */
+    uart[0x38 / 4] = (1u << 4) | (1u << 6);
+}
+
+/* 清除接收相關的中斷狀態(ICR,0x44)。資料已經由 arch_console_getc 讀完之後呼叫 */
+void uart_rx_irq_ack(void)
+{
+    uart[0x44 / 4] = (1u << 4) | (1u << 6);
 }
 
 void arch_putc(char c)
@@ -198,4 +223,11 @@ void arch_enter_user(uintptr_t entry, uintptr_t usp, uintptr_t arg)
     arch_irq_disable();                  /* 設定 ELR/SPSR 到 eret 之間不可被中斷 */
     sched_stack_bounds(&lo, &hi);
     arch_user_return(entry, usp, arg, hi);
+}
+
+/* 磁碟:QEMU virt 機器的 virtio-mmio 裝置在 0x0a000000 起的 32 個位置,每個 0x200 位元組 */
+#include "blk.h"
+struct blkdev *arch_blk_probe(void)
+{
+    return virtio_blk_probe(0x0a000000UL, 0x200, 32);
 }

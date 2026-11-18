@@ -43,6 +43,8 @@ struct cpu {
     struct thread *idle;         /* 這顆 CPU 的 idle 執行緒 */
     struct thread *zombie;       /* 剛在這顆 CPU 上結束、等待回收的執行緒 */
     struct vm_space *loaded_space; /* 這顆 CPU 目前載入的位址空間;NULL = kernel 頁表 */
+    unsigned long ticks_busy;    /* 計時器 tick 來的時候,這顆 CPU 正在執行某條執行緒的次數 */
+    unsigned long ticks_idle;    /* …正在閒置的次數。兩者的比例就是這顆 CPU 的使用率(top 用) */
 };
 
 _Static_assert(offsetof(struct cpu, kstack_limit) == 0, "cpu.kstack_limit");

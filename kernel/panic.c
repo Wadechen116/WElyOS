@@ -37,6 +37,7 @@ void panic(const char *fmt, ...)
     kprintf("\n*** KERNEL PANIC: ");
     va_start(ap, fmt);
     kvprintf(fmt, ap);
+    arch_console_flush();
     va_end(ap);
     kprintf(" ***\n");
     arch_backtrace(0, arch_current_fp());

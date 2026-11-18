@@ -181,6 +181,7 @@ int kprintf(const char *fmt, ...)
     va_start(ap, fmt);
     int n = kvprintf(fmt, ap);
     va_end(ap);
+    arch_console_flush();
     spin_unlock_irqrestore(&console_lk, flags);
     return n;
 }

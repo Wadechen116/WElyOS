@@ -54,6 +54,7 @@ struct vm_space {
      * 大多數行程只在一兩顆 CPU 上執行過,所以通常只需要通知很少的 CPU,甚至不必通知。
      */
     volatile unsigned used_cpus;
+    unsigned long pages;                     /* 目前對映了幾個使用者的頁(top 顯示行程的記憶體用量) */
 };
 
 #if MMU_ASID_MAX > 0
@@ -330,6 +331,7 @@ struct vm_space *vm_space_create(void)
     struct vm_space *vs = kmalloc(sizeof(*vs));
     if (!vs)
         return NULL;
+    vs->pages = 0;
 
     unsigned long irq = spin_lock_irqsave(&vm_lk);
     vs->root = table_alloc();
@@ -414,6 +416,7 @@ int vm_space_map(struct vm_space *vs, uintptr_t va, uintptr_t pa, unsigned flags
     if (e) {
         int was_valid = arch_pte_valid(*e);
         *e = arch_pte_leaf(pa, flags, 0);
+        vs->pages += !was_valid;
         if (enabled) {
             if (was_valid)
                 tlb_shootdown_space(vs, va); /* 同一行程的其他執行緒可能正在別顆 CPU 上執行 */
@@ -459,12 +462,18 @@ int vm_space_map_new(struct vm_space *vs, uintptr_t va, uintptr_t pa, unsigned f
         rc = 1;                              /* 別人已經先對映了 */
     } else if (e) {
         *e = arch_pte_leaf(pa, flags, 0);
+        vs->pages++;
         if (enabled)
             arch_tlb_flush(va);
         rc = 0;
     }
     spin_unlock_irqrestore(&vm_lk, irq);
     return rc;
+}
+
+unsigned long vm_space_pages(struct vm_space *vs)
+{
+    return vs->pages;                        /* 只是統計用的數字,不上鎖 */
 }
 
 /* ---- 寫入時複製 ---- */
@@ -521,6 +530,7 @@ static int fork_table(struct vm_space *child, pte_t *t, int level, uintptr_t bas
         if (!(flags & VM_SHARED))
             pmm_ref((void *)pa);             /* 對映成功才算數:失敗時 child 會被整個釋放 */
         *e = arch_pte_leaf(pa, flags, 0);
+        child->pages++;
     }
     return 0;
 }

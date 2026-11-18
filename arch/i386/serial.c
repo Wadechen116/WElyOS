@@ -18,13 +18,20 @@
  */
 void serial_init(void)
 {
-    outb(COM1 + 1, 0x00);   /* 關閉 UART 中斷(目前採輪詢,不用中斷) */
+    outb(COM1 + 1, 0x00);   /* 先關閉 UART 中斷;之後由 serial_irq_enable 開啟 */
     outb(COM1 + 3, 0x80);   /* 開啟 DLAB,以便寫入鮑率除數 */
     outb(COM1 + 0, 0x01);   /* 除數低位元組 = 1 -> 115200 baud(基頻 / 1) */
     outb(COM1 + 1, 0x00);   /* 除數高位元組 = 0 */
     outb(COM1 + 3, 0x03);   /* 關閉 DLAB;格式 8 資料位元、無同位、1 停止位元(8N1) */
-    outb(COM1 + 2, 0xC7);   /* 啟用 FIFO、清空收發緩衝、觸發門檻 14 位元組 */
+    outb(COM1 + 2, 0x07);   /* 啟用 FIFO、清空收發緩衝、觸發門檻 1 位元組(一有字元就通知) */
     outb(COM1 + 4, 0x03);   /* 拉起 DTR 與 RTS */
+}
+
+/* 啟用「收到資料」中斷(COM1 接在 IRQ 4)。PIC 那一側的開關在 timer.c */
+void serial_irq_enable(void)
+{
+    outb(COM1 + 4, 0x0B);   /* 再拉起 OUT2:PC 上 UART 的中斷線要經過它才接得到 PIC */
+    outb(COM1 + 1, 0x01);   /* 中斷致能:bit 0 = 收到資料 */
 }
 
 void serial_putc(char c)
