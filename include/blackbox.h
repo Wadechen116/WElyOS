@@ -24,6 +24,7 @@ enum {
     BB_DISK,                 /* 磁碟寫入失敗,檔案系統轉為唯讀 */
     BB_RESTART,              /* 受監督的程式結束,被重新啟動(或放棄) */
     BB_NOTE,                 /* 其他註記 */
+    BB_HEALTHY,              /* 這一次開機順利完成(安全模式用它判斷「連續幾次開機失敗」) */
 };
 
 #define BB_TEXT_MAX 100
@@ -44,8 +45,16 @@ struct blkdev;
 
 /* 啟用:dev 是磁碟,fs_blocks 是檔案系統使用的區塊數(每塊 4KB)。
    檔案系統之後沒有留出那 8KB(舊格式的磁碟)、或沒有磁碟時,黑盒子停用,其他函式都安全地不做事 */
-void blackbox_init(struct blkdev *dev, uint32_t fs_blocks, uint32_t boot_count);
+void blackbox_init(struct blkdev *dev, uint32_t fs_blocks);
 int  blackbox_enabled(void);
+uint32_t blackbox_boot(void);            /* 這是第幾次開機(紀錄裡最大的開機次數加一) */
+
+/*
+ * 最近連續幾次開機「沒有順利完成」:從最新的紀錄往回數 BB_BOOT,直到遇到 BB_HEALTHY
+ * 或 BB_SHUTDOWN 為止。開機紀錄的內容帶有 "(test)" 的不算(故意當機的測試)。
+ * 要在記下這一次的 BB_BOOT 之前呼叫。
+ */
+unsigned blackbox_failed_boots(void);
 
 /* 記下一筆(printf 的格式)。會等磁碟寫完,只能在執行緒裡呼叫(不可在中斷或持有 spinlock 時) */
 void blackbox_log(int type, const char *fmt, ...);

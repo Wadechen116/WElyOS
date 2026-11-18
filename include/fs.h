@@ -278,6 +278,7 @@ struct wfs_stats {
     int sb_restored;             /* 這次掛載時,superblock 是從備份救回來的 */
     unsigned long disk_reads, disk_writes;   /* 實際對磁碟讀寫的區塊數 */
 };
+uint32_t wfs_probe(struct blkdev *dev);      /* 不掛載,只回報檔案系統佔幾個區塊(0 = 認不得的內容) */
 int  wfs_mount(struct blkdev *dev, struct inode **root);
 void wfs_shutdown(void);
 void wfs_stats(struct wfs_stats *st);

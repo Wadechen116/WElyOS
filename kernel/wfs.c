@@ -435,8 +435,13 @@ static int dinode_rw(uint32_t inum, struct dinode *d, int write)
 {
     struct buf *b = bget(sb.inode_start + inum / IPB, 1);
 
-    if (!b)
+    if (!b) {
+        /* 要「寫」卻連那個區塊都讀不進來(讀取錯誤或檢查碼不符):記憶體裡的 inode 已經改了,
+           磁碟上的沒有。不能假裝沒事繼續改下去 — 轉為唯讀,下次掛載時以磁碟上的為準重新檢查 */
+        if (write)
+            fs_failed = 1;
         return -E_IO;
+    }
     struct dinode *slot = (struct dinode *)b->data + inum % IPB;
     if (write) {
         *slot = *d;
@@ -642,26 +647,28 @@ static long file_write(struct wnode *n, const void *buf, size_t len, uint64_t of
 static int file_truncate(struct wnode *n, uint64_t size)
 {
     uint32_t keep = (uint32_t)((size + BSIZE - 1) / BSIZE);
+    struct buf *ib = NULL;
 
+    /* 間接區塊要先讀得進來才動手:讀不到的話,不知道它底下有哪些資料區塊,
+       這時候把它本身釋放掉,那些資料區塊就永遠沒有人記得了。寧可整個操作失敗、什麼都不改 */
+    if (n->d.indirect && !(ib = bget(n->d.indirect, 1)))
+        return -E_IO;
     for (uint32_t fb = keep; fb < NDIRECT; fb++) {
         if (n->d.addr[fb]) {
             bfree(n->d.addr[fb]);
             n->d.addr[fb] = 0;
         }
     }
-    if (n->d.indirect) {
-        struct buf *ib = bget(n->d.indirect, 1);
-        if (ib) {
-            uint32_t *tab = (uint32_t *)ib->data;
-            for (uint32_t i = keep > NDIRECT ? keep - NDIRECT : 0; i < NINDIRECT; i++) {
-                if (tab[i]) {
-                    bfree(tab[i]);
-                    tab[i] = 0;
-                    ib->dirty = 1;
-                }
+    if (ib) {
+        uint32_t *tab = (uint32_t *)ib->data;
+        for (uint32_t i = keep > NDIRECT ? keep - NDIRECT : 0; i < NINDIRECT; i++) {
+            if (tab[i]) {
+                bfree(tab[i]);
+                tab[i] = 0;
+                ib->dirty = 1;
             }
-            bput(ib);
         }
+        bput(ib);
         if (keep <= NDIRECT) {
             bfree(n->d.indirect);
             n->d.indirect = 0;
@@ -994,9 +1001,14 @@ static void wfs_release(struct inode *in)
         mutex_unlock(&wfs_lk);
         return;
     }
-    file_truncate(n, 0);
-    n->d.type = 0;
-    dinode_rw(n->inum, &n->d, 1);
+    /* 內容釋放不了(間接區塊讀不到)或 inode 寫不回去:不要把它標成空的 —
+       那會讓它底下的區塊永遠收不回來。留在磁碟上,轉為唯讀,交給下次掛載的檢查處理 */
+    if (file_truncate(n, 0) != 0 || (n->d.type = 0, dinode_rw(n->inum, &n->d, 1)) != 0) {
+        fs_failed = 1;
+        n->loaded = 0;
+        mutex_unlock(&wfs_lk);
+        return;
+    }
     n->loaded = 0;
     free_inodes++;
     if (n->inum < ialloc_hint)
@@ -1364,6 +1376,41 @@ static int wfs_format(uint32_t nblocks)
     return bsync();
 }
 
+/*
+ * 不掛載,只看磁碟上的檔案系統佔了幾個區塊(黑盒子要在掛載之前就知道自己那 8KB 有沒有被佔用)。
+ * 回傳:區塊數;全新的磁碟回傳「格式化之後會是多少」;認不得的內容回傳 0(呼叫者應視為「不可以碰」)。
+ */
+uint32_t wfs_probe(struct blkdev *dev)
+{
+    uint64_t dev_blocks = dev->sectors / BSECT;
+    struct wsuper s;
+    uint32_t result = 0;
+    uint8_t *buf;
+
+    if (dev_blocks < 64 || !(buf = pmm_alloc()))
+        return 0;
+    if (dev_blocks > 0x100000)
+        dev_blocks = 0x100000;
+    uint64_t fs_max = dev_blocks - 2;
+    if (dev->rw(dev, 0, BSECT, buf, 0) == 0) {
+        int blank = 1;
+        for (unsigned i = 0; i < BSIZE && blank; i++)
+            blank = buf[i] == 0;
+        memcpy(&s, buf, sizeof(s));
+        if (sb_valid(&s, dev_blocks)) {
+            result = s.nblocks;
+        } else if (dev->rw(dev, (fs_max - 1) * BSECT, BSECT, buf, 0) == 0) {
+            memcpy(&s, buf, sizeof(s));
+            if (s.magic == WFS_MAGIC && s.nblocks == fs_max && sb_valid(&s, dev_blocks))
+                result = s.nblocks;          /* 區塊 0 壞了但備份在:掛載時會用它 */
+            else if (blank)
+                result = (uint32_t)fs_max;   /* 全新的磁碟 */
+        }
+    }
+    pmm_free(buf);
+    return result;
+}
+
 int wfs_mount(struct blkdev *dev, struct inode **root_out)
 {
     int err = -E_IO, formatted = 0;
@@ -1669,7 +1716,8 @@ int wfs_test_damage(const char *victim_name)
     if (!v)
         goto out;
     v->d.nlink = 5;
-    iupdate(v);
+    if (iupdate(v) != 0)                         /* 沒弄壞成功就不能回報「已經弄壞」 */
+        goto out;
     rc = bsync();
 out:
     mutex_unlock(&wfs_lk);

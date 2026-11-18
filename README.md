@@ -56,12 +56,13 @@
 - [x] 可靠性之一:看門狗(CPU 互相監看心跳,卡死時 panic)、黑盒子(磁碟最後 8KB 的事件紀錄,每筆有 CRC-32,panic 時以不上鎖的緊急路徑寫入,重新開機後可讀)、`supervise`(程式當掉時重新啟動,退避、有上限)、`faultlog`
 - [x] 可靠性之二:磁碟每個區塊的 CRC-32(讀取時核對,損壞的資料不會交給程式)、superblock 兩份(主要的壞了用備份並修復,而不是誤判成新磁碟而格式化)、背景巡檢與 `scrub` 命令、位元翻轉的錯誤注入;磁碟格式 WFS2(舊格式仍可掛載)
 - [x] 靜態檢查(由 Codex 實作):`scripts/static-check.sh` — 快速的規則掃描(遞迴、未檢查的錯誤回傳、禁用函式等)與按需的 GCC `-fanalyzer`;已據此修正 `printf` 寬度的溢位等缺陷
+- [x] 可靠性之三:開機失敗計數(黑盒子記錄每次開機是否順利完成)與安全模式(連續 3 次失敗後只啟動最少的功能:不掛載磁碟、不啟動網路、單一 CPU,但仍可用 `faultlog` 診斷)
 
 ## 規劃中
 
 - [ ] 多核心(Symmetric Multiprocessing,SMP)效能:縮小排程器的大鎖、喚醒時考慮上次執行的 CPU、mutex 先自旋再睡
 - [ ] TCP;i386 的 PS/2 鍵盤;檔案系統的日誌(journaling)、以磁碟為根目錄
-- [ ] 可靠性(參考航太飛行軟體的做法):安全模式;期限排程;三重執行加投票
+- [ ] 可靠性(參考航太飛行軟體的做法):期限排程;三重執行加投票
 - [ ] 結構整理:中斷與裝置的註冊介面、kernel 與使用者共用的定義檔、拆分 `proc.c` / `main.c`、區塊快取獨立成一層
 
 ## 需求
@@ -97,9 +98,11 @@ bash scripts/build-opensbi.sh                  # (選用)重新建置 RISC-V 的
 bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf                                # 開機後進入 shell(輸入 help 看有哪些命令;top 看即時的系統狀態,q 離開)。Ctrl-C 終止、Ctrl-Z 暫停執行中的命令(fg / bg 繼續);輸入 exit 關機;Ctrl-] 強制結束 QEMU
 python3 scripts/type-input.py 1.5 0.01 'ls /\nexit\n' | bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit shell"   # 自動化:模擬打字餵給 shell
 QEMU_SMP=8 bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit selftest"   # 指定 CPU 數(預設 4,最多 8;1 = 單核心)
+bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "safe"                 # 強制以安全模式開機(連續 3 次開機失敗時會自動進入)
 QEMU_NET=none bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf                  # 不接網路卡(預設接上;QEMU_TFTP=目錄 可指定以 tftp 分享給客體的主機目錄,預設 rootfs/)
 bash scripts/host-test-net.sh                  # 在主機上測試網路的協定堆疊(不需要 QEMU)
 bash scripts/static-check.sh                   # 靜態檢查(快速模式約 2 秒;--mode analyze 以 GCC 分析器檢查三個架構)
+bash scripts/static-refresh.sh                 # 處理完新增的提示之後,更新回歸測試用來比較的參考報告
 QEMU_DISK=none bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf                 # 不接磁碟(預設接上 build/<架構>/disk.img,掛載在 /disk;QEMU_DISK=路徑 可指定別的映像檔)
 ```
 

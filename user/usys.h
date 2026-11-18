@@ -320,7 +320,7 @@ static inline long sys_netinfo(struct netinfo *info) { return syscall3(SYS_netin
  * 黑盒子:kernel 記在磁碟上、重新開機後還在的事件紀錄(開機、關機、panic、看門狗、
  * 程式因例外被終止、磁碟錯誤、受監督的程式被重新啟動、註記)。
  */
-enum { BB_BOOT = 1, BB_SHUTDOWN, BB_PANIC, BB_WATCHDOG, BB_FAULT, BB_DISK, BB_RESTART, BB_NOTE };
+enum { BB_BOOT = 1, BB_SHUTDOWN, BB_PANIC, BB_WATCHDOG, BB_FAULT, BB_DISK, BB_RESTART, BB_NOTE, BB_HEALTHY };
 struct bb_record {
     unsigned int magic, seq;                 /* seq:序號,越大越新 */
     unsigned long long time;                 /* 1970-01-01 UTC 至今的秒數 */

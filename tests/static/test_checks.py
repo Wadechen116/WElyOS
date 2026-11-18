@@ -170,5 +170,119 @@ class GateTest(unittest.TestCase):
         self.assertIn('timeout', result['stderr'])
 
 
+class ComparisonTest(unittest.TestCase):
+    @staticmethod
+    def item(number, accepted=False):
+        return {'id': f'{number:024x}', 'accepted': accepted, 'path':'kernel/a.c',
+                'rule':'banned-call', 'category':'candidate'}
+
+    def reference(self, findings):
+        return {'schema_version': runner.SCHEMA_VERSION, 'mode':'fast',
+                'scan_scope': runner.SCAN_SCOPE, 'rules_fingerprint':'fixture-rules',
+                'changed_inputs':[], 'changed_tools':[],
+                'coverage':[{'tool':'lexical','status':'heuristic'},
+                            {'tool':'gcc/cppcheck','status':'not-requested'}],
+                'exit_code': 1 if any(not f['accepted'] for f in findings) else 0,
+                'new_count':sum(not f['accepted'] for f in findings),
+                'accepted_count':sum(f['accepted'] for f in findings), 'findings':findings}
+
+    def test_existing_reopened_added_resolved_remain_distinct(self):
+        old = self.reference([self.item(1),self.item(2,True),self.item(3)])
+        current = [self.item(1),self.item(2),self.item(4),self.item(5,True)]
+        delta = runner.compare_findings(current,old,{'kind':'fixture'})
+        self.assertEqual(delta['existing_unreviewed_ids'],[self.item(1)['id']])
+        self.assertEqual(delta['newly_unreviewed_ids'],[self.item(2)['id'],self.item(4)['id']])
+        self.assertEqual(delta['reopened_ids'],[self.item(2)['id']])
+        self.assertEqual(delta['resolved_ids'],[self.item(3)['id']])
+        self.assertEqual(delta['introduced_ids'],[self.item(4)['id'],self.item(5)['id']])
+        self.assertFalse(current[0]['accepted'])
+
+    def test_reference_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'report.json'
+            good = self.reference([self.item(1)])
+            path.write_text(json.dumps(good))
+            loaded, provenance = runner.load_comparison(path,None,'fixture-rules')
+            self.assertEqual(loaded,good)
+            self.assertEqual(provenance['kind'],'file')
+            cases = [dict(good,mode='analyze'),dict(good,schema_version=0),
+                     dict(good,rules_fingerprint='changed'),dict(good,scan_scope={}),
+                     dict(good,changed_inputs=['kernel/a.c']),dict(good,changed_tools=['rules.py']),
+                     dict(good,exit_code=2),dict(good,findings=[self.item(1),self.item(1)]),
+                     dict(good,new_count=0),dict(good,coverage=[{'tool':'gcc','status':'unavailable'}]),
+                     dict(good,findings=[dict(self.item(1),accepted='false')])]
+            for bad in cases:
+                with self.subTest(bad=bad):
+                    path.write_text(json.dumps(bad))
+                    with self.assertRaises(ValueError):
+                        runner.load_comparison(path,None,'fixture-rules')
+
+    def test_git_reference_is_pinned_without_mutating_git(self):
+        report = self.reference([self.item(1)])
+        commit = 'a'*40
+        replies = [{'returncode':0,'stdout':commit+'\n','stderr':''},
+                   {'returncode':0,'stdout':json.dumps(report),'stderr':''}]
+        with mock.patch.object(runner,'run',side_effect=replies) as invoke:
+            loaded, provenance = runner.load_comparison(None,'HEAD:tests/static/ref.json','fixture-rules')
+        self.assertEqual(loaded,report)
+        self.assertEqual(provenance['commit'],commit)
+        self.assertEqual(invoke.call_args_list[1].args[0],['git','show',commit+':tests/static/ref.json'])
+        for bad in ('HEAD',':ref.json','-x:ref.json','HEAD:/outside.json','HEAD:../outside.json'):
+            with self.assertRaises(ValueError):
+                runner.load_comparison(None,bad,'fixture-rules')
+
+    def test_cli_delta_is_opt_in_and_preserves_unreviewed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)/'project'
+            root.mkdir()
+            (root/'CMakeLists.txt').write_text('')
+            for tree in runner.TREES:
+                (root/tree).mkdir()
+            source = root/'kernel/a.c'
+            source.write_text('void f(int n){if(n)strcpy(dst,"old");}')
+            baseline = root/'baseline.txt'
+            baseline.write_text('')
+            def gate(label, *options):
+                out = Path(directory)/label
+                with mock.patch.object(runner,'ROOT',root), mock.patch.object(
+                        sys,'argv',['check.py','--out',str(out),'--baseline',str(baseline),*options]), \
+                        contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    rc = runner.main()
+                path = out/'findings.json'
+                return rc, json.loads(path.read_text()) if path.exists() else None, path
+            rc, first, ref = gate('first')
+            self.assertEqual(rc,1)
+            rc, result, _ = gate('same','--compare',str(ref),'--gate','delta','--changes-only')
+            self.assertEqual(rc,0)
+            self.assertEqual(result['new_count'],1)
+            self.assertEqual(result['accepted_count'],0)
+            self.assertEqual(len(result['comparison']['existing_unreviewed_ids']),1)
+            self.assertEqual(baseline.read_text(),'')
+            self.assertEqual(gate('strict','--compare',str(ref))[0],1)
+            source.write_text('void f(int n){if(n)strcpy(dst,"new");}')
+            rc, result, _ = gate('new','--compare',str(ref),'--gate','delta')
+            self.assertEqual(rc,1)
+            self.assertEqual(len(result['comparison']['newly_unreviewed_ids']),1)
+            key = result['findings'][0]['id']
+            baseline.write_text(json.dumps({'id':key,'reviewer':'fixture','reason':'fixture','date':'2026-11-18'}))
+            rc, accepted, reviewed_ref = gate('accepted')
+            self.assertEqual(rc,0)
+            baseline.write_text('')
+            rc, result, _ = gate('reopened','--compare',str(reviewed_ref),'--gate','delta')
+            self.assertEqual(rc,1)
+            self.assertEqual(result['comparison']['reopened_ids'],[key])
+            invalid = Path(directory)/'invalid.json'
+            invalid.write_text('{}')
+            self.assertEqual(gate('invalid','--compare',str(invalid),'--gate','delta')[0],2)
+
+    def test_parser_rejects_implicit_or_analyzer_delta(self):
+        for argv in (['--gate','delta'],['--changes-only'],
+                     ['--mode','analyze','--compare','unused.json']):
+            with mock.patch.object(sys,'argv',['check.py',*argv]), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as exc:
+                    runner.main()
+            self.assertEqual(exc.exception.code,2)
+
+
 if __name__ == '__main__':
     unittest.main()

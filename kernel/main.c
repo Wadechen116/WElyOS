@@ -681,6 +681,17 @@ static void prio_demo(void)
 /* 使用者模式示範                                                      */
 /* ------------------------------------------------------------------ */
 
+/* cmdline 裡有沒有出現 needle 這段文字(不要求是完整的單字) */
+static int strstr_simple(const char *hay, const char *needle)
+{
+    size_t n = strlen(needle);
+
+    for (; *hay; hay++)
+        if (strncmp(hay, needle, n) == 0)
+            return 1;
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* 網路卡                                                              */
 /* ------------------------------------------------------------------ */
@@ -775,18 +786,74 @@ static struct blkdev *arch_blk_probe_cached(void) { return boot_disk; }
 
 /* 找出磁碟,把上面的檔案系統掛載到 /disk。沒有磁碟、或磁碟上不是我們的檔案系統時,
    只印出訊息,系統照常使用記憶體檔案系統 */
-static void disk_init(void)
+/*
+ * ---- 安全模式 ----
+ *
+ * 開機本身也可能失敗:掛載磁碟時當掉、某個驅動程式在這台機器上出錯…。如果每次開機都走同一條路,
+ * 系統就會永遠卡在「開機、當掉、開機、當掉」,而且因為根本到不了可以操作的地方,沒有人能介入。
+ *
+ * 做法:黑盒子裡每次開機有一筆紀錄,順利完成時再記一筆(BB_HEALTHY)。
+ * 開機時數一數「最近連續幾次沒有順利完成」;到達 SAFE_AFTER 次就改以安全模式開機 —
+ * 只啟動最少的東西:不掛載磁碟上的檔案系統、不啟動網路、其他 CPU 不參與排程、不跑背景工作。
+ * 目的只有一個:讓人進得來,用 faultlog 看看發生了什麼事。
+ * 在安全模式裡正常離開(exit)會記下「順利」,下一次開機再試一次完整的開機。
+ *
+ * 開機參數:safe = 強制以安全模式開機;nosafe = 不要自動進入(除錯用)。
+ */
+#define SAFE_AFTER 3
+static int safe_mode;
+
+static void disk_init(const char *cmdline)
 {
     /* 外面包一層可以故意出錯的裝置(測試磁碟錯誤時使用;平常只是原樣轉送) */
     struct blkdev *dev = blk_fault_wrap(arch_blk_probe());
     struct inode *fsroot;
     struct wfs_stats st;
+    struct bb_record last;
+    unsigned failed = 0;
+    /* 故意當機的測試(crash=、disktest=)不該被算成開機失敗;crash=boot 例外,它就是用來測這個的 */
+    int test_boot = (strstr_simple(cmdline, "crash=") || strstr_simple(cmdline, "disktest=")) &&
+                    !cmdline_has(cmdline, "crash=boot");
 
     boot_disk = dev;
+    safe_mode = cmdline_has(cmdline, "safe");
     if (!dev) {
         kprintf("disk: none\n");
+        if (safe_mode)
+            kprintf("\n*** SAFE MODE (requested on the command line) ***\n\n");
         return;
     }
+
+    /* 黑盒子:要在掛載之前啟用,才能在碰磁碟上的檔案系統之前決定要不要進安全模式 */
+    blackbox_init(dev, wfs_probe(dev));
+    if (!blackbox_enabled()) {
+        kprintf("blackbox: disabled (no room on this disk, or its contents are not ours)\n");
+    } else {
+        failed = blackbox_failed_boots();
+        if (blackbox_read(0, &last) != 0)
+            kprintf("blackbox: empty (first boot with this disk)\n");
+        else if (last.type == BB_SHUTDOWN || last.type == BB_HEALTHY)
+            kprintf("blackbox: %u records; the previous boot %s\n", blackbox_count(),
+                    last.type == BB_SHUTDOWN ? "shut down cleanly" : "came up but was not shut down");
+        else if (last.type == BB_PANIC || last.type == BB_WATCHDOG)
+            kprintf("blackbox: %u records; the previous boot ended with: %s\n", blackbox_count(), last.text);
+        else
+            kprintf("blackbox: %u records; the previous boot did not shut down (power loss, or the "
+                    "emulator was closed)\n", blackbox_count());
+        if (failed >= SAFE_AFTER && !cmdline_has(cmdline, "nosafe"))
+            safe_mode = 1;
+        blackbox_log(BB_BOOT, "boot #%u on %s%s%s", blackbox_boot(), arch_name(),
+                     safe_mode ? ", safe mode" : "", test_boot ? " (test)" : "");
+    }
+    if (safe_mode) {
+        kprintf("\n*** SAFE MODE ***\n");
+        if (failed >= SAFE_AFTER)
+            kprintf("The last %u boots did not complete.\n", failed);
+        kprintf("The disk is not mounted, the network is off and only one CPU is used.\n"
+                "Use \"faultlog\" to see what happened; \"exit\" to try a normal boot next time.\n\n");
+        return;
+    }
+
     int rc = wfs_mount(dev, &fsroot);
     if (rc < 0) {
         kprintf("disk: %s, %llu MB: not mounted (error %d)%s\n", dev->name,
@@ -802,28 +869,10 @@ static void disk_init(void)
             (unsigned long long)(dev->sectors / 2048),
             rc == 1 ? "new file system created and mounted" : "mounted",
             st.mounts, st.free_blocks * (unsigned)(PAGE_SIZE / 1024));
-
-    /* 黑盒子:磁碟最後 8KB 的事件紀錄。先看上一次開機是怎麼結束的,再記下這一次開機 */
     if (st.sb_restored)
         kprintf("disk: superblock restored from its backup copy\n");
     if (st.checksums && thread_create_prio("scrub", scrub_thread, NULL, PRIO_LOW) > 0)
         scrub_running = 1;                   /* 低優先權:只在沒有別的事要做時才巡檢 */
-    blackbox_init(dev, st.blocks, st.mounts);
-    if (!blackbox_enabled()) {
-        kprintf("blackbox: disabled (this disk was formatted before the log area existed)\n");
-        return;
-    }
-    struct bb_record last;
-    if (blackbox_read(0, &last) != 0)
-        kprintf("blackbox: empty (first boot with this disk)\n");
-    else if (last.type == BB_SHUTDOWN)
-        kprintf("blackbox: %u records; the previous boot shut down cleanly\n", blackbox_count());
-    else if (last.type == BB_PANIC || last.type == BB_WATCHDOG)
-        kprintf("blackbox: %u records; the previous boot ended with: %s\n", blackbox_count(), last.text);
-    else
-        kprintf("blackbox: %u records; the previous boot did not shut down (power loss, or the "
-                "emulator was closed)\n", blackbox_count());
-    blackbox_log(BB_BOOT, "boot #%u on %s", st.mounts, arch_name());
     if (st.repairs)
         blackbox_log(BB_NOTE, "file system check repaired %u problem(s) at mount", st.repairs);
     if (st.sb_restored)
@@ -838,6 +887,8 @@ static void shutdown(int code)
     wfs_stats(&st);
     if (st.failed)
         blackbox_log(BB_DISK, "shutting down with the file system read-only after a write error");
+    if (safe_mode)
+        blackbox_log(BB_HEALTHY, "safe mode session ended normally; the next boot will be a normal one");
     blackbox_log(BB_SHUTDOWN, "clean shutdown, exit code %d", code);
     wfs_shutdown();
     arch_exit(code);
@@ -2076,8 +2127,12 @@ void kmain(const struct boot_info *bi)
             panic("fs: cannot unpack the boot archive (error %d)", nfiles);
         kprintf("fs: root file system ready: %d files unpacked from a %zu KB boot archive\n",
                 nfiles, (size_t)(rootfs_end - rootfs_start) / 1024);
-        disk_init();                         /* 有磁碟的話,掛載到 /disk */
-        boot_nic = arch_net_probe();         /* 網路卡 */
+        disk_init(bi->cmdline);              /* 有磁碟的話,掛載到 /disk(或決定進入安全模式) */
+        if (cmdline_has(bi->cmdline, "crash=boot"))
+            panic("test: this boot fails before it completes");      /* 測試安全模式用 */
+        if (safe_mode)
+            selftest = 0;                    /* 安全模式只做最少的事:不跑自我測試 */
+        boot_nic = safe_mode ? NULL : arch_net_probe();   /* 網路卡(安全模式不啟動) */
         if (boot_nic)
             kprintf("net: %s, address %02x:%02x:%02x:%02x:%02x:%02x\n", boot_nic->name,
                     boot_nic->mac[0], boot_nic->mac[1], boot_nic->mac[2], boot_nic->mac[3],
@@ -2100,7 +2155,8 @@ void kmain(const struct boot_info *bi)
 
     /* 以上的示範檢查的是「單一 CPU 上的排程行為」(誰先執行、誰搶佔誰),
        所以在其他 CPU 加入之前跑。從這裡起,執行緒會真正同時在多顆 CPU 上執行 */
-    smp_sched_start();
+    if (!safe_mode)
+        smp_sched_start();                   /* 安全模式:其他 CPU 維持待命,只用開機的這一顆 */
     if (cmdline_has(bi->cmdline, "crash=wdog")) {
         if (smp_started() < 2) {
             /* 只有一顆 CPU 時沒有人可以看它(見 watchdog.c 的限制):這個測試無法進行 */
@@ -2145,6 +2201,15 @@ void kmain(const struct boot_info *bi)
      *                              以它的結束碼結束模擬器
      */
     int exit_code = 0;
+    /* 測試用:確認這次開機是不是安全模式 */
+    if (cmdline_has(bi->cmdline, "expect=safe"))
+        KASSERT(safe_mode && boot_nic == NULL && !scrub_running && cpu_count == 1);
+    if (cmdline_has(bi->cmdline, "expect=normal"))
+        KASSERT(!safe_mode);
+    /* 走到這裡表示開機順利完成:記下來。之後即使被直接關掉電源,也不算「開機失敗」。
+       安全模式不在這裡記:要等有人看過、正常離開之後(見 shutdown) */
+    if (!safe_mode)
+        blackbox_log(BB_HEALTHY, "boot completed");
     int shell = !autoexit || cmdline_has(bi->cmdline, "shell");
     if (shell) {
         kprintf("starting /bin/sh (type \"help\" for a list of commands)\n");

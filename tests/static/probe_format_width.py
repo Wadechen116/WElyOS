@@ -27,6 +27,27 @@ names = {f.name for f in functions('user/libc.c', source)}
 int welyos_probe_snprintf(char *, size_t, const char *, ...);
 int main(int argc, char **argv) {
     char out[32];
+    if(argc>1 && argv[1][0]=='b') {
+        const int widths[]={INT_MIN,-1025,-1024,-1023,-5,-1,0,1,5,1023,1024,1025,INT_MAX};
+        for(size_t i=0;i<sizeof(widths)/sizeof(widths[0]);++i) {
+            int w=widths[i];
+            int expected=w < -1024 || w > 1024 ? 1024 : w<0 ? -w : w;
+            if(!expected) expected=1;
+            int got=welyos_probe_snprintf(out,sizeof(out),"%*d",w,7);
+            if(got!=expected) return 11;
+            int kept=expected<31 ? expected : 31;
+            for(int j=0;j<kept;++j) {
+                char want=w<0 ? (j==0 ? '7' : ' ') : (j==expected-1 ? '7' : ' ');
+                if(out[j]!=want) return 12;
+            }
+            if(out[kept]!=0) return 13;
+        }
+        if(welyos_probe_snprintf(out,sizeof(out),"%99999999999999999999d",7)!=1024) return 14;
+        if(welyos_probe_snprintf(out,sizeof(out),"%05d|%-5d",7,7)!=11) return 15;
+        const char expected[]="00007|7    ";
+        for(size_t i=0;i<sizeof(expected);++i) if(out[i]!=expected[i]) return 16;
+        return 0;
+    }
     if(argc>1 && argv[1][0]=='s')
         return welyos_probe_snprintf(out,sizeof(out),"%*d",INT_MIN,1)<0;
     return welyos_probe_snprintf(out,sizeof(out),"%2147483648d",1)<0;
@@ -40,7 +61,7 @@ if proc.returncode:
     print(proc.stderr)
     sys.exit(2)
 results = []
-for mode in ('star', 'digits'):
+for mode in ('star', 'digits', 'bounds'):
     try:
         p = subprocess.run([str(out/'probe'), mode], capture_output=True, text=True, timeout=3)
         results.append({'mode':mode, 'returncode':p.returncode, 'stdout':p.stdout, 'stderr':p.stderr})

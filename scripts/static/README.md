@@ -22,6 +22,25 @@ python3 tests/static/test_checks.py
 baseline 仍需人工確認跨函式前提／巨集變更；它不是永久正確性保證。
 `baseline_stale_ids` 列出目前沒有再出現的接受紀錄，不能自動移除或轉套到新提示。
 
+## 與參考報告比較(只看新增的提示)
+
+```sh
+bash scripts/static-check.sh --compare tests/static/findings-fast.json --gate delta --changes-only
+bash scripts/static-check.sh --compare-ref HEAD:tests/static/findings-fast.json --gate delta
+bash scripts/static-refresh.sh        # 處理完新增的提示之後,更新參考報告
+```
+
+- `--compare 檔案` 或 `--compare-ref 版本:路徑`(固定到某個 commit 的報告)指定比較的對象;只支援快速模式。
+- `--gate delta`:只有「新增的未審查提示」才讓結果為 exit 1;預設的 `--gate all` 不變(任何未審查的提示都是 exit 1)。
+- `--changes-only`:主控台與 Markdown 只列新增的;`findings.json` 永遠是完整的。
+- 參考報告必須和目前的規則版本、掃描範圍相容,而且本身是完整的;否則是 exit 2,不會被當成通過。
+- **比較不是審查。** 參考報告裡已經出現過的提示仍然是「既有未審查」(existing-unreviewed),
+  不會變成已接受;delta 通過不代表專案沒有問題。
+- 提示的 ID 含有函式內容的雜湊:修改一個本來就有提示的函式,那個提示會以新的 ID 重新出現,算作新增。
+
+`scripts/regress.sh` 的最後一步就是這個比較:新增的遞迴、禁用函式、未檢查的錯誤回傳會讓回歸失敗;
+新增的風格提示(missing-check、function-length)只列出數量。
+
 ## 快速模式的明確界線
 
 所有 `kernel/`、`arch/`、`lib/`、`user/` 的 C 檔與支援標頭 `include/` 都進入詞法掃描。

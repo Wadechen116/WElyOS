@@ -89,3 +89,24 @@ Claude 持有 `scripts/regress.sh`，應在審查／修復既有提示後再接�
 
 參考：[JPL 原文](https://spinroot.com/gerard/pdf/P10.pdf)、
 [GCC 官方分析器說明](https://gcc.gnu.org/onlinedocs/gcc/Static-Analyzer-Options.html)。
+
+## 後續(2026-11-18,Claude 接手收尾)
+
+Codex 在完成比較功能(`--compare`、`--compare-ref`、`--gate delta`、`--changes-only`,含測試)後用完額度,
+使用者請 Claude 接手完成。上面各節是第一輪交付當時的數字,以下是目前的狀態:
+
+| 項目 | 狀態 |
+|---|---|
+| 工具自身的測試 | `python3 tests/static/test_checks.py`:21 項通過 |
+| 寬度溢位的重現工具 | `probe_format_width.py`:star、digits、bounds 三種模式都通過(已修正) |
+| 快速掃描 | 886 個未審查(730 missing-check、125 unchecked-error、31 function-length)、32 個已審查接受、沒有過期的基準紀錄 |
+| 遞迴、禁用函式 | 全部已逐筆審查(15 + 4),沒有未審查的 |
+| 參考報告 | `findings-fast.json`、`snapshot-fast.json` 已更新為新的格式(schema 2) |
+| 回歸整合 | `scripts/regress.sh` 最後一步以 delta 比較:新增的遞迴/禁用函式/未檢查回傳視為失敗,風格提示只計數 |
+| 分析模式 | `findings-analyze.json`、`snapshot-analyze.json` 仍是第一輪的結果,**沒有**重新產生 |
+
+依這份報告修正的程式缺陷:`printf` 寬度的兩個未定義行為(使用者端與 kernel);
+`wfs_unlink`、`wfs_check`、`initrd_unpack` 忽略的錯誤回傳;`file_truncate` 在間接區塊讀不到時遺失資料區塊;
+`wfs_release` 與 `dinode_rw` 在讀取失敗時未轉為唯讀;測試中 `malloc` 之後沒有檢查。
+
+尚未做的:125 個 unchecked-error(大多在 `user/init.c`、`user/sh.c`、`user/top.c`)與 GCC 分析器的 69 個診斷仍未逐筆審查。

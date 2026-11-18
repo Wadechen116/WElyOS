@@ -29,7 +29,7 @@ static struct mutex bb_lock = MUTEX_INIT;
 
 static int rec_valid(const struct bb_record *r)
 {
-    return r->magic == BB_MAGIC && r->len <= BB_TEXT_MAX && r->type >= BB_BOOT && r->type <= BB_NOTE &&
+    return r->magic == BB_MAGIC && r->len <= BB_TEXT_MAX && r->type >= BB_BOOT && r->type <= BB_HEALTHY &&
            r->crc == crc32(r, sizeof(*r) - sizeof(r->crc));
 }
 
@@ -57,7 +57,7 @@ static void load(void)
     }
 }
 
-void blackbox_init(struct blkdev *dev, uint32_t fs_blocks, uint32_t boot_count)
+void blackbox_init(struct blkdev *dev, uint32_t fs_blocks)
 {
     enabled = 0;
     if (!dev || dev->sectors < BB_SECTORS)
@@ -68,9 +68,42 @@ void blackbox_init(struct blkdev *dev, uint32_t fs_blocks, uint32_t boot_count)
     if ((uint64_t)fs_blocks * (PAGE_SIZE / BLK_SECTOR) > base_lba)
         return;
     disk = dev;
-    this_boot = boot_count;
     load();
+    this_boot = 1;                           /* 開機次數由紀錄自己推算:不依賴檔案系統有沒有掛載 */
+    for (unsigned i = 0; i < BB_RECORDS; i++)
+        if (recs[i].magic == BB_MAGIC && recs[i].boot >= this_boot)
+            this_boot = recs[i].boot + 1;
     enabled = 1;
+}
+
+uint32_t blackbox_boot(void)
+{
+    return this_boot;
+}
+
+unsigned blackbox_failed_boots(void)
+{
+    unsigned failed = 0;
+
+    if (!enabled)
+        return 0;
+    mutex_lock(&bb_lock);
+    for (unsigned k = 0, slot = next_slot; k < BB_RECORDS; k++) {
+        slot = (slot + BB_RECORDS - 1) % BB_RECORDS;
+        const struct bb_record *r = &recs[slot];
+        if (r->magic != BB_MAGIC)
+            continue;
+        if (r->type == BB_HEALTHY || r->type == BB_SHUTDOWN)
+            break;                           /* 那一次開機是順利的:更早的不必看 */
+        if (r->type != BB_BOOT)
+            continue;
+        int test = 0;                        /* 故意當機的測試不算開機失敗 */
+        for (unsigned i = 0; i + 6 <= r->len && !test; i++)
+            test = memcmp(r->text + i, "(test)", 6) == 0;
+        failed += !test;
+    }
+    mutex_unlock(&bb_lock);
+    return failed;
 }
 
 int blackbox_enabled(void)

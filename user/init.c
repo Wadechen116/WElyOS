@@ -1408,6 +1408,8 @@ static int mode_heap(void)
 
     /* realloc 保留內容;calloc 清為 0;大小為 0 也給一個可以 free 的指標 */
     char *r = malloc(10);
+    if (!r)
+        return 1149;
     strcpy(r, "123456789");
     r = realloc(r, 5000);
     if (!r || strcmp(r, "123456789") != 0)
@@ -1438,6 +1440,8 @@ static int mode_heap(void)
 
     /* fork:子行程改它自己的 heap,不影響我們的 */
     char *shared = malloc(32);
+    if (!shared)
+        return 1150;
     strcpy(shared, "parent");
     pid = sys_fork();
     if (pid == 0) {
