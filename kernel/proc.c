@@ -11,6 +11,8 @@
 #include "kprintf.h"
 #include "kstring.h"
 #include "mmu.h"
+#include "net.h"
+#include "netif.h"
 #include "panic.h"
 #include "pmm.h"
 #include "proc.h"
@@ -1686,6 +1688,74 @@ static long sys_sbrk(struct proc *p, long incr)
     return (long)old;
 }
 
+/* ---- 網路 ---- */
+
+static long sys_udp_open(struct proc *p, long port)
+{
+    struct file *f;
+
+    if (port < 0 || port > 65535)
+        return -E_INVAL;
+    int err = netif_udp_open((uint16_t)port, &f);
+    if (err)
+        return err;
+    int fd = fd_install(p, f);
+    if (fd < 0)
+        vfs_close(f);                        /* 描述符表滿了:socket 隨這次關閉釋放 */
+    return fd;
+}
+
+/* 送出與接收共用:把使用者的 struct udpmsg 搬進來,資料經過一塊 kernel 的暫存區 */
+static long sys_udp_io(struct proc *p, long fd, uintptr_t umsg, long timeout_ms, int recv)
+{
+    struct udpmsg m;
+    long rc;
+
+    if (copy_from_user(p, &m, umsg, sizeof(m)) != 0)
+        return -E_FAULT;
+    if (m.len > NET_UDP_MAX && !recv)
+        return -E_INVAL;
+    if (timeout_ms < 0 || timeout_ms > 60000)
+        return -E_INVAL;
+    struct file *f = fd_get(p, fd);
+    if (!f)
+        return -E_BADF;
+    uint8_t *buf = kmalloc(NET_UDP_MAX);
+    if (!buf) {
+        vfs_close(f);
+        return -E_NOMEM;
+    }
+    if (recv) {
+        uint32_t ip = 0;
+        uint16_t port = 0;
+        size_t cap = m.len < NET_UDP_MAX ? m.len : NET_UDP_MAX;
+        rc = netif_udp_recv(f, &ip, &port, buf, cap, (unsigned)timeout_ms);
+        if (rc >= 0) {
+            m.ip = ip;
+            m.port = port;
+            m.len = (uint32_t)rc;
+            if (copy_to_user(p, (uintptr_t)m.data, buf, (size_t)rc) != 0 ||
+                copy_to_user(p, umsg, &m, sizeof(m)) != 0)
+                rc = -E_FAULT;
+        }
+    } else if (copy_from_user(p, buf, (uintptr_t)m.data, m.len) != 0) {
+        rc = -E_FAULT;
+    } else {
+        rc = netif_udp_send(f, m.ip, m.port, buf, m.len);
+    }
+    kfree(buf);
+    vfs_close(f);
+    return rc;
+}
+
+static long sys_netinfo(struct proc *p, uintptr_t uinfo)
+{
+    struct netinfo ni;
+
+    netif_info(&ni);
+    return copy_to_user(p, uinfo, &ni, sizeof(ni)) == 0 ? 0 : -E_FAULT;
+}
+
 static long sys_lseek(struct proc *p, long fd, long off, long whence)
 {
     struct file *f = fd_get(p, fd);
@@ -2262,6 +2332,18 @@ long syscall_dispatch(long num, long a0, long a1, long a2, void *tf)
         return sys_munmap(p, (uintptr_t)a0);
     case SYS_memlimit:
         return sys_memlimit(p, a0);
+    case SYS_ping:
+        if (a1 < 0 || a1 > 60000)
+            return -E_INVAL;
+        return netif_ping((uint32_t)a0, (unsigned)a1);
+    case SYS_udp_open:
+        return sys_udp_open(p, a0);
+    case SYS_udp_send:
+        return sys_udp_io(p, a0, (uintptr_t)a1, 0, 0);
+    case SYS_udp_recv:
+        return sys_udp_io(p, a0, (uintptr_t)a1, a2, 1);
+    case SYS_netinfo:
+        return sys_netinfo(p, (uintptr_t)a0);
     case SYS_time: {
         struct timeval tv;
         memset(&tv, 0, sizeof(tv));

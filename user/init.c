@@ -42,6 +42,7 @@ enum {
     UMODE_TIME,          /* 日期時間:sys_time、秒數與年月日的換算、檔案的修改時間 */
     UMODE_PERM,          /* 使用者與權限:檔案的擁有者與權限位元、特權只能減少、誰可以對誰送訊號 */
     UMODE_MEMQUOTA,      /* 記憶體配額(要求當場成功或失敗,不會事後被終止)與匿名對映 */
+    UMODE_NET,           /* 網路:ping、UDP socket(以模擬器內建的 TFTP 伺服器驗證收送) */
 };
 
 /* 各架構 kernel 映像所在的位址(使用者模式不應該讀得到) */
@@ -518,6 +519,111 @@ static int mode_signal(void)
 
     puts_("  [user] process relationships and signals work as expected\n");
     return 17;
+}
+
+/* ---- UMODE_NET ---- */
+
+#define NET_GW NET_IP(10, 0, 2, 2)
+
+static int net_unprivileged(void)
+{
+    /* 沒有特權的行程不能綁定 1024 以下的埠;其他的可以 */
+    if (sys_udp_open(69) != -E_ACCES)
+        return 1;
+    long s = sys_udp_open(5000);
+    if (s < 0)
+        return 2;
+    return 0;                                            /* 不關閉就結束:kernel 要代為釋放那個埠 */
+}
+
+static int mode_net(void)
+{
+    static unsigned char pkt[600], motd[600];
+    static const unsigned char rrq[] = "\0\1etc/motd\0octet";     /* TFTP 的讀取要求 */
+    struct netinfo ni;
+    unsigned ip = 0, port = 0;
+    long s, s2, n, fd, len;
+
+    if (sys_netinfo(&ni) != 0 || !ni.up || ni.ip != NET_IP(10, 0, 2, 15) || ni.gateway != NET_GW)
+        return 1601;
+    if (sys_netinfo((struct netinfo *)KERNEL_ADDR) != -E_FAULT)
+        return 1602;
+
+    /* ping:閘道會回答;同一個網路上不存在的位址等不到(第一個要先問到硬體位址,時間寬一點) */
+    long ms = sys_ping(NET_GW, 1000);
+    if (ms < 0 || ms > 1000)
+        return 1603;
+    if ((ms = sys_ping(NET_GW, 1000)) < 0 || ms > 200)
+        return 1604;
+    if (sys_ping(NET_IP(10, 0, 2, 99), 30) != -E_TIMEDOUT || sys_ping(NET_GW, -1) != -E_INVAL)
+        return 1605;
+
+    /* UDP socket 的基本規則 */
+    if ((s = sys_udp_open(0)) < 0 || (s2 = sys_udp_open(6000)) < 0)
+        return 1610;
+    if (sys_udp_open(6000) != -E_BUSY || sys_udp_open(70000) != -E_INVAL)    /* 已被綁定;埠號不合理 */
+        return 1611;
+    if (sys_udp_send(1, NET_GW, 9, "x", 1) != -E_BADF || sys_udp_send(99, NET_GW, 9, "x", 1) != -E_BADF)
+        return 1612;                                     /* 不是 socket;不存在的描述符 */
+    if (sys_read(s, pkt, 4) != -E_INVAL || sys_write(s, "x", 1) != -E_INVAL || sys_lseek(s, 0, 0) != -E_SPIPE)
+        return 1613;                                     /* socket 不能當成檔案讀寫 */
+    if (sys_udp_recv(s, pkt, sizeof(pkt), &ip, &port, 5) != -E_TIMEDOUT)
+        return 1614;
+    if (sys_udp_send(s, NET_GW, 9, (void *)KERNEL_ADDR, 4) != -E_FAULT ||
+        sys_udp_send(s, NET_GW, 9, pkt, 2000) != -E_INVAL)
+        return 1615;
+    if (sys_close(s2) != 0 || (s2 = sys_udp_open(6000)) < 0)                 /* 關閉後那個埠可以再用 */
+        return 1616;
+    sys_close(s2);
+
+    /* 真的收送一次:向模擬器內建的 TFTP 伺服器要 etc/motd,第一塊資料應該就是整個檔案 */
+    if ((fd = sys_open("/etc/motd", O_RDONLY)) < 0 || (len = sys_read(fd, motd, sizeof(motd))) <= 0)
+        return 1620;
+    sys_close(fd);
+    n = -1;
+    for (int tries = 0; tries < 3 && n < 0; tries++) {
+        if (sys_udp_send(s, NET_GW, 69, rrq, sizeof(rrq)) != (long)sizeof(rrq))
+            return 1621;
+        n = sys_udp_recv(s, pkt, sizeof(pkt), &ip, &port, 500);
+    }
+    if (n != len + 4 || ip != NET_GW || port == 0 || pkt[0] != 0 || pkt[1] != 3 || pkt[3] != 1)
+        return 1622;
+    for (long i = 0; i < len; i++)
+        if (pkt[4 + i] != motd[i])
+            return 1623;                                 /* 內容和本機的那一份逐位元組相同 */
+    unsigned char ack[4] = { 0, 4, 0, 1 };
+    if (sys_udp_send(s, ip, port, ack, 4) != 4)
+        return 1624;
+
+    /* 特權與資源回收:子行程降為一般使用者 */
+    int st = 1;
+    long pid = sys_fork();
+    if (pid == 0) {
+        sys_setuid(1000, 1000);
+        sys_exit(net_unprivileged());
+    }
+    if (pid < 0 || sys_waitpid(pid, &st, 0) != pid || st != 0)
+        return 1630 + st;
+    if ((s2 = sys_udp_open(5000)) < 0)                   /* 子行程沒關就結束的那個埠:已經被釋放 */
+        return 1635;
+    sys_close(s2);
+    /* socket 的數量有上限;用完之後全部關掉,又可以再開 */
+    long many[10];
+    int got = 0;
+    for (; got < 10; got++)
+        if ((many[got] = sys_udp_open(0)) < 0)
+            break;
+    if (got != 7 || many[got] != -E_NOMEM)               /* 一共 8 個,s 佔了一個 */
+        return 1636;
+    for (int i = 0; i < got; i++)
+        sys_close(many[i]);
+    sys_close(s);
+    if (sys_netinfo(&ni) != 0 || ni.udp_delivered < 1 || ni.tx_errors != 0)
+        return 1637;
+
+    printf("  [user] network: the gateway answers pings; a file fetched over UDP (TFTP) matches, %u frames in, %u out\n",
+           ni.rx_frames, ni.tx_frames);
+    return 28;
 }
 
 /* ---- UMODE_MEMQUOTA ---- */
@@ -2157,6 +2263,9 @@ static int umain(long mode)
 
     case UMODE_MEMQUOTA:
         return mode_memquota();
+
+    case UMODE_NET:
+        return mode_net();
 
     case UMODE_PERM: {
         /* 同一組測試在記憶體檔案系統與磁碟上各做一次 */

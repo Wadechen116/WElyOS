@@ -50,13 +50,15 @@
 #define E_SPIPE        29    /* 這種東西沒有「讀寫位置」(管線、裝置) */
 #define E_PIPE         32    /* 寫入一條已經沒有人在讀的管線 */
 #define E_NAMETOOLONG  36    /* 名稱或路徑太長 */
+#define E_NETDOWN      100   /* 沒有網路(沒有網路卡) */
+#define E_TIMEDOUT     110   /* 等了指定的時間,沒有等到 */
 #define E_NOTEMPTY     39    /* 目錄不是空的 */
 
 #define FS_NAME_MAX    59    /* 單一名稱的最大長度(不含結尾的 0) */
 #define FS_PATH_MAX    255   /* 整條路徑的最大長度 */
 
 /* inode 的類型 */
-enum { I_FILE = 1, I_DIR, I_DEV, I_PIPE };
+enum { I_FILE = 1, I_DIR, I_DEV, I_PIPE, I_SOCK };   /* I_SOCK:網路的 socket(沒有名稱,只以描述符存在) */
 
 /* 開啟方式(數值沿用 Linux 的定義) */
 #define O_RDONLY  0x000
@@ -241,6 +243,8 @@ int vfs_pipe(struct file **rd, struct file **wr);
 
 /* 替一個 inode 建立一次開啟(管線這類沒有路徑的物件使用)。失敗回傳 NULL */
 struct file *vfs_file_new(struct inode *in, int flags);
+/* 一次開啟所指的 inode(socket 這類物件用它從描述符找回自己) */
+struct inode *vfs_file_inode(struct file *f);
 
 /* 實際的檔案系統建立 inode 時呼叫:填好共同的欄位 */
 void inode_init(struct inode *in, const struct inode_ops *ops, int type);

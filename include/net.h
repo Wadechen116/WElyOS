@@ -11,7 +11,7 @@
  *   kernel 其他部分(系統呼叫、ping 之類的使用者程式)
  *        |  net_ping_send / net_udp_send / net_udp_bind ...
  *        v
- *   協定堆疊(kernel/net/*.c)     乙太網路、ARP、IPv4、ICMP、UDP
+ *   協定堆疊(kernel/net/ 底下)   乙太網路、ARP、IPv4、ICMP、UDP
  *        |  nif->send(整個乙太網路訊框)        ^ net_rx(收到的訊框)
  *        v                                      |
  *   網路卡驅動程式                 virtio-net 等
@@ -75,7 +75,7 @@ struct netif {
     void    *driver;
 };
 
-/* ---- 協定堆疊提供(kernel/net/*.c) ---- */
+/* ---- 協定堆疊提供(kernel/net/ 底下的 .c) ---- */
 
 /* 以 nif 作為唯一的網路介面,清空所有表格。可以重複呼叫(測試會這樣做) */
 void net_init(struct netif *nif);

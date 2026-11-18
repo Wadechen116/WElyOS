@@ -24,6 +24,8 @@
 #include "timer.h"
 #include "vm.h"
 #include "mmu.h"
+#include "netdev.h"
+#include "netif.h"
 
 /*
  * 開機參數(cmdline)中是否含有指定的「完整單字」(以空白分隔)。
@@ -676,6 +678,59 @@ static void prio_demo(void)
 /* ------------------------------------------------------------------ */
 
 /* ------------------------------------------------------------------ */
+/* 網路卡                                                              */
+/* ------------------------------------------------------------------ */
+
+static struct netdev *boot_nic;
+
+/*
+ * 網路卡驅動程式的測試(不經過協定堆疊):手工組一個 ARP 詢問「10.0.2.2 的硬體位址是什麼」,
+ * 送出去,然後等回答。模擬器的使用者模式網路會以閘道的身分回答,
+ * 所以收得到就表示傳送與接收兩個方向都通。
+ */
+static void nic_selftest(void)
+{
+    static uint8_t frame[1600];
+    static const uint8_t my_ip[4] = { 10, 0, 2, 15 }, gw_ip[4] = { 10, 0, 2, 2 };
+    struct netdev *d = boot_nic;
+
+    if (!d) {
+        kprintf("net: no network card, tests skipped\n");
+        return;
+    }
+    memset(frame, 0, 42);
+    memset(frame, 0xFF, 6);                  /* 目的:廣播 */
+    memcpy(frame + 6, d->mac, 6);
+    frame[12] = 0x08; frame[13] = 0x06;      /* 類型:ARP */
+    frame[14] = 0; frame[15] = 1;            /* 硬體:乙太網路 */
+    frame[16] = 0x08; frame[17] = 0;         /* 協定:IPv4 */
+    frame[18] = 6; frame[19] = 4;            /* 位址長度 */
+    frame[20] = 0; frame[21] = 1;            /* 詢問 */
+    memcpy(frame + 22, d->mac, 6);
+    memcpy(frame + 28, my_ip, 4);
+    memcpy(frame + 38, gw_ip, 4);
+    KASSERT(d->send(d, frame, 42) == 0);
+    KASSERT(d->send(d, frame, 10) == -E_INVAL && d->send(d, frame, 1515) == -E_INVAL);   /* 長度不合理 */
+
+    uint64_t t0 = timer_ticks();
+    int got = 0;
+    while (!got && timer_ticks() - t0 < 500) {
+        int n = d->recv(d, frame, sizeof(frame));
+        KASSERT(n >= 0 && n <= 1514);
+        /* 是 ARP 的回答、問的是閘道、而且是回給我們的 */
+        if (n >= 42 && frame[12] == 0x08 && frame[13] == 0x06 && frame[21] == 2 &&
+            !memcmp(frame + 28, gw_ip, 4) && !memcmp(frame, d->mac, 6))
+            got = 1;
+        else if (n == 0)
+            thread_sleep(1);
+    }
+    KASSERT(got);
+    kprintf("net: ok (%s: sent an ARP request, the gateway 10.0.2.2 answered from "
+            "%02x:%02x:%02x:%02x:%02x:%02x after %u ms)\n", d->name, frame[22], frame[23], frame[24],
+            frame[25], frame[26], frame[27], (unsigned)(timer_ticks() - t0));
+}
+
+/* ------------------------------------------------------------------ */
 /* 磁碟                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -1227,7 +1282,7 @@ enum {
     UMODE_FORK, UMODE_STACK_GROW, UMODE_PIPE, UMODE_SIGNAL, UMODE_JOBS,
     UMODE_STOP, UMODE_DISK, UMODE_SYSINFO, UMODE_FILEOPS, UMODE_HEAP,
     UMODE_SIGHANDLER, UMODE_TIME, UMODE_PERM,
-    UMODE_MEMQUOTA,
+    UMODE_MEMQUOTA, UMODE_NET,
 };
 
 /* 以測試編號 mode 啟動 /bin/init:編號轉成字串,當作 argv[1] 傳給它 */
@@ -1327,6 +1382,9 @@ static void user_demo(void)
     run_user("users and permissions", UMODE_PERM, 26);
     /* 記憶體配額(超過的要求當場失敗)與匿名對映 */
     run_user("memory quota and mmap", UMODE_MEMQUOTA, 27);
+    /* 網路(有網路卡的話):ping、UDP socket、以 TFTP 實際收送一個檔案 */
+    if (boot_nic)
+        run_user("network: ping and UDP", UMODE_NET, 28);
     /* top 的基礎:系統狀態、行程的記憶體用量、主控台的輸入模式 */
     run_user("system information for top", UMODE_SYSINFO, 21);
     thread_sleep(30);
@@ -1407,7 +1465,7 @@ static void user_demo(void)
     thread_sleep(2);
     sched_trim();
     kheap_stats(&h1);
-    KASSERT(sched_thread_count() == 1);
+    KASSERT(sched_thread_count() == 1 + (boot_nic != NULL));   /* main,加上網路的接收執行緒(有網路卡時) */
     /* heap 向頁面配置器要來的頁不會歸還(見 kmalloc.c),所以這段期間 heap 若長大了
        (例如管線的緩衝區第一次配置),要把那部分算進去:那些頁現在是 heap 的空閒空間 */
     size_t heap_grow = h1.heap_bytes - h0.heap_bytes;
@@ -1462,7 +1520,7 @@ static void sched_stress(void)
     thread_sleep(10);                        /* post 之後它們還要一點時間真正結束並被回收 */
     kprintf("stress: all finished in %llu ticks, %lu context switches\n",
             (unsigned long long)(timer_ticks() - t0), sched_switch_count() - sw0);
-    KASSERT(created == STRESS_THREADS && sched_thread_count() == 1);
+    KASSERT(created == STRESS_THREADS && sched_thread_count() == 1 + (boot_nic != NULL));
 
     /* 第二階段:一條接一條地建立並等待結束(同時只有一條存活)。
        這是 stack 快取發揮作用的情況:每次都重複使用同一條 stack,
@@ -1850,6 +1908,13 @@ void kmain(const struct boot_info *bi)
         kprintf("fs: root file system ready: %d files unpacked from a %zu KB boot archive\n",
                 nfiles, (size_t)(rootfs_end - rootfs_start) / 1024);
         disk_init();                         /* 有磁碟的話,掛載到 /disk */
+        boot_nic = arch_net_probe();         /* 網路卡 */
+        if (boot_nic)
+            kprintf("net: %s, address %02x:%02x:%02x:%02x:%02x:%02x\n", boot_nic->name,
+                    boot_nic->mac[0], boot_nic->mac[1], boot_nic->mac[2], boot_nic->mac[3],
+                    boot_nic->mac[4], boot_nic->mac[5]);
+        else
+            kprintf("net: none\n");
         disk_stage_test(bi->cmdline);
     }
 
@@ -1878,6 +1943,10 @@ void kmain(const struct boot_info *bi)
         smp_sched_demo();
         fs_demo();
         disk_demo();
+        nic_selftest();                      /* 驅動程式單獨的測試:要在協定堆疊開始收訊框之前 */
+    }
+    netif_start(boot_nic);                   /* 啟動網路(沒有網路卡時不做任何事) */
+    if (selftest) {
         pipe_demo();
         user_demo();
     }

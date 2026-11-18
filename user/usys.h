@@ -26,6 +26,7 @@ enum {
     SYS_signal, SYS_sigreturn, SYS_time,
     SYS_getuid, SYS_getgid, SYS_setuid, SYS_capget, SYS_capdrop, SYS_chmod, SYS_chown,
     SYS_mmap, SYS_munmap, SYS_memlimit,
+    SYS_ping, SYS_udp_open, SYS_udp_send, SYS_udp_recv, SYS_netinfo,
 };
 #define SYS_SIGRETURN_NUM 40 /* SYS_sigreturn 的數值:crt0.c 裡的組合語言要用(下面有檢查) */
 _Static_assert(SYS_sigreturn == SYS_SIGRETURN_NUM, "update SYS_SIGRETURN_NUM");
@@ -104,6 +105,8 @@ struct sysinfo {
 #define E_ISDIR   21
 #define E_SPIPE   29
 #define E_NAMETOOLONG 36
+#define E_NETDOWN 100        /* 沒有網路 */
+#define E_TIMEDOUT 110       /* 等了指定的時間,沒有等到 */
 #define SEEK_SET  0
 #define SEEK_CUR  1
 #define SEEK_END  2
@@ -266,6 +269,52 @@ static inline long sys_chown(const char *path, long uid, long gid)
 {
     return syscall3(SYS_chown, (long)path, uid, gid);
 }
+/*
+ * 網路。位址是 32 位元的整數,最高位元組在前:10.0.2.15 = NET_IP(10, 0, 2, 15)。
+ * 這台機器固定是 10.0.2.15,閘道 10.0.2.2,名稱伺服器 10.0.2.3(模擬器提供的私有網路)。
+ */
+#define NET_IP(a, b, c, d) (((unsigned)(a) << 24) | ((unsigned)(b) << 16) | ((unsigned)(c) << 8) | (unsigned)(d))
+struct udpmsg {
+    unsigned int ip;                         /* 送出:目的位址;接收後:來源位址 */
+    unsigned short port, pad;                /* 同上,埠號 */
+    unsigned int len, pad2;                  /* 送出:資料長度;接收前:緩衝區大小,接收後:實際長度 */
+    unsigned long long data;                 /* 資料 / 緩衝區的位址 */
+};
+struct netinfo {
+    unsigned int up;                         /* 1 = 網路可用 */
+    unsigned char mac[6];
+    unsigned short pad;
+    unsigned int ip, netmask, gateway;
+    unsigned int rx_frames, tx_frames, rx_dropped;
+    unsigned int rx_bad_length, rx_bad_checksum, rx_filtered, rx_unbound;
+    unsigned int tx_errors, tx_queue_full, arp_timeouts, arp_cache_entries;
+    unsigned int icmp_echo_replied, udp_delivered;
+    unsigned int sock_dropped;
+};
+/* ping:回傳來回的毫秒數;逾時回傳 -E_TIMEDOUT;沒有網路回傳 -E_NETDOWN */
+static inline long sys_ping(unsigned ip, long timeout_ms) { return syscall3(SYS_ping, (long)ip, timeout_ms, 0); }
+/* UDP:先以 sys_udp_open 取得一個描述符(port 0 = 自動挑一個),用完以 sys_close 關閉 */
+static inline long sys_udp_open(long port)        { return syscall3(SYS_udp_open, port, 0, 0); }
+static inline long sys_udp_send(long fd, unsigned ip, unsigned port, const void *data, unsigned len)
+{
+    struct udpmsg m = { ip, (unsigned short)port, 0, len, 0, (unsigned long)data };
+    return syscall3(SYS_udp_send, fd, (long)&m, 0);
+}
+/* 等一個封包(最多 timeout_ms 毫秒)。回傳長度,*ip 與 *port 是來源;沒有等到回傳 -E_TIMEDOUT */
+static inline long sys_udp_recv(long fd, void *buf, unsigned cap, unsigned *ip, unsigned *port,
+                                long timeout_ms)
+{
+    struct udpmsg m = { 0, 0, 0, cap, 0, (unsigned long)buf };
+    long n = syscall3(SYS_udp_recv, fd, (long)&m, timeout_ms);
+    if (n >= 0) {
+        if (ip)
+            *ip = m.ip;
+        if (port)
+            *port = m.port;
+    }
+    return n;
+}
+static inline long sys_netinfo(struct netinfo *info) { return syscall3(SYS_netinfo, (long)info, 0, 0); }
 /* 現在的日期時間:1970-01-01 00:00:00 UTC 至今的秒數與微秒(換成年月日見 libc.h 的 gmtime_) */
 static inline long sys_time(struct timeval *tv)   { return syscall3(SYS_time, (long)tv, 0, 0); }
 /* 把還留在記憶體裡的修改寫到磁碟上 */

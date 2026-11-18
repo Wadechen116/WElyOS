@@ -20,6 +20,8 @@ WElyOS root file system
 /bin/id        shows who you are (uid, gid) and which privileges you hold
 /bin/su        starts a shell as another user (su alice); exit returns
 /bin/chmod     changes permissions (chmod 755 FILE); chown changes the owner (root only)
+/bin/ping      checks that another machine answers (ping 10.0.2.2); net shows the network state
+/bin/tftp      fetches a file from the host (tftp etc/motd /disk/motd)
 /bin/sh        the shell (pipes, redirection, background jobs with &, Ctrl-Z, fg, bg)
 /etc/test.sh   shell script used by the self-test
 /etc/motd      message shown by the file system self-test

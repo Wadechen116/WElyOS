@@ -237,3 +237,10 @@ uint64_t arch_rtc_read(void)
 {
     return *(volatile uint32_t *)0x09010000UL;
 }
+
+/* 網路卡:和磁碟一樣是 virtio-mmio 裝置,在同一批位置裡找 */
+#include "netdev.h"
+struct netdev *arch_net_probe(void)
+{
+    return virtio_net_probe(0x0a000000UL, 0x200, 32);
+}

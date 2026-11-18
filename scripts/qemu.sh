@@ -6,6 +6,7 @@
 #           QEMU_SMP(CPU 數,預設 4;kernel 最多使用 8 顆)、QEMU_CPU(CPU 型號)
 #           QEMU_DISK(磁碟映像檔;預設 build/<arch>/disk.img,不存在時自動建立 16MB 的空白檔;
 #                     設為 none 則不接磁碟)
+#           QEMU_NET(設為 none 則不接網路卡;預設接上使用者模式的網路)
 set -e
 ARCH="$1"; ELF="$2"; shift 2
 
@@ -86,8 +87,27 @@ if [ -t 0 ]; then
   stty -icanon -echo intr '^]' quit undef susp undef
 fi
 
+# 網路:QEMU 的「使用者模式網路」(不需要管理員權限,也不會動到主機的網路設定)。
+# 客體看到的是一個小型的私有網路:自己是 10.0.2.15,閘道 10.0.2.2,名稱伺服器 10.0.2.3。
+#   i386             NE2000(ISA 介面,I/O port 0x300):不需要 PCI 匯流排的支援
+#   riscv64/aarch64  virtio 網路卡(virtio-mmio)
+# 模擬器另外在閘道上提供一個 TFTP(Trivial File Transfer Protocol)伺服器,把主機的一個目錄
+# 唯讀地分享給客體:預設是專案的 rootfs/(可用 QEMU_TFTP 指定別的目錄)。
+# 在 WElyOS 裡用 `tftp etc/motd` 就能把檔案抓進來;自我測試也用它驗證 UDP 的收送。
+NET_ARGS=()
+if [ "${QEMU_NET:-user}" != none ]; then
+  TFTP_DIR="${QEMU_TFTP:-$(dirname "$0")/../rootfs}"
+  case "$QEMU" in *.exe) TFTP_DIR="$(wslpath -w "$TFTP_DIR")" ;; esac
+  if [ "$ARCH" = i386 ]; then
+    NET_ARGS=(-netdev "user,id=n0,tftp=$TFTP_DIR" -device ne2k_isa,netdev=n0,iobase=0x300,irq=9)
+  else
+    NET_ARGS=(-global virtio-mmio.force-legacy=false -netdev "user,id=n0,tftp=$TFTP_DIR"
+              -device virtio-net-device,netdev=n0)
+  fi
+fi
+
 set +e
-"$QEMU" "${MACHINE[@]}" "${DISK_ARGS[@]}" -kernel "$ELF" -serial stdio \
+"$QEMU" "${MACHINE[@]}" "${DISK_ARGS[@]}" "${NET_ARGS[@]}" -kernel "$ELF" -serial stdio \
         -display "${QEMU_DISPLAY:-none}" -no-reboot "$@"
 rc=$?
 # i386 的 isa-debug-exit 寫入 0 時,QEMU 回傳 1,視為成功

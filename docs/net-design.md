@@ -69,8 +69,25 @@ Codex 審閱介面後提出、雙方同意納入的性質。每一條都要有�
 
 界線:主機與 QEMU 上的結果不是最壞執行時間(WCET)的證明,也不代表抗輻射或真實硬體上的容錯能力。
 
+## 實作時補充的政策(Codex 提出,雙方同意)
+
+- **不支援送給自己**:`net_ping_send` / `net_udp_send` 的目的是本機位址時回傳 `-E_INVAL`。
+- **參數**:`net_udp_bind` 的埠為 0 或回呼為 NULL 回傳 `-E_INVAL`;`net_udp_send` 的目的埠為 0 回傳 `-E_INVAL`,來源埠為 0 允許。
+  整合層(`kernel/netif.c`)自動挑選埠時,自己從 49152 起找沒人用的,不會把 0 傳給堆疊。
+- **只收給本機單點位址的封包**:目的不是本機的(包括廣播)不交給 UDP。
+- **表格大小**:ARP 快取、等待 ARP 的封包、UDP 綁定各 8 格(整合層的 socket 也是 8 個)。
+- **回答 ping 不經過 ARP**:echo reply 直接送回收到的那個訊框的來源硬體位址。
+
 ## DNS(`user/dns.h`)
 
 純函式,呼叫者提供緩衝區與容量。解析回應時必須核對:查詢編號、是回應(QR)、opcode、rcode、問題區段與原本問的名稱相同;
 名稱壓縮的指標跳轉有上限並拒絕循環;CNAME 鏈有上限,而且只接受「對應到查詢名稱」的 A 紀錄,不可以拿回應裡第一個出現的 A 紀錄。
-函式簽名由 Codex 先在 memory server 提出,雙方同意後再實作與整合。
+雙方同意的函式(`static inline`,位址為主機順序):
+
+```c
+int dns_build_query(uint8_t *out, size_t cap, uint16_t id, const char *qname, size_t *out_len);
+int dns_parse_a(const uint8_t *msg, size_t len, uint16_t id, const char *qname, uint32_t *out_ip);
+```
+
+回傳 0 = 成功;-1 = 格式、參數、不相符或伺服器回報錯誤;-2 = 沒有對應的 A 紀錄(包括名稱不存在)。
+名稱不分大小寫,允許結尾有一個點;CNAME 最多跟 8 層。

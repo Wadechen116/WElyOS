@@ -310,6 +310,11 @@ struct file *vfs_file_new(struct inode *in, int flags)
     return f;
 }
 
+struct inode *vfs_file_inode(struct file *f)
+{
+    return f->in;
+}
+
 struct file *vfs_dup(struct file *f)
 {
     unsigned long fl = spin_lock_irqsave(&inode_lk);
@@ -344,6 +349,8 @@ long vfs_pread(struct file *f, void *buf, size_t n, uint64_t off)
         return -E_BADF;
     if (in->type == I_DIR)
         return -E_ISDIR;
+    if (in->type == I_SOCK)
+        return -E_INVAL;                     /* socket 用專屬的收送呼叫,不能當成檔案讀寫 */
     if (in->type == I_DEV)
         return in->dev->read ? in->dev->read(buf, n) : -E_INVAL;
     /* 管線的讀取可能要等對方寫入,不能拿著 inode 的鎖等(對方寫入時也要這把鎖)。
@@ -376,7 +383,7 @@ long vfs_seek(struct file *f, long off, int whence)
     struct inode *in = f->in;
     long r = -E_INVAL;
 
-    if (in->type == I_PIPE || in->type == I_DEV)
+    if (in->type == I_PIPE || in->type == I_DEV || in->type == I_SOCK)
         return -E_SPIPE;
     mutex_lock(&f->lock);
     if (in->type == I_DIR) {
@@ -405,6 +412,8 @@ long vfs_write(struct file *f, const void *buf, size_t n)
         return -E_BADF;
     if (in->type == I_DIR)
         return -E_ISDIR;
+    if (in->type == I_SOCK)
+        return -E_INVAL;
     if (in->type == I_DEV)
         return in->dev->write ? in->dev->write(buf, n) : -E_INVAL;
     if (in->type == I_PIPE)

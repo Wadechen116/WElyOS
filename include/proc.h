@@ -115,6 +115,12 @@ enum {
     SYS_mmap,               /* (len)           要一塊內容為 0 的記憶體(匿名對映);回傳位址 */
     SYS_munmap,             /* (addr)          歸還 mmap 得到的一整塊 */
     SYS_memlimit,           /* (kb)            記憶體配額:0 = 查詢;調低隨時可以,調高需要 CAP_ADMIN。回傳配額(KB) */
+    /* ---- 網路(見 netif.h;位址與埠號是主機順序的整數) ---- */
+    SYS_ping,               /* (ip, timeout_ms)  送出 echo request 並等回答;回傳來回的毫秒數 */
+    SYS_udp_open,           /* (port)          建立綁定在 port 的 UDP socket(0 = 自動挑選);回傳檔案描述符 */
+    SYS_udp_send,           /* (fd, msg)       送出一個封包(struct udpmsg:目的位址、埠、資料);回傳長度 */
+    SYS_udp_recv,           /* (fd, msg, timeout_ms)  等一個封包;填入來源與資料,回傳長度 */
+    SYS_netinfo,            /* (info)          網路的設定與統計(struct netinfo,見 netif.h) */
 };
 
 /* SYS_waitpid 的選項 */
@@ -138,6 +144,16 @@ struct sysinfo {
     struct {
         uint64_t busy, idle;    /* 這顆 CPU 忙碌 / 閒置的 tick 數(累計) */
     } cpu[SYSINFO_MAX_CPUS];
+};
+
+/* SYS_udp_send / SYS_udp_recv 的參數(使用者端的定義在 user/usys.h,必須一致)。
+   送出:ip、port 是目的,data / len 是要送的資料。
+   接收:data / len 是緩衝區與它的大小;返回時 ip、port 是來源,len 是實際的長度 */
+struct udpmsg {
+    uint32_t ip;
+    uint16_t port, pad;
+    uint32_t len, pad2;
+    uint64_t data;              /* 使用者位址(固定用 64 位元,三個架構的格式才相同) */
 };
 
 /* SYS_time 回報的內容 */

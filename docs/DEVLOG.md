@@ -13,6 +13,7 @@
 | 縮寫 | 英文全名 | 中文 |
 |---|---|---|
 | ACPI | Advanced Configuration and Power Interface | 進階組態與電源介面:BIOS 描述硬體的一組表格 |
+| ARP | Address Resolution Protocol | 位址解析協定:由 IP 位址問出對方網路卡的硬體位址 |
 | AP | Application Processor | 應用處理器:開機後才被叫醒的其他 CPU |
 | AHCI | Advanced Host Controller Interface | 進階主機控制器介面:現代 SATA 硬碟的標準介面(本專案未使用) |
 | ASID | Address Space Identifier | 位址空間編號 |
@@ -26,6 +27,11 @@
 | BCD | Binary-Coded Decimal | 二進位編碼的十進位:每 4 個位元表示一位十進位數字 |
 | CMOS | Complementary Metal-Oxide-Semiconductor | 這裡指 PC 主機板上由電池供電的時鐘與設定記憶體 |
 | CSR | Control and Status Register | 控制與狀態暫存器 |
+| DHCP | Dynamic Host Configuration Protocol | 動態主機設定協定:自動取得 IP 位址(本專案未實作) |
+| DNS | Domain Name System | 網域名稱系統:由名稱查出 IP 位址 |
+| ICMP | Internet Control Message Protocol | 網際網路控制訊息協定:ping 使用的協定 |
+| MAC | Media Access Control address | 網路卡的硬體位址(6 個位元組) |
+| NIC | Network Interface Card | 網路卡 |
 | DMA | Direct Memory Access | 直接記憶體存取:裝置自己把資料搬進記憶體,不經過 CPU |
 | fsck | file system check | 檔案系統檢查:找出並修復磁碟上不一致的地方 |
 | LBA | Logical Block Addressing | 邏輯區塊定址:磁區從 0 開始依序編號 |
@@ -35,6 +41,9 @@
 | RSS | Resident Set Size | 常駐記憶體大小:行程目前實際對映的記憶體(含與別人共用的) |
 | RTC | Real-Time Clock | 即時時鐘:由電池供電、關機時也在走的硬體時鐘 |
 | UTC | Coordinated Universal Time | 世界協調時間:不含時區的標準時間 |
+| TCP | Transmission Control Protocol | 傳輸控制協定:可靠、有順序的連線(本專案未實作) |
+| TFTP | Trivial File Transfer Protocol | 簡易檔案傳輸協定:建立在 UDP 上 |
+| UDP | User Datagram Protocol | 使用者資料包協定:不保證送達、沒有連線的封包傳送 |
 | WFS | WElyOS File System | 本專案自訂的磁碟檔案系統 |
 | DTB | Device Tree Blob | 裝置樹二進位檔 |
 | EEVDF | Earliest Eligible Virtual Deadline First | 最早合格虛擬截止時間優先 |
@@ -167,6 +176,10 @@
 | commit accounting | commit accounting | 承諾記帳:記錄已經答應出去的記憶體總量,不答應超過實際有的 |
 | quota | resource quota | 配額:單一行程可以使用的資源上限 |
 | anonymous mapping | anonymous memory mapping (mmap) | 匿名對映:一塊不對應任何檔案、可以個別歸還的記憶體 |
+| frame / packet | Ethernet frame / IP packet | 訊框(乙太網路上的一個單位)/ 封包(IP 層的一個單位) |
+| socket | socket | 行程用來收送網路資料的端點,這裡以檔案描述符表示 |
+| protocol stack | protocol stack | 協定堆疊:一層疊一層的網路協定實作 |
+| sanitizer | AddressSanitizer / UndefinedBehaviorSanitizer | 執行時檢查記憶體越界與未定義行為的編譯器工具 |
 | identity mapping | identity mapping | 恆等對映:虛擬位址等於實體位址 |
 | initramfs | initial RAM file system | 初始記憶體檔案系統:開機時解開到記憶體的一包檔案 |
 | inode | index node | 索引節點:代表一個檔案或目錄本身,與名稱無關 |
@@ -5818,3 +5831,139 @@ still running
 - **`mmap` 不能對映檔案、不能指定位址與權限、不能只歸還一部分**;位址不重複使用。
 - **`malloc` 沒有改用 `mmap` 配置大塊記憶體**,仍然全部來自 heap。
 - **root 的 shell 可以把配額再調高**(它有 `CAP_ADMIN`);要讓限制不可逆,先用 `su` 降為一般使用者。
+
+---
+
+## 第 36 步:網路
+
+### 目標
+
+讓 WElyOS 能和外面通訊:送出與回應 `ping`,以 UDP(User Datagram Protocol)收送資料。範圍到 UDP 為止,不含 TCP。
+
+這一步由兩方分工完成,以 memory server 上的訊息協調:
+
+| 部分 | 負責 | 位置 |
+|---|---|---|
+| 協定堆疊:乙太網路(Ethernet)、ARP(Address Resolution Protocol)、IPv4、ICMP(Internet Control Message Protocol)、UDP | Codex | `kernel/net/` |
+| 堆疊的主機端測試 | Codex | `tests/host/net/`、`scripts/host-test-net.sh` |
+| 介面的定義 | Claude | `include/net.h`、`docs/net-design.md` |
+| 網路卡驅動程式、接進 kernel 的整合層、系統呼叫、使用者程式、在 QEMU 上的驗證 | Claude | 其餘 |
+
+### 先定介面,再各自實作
+
+分工可行的前提,是兩邊之間的界線在動工之前就寫清楚。`include/net.h` 定義了堆疊對外的九個函式,以及雙方都要遵守的規則。這些規則同時也是這個專案從第 34 步起對照的高可靠系統做法:
+
+| 規則 | 理由 |
+|---|---|
+| 堆疊不上鎖、不知道執行緒與行程 | 同一份程式可以在主機上直接編譯測試,不需要模擬器 |
+| 不配置記憶體,表格都是固定大小 | 不會在執行中途因為記憶體不足而失敗;最壞情況的用量在編譯時就知道 |
+| 重試與佇列都有上限 | ARP 最多問四次;每個下一站只留一個等待中的封包;滿了明確拒絕,不悄悄覆蓋 |
+| 收到的內容一律不信任 | 每個長度與位移先檢查;不合理的丟掉並依原因計數 |
+| 時間以會繞回的 32 位元計算 | 明確規定用「模 2^32 的差」,系統跑得再久也不會在繞回的那一刻出錯 |
+
+介面在實作前由 Codex 審閱過一輪,補上了幾項原本沒寫清楚的約定(等待中的封包不可被覆蓋、ARP 的重試時程、丟棄原因的分類統計、驅動程式必須在返回前把訊框複製走)。這些都是「兩邊各自以為理所當然、實際上想法不同」的地方,事先寫下來比整合時才發現便宜得多。
+
+### 網路卡驅動程式
+
+和磁碟一樣先定一個小介面(`include/netdev.h`):硬體位址、送出一個訊框、取出一個收到的訊框。
+
+**RISC-V 與 AArch64:virtio-net。** 和第 27 步的 virtio 磁碟是同一套機制,差別在於有兩條佇列:接收用的那一條,由我們事先放一批空的緩衝區進去,裝置收到訊框就填一個;傳送用的那一條放要送的訊框。暫存器與佇列的共用定義抽成 `kernel/virtio_mmio.h`,兩個驅動程式共用。
+
+**i386:NE2000(ISA 介面)。** i386 的 QEMU 機器沒有 virtio-mmio;常見的網路卡都接在 PCI(Peripheral Component Interconnect)匯流排上,要先做匯流排的裝置探索。NE2000 的 ISA 版本暫存器在固定的 I/O port,用既有的 `in` / `out` 指令就能操作,是不必先做 PCI 的最短路徑。卡上有 16KB 的記憶體,其中一段是接收用的環狀緩衝區;存取要透過「遠端 DMA」(告訴晶片位址與長度,再從資料埠逐字讀寫)。
+
+兩者都是**輪詢**的:不使用中斷,由一條 kernel 執行緒每 1ms 問一次有沒有收到訊框。這樣不需要為網路卡接中斷,延遲的上限固定是一個 tick,行為也容易推論。
+
+**踩坑:NE2000 的長度扣了兩次。** 晶片在每個收到的訊框前面放 4 位元組的標頭,長度欄位包含這 4 個位元組;真實的晶片還會在最後附上 4 位元組的檢查碼,所以我兩者都扣掉了。模擬器並不附檢查碼,結果每個訊框少了最後 4 個位元組。ARP 的回答因為有補齊到 60 位元組而沒事,`ping` 的回答就被截斷了。發現的過程很快:`net` 命令顯示「丟棄 3 個,原因:長度不合」— 堆疊沒有照著錯誤的長度去解析,而是丟掉並歸類。這正是審閱時加上「依原因分類統計」的用途。
+
+### 整合層(`kernel/netif.c`)
+
+堆疊不上鎖,所以由這一層保證同一時間只有一條執行緒在裡面:
+
+```
+接收   網路卡 --recv--> [net 執行緒] --鎖--> net_rx() --回呼--> socket 的佇列 / ping 的等待者
+傳送   系統呼叫 --鎖--> net_udp_send() / net_ping_send() --send--> 網路卡
+計時   net 執行緒每 100ms --鎖--> net_tick()
+```
+
+堆疊在鎖裡面呼叫的回呼只做兩件事:把資料複製到固定大小的佇列、設定旗標。等待的一方在鎖外以 1ms 的間隔檢查旗標。沒有額外的同步機制,每一步最多等多久都看得出來。
+
+**UDP socket 是檔案描述符。** VFS 新增一種 inode 類型 `I_SOCK`(和管線一樣沒有名稱)。好處是不必另外管理生命期:行程關閉描述符、或行程結束時 kernel 代為關閉,socket 就被釋放、埠就空出來;`fork` 與 `dup2` 也自然適用。socket 不能用 `read` / `write`(UDP 的每個封包有各自的來源與目的),要用專屬的 `udp_send` / `udp_recv`。
+
+記憶體全部是靜態的:8 個 socket,每個暫存 4 個收到的封包。程式來不及讀時,多的丟掉並計數。
+
+1024 以下的埠需要 `CAP_ADMIN`(第 34 步的特權)。
+
+### 使用者程式
+
+| | |
+|---|---|
+| `ping [-c 次數] 位址` | 送出 echo request,顯示來回的時間 |
+| `net` | 顯示位址設定與統計(收送的訊框數、各種原因的丟棄數、ARP 的狀態) |
+| `tftp 遠端檔名 [本機檔名]` | 以 TFTP(Trivial File Transfer Protocol)從主機下載檔案 |
+
+位址是固定的:本機 `10.0.2.15`、閘道 `10.0.2.2`,這是 QEMU 使用者模式網路提供的環境。`scripts/qemu.sh` 預設接上網路卡(`QEMU_NET=none` 可不接),並讓模擬器在閘道上開一個 TFTP 伺服器,唯讀分享專案的 `rootfs/` 目錄。`tftp` 因此成了把檔案從主機放進 WElyOS 最方便的方法,自我測試也靠它驗證 UDP:完全在本機進行,不需要對外的網路。
+
+`tftp` 只接受「來自伺服器位址、而且和第一個回答同一個埠」的封包,其他來源的一律不理;每一步等不到就重送,最多 4 次。
+
+### 驗證
+
+**堆疊的主機端測試**(Codex 撰寫;我在修正標頭的兩個註解警告後實際執行了正式的腳本):
+
+```
+$ bash scripts/host-test-net.sh
+net: PASS (1064208 checks)
+i386 / riscv64 / aarch64: freestanding compile PASS
+```
+
+以 AddressSanitizer 與 UndefinedBehaviorSanitizer 執行,內容包括:每個合法封包從每個位置截斷、IPv4 與 UDP 長度欄位的全部 65536 個值、20 萬個固定種子的亂數與結構化損壞的訊框、ARP 的完整流程(詢問、回答、重試、放棄、過期、抗覆寫)、32 位元時間繞回。
+
+**驅動程式單獨的測試**(kernel 內,不經過堆疊):手工組一個 ARP 詢問送出,收到閘道的回答。三個架構都在 1ms 內收到。
+
+**使用者程式的測試**(`UMODE_NET`,在 QEMU 上、有網路卡時執行):
+
+| 項目 | 結果 |
+|---|---|
+| `ping` 閘道 | 有回答(第一次含 ARP,之後 200ms 內) |
+| `ping` 同網路上不存在的位址 | `E_TIMEDOUT` |
+| 同一個埠綁定兩次;埠號 70000 | `E_BUSY`;`E_INVAL` |
+| 對不是 socket 的描述符收送 | `E_BADF` |
+| 對 socket 用 `read`、`write`、`lseek` | `E_INVAL`、`E_INVAL`、`E_SPIPE` |
+| 沒有封包時接收(等 5ms) | `E_TIMEDOUT` |
+| 資料指標是 kernel 的位址;長度 2000 | `E_FAULT`;`E_INVAL` |
+| 關閉後重新綁定同一個埠 | 成功 |
+| 向 TFTP 伺服器要 `etc/motd` | 收到的資料和本機的 `/etc/motd` 逐位元組相同 |
+| 一般使用者綁定 69 埠 | `E_ACCES` |
+| 子行程沒有關閉 socket 就結束 | 那個埠可以立刻再綁定 |
+| 開到第 9 個 socket | `E_NOMEM`;全部關閉後可以再開 |
+
+互動測試(三個架構結果相同):
+
+```
+$ ping -c 3 10.0.2.2
+reply from 10.0.2.2: time 3 ms
+reply from 10.0.2.2: time 4 ms
+reply from 10.0.2.2: time 3 ms
+3 sent, 3 received
+$ tftp etc/test.sh /disk/t.sh
+/disk/t.sh: 1105 bytes            ← 三個資料塊;大小與主機上的檔案相同
+$ tftp no/such/file
+tftp: server says: File not found
+$ net
+address  10.0.2.15
+frames   received 4, sent 6, send errors 0
+dropped  0 (bad length 0, bad checksum 0, not for us 0, no listener 0)
+```
+
+### 已知限制
+
+- **沒有 TCP**,所以不能連網頁、SSH 這類服務。
+- **位址是寫死的**(沒有 DHCP);只有一張網路卡、一個預設閘道。
+- **DNS(名稱查詢)尚未完成**:訊息的組合與解析由 Codex 實作中(`user/dns.h`),查詢工具等它交付後加入。
+- **輪詢式的驅動程式**:接收的延遲最多 1ms;沒有封包時,接收執行緒每 1ms 仍然醒來一次。
+- **IPv4 的分段、選項、廣播與群播的 UDP 都不支援**;不會產生「無法到達」這類 ICMP 錯誤回報。
+- **等待 ARP 期間,同一個下一站只能排一個封包**,第二個會被拒絕(`E_BUSY`)。
+- **不能送給自己**(沒有 loopback):`ping 10.0.2.15` 會回報參數錯誤。
+- **socket 最多 8 個**,每個最多暫存 4 個封包,多的丟掉。
+- **`ping` 任何人都可以用**(傳統 Unix 需要特權);沒有限制送出的頻率。
+- **NE2000 驅動程式只在模擬器上驗證過**:真實硬體的訊框最後會多 4 位元組的檢查碼,目前原樣交給上層。
+- **主機與模擬器上的測試不代表真實網路上的行為**(封包遺失、重複、亂序只有測試裡模擬的那些)。

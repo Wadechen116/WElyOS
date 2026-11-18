@@ -99,6 +99,15 @@ for a in $ARCHS; do
   fi
 done
 
+# 網路的協定堆疊:主機端的測試(不需要 QEMU;-q 時略過)
+if [ "$QUICK" -eq 0 ] && [ -f scripts/host-test-net.sh ]; then
+  if bash scripts/host-test-net.sh > "$OUT/host-net.txt" 2>&1; then
+    echo "網路堆疊主機測試:$(grep -o 'net: PASS.*' "$OUT/host-net.txt" | head -1)"
+  else
+    fail=1; echo "  網路堆疊主機測試失敗,輸出在 $OUT/host-net.txt"
+  fi
+fi
+
 # Windows 版 QEMU 逾時被中止時可能殘留行程
 command -v taskkill.exe >/dev/null && taskkill.exe /F /IM qemu-system-i386.exe /IM qemu-system-riscv64.exe /IM qemu-system-aarch64.exe >/dev/null 2>&1
 [ "$fail" -eq 0 ] && echo "全部符合預期" || echo "有不符合預期的結果"

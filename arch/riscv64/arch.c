@@ -256,3 +256,10 @@ uint64_t arch_rtc_read(void)
 
     return ((hi << 32) | lo) / 1000000000ull;
 }
+
+/* 網路卡:和磁碟一樣是 virtio-mmio 裝置,在同一批位置裡找 */
+#include "netdev.h"
+struct netdev *arch_net_probe(void)
+{
+    return virtio_net_probe(0x10001000UL, 0x1000, 8);
+}
