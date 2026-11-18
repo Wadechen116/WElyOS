@@ -27,7 +27,7 @@ enum {
     SYS_getuid, SYS_getgid, SYS_setuid, SYS_capget, SYS_capdrop, SYS_chmod, SYS_chown,
     SYS_mmap, SYS_munmap, SYS_memlimit,
     SYS_ping, SYS_udp_open, SYS_udp_send, SYS_udp_recv, SYS_netinfo,
-    SYS_bbread, SYS_bblog, SYS_scrub,
+    SYS_bbread, SYS_bblog, SYS_scrub, SYS_rt_set, SYS_rt_wait,
 };
 #define SYS_SIGRETURN_NUM 40 /* SYS_sigreturn 的數值:crt0.c 裡的組合語言要用(下面有檢查) */
 _Static_assert(SYS_sigreturn == SYS_SIGRETURN_NUM, "update SYS_SIGRETURN_NUM");
@@ -336,6 +336,18 @@ static inline long sys_bblog(long type, const char *text) { return syscall3(SYS_
 /* 立刻把整顆磁碟巡檢一遍:直接從磁碟讀每個區塊,核對檢查碼。需要系統管理的特權 */
 struct scrubinfo { unsigned int checksums, blocks, bad, read_errors, sb_restored, pad; };
 static inline long sys_scrub(struct scrubinfo *info) { return syscall3(SYS_scrub, (long)info, 0, 0); }
+/*
+ * 週期性的即時工作(需要 CAP_ADMIN)。
+ * sys_rt_set:每 period_ms 毫秒做一次,每次最多用 budget_ms 毫秒的 CPU;在預算內優先於所有一般的行程。
+ *   -E_BUSY = 全系統的即時工作合計會超過 CPU 的 70%,不接受;period_ms 為 0 = 取消。
+ * sys_rt_wait:這一次做完了,睡到下一個週期。錯過期限、超出預算都會被計數(見 struct rt_stats)。
+ */
+struct rt_stats { unsigned int period_ms, budget_ms, releases, misses, overruns, max_used_ms, throttled, total_util; };
+static inline long sys_rt_set(unsigned period_ms, unsigned budget_ms)
+{
+    return syscall3(SYS_rt_set, (long)period_ms, (long)budget_ms, 0);
+}
+static inline long sys_rt_wait(struct rt_stats *st) { return syscall3(SYS_rt_wait, (long)st, 0, 0); }
 /* 現在的日期時間:1970-01-01 00:00:00 UTC 至今的秒數與微秒(換成年月日見 libc.h 的 gmtime_) */
 static inline long sys_time(struct timeval *tv)   { return syscall3(SYS_time, (long)tv, 0, 0); }
 /* 把還留在記憶體裡的修改寫到磁碟上 */

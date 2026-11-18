@@ -2335,6 +2335,21 @@ long syscall_dispatch(long num, long a0, long a1, long a2, void *tf)
         return sys_munmap(p, (uintptr_t)a0);
     case SYS_memlimit:
         return sys_memlimit(p, a0);
+    case SYS_rt_set:                 /* 即時工作優先於所有人:只給有特權的行程(而且仍受預算與總量的限制) */
+        if (!(p->cred.caps & CAP_ADMIN))
+            return -E_PERM;
+        if (a0 < 0 || a1 < 0 || a0 > 60000 || a1 > 60000)
+            return -E_INVAL;
+        return thread_set_periodic((unsigned)a0, (unsigned)a1);
+    case SYS_rt_wait: {
+        struct rt_stats rs;
+        int rc = thread_wait_period(&rs);
+        if (rc == -E_INVAL)
+            return rc;                           /* 不是週期性工作:rs 沒有內容 */
+        if (a0 && copy_to_user(p, (uintptr_t)a0, &rs, sizeof(rs)) != 0)
+            return -E_FAULT;
+        return rc;
+    }
     case SYS_bbread: {               /* 讀取黑盒子的一筆紀錄(0 = 最新的) */
         struct bb_record r;
         if (a0 < 0)

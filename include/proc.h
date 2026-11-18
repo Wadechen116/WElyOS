@@ -125,6 +125,9 @@ enum {
     SYS_bbread,             /* (index, rec)    讀取一筆事件紀錄(0 = 最新的);0 = 取得,1 = 沒有這麼多筆 */
     SYS_bblog,              /* (type, text)    留下一筆紀錄(BB_NOTE 或 BB_RESTART);需要 CAP_ADMIN */
     SYS_scrub,              /* (info)          立刻把整顆磁碟巡檢一遍(需要 CAP_ADMIN);結果寫入 struct scrubinfo */
+    /* ---- 週期性的即時工作(見 sched.h) ---- */
+    SYS_rt_set,             /* (period_ms, budget_ms)  把自己宣告為週期性工作(需要 CAP_ADMIN);period 為 0 = 取消 */
+    SYS_rt_wait,            /* (stats)         這一次做完了,睡到下一個週期;stats 不是 0 時填入 struct rt_stats */
 };
 
 /* SYS_waitpid 的選項 */

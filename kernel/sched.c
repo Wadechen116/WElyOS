@@ -33,6 +33,7 @@
 #include <stddef.h>
 #include "arch.h"
 #include "cpu.h"
+#include "kerrno.h"
 #include "kmalloc.h"
 #include "kprintf.h"
 #include "kstring.h"
@@ -89,6 +90,14 @@ struct thread {
     volatile int killed;       /* 被要求終止:返回使用者模式前自行結束 */
     volatile int interrupted;  /* 有訊號等著它的行程處理:正在等的事情先放下,回使用者模式去執行處理函式 */
     struct wait_queue joiners; /* 正在 thread_join 等我結束的執行緒 */
+    /* ---- 週期性的即時工作(rt_period 為 0 = 不是);單位都是 tick ---- */
+    unsigned rt_period, rt_budget;
+    unsigned rt_used;          /* 這個週期已經用掉的 CPU 時間 */
+    uint64_t rt_release;       /* 下一個週期開始的時間 = 目前這一次的期限 */
+    int rt_waiting;            /* 這一次已經做完,正在睡到下一個週期 */
+    int rt_throttled;          /* 這個週期超出預算:降回一般優先權,到下個週期為止 */
+    unsigned rt_util;          /* 佔 CPU 的千分比(預算 / 週期) */
+    unsigned rt_releases, rt_misses, rt_overruns, rt_max_used;
 };
 
 /* 開機時 boot.S 設定的 stack,main 執行緒繼續使用它;stack_guard 是它下方的保護頁 */
@@ -120,8 +129,21 @@ static unsigned starve_ticks = 100;          /* STARVE_MS 換算成 tick 數 */
 static unsigned starve_scan_ticks = 10;      /* STARVE_SCAN_MS 換算成 tick 數 */
 static unsigned long nstarve_boosts;         /* 累計的防飢餓提升次數 */
 
+/*
+ * 即時工作的登記表。數量刻意很少而且固定:每個 tick 都要把它走一遍(檢查期限),
+ * 固定的上限讓這件事的時間有界 — 即時系統裡,檢查本身不可以變成不可預測的來源。
+ */
+#define RT_MAX       8u
+#define RT_UTIL_MAX  700u                    /* 即時工作合計最多佔 CPU 的千分比(見 thread_set_periodic) */
+static struct thread *rt_tasks[RT_MAX];
+static unsigned rt_util_total;
+
 static void schedule(void);
 static void thread_free(struct thread *t);
+static void update_prio(struct thread *t);
+static void rt_begin_period(struct thread *t);
+static void rt_check_deadlines(uint64_t now);
+static void rt_remove(struct thread *t);
 
 /* ---- 排程器的鎖 ---- */
 
@@ -833,6 +855,8 @@ static void update_prio(struct thread *t)
     int prio = t->inherit_prio > t->base_prio ? t->inherit_prio : t->base_prio;
     if (t->starve_boost)
         prio = PRIO_MAX;
+    if (t->rt_period && !t->rt_throttled)
+        prio = PRIO_RT;                      /* 預算之內的即時工作:高於所有一般的執行緒 */
     if (t->prio == prio)
         return;
 
@@ -925,6 +949,23 @@ void thread_yield(void)
     sched_unlock(flags);
 }
 
+/* 睡到第 tick 個 tick。呼叫時持有 sched_lk;醒來(時間到,或被提早叫醒)後返回 */
+static void sleep_until_locked(struct thread *self, uint64_t tick)
+{
+    self->wake_tick = tick;
+    self->state = T_SLEEPING;
+
+    /* 依喚醒時間插入到正確位置:每個 tick 只需檢查串列的第一個。
+       用 <= 讓同一時間到期的維持先來後到的順序 */
+    struct thread **pp = &sleepers;
+    while (*pp && (*pp)->wake_tick <= self->wake_tick)
+        pp = &(*pp)->next;
+    self->next = *pp;
+    *pp = self;
+
+    schedule();                              /* 醒來後才會從這裡返回 */
+}
+
 void thread_sleep(unsigned ms)
 {
     /* 毫秒換算成 tick,無條件進位;再加 1 是因為目前這個 tick 已經過了一部分。
@@ -941,19 +982,171 @@ void thread_sleep(unsigned ms)
         sched_unlock(flags);
         return;
     }
-    self->wake_tick = timer_ticks() + n;
-    self->state = T_SLEEPING;
-
-    /* 依喚醒時間插入到正確位置:每個 tick 只需檢查串列的第一個。
-       用 <= 讓同一時間到期的維持先來後到的順序 */
-    struct thread **pp = &sleepers;
-    while (*pp && (*pp)->wake_tick <= self->wake_tick)
-        pp = &(*pp)->next;
-    self->next = *pp;
-    *pp = self;
-
-    schedule();                              /* 醒來後才會從這裡返回 */
+    sleep_until_locked(self, timer_ticks() + n);
     sched_unlock(flags);
+}
+
+/*
+ * ---- 期限排程:週期性的即時工作 ----
+ *
+ * 一般的執行緒只有「優先權」:誰重要誰先跑,但沒有人承諾「多久之內一定輪得到」。
+ * 控制類的工作(每 20 毫秒讀一次感測器、算一次控制量)需要的是另一種保證:
+ * 每個週期都準時開始、在期限之前做完;做不到的時候要被發現,而不是悄悄地晚了。
+ *
+ * 這裡的做法是飛行軟體常見的三件事:
+ *   1. 接受前先算(admission control):每個工作宣告「週期」與「每次最多用多少 CPU」。
+ *      全部加起來超過 CPU 的 70% 就拒絕 — 系統只承諾做得到的事。
+ *      (70% 是保守的界線:固定優先權下,總使用率不超過約 69% 時,不論有幾個工作、
+ *       週期怎麼搭配,都保證排得進去。這裡以一顆 CPU 計算,多顆 CPU 時只會更寬裕。)
+ *   2. 預算強制(budget enforcement):某個工作用超過它宣告的時間,就在這個週期剩下的時間
+ *      降回一般優先權。一個出錯的工作不能拖垮其他準時的工作。
+ *   3. 期限監控(deadline monitoring):每個 tick 檢查有沒有工作在新週期開始時還沒做完,
+ *      有就記一次錯過。就算那個工作整個卡住、再也不回報,也數得到。
+ *
+ * 週期以「絕對時間」推進(下一次 = 上一次的預定時間 + 週期,不是「現在」+ 週期),
+ * 所以每次晚一點點醒來的誤差不會累積。
+ */
+
+/* 新的週期開始:期限往後推一個週期、預算重新算。呼叫時持有 sched_lk */
+static void rt_begin_period(struct thread *t)
+{
+    t->rt_waiting = 0;
+    t->rt_release += t->rt_period;
+    t->rt_used = 0;
+    t->rt_releases++;
+    if (t->rt_throttled) {
+        t->rt_throttled = 0;
+        update_prio(t);
+    }
+}
+
+/* 每個 tick 由第 0 顆 CPU 呼叫:新的週期到了,工作卻還沒做完的,記一次錯過期限 */
+static void rt_check_deadlines(uint64_t now)
+{
+    for (unsigned i = 0; i < RT_MAX; i++) {
+        struct thread *t = rt_tasks[i];
+        if (!t || t->rt_waiting || now < t->rt_release)
+            continue;
+        t->rt_misses++;
+        if (t->rt_used > t->rt_max_used)
+            t->rt_max_used = t->rt_used;
+        /* 下一個週期照常開始(包括新的預算):沒做完的那一次繼續做,佔用的是新週期的時間 */
+        t->rt_release += t->rt_period;
+        t->rt_used = 0;
+        if (t->rt_throttled) {
+            t->rt_throttled = 0;
+            update_prio(t);
+        }
+    }
+}
+
+/* 取消 t 的即時工作身分(本來就不是的話不做任何事)。呼叫時持有 sched_lk */
+static void rt_remove(struct thread *t)
+{
+    if (!t->rt_period)
+        return;
+    for (unsigned i = 0; i < RT_MAX; i++)
+        if (rt_tasks[i] == t)
+            rt_tasks[i] = NULL;
+    rt_util_total -= t->rt_util;
+    t->rt_period = 0;
+    t->rt_throttled = t->rt_waiting = 0;
+}
+
+int thread_set_periodic(unsigned period_ms, unsigned budget_ms)
+{
+    unsigned hz = timer_hz();
+    int rc = 0;
+
+    /* 上限讓下面的乘法不會溢位,也擋掉沒有意義的宣告 */
+    if (period_ms > 60000 || budget_ms > period_ms || (period_ms && !budget_ms))
+        return -E_INVAL;
+    unsigned period = (period_ms * hz + 999) / 1000, budget = (budget_ms * hz + 999) / 1000;
+
+    unsigned long flags = sched_lock();
+    struct thread *self = cur();
+    if (period_ms == 0) {
+        rt_remove(self);
+        update_prio(self);
+        sched_preempt_point();               /* 降回一般優先權:有人更優先就讓出 */
+        sched_unlock(flags);
+        return 0;
+    }
+    unsigned util = (budget * 1000 + period - 1) / period;       /* 無條件進位:寧可高估 */
+    unsigned others = rt_util_total - (self->rt_period ? self->rt_util : 0);
+    int slot = -1;
+    for (unsigned i = 0; i < RT_MAX; i++) {
+        if (rt_tasks[i] == self) {
+            slot = (int)i;
+            break;
+        }
+        if (!rt_tasks[i] && slot < 0)
+            slot = (int)i;
+    }
+    if (period < 2 || budget >= period)
+        rc = -E_INVAL;                       /* 至少要留一個 tick 給別人,也給「睡到下個週期」 */
+    else if (slot < 0)
+        rc = -E_NOSPC;
+    else if (others + util > RT_UTIL_MAX)
+        rc = -E_BUSY;
+    if (rc == 0) {
+        rt_tasks[slot] = self;
+        rt_util_total = others + util;
+        self->rt_util = util;
+        self->rt_period = period;
+        self->rt_budget = budget;
+        self->rt_used = 0;
+        self->rt_throttled = self->rt_waiting = 0;
+        self->rt_releases = self->rt_misses = self->rt_overruns = self->rt_max_used = 0;
+        self->rt_release = timer_ticks() + period;       /* 第一個週期從現在開始 */
+        update_prio(self);
+    }
+    sched_unlock(flags);
+    return rc;
+}
+
+int thread_wait_period(struct rt_stats *st)
+{
+    unsigned hz = timer_hz();
+    int rc = 0;
+
+    unsigned long flags = sched_lock();
+    struct thread *self = cur();
+    if (!self->rt_period) {
+        sched_unlock(flags);
+        return -E_INVAL;
+    }
+    if (self->rt_used > self->rt_max_used)
+        self->rt_max_used = self->rt_used;
+    if (self->killed || self->interrupted) {
+        rc = -E_INTR;
+    } else {
+        /* 期限正好在這個 tick、而每個 tick 的檢查還沒輪到:在這裡算,結果才不會取決於誰先跑 */
+        uint64_t now = timer_ticks();
+        while (self->rt_release <= now) {
+            self->rt_misses++;
+            self->rt_release += self->rt_period;
+            self->rt_used = 0;
+        }
+        self->rt_waiting = 1;
+        sleep_until_locked(self, self->rt_release);
+        if (self->rt_waiting) {              /* 不是時間到,而是被提早叫醒(終止、訊號) */
+            self->rt_waiting = 0;
+            rc = -E_INTR;
+        }
+    }
+    if (st) {
+        st->period_ms = self->rt_period * 1000 / hz;
+        st->budget_ms = self->rt_budget * 1000 / hz;
+        st->releases = self->rt_releases;
+        st->misses = self->rt_misses;
+        st->overruns = self->rt_overruns;
+        st->max_used_ms = self->rt_max_used * 1000 / hz;
+        st->throttled = (uint32_t)self->rt_throttled;
+        st->total_util = rt_util_total;
+    }
+    sched_unlock(flags);
+    return rc;
 }
 
 void thread_exit(void)
@@ -972,6 +1165,7 @@ void thread_exit(void)
         }
     }
     wq_wake_all(&self->joiners);             /* 叫醒所有在等我結束的執行緒 */
+    rt_remove(self);                         /* 即時工作:把佔用的 CPU 配額還回去 */
 
     self->state = T_ZOMBIE;
     c->zombie = self;                        /* 由這顆 CPU 上的下一條執行緒回收 */
@@ -1001,6 +1195,8 @@ void sched_tick(void)
         while (sleepers && now >= sleepers->wake_tick) {
             struct thread *t = sleepers;
             sleepers = t->next;
+            if (t->rt_waiting)
+                rt_begin_period(t);          /* 即時工作的新週期從這一刻開始 */
             /* 相同優先權:排到隊尾等待輪到,不插隊(見 DEVLOG 第 10 步的公平性問題)。
                比某顆 CPU 正在跑的更優先:make_ready 會要求它立刻重新排程 */
             make_ready(t);
@@ -1010,6 +1206,7 @@ void sched_tick(void)
            轉成 32 位元再取餘數:i386 上 64 位元的除法 / 餘數需要 libgcc */
         if ((unsigned)now % starve_scan_ticks == 0)
             starve_scan(now);
+        rt_check_deadlines(now);
     }
 
     /* 時間片用完:有「優先權不低於自己」的人在等才換人。
@@ -1020,6 +1217,15 @@ void sched_tick(void)
         c->ticks_idle++;
     else
         c->ticks_busy++;
+    /* 即時工作的預算:用超過了,這個週期剩下的時間降回一般優先權。
+       它還是可以繼續做(和一般的執行緒一起排隊),只是不再能擋住別人 */
+    if (t->rt_period && !t->rt_throttled && ++t->rt_used > t->rt_budget) {
+        t->rt_throttled = 1;
+        t->rt_overruns++;
+        update_prio(t);
+        if (rq_highest() >= t->prio)
+            c->need_resched = 1;
+    }
     /* 閒置中的 CPU:佇列裡(包括別顆 CPU 的)有工作就去拿。平常有工作時會被直接通知,
        這裡是保險,確保不會有「有人在排隊、卻有 CPU 閒著」的情況持續超過一個 tick */
     if (t == c->idle && rq_highest() >= 0)

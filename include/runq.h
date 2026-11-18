@@ -22,7 +22,7 @@
  *   - 相同優先權大致先進先出(ring 在多顆 CPU 之間不保證嚴格的順序)
  *   - 一個節點在同一時間最多只會被 runq_pop 交給一個呼叫者
  */
-#define RUNQ_LEVELS 8
+#define RUNQ_LEVELS 9
 
 struct rq_node {
     struct rq_node *next, *prev;     /* 串列用的連結(list;ring 的溢出串列) */

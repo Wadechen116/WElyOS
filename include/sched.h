@@ -28,7 +28,8 @@ struct thread;
 #define PRIO_NORMAL  4      /* thread_create 的預設值 */
 #define PRIO_HIGH    6
 #define PRIO_MAX     7
-#define PRIO_LEVELS  8
+#define PRIO_RT      8      /* 只給週期性的即時工作使用(見 thread_set_periodic);不能直接指定 */
+#define PRIO_LEVELS  9
 
 /* 初始化排程器:把目前正在跑的開機流程登記為第一條執行緒(main)。
    需先完成 pmm_init() 與 timer_init()(時間片要依 tick 頻率換算);
@@ -54,6 +55,34 @@ unsigned long thread_cpu_ticks(void);
 /* 等待編號為 tid 的執行緒結束。若它已經結束(或不存在)則立即返回。
    等待期間本執行緒不佔 CPU,由對方結束時直接喚醒 */
 void thread_join(int tid);
+
+/*
+ * ---- 週期性的即時工作(見 sched.c「期限排程」) ----
+ *
+ * thread_set_periodic:宣告目前的執行緒是一個週期性工作 — 每 period_ms 毫秒要做一次事,
+ * 每次最多使用 budget_ms 毫秒的 CPU 時間,而且必須在下一個週期開始之前做完(期限 = 週期)。
+ * 被接受之後,它在自己的預算之內優先於所有一般的執行緒。
+ *   回傳 0 = 接受;-E_INVAL = 參數不合理;-E_BUSY = 接受的話,即時工作合計會佔用太多 CPU
+ *   (系統不承諾做不到的事);-E_NOSPC = 即時工作的數量已滿。period_ms 為 0 = 取消。
+ *
+ * thread_wait_period:這一次的工作做完了,睡到下一個週期開始。
+ *   回傳 0;被終止或有訊號時回傳 -E_INTR。st 不是 NULL 時填入累計的統計。
+ *
+ * 沒做到的事情不會被隱藏,而是被計數:
+ *   misses   錯過期限 — 新的週期開始時,上一次的工作還沒做完
+ *   overruns 超出預算 — 那一次剩下的時間被降回一般的優先權,不讓它拖累別人
+ */
+struct rt_stats {
+    uint32_t period_ms, budget_ms;
+    uint32_t releases;       /* 準時開始了幾個週期 */
+    uint32_t misses;         /* 錯過了幾次期限 */
+    uint32_t overruns;       /* 超出預算幾次 */
+    uint32_t max_used_ms;    /* 單一週期用掉最多的 CPU 時間 */
+    uint32_t throttled;      /* 1 = 目前因超出預算而被降級中 */
+    uint32_t total_util;     /* 全系統已接受的即時工作合計佔 CPU 的千分比 */
+};
+int thread_set_periodic(unsigned period_ms, unsigned budget_ms);
+int thread_wait_period(struct rt_stats *st);
 
 void thread_yield(void);                 /* 主動讓出 CPU,排到隊伍最後 */
 void thread_sleep(unsigned ms);          /* 休眠至少 ms 毫秒(精度為一個 tick) */

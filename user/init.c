@@ -43,6 +43,7 @@ enum {
     UMODE_PERM,          /* 使用者與權限:檔案的擁有者與權限位元、特權只能減少、誰可以對誰送訊號 */
     UMODE_MEMQUOTA,      /* 記憶體配額(要求當場成功或失敗,不會事後被終止)與匿名對映 */
     UMODE_NET,           /* 網路:ping、UDP socket(以模擬器內建的 TFTP 伺服器驗證收送) */
+    UMODE_RT,            /* 週期性的即時工作:準時、負載檢查、需要特權 */
 };
 
 /* 各架構 kernel 映像所在的位址(使用者模式不應該讀得到) */
@@ -519,6 +520,45 @@ static int mode_signal(void)
 
     puts_("  [user] process relationships and signals work as expected\n");
     return 17;
+}
+
+/* ---- UMODE_RT ---- */
+
+static int mode_rt(void)
+{
+    struct rt_stats st;
+    long pid;
+    int status = -1;
+
+    if (sys_rt_wait(&st) != -E_INVAL)                    /* 還不是週期性工作 */
+        return 1;
+    if (sys_rt_set(10, 10) != -E_INVAL || sys_rt_set(0, 5) != -E_INVAL)
+        return 2;
+    if (sys_rt_set(10, 8) != -E_BUSY)                    /* 80%:超過系統願意承諾的量 */
+        return 3;
+    if (sys_rt_set(10, 2) != 0)
+        return 4;
+    /* 另一個行程再要 60%:加上我們的 20% 超過上限,被拒絕;沒有特權的行程則根本不能要求 */
+    pid = sys_fork();
+    if (pid == 0) {
+        if (sys_rt_set(10, 6) != -E_BUSY || sys_rt_set(10, 4) != 0)
+            sys_exit(1);
+        sys_capdrop(CAP_ADMIN);
+        sys_exit(sys_rt_set(20, 1) == -E_PERM ? 0 : 2);
+    }
+    for (int i = 0; i < 6; i++)                          /* 六個週期,幾乎不做事 */
+        if (sys_rt_wait(&st) != 0)
+            return 5;
+    if (st.period_ms != 10 || st.budget_ms != 2 || st.releases != 6 || st.misses != 0 ||
+        st.overruns != 0)
+        return 6;
+    if (sys_waitpid(pid, &status, 0) != pid || status != 0)
+        return 7;
+    if (sys_rt_wait(&st) != 0 || st.total_util != 200)   /* 子行程結束:它佔的 40% 已經還回來 */
+        return 8;
+    if (sys_rt_set(0, 0) != 0 || sys_rt_wait(&st) != -E_INVAL)
+        return 9;
+    return 29;
 }
 
 /* ---- UMODE_NET ---- */
@@ -2244,8 +2284,8 @@ static int umain(long mode)
         /* 成功的話不會返回:這個行程接下來執行的是 /bin/echo,
            結束碼也由它決定(echo 回傳它收到的參數個數) */
         char *argv[] = { "echo", "  [user] this line is printed by /bin/echo after exec,", "same pid", 0 };
-        sys_exec("/bin/echo", argv);
-        return 1;                                        /* 走到這裡表示 exec 失敗 */
+        long er = sys_exec("/bin/echo", argv);
+        return er < 0 ? 1 : 2;                           /* 走到這裡表示 exec 失敗(不論它回傳什麼) */
     }
 
     case UMODE_EXEC_THREADS: {
@@ -2290,6 +2330,9 @@ static int umain(long mode)
     case UMODE_NET:
         return mode_net();
 
+    case UMODE_RT:
+        return mode_rt();
+
     case UMODE_PERM: {
         /* 同一組測試在記憶體檔案系統與磁碟上各做一次 */
         struct fsinfo fi;
@@ -2317,7 +2360,8 @@ static int umain(long mode)
                 rc = 1090;
             /* 跨檔案系統不能改名 */
             long fd = sys_open("/fo-x", O_CREAT | O_WRONLY);
-            sys_close(fd);
+            if (fd < 0 || sys_close(fd) != 0)
+                rc = rc ? rc : 1092;
             if (rc == 0 && (sys_rename("/fo-x", "/disk/fo-x") != -E_XDEV ||
                             sys_link("/fo-x", "/disk/fo-x") != -E_XDEV))
                 rc = 1091;

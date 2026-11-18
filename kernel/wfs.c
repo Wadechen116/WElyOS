@@ -1647,11 +1647,12 @@ uint32_t wfs_block_count(void)
     return mounted ? sb.nblocks : 0;
 }
 
-/* 測試用:檔案 in 的第 fb 個區塊在磁碟上的編號(0 = 沒有配置) */
+/* 測試用:檔案 in 的第 fb 個區塊在磁碟上的編號(0 = 沒有配置);
+   fb 為 0xFFFFFFFF 時回傳它的間接區塊 */
 uint32_t wfs_test_file_block(struct inode *in, uint32_t fb)
 {
     mutex_lock(&wfs_lk);
-    uint32_t no = bmap(wn(in), fb, 0);
+    uint32_t no = fb == 0xFFFFFFFFu ? wn(in)->d.indirect : bmap(wn(in), fb, 0);
     mutex_unlock(&wfs_lk);
     return no;
 }

@@ -289,9 +289,11 @@ static void sched_demo(void)
     sched_trim();                            /* 快取中閒置的 stack 也要還回去才能核對 */
     kheap_stats(&h1);
     KASSERT(sched_thread_count() == threads0);
-    /* 保護頁會把所在的大分頁拆開,多出來的頁表不會歸還,所以一併計入 */
-    KASSERT(pmm_free_count() + vm_table_pages() == free0);
-    KASSERT(h1.free_bytes + (sched_pool_bytes() - pool0) == h0.free_bytes);
+    /* 保護頁會把所在的大分頁拆開,多出來的頁表不會歸還,所以一併計入。
+       heap 也一樣:執行緒結構的池子成長時,heap 可能向 pmm 多要了分頁,那些不會歸還 */
+    size_t heap_grown = h1.heap_bytes - h0.heap_bytes;
+    KASSERT(pmm_free_count() + vm_table_pages() + heap_grown / PAGE_SIZE == free0);
+    KASSERT(h1.free_bytes + (sched_pool_bytes() - pool0) == h0.free_bytes + heap_grown);
     kprintf("sched: all threads exited, memory reclaimed\n");
 }
 
@@ -1235,6 +1237,54 @@ static void disk_stage_test(const char *cmd)
         KASSERT(vfs_unlink("/disk/sbtest") == 0);
         kprintf("disktest 9: the backup superblock was used and the primary repaired; "
                 "/disk/sbtest is intact\n");
+    } else if (cmdline_has(cmd, "disktest=10")) {
+        /* 間接區塊讀不到時刪除檔案:不可以把它底下的資料區塊弄丟。
+           預期:什麼都不釋放、檔案系統轉為唯讀;下一次開機的檢查把整個檔案的空間收回來(第 11 階段) */
+        struct wfs_stats before, after;
+        struct file *f;
+        uint32_t base;
+
+        KASSERT(s.mounted && s.checksums && !s.failed);
+        vfs_unlink("/disk/indbase");
+        vfs_unlink("/disk/indfile");
+        KASSERT(vfs_open("/disk/indbase", O_CREAT | O_WRONLY | O_TRUNC, &f) == 0);
+        KASSERT(vfs_write(f, &base, sizeof(base)) == sizeof(base));      /* 先佔好位置 */
+        vfs_close(f);
+        KASSERT(vfs_sync() == 0);
+        wfs_stats(&before);
+        base = before.free_blocks;                       /* 基準:indfile 還不存在時的可用區塊數 */
+        KASSERT(vfs_open("/disk/indbase", O_WRONLY, &f) == 0);
+        KASSERT(vfs_write(f, &base, sizeof(base)) == sizeof(base));
+        vfs_close(f);
+        disk_write_file("/disk/indfile", 12 * PAGE_SIZE, 11);            /* 12 個區塊:用到間接區塊 */
+        KASSERT(wfs_test_drop_cache() == 0);
+        wfs_stats(&before);
+        KASSERT(before.free_blocks == base - 13);        /* 12 個資料 + 1 個間接 */
+        KASSERT(vfs_open("/disk/indfile", O_RDONLY, &f) == 0);
+        uint32_t ind = wfs_test_file_block(vfs_file_inode(f), 0xFFFFFFFFu);
+        vfs_close(f);
+        KASSERT(ind != 0 && wfs_test_drop_cache() == 0);
+        KASSERT(blk_fault_flip((uint64_t)ind * 8, 100, 5) == 0);
+        KASSERT(vfs_unlink("/disk/indfile") == 0);       /* 名稱拿掉了(刪除本身成功),但內容釋放不了 */
+        wfs_stats(&after);
+        KASSERT(after.failed && after.csum_errors >= 1);
+        KASSERT(after.free_blocks == before.free_blocks);                /* 一個區塊都沒有被釋放 */
+        KASSERT(vfs_mkdir("/disk/no") == -E_IO);         /* 已經轉為唯讀 */
+        kprintf("disktest 10: the indirect block of a 12-block file was unreadable when the file was "
+                "deleted; nothing was freed and the file system went read-only\n");
+    } else if (cmdline_has(cmd, "disktest=11")) {
+        struct file *f;
+        uint32_t base = 0;
+
+        KASSERT(s.mounted && !s.failed && s.repairs >= 1);               /* 開機時的檢查處理過了 */
+        KASSERT(vfs_stat("/disk/indfile", &st) == -E_NOENT);
+        KASSERT(vfs_open("/disk/indbase", O_RDONLY, &f) == 0);
+        KASSERT(vfs_read(f, &base, sizeof(base)) == sizeof(base));
+        vfs_close(f);
+        KASSERT(s.free_blocks == base);                  /* 13 個區塊全部收回來了,沒有遺失 */
+        KASSERT(wfs_check_now() == 0);
+        KASSERT(vfs_unlink("/disk/indbase") == 0);
+        kprintf("disktest 11: the mount-time check reclaimed all 13 blocks of the deleted file\n");
     }
 }
 
@@ -1493,7 +1543,7 @@ enum {
     UMODE_FORK, UMODE_STACK_GROW, UMODE_PIPE, UMODE_SIGNAL, UMODE_JOBS,
     UMODE_STOP, UMODE_DISK, UMODE_SYSINFO, UMODE_FILEOPS, UMODE_HEAP,
     UMODE_SIGHANDLER, UMODE_TIME, UMODE_PERM,
-    UMODE_MEMQUOTA, UMODE_NET,
+    UMODE_MEMQUOTA, UMODE_NET, UMODE_RT,
 };
 
 /* 以測試編號 mode 啟動 /bin/init:編號轉成字串,當作 argv[1] 傳給它 */
@@ -1593,6 +1643,8 @@ static void user_demo(void)
     run_user("users and permissions", UMODE_PERM, 26);
     /* 記憶體配額(超過的要求當場失敗)與匿名對映 */
     run_user("memory quota and mmap", UMODE_MEMQUOTA, 27);
+    /* 週期性的即時工作:參數檢查、負載上限、需要特權、準時 */
+    run_user("periodic real-time tasks", UMODE_RT, 29);
     /* 網路(有網路卡的話):ping、UDP socket、以 TFTP 實際收送一個檔案 */
     if (boot_nic)
         run_user("network: ping and UDP", UMODE_NET, 28);
@@ -1903,6 +1955,94 @@ static void smp_worker(void *arg)
     }
 }
 
+/*
+ * ---- 期限排程的測試 ----
+ * 讓每顆 CPU 都被一條一般優先權的執行緒吃滿,然後看一個每 20 毫秒一次的即時工作:
+ *   1. 十個週期都準時開始(晚到的 tick 數很小),沒有錯過期限
+ *   2. 故意用超過預算:被記一次超出預算,但還來得及在期限前做完
+ *   3. 故意做到跨過兩個期限:被記兩次錯過
+ *   4. 會讓即時工作合計超過上限的要求被拒絕
+ */
+static volatile int rt_hog_stop;
+static volatile unsigned rt_max_late;
+
+static void rt_hog(void *arg)
+{
+    (void)arg;
+    while (!rt_hog_stop)
+        ;
+}
+
+static void rt_spin_until(uint64_t tick)
+{
+    while (timer_ticks() < tick)
+        ;
+}
+
+static void rt_task(void *arg)
+{
+    struct rt_stats st;
+    unsigned late = 0;
+
+    (void)arg;
+    KASSERT(thread_wait_period(&st) == -E_INVAL);        /* 還不是週期性工作 */
+    /* 自己原本的優先權設成「高」:超出預算被降級之後仍然排在那些吃 CPU 的執行緒前面,
+       測試的時間才是確定的(降級之後要和別人輪流的話,什麼時候做完就看運氣了) */
+    thread_set_priority(PRIO_HIGH);
+    /* 基準時間要在宣告「之前」讀:宣告之後才讀的話,中間剛好過了一個 tick 就會以為被提早叫醒。
+       (因此量到的「晚到」可能比實際多 1 個 tick) */
+    uint64_t expect = timer_ticks() + 20;
+    KASSERT(thread_set_periodic(20, 5) == 0);
+    KASSERT(thread_effective_prio(thread_current()) == PRIO_RT);
+    for (int i = 0; i < 10; i++, expect += 20) {
+        KASSERT(thread_wait_period(&st) == 0);
+        uint64_t now = timer_ticks();
+        KASSERT(now >= expect);                          /* 不會提早 */
+        if (now - expect > late)
+            late = (unsigned)(now - expect);
+        rt_spin_until(now + 1);                          /* 做一點點事 */
+    }
+    KASSERT(st.releases == 10 && st.misses == 0 && st.overruns == 0 && st.period_ms == 20);
+    rt_max_late = late;
+
+    /* 超出預算:這個週期用 12 毫秒(預算 5)。仍然在 20 毫秒的期限內做完 */
+    rt_spin_until(timer_ticks() + 12);
+    KASSERT(thread_effective_prio(thread_current()) == PRIO_HIGH);       /* 已經被降回原本的優先權 */
+    KASSERT(thread_wait_period(&st) == 0);
+    KASSERT(st.overruns == 1 && st.misses == 0 && st.max_used_ms >= 5 && st.throttled == 0);
+    KASSERT(thread_effective_prio(thread_current()) == PRIO_RT);         /* 新的週期:恢復 */
+
+    /* 錯過期限:一口氣做 45 毫秒,跨過兩個期限 */
+    rt_spin_until(timer_ticks() + 45);
+    KASSERT(thread_wait_period(&st) == 0);
+    KASSERT(st.misses == 2 && st.overruns >= 3);
+
+    /* 負載檢查:改成 80% 會被拒絕,而且原本的設定不受影響 */
+    KASSERT(thread_set_periodic(10, 8) == -E_BUSY && thread_set_periodic(10, 10) == -E_INVAL);
+    KASSERT(thread_wait_period(&st) == 0 && st.period_ms == 20 && st.total_util == 250);
+    KASSERT(thread_set_periodic(0, 0) == 0 && thread_wait_period(NULL) == -E_INVAL);
+    rt_hog_stop = 1;
+}
+
+static void rt_demo(void)
+{
+    int hogs[MAX_CPUS], n = 0;
+
+    rt_hog_stop = 0;
+    for (int i = 0; i < cpu_count && i < MAX_CPUS; i++)
+        if ((hogs[n] = thread_create("rt-hog", rt_hog, NULL)) > 0)
+            n++;
+    int t = thread_create("rt-task", rt_task, NULL);
+    KASSERT(t > 0 && n >= 1);
+    thread_join(t);
+    for (int i = 0; i < n; i++)
+        thread_join(hogs[i]);
+    kprintf("rt: a 20 ms periodic task ran 10 periods on time with every CPU busy (worst lateness %u "
+            "tick%s); a budget overrun and 2 missed deadlines were detected; 80%% load was refused\n",
+            rt_max_late, rt_max_late == 1 ? "" : "s");
+    KASSERT(rt_max_late <= 3);
+}
+
 static void smp_sched_demo(void)
 {
     int tid[SMP_WORKERS];
@@ -2178,6 +2318,7 @@ void kmain(const struct boot_info *bi)
     }
     if (selftest) {
         smp_sched_demo();
+        rt_demo();
         fs_demo();
         disk_demo();
         nic_selftest();                      /* 驅動程式單獨的測試:要在協定堆疊開始收訊框之前 */
