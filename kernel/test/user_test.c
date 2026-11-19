@@ -134,6 +134,8 @@ void user_demo(void)
     run_user("periodic real-time tasks", UMODE_RT, 29);
     /* 三重執行加投票:對其中一份注入位元翻轉、讓一份卡住、讓兩份都出錯 */
     run_user("triple execution with voting", UMODE_TMR, 30);
+    /* 多條執行緒同時改變對映,同時讓 kernel 讀寫那些記憶體:沒有當機、沒有內容被破壞 */
+    run_user("concurrent mapping changes and kernel copies", UMODE_MEMRACE, 31);
     /* 網路(有網路卡的話):ping、UDP socket、以 TFTP 實際收送一個檔案 */
     if (boot_nic)
         run_user("network: ping and UDP", UMODE_NET, 28);

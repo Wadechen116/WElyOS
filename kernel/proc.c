@@ -1049,6 +1049,13 @@ long sys_sysinfo(struct proc *p, uintptr_t uinfo)
     si.mem_total_kb = (uint64_t)pmm_total_pages() * (PAGE_SIZE / 1024);
     si.mem_free_kb = (uint64_t)pmm_free_count() * (PAGE_SIZE / 1024);
     si.ctx_switches = sched_switch_count();
+    struct timer_stats ts;
+    timer_get_stats(&ts);
+    _Static_assert(TIMER_BURST_BUCKETS == 6, "sysinfo.timer_burst");
+    for (unsigned b = 0; b < TIMER_BURST_BUCKETS; b++)
+        si.timer_burst[b] = ts.burst[b];
+    si.timer_max_burst = ts.max_burst;
+    si.timer_resyncs = ts.resyncs;
     /* 各 CPU 的計數由它們自己在計時器中斷裡累加;這裡不上鎖直接讀,差一兩個 tick 無妨 */
     for (int i = 0; i < cpu_count && i < SYSINFO_MAX_CPUS; i++) {
         si.cpu[i].busy = cpus[i].ticks_busy;

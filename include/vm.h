@@ -1,5 +1,6 @@
 #ifndef WELYOS_VM_H
 #define WELYOS_VM_H
+#include <stddef.h>
 #include <stdint.h>
 #include "boot_info.h"
 
@@ -103,6 +104,9 @@ void vm_space_switch(struct vm_space *vs);
 struct vm_space *vm_space_fork(struct vm_space *parent);
 int vm_space_fault(struct vm_space *vs, uintptr_t va, int write);
 int vm_space_map_new(struct vm_space *vs, uintptr_t va, uintptr_t pa, unsigned flags);
+/* 在 VM 的鎖之內查表並複製 n 個位元組(不跨頁);to_user = 1 是寫入使用者頁(必須可寫)。
+   0 = 完成;-1 = 沒有對映或權限不符(呼叫者處理 fault 後重試)。說明見 vm.c */
+int vm_space_copy(struct vm_space *vs, uintptr_t va, void *kbuf, size_t n, int to_user);
 void vm_space_switch_flush(struct vm_space *vs);   /* 重新載入 vs 並清掉它在這顆 CPU 上的 TLB 紀錄 */
 
 /* 統計(測試用):寫入時複製真的複製了幾頁、有幾次因為只剩自己在用而免於複製 */

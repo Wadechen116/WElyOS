@@ -33,10 +33,24 @@ CRASH="panic fault illegal break dfree stack mainstack thread relock null wtext 
 fail=0
 
 for a in $ARCHS; do
-  if ! cmake --preset "$a" >/dev/null 2>&1 || ! cmake --build --preset "$a" 2>&1 | grep -E " error |warning:" ; [ "${PIPESTATUS[0]}" -ne 0 ]; then
-    : # 建置訊息已在上面列出(沒有輸出代表沒有錯誤與警告)
+  # A failed configure/build must never fall through to an old ELF.
+  if ! cmake --preset "$a" > "$OUT/$a-configure.txt" 2>&1; then
+    echo "$a: configure failed; log: $OUT/$a-configure.txt"
+    cat "$OUT/$a-configure.txt"
+    fail=1
+    continue
   fi
-  [ -f "build/$a/welyos.elf" ] || { echo "$a: 建置失敗"; fail=1; continue; }
+  if ! cmake --build --preset "$a" > "$OUT/$a-build.txt" 2>&1; then
+    echo "$a: build failed; log: $OUT/$a-build.txt"
+    cat "$OUT/$a-build.txt"
+    fail=1
+    continue
+  fi
+  grep -E " error |warning:" "$OUT/$a-build.txt" || true
+  [ -s "build/$a/welyos.elf" ] || { echo "$a: missing/empty ELF after build"; fail=1; continue; }
+  if [ "$a" = aarch64 ] && [ ! -s "build/$a/welyos.bin" ]; then
+    echo "$a: missing/empty binary after build"; fail=1; continue
+  fi
 
   cases=("" "selftest" "selftest memtest stress")
   if [ "$QUICK" -eq 0 ]; then
@@ -58,12 +72,11 @@ for a in $ARCHS; do
     QEMU_WINEXIT=$wx timeout 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" -append "autoexit $c" > "$log" 2>&1 < /dev/null
     rc=$?
     t=$(echo "$(date +%s.%N) - $t0" | bc)
-    # 結束碼 5 不是 kernel 會給的值(它只用 0 與 1;i386 是 3)。在 Windows 版的 QEMU 上偶爾出現
-    # (幾百次一次),而且輸出都已經完整印完 — 推測是模擬器結束時自己異常終止
-    # (0xC0000005 的最低位元組)。明確標示出來並重試一次,不默默放過,也不因此判定 kernel 失敗
+    # Exit 5 has no proven cause. Preserve failure and evidence; retry only for diagnostics.
     if [ "$rc" -eq 5 ] && [ "$want" -ne 5 ]; then
       echo "  注意:$a ${c:-(只開機)} 的模擬器以結束碼 5 結束(不是 kernel 的結束碼),重試一次"
       echo "       完整的結束碼:$(grep -ao 'WIN_EXIT=[-0-9]* (0x[0-9A-F]*)' "$log" | tail -1 || true)(輸出保留在 $log.exit5)"
+      fail=1  # Keep unexpected exit 5 failed even if the diagnostic retry succeeds.
       cp "$log" "$log.exit5"
       mkdir -p build/exit5-hunt && cp "$log" "build/exit5-hunt/regress-$(date +%Y%m%d-%H%M%S)-$a-${c// /+}.txt"
     timeout 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" -append "autoexit $c" > "$log" 2>&1 < /dev/null
@@ -127,6 +140,17 @@ for a in $ARCHS; do
       fail=1; echo "  $a 外來磁碟測試失敗(結束碼 $frc),輸出在 $OUT/$a-foreign.txt"
     fi
     rm -f "$img"
+
+    # 沒有磁碟、也沒有網路卡:每個驅動程式都必須正確回報「沒有」,自我測試照樣通過。
+    # (第 48 步以前只在 RISC-V 上跑過這個組合,i386 的 NE2000 偵測因此把空的匯流排當成一張卡)
+    QEMU_DISK=none QEMU_NET=none timeout 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
+         -append "autoexit selftest" > "$OUT/$a-bare.txt" 2>&1 < /dev/null
+    brc=$?
+    if [ "$brc" -eq 0 ] && grep -q "^net: none" "$OUT/$a-bare.txt" && grep -q "^disk: none" "$OUT/$a-bare.txt"; then
+      echo "$a: 沒有磁碟與網路卡時正確偵測為「沒有」,自我測試通過"
+    else
+      fail=1; echo "  $a 無磁碟無網路測試失敗(結束碼 $brc),輸出在 $OUT/$a-bare.txt"
+    fi
   fi
 
   if [ "$REPEAT" -gt 0 ]; then

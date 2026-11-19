@@ -7,6 +7,7 @@
 #include "arch.h"
 #include "cpu.h"
 #include "sched.h"
+#include "spinlock.h"
 #include "timer.h"
 #include "watchdog.h"
 
@@ -27,7 +28,15 @@ void timer_tick(void)
     if (this_cpu()->id == 0)
         ticks++;
     watchdog_tick();           /* 心跳,並看看隔壁的 CPU 是不是還活著 */
-    sched_tick();              /* 喚醒休眠者、扣時間片(排程器未啟動時無作用) */
+    sched_tick(1);             /* 喚醒休眠者、扣時間片(排程器未啟動時無作用) */
+}
+
+void timer_tick_stolen(void)
+{
+    if (this_cpu()->id == 0)
+        ticks++;
+    watchdog_tick();
+    sched_tick(0);             /* 只推進時間:不記 CPU 時間、不扣時間片與即時工作的預算 */
 }
 
 /*
@@ -42,6 +51,45 @@ uint64_t timer_ticks(void)
         b = ticks;
     } while (a != b);
     return a;
+}
+
+/* 晚到的紀錄(見 timer.h)。中斷處理程式(各 CPU 都可能)寫入,以一把 spinlock 保護;只有幾條指令 */
+static struct timer_stats tstats;
+static struct spinlock tstat_lk = SPINLOCK_INIT("timer-stats");
+static const unsigned bucket_lo[TIMER_BURST_BUCKETS] = { 2, 3, 4, 6, 7, 10 };
+
+void timer_note_catchup(int n, int resynced)
+{
+    if (n < 2 && !resynced)
+        return;
+    unsigned b = TIMER_BURST_BUCKETS - 1;
+    if (!resynced)
+        while (b > 0 && (unsigned)n < bucket_lo[b])
+            b--;
+    unsigned long fl = spin_lock_irqsave(&tstat_lk);
+    tstats.burst[b]++;
+    if (resynced)
+        tstats.resyncs++;
+    else if ((uint32_t)n > tstats.max_burst)
+        tstats.max_burst = (uint32_t)n;
+    spin_unlock_irqrestore(&tstat_lk, fl);
+}
+
+void timer_get_stats(struct timer_stats *st)
+{
+    unsigned long fl = spin_lock_irqsave(&tstat_lk);
+    *st = tstats;
+    spin_unlock_irqrestore(&tstat_lk, fl);
+}
+
+uint32_t timer_bursts_at_least(const struct timer_stats *st, unsigned k)
+{
+    uint32_t sum = 0;
+
+    for (unsigned b = 0; b < TIMER_BURST_BUCKETS; b++)
+        if (bucket_lo[b] >= k)
+            sum += st->burst[b];
+    return sum;
 }
 
 unsigned timer_hz(void)

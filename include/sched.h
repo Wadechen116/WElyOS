@@ -191,7 +191,7 @@ void sched_space_flush(struct vm_space *vs);     /* 位址空間的對映大量�
 void sched_irq_enter(void);
 
 /* 每顆 CPU 的每個計時器 tick 呼叫一次(中斷關閉中):喚醒到期的休眠者、扣時間片 */
-void sched_tick(void);
+void sched_tick(int charge);             /* 計時器中斷時呼叫;charge = 0:補記的 tick(不記 CPU 時間,見 timer.h) */
 
 /* 架構層在中斷處理的最後(已通知中斷控制器之後)呼叫:
    若時間片用完或有人被喚醒,就在這裡切換到別的執行緒(搶佔) */

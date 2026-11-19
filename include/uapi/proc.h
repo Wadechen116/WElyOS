@@ -33,6 +33,10 @@ struct sysinfo {
     struct {
         uint64_t busy, idle;    /* 這顆 CPU 忙碌 / 閒置的 tick 數(累計) */
     } cpu[SYSINFO_MAX_CPUS];
+    /* 計時器中斷晚到的紀錄(見 kernel 的 timer.h):一次補記的 tick 數依幅度分組的累計次數
+       (2、3、4~5、6、7~9、10 以上),以及最大的一次與放棄補記的次數 */
+    uint32_t timer_burst[6];
+    uint32_t timer_max_burst, timer_resyncs;
 };
 
 /* SYS_scrub 回報的內容 */
@@ -99,7 +103,7 @@ struct rt_stats {
 };
 
 /* 佈局的檢查:這些結構在 32 與 64 位元的架構上必須一樣大(欄位都對齊在自然的位置上) */
-_Static_assert(sizeof(struct sysinfo) == 176, "ABI: struct sysinfo");
+_Static_assert(sizeof(struct sysinfo) == 208, "ABI: struct sysinfo");
 _Static_assert(sizeof(struct scrubinfo) == 24, "ABI: struct scrubinfo");
 _Static_assert(sizeof(struct timeval) == 16, "ABI: struct timeval");
 _Static_assert(sizeof(struct procinfo) == 64, "ABI: struct procinfo");

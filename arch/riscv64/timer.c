@@ -83,12 +83,17 @@ void timer_interrupt(void)
     int n = 0;
 
     while (deadline <= now && n < MAX_CATCHUP) {
-        timer_tick();
+        if (n == 0)
+            timer_tick();
+        else
+            timer_tick_stolen();         /* 補記的:不算成誰的 CPU 時間 */
         deadline += interval;
         n++;
     }
-    if (deadline <= now)                     /* 落後太多(例如被除錯器暫停):放棄補記,重新對時 */
+    int resynced = deadline <= now;
+    if (resynced)                     /* 落後太多(例如被除錯器暫停):放棄補記,重新對時 */
         deadline = now + interval;
+    timer_note_catchup(n, resynced);   /* 晚到的紀錄(見 timer.h) */
 
     sbi_set_timer(deadline);                 /* 設定下一次,並清除本次的待處理狀態 */
     sched_irq_exit();                        /* 時間片用完就在這裡換人(下一次鬧鐘已設好) */

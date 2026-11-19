@@ -161,12 +161,17 @@ void irq_handler(void)
         uint64_t now = read_counter();
         int n = 0;
         while (deadline <= now && n < MAX_CATCHUP) {
-            timer_tick();
+            if (n == 0)
+                timer_tick();
+            else
+                timer_tick_stolen();         /* 補記的:不算成誰的 CPU 時間 */
             deadline += interval;
             n++;
         }
-        if (deadline <= now)                 /* 落後太多:放棄補記,重新對時 */
+        int resynced = deadline <= now;
+        if (resynced)                 /* 落後太多:放棄補記,重新對時 */
             deadline = now + interval;
+        timer_note_catchup(n, resynced);   /* 晚到的紀錄(見 timer.h) */
         /* 寫入新的比較值:同時讓計時器的中斷訊號消失 */
         __asm__ volatile("msr cntp_cval_el0, %0" : : "r"(deadline));
     } else if (id == IRQ_UART) {

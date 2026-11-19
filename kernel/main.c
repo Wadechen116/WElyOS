@@ -355,8 +355,12 @@ void kmain(const struct boot_info *bi)
     if (cmdline_has(bi->cmdline, "stress"))
         sched_stress();
 
-    kprintf("uptime: %llu ticks, %lu context switches\n",
-            (unsigned long long)timer_ticks(), sched_switch_count());
+    struct timer_stats ts;
+    timer_get_stats(&ts);
+    kprintf("uptime: %llu ticks, %lu context switches\n", (unsigned long long)timer_ticks(), sched_switch_count());
+    kprintf("timer: late interrupts (ticks caught up at once): 2:%u 3:%u 4-5:%u 6:%u 7-9:%u 10+:%u, "
+            "largest %u, resyncs %u\n", ts.burst[0], ts.burst[1], ts.burst[2], ts.burst[3], ts.burst[4],
+            ts.burst[5], ts.max_burst, ts.resyncs);
 
     /*
      * 啟動 shell:從主控台讀命令並執行。

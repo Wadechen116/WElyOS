@@ -131,6 +131,7 @@ struct proc_mem {
     uintptr_t PMEM_F(mmap_next);             /* 下一塊對映要放的位址(只往上走,不重複使用) */
     uintptr_t PMEM_F(brk);                   /* heap 目前的結尾(0 = 還沒用過,等於 USER_HEAP_BASE);受 pstate_lk 保護 */
     volatile int PMEM_F(seu_pending);        /* 故障注入(SYS_seu):等著翻轉的一個位元(見 proc_mem.c) */
+    struct mutex PMEM_F(mx);         /* 序列化「改變使用者範圍的對映」:fault 的配置、munmap、sbrk(見 proc_mem.c) */
     uintptr_t PMEM_F(seu_addr);
     uint8_t PMEM_F(seu_mask);
 };

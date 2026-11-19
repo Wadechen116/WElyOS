@@ -517,6 +517,143 @@ static int fsync_on(const char *path)
     return sys_unlink(path) == 0 ? 0 : 1307;
 }
 
+/* ---- UMODE_MEMRACE ---- */
+
+/*
+ * 對映的變更與「kernel 讀寫使用者記憶體」同時發生(第 48 步修正的兩個競態,Codex 以確定的交錯證實過):
+ *   對映者  反覆 mmap 一塊 4 頁、前 3 頁填上 0x5A、公開位址、檢查內容、收回位址、munmap
+ *   heap    反覆把 heap 長大 3 頁、填上 0xA5、檢查、再縮回去
+ *   複製者  反覆對「目前公開的那一塊」做會讓 kernel 寫入(getcwd)與讀出(write 到 /dev/null)的系統呼叫
+ * 要求:沒有當機;複製只會成功或回報 E_FAULT(那一塊剛好被收回了);
+ *       任何人的內容都沒有被別人改掉 — 包括兩塊事先填好、從頭到尾不動的「哨兵」記憶體
+ *       (被釋放的頁若被寫到了,下一個拿到那一頁的人就會看到不是自己寫的內容)。
+ * 這是壓力測試:在真正的多顆 CPU 上以時間換取交錯的機會,不保證每次都碰到那個空檔;
+ * 確定性的證明在主機端(tests/static/probe_memory_races.py)。
+ */
+static volatile int mr_stop, mr_running;
+static volatile long mr_errors, mr_loops[3], mr_partial;
+static volatile long mr_first_site, mr_first_value;     /* 第一個錯誤發生在哪裡、得到什麼值 */
+#define MR_ERR(site, v) do { if (!mr_errors++) { mr_first_site = (site); mr_first_value = (long)(v); } } while (0)
+static uint8_t *volatile mr_cur;
+static long mr_null_fd, mr_file_fd;
+
+static int mr_check(const uint8_t *p, unsigned long n, uint8_t v)
+{
+    for (unsigned long i = 0; i < n; i++)
+        if (p[i] != v)
+            return 1;
+    return 0;
+}
+
+static void mr_mapper(long arg)
+{
+    (void)arg;
+    while (!mr_stop) {
+        uint8_t *p = sys_mmap(4 * 4096);
+        if ((long)p < 0) {
+            MR_ERR(1, p);
+            break;
+        }
+        memset(p, 0x5A, 3 * 4096);
+        mr_cur = p;
+        sys_yield();
+        if (mr_check(p, 3 * 4096, 0x5A))
+            MR_ERR(2, 0);
+        mr_cur = 0;
+        long um = sys_munmap(p);
+        if (um != 0)
+            MR_ERR(3, um);
+        mr_loops[0]++;
+    }
+    __sync_fetch_and_sub(&mr_running, 1);
+    sys_thread_exit();
+}
+
+static void mr_heap(long arg)
+{
+    (void)arg;
+    while (!mr_stop) {
+        uint8_t *p = (uint8_t *)sys_sbrk(3 * 4096);
+        if ((long)p < 0) {
+            MR_ERR(4, p);
+            break;
+        }
+        memset(p, 0xA5, 3 * 4096);
+        sys_yield();
+        if (mr_check(p, 3 * 4096, 0xA5))
+            MR_ERR(5, 0);
+        long sb = sys_sbrk(-3 * 4096);
+        if (sb < 0)
+            MR_ERR(6, sb);
+        mr_loops[1]++;
+    }
+    __sync_fetch_and_sub(&mr_running, 1);
+    sys_thread_exit();
+}
+
+static void mr_copier(long arg)
+{
+    (void)arg;
+    while (!mr_stop) {
+        uint8_t *p = mr_cur;
+        if (p) {
+            /* kernel 寫入使用者記憶體:從檔案讀一整頁到第 4 頁(只有這一頁不在對映者的檢查範圍內)。
+               寫入的若是「已經被收回、配給別人」的頁,拿到那一頁的 heap 執行緒會看到不是 0xA5 的內容 */
+            long r = sys_lseek(mr_file_fd, 0, SEEK_SET);
+            if (r == 0)
+                r = sys_read(mr_file_fd, p + 3 * 4096, 4096);
+            if (r != -E_FAULT && (r <= 0 || r > 4096))
+                MR_ERR(7, r);
+            /* kernel 讀出使用者記憶體。合法的結果:全部寫出;E_FAULT(一開始就不合法);
+               或寫出一部分 — 讀到一半那一塊被收回了,回報已寫出的量(和 POSIX 的 write 相同) */
+            r = sys_write(mr_null_fd, p, 3 * 4096);
+            if (r != -E_FAULT && (r <= 0 || r > 3 * 4096))
+                MR_ERR(8, r);
+            if (r > 0 && r < 3 * 4096)
+                mr_partial++;
+        }
+        mr_loops[2]++;
+        sys_yield();
+    }
+    __sync_fetch_and_sub(&mr_running, 1);
+    sys_thread_exit();
+}
+
+static int mode_memrace(void)
+{
+    uint8_t *canary_map = sys_mmap(8 * 4096);
+    uint8_t *canary_heap = (uint8_t *)sys_sbrk(8 * 4096);
+
+    if ((long)canary_map < 0 || (long)canary_heap < 0)
+        return 1;
+    memset(canary_map, 0xC3, 8 * 4096);
+    memset(canary_heap, 0x3C, 8 * 4096);
+    if ((mr_null_fd = sys_open("/dev/null", O_WRONLY)) < 0 || (mr_file_fd = sys_open("/bin/init", O_RDONLY)) < 0)
+        return 2;
+    mr_running = 3;
+    if (sys_thread_create(mr_mapper, 0) < 0 || sys_thread_create(mr_heap, 0) < 0 ||
+        sys_thread_create(mr_copier, 0) < 0)
+        return 3;
+    sys_sleep(250);
+    mr_stop = 1;
+    while (mr_running > 0)
+        sys_sleep(1);
+    close_quiet(mr_null_fd);
+    close_quiet(mr_file_fd);
+    if (mr_check(canary_map, 8 * 4096, 0xC3) || mr_check(canary_heap, 8 * 4096, 0x3C))
+        return 4;                                        /* 哨兵被改了:有人寫到了不屬於它的頁 */
+    if (mr_errors) {
+        printf("  [user] memrace: %ld error(s); first at site %ld, value %ld\n", mr_errors, mr_first_site,
+               mr_first_value);
+        return 5;
+    }
+    if (mr_loops[0] < 10 || mr_loops[1] < 10 || mr_loops[2] < 10)
+        return 6;                                        /* 交錯的次數太少,測試沒有意義 */
+    printf("  [user] concurrent mmap/munmap %ld, sbrk %ld, kernel copies %ld (%ld cut short by a munmap): "
+           "no corruption\n", mr_loops[0], mr_loops[1], mr_loops[2], mr_partial);
+    return 31;
+}
+
 /* ---- UMODE_TMR ---- */
 
 #include "tmr.h"
@@ -639,16 +776,27 @@ static int mode_rt(void)
         sys_capdrop(CAP_ADMIN);
         sys_exit(sys_rt_set(20, 1) == -E_PERM ? 0 : 2);
     }
+    struct sysinfo t0, t1;
+    if (sys_sysinfo(&t0) != 0)
+        return 10;
     for (int i = 0; i < 6; i++)                          /* 六個週期,幾乎不做事 */
         if (sys_rt_wait(&st) != 0)
             return 5;
-    /* 六個週期幾乎不做事:應該都準時、不超出預算。容許各 1 次:在模擬器上(尤其虛擬 CPU 比主機的
-       核心多的時候)一顆虛擬 CPU 可能停頓十幾毫秒,之後補發的 tick 會一次算在當時正在執行的工作頭上,
-       看起來就像它超出了預算或錯過了期限。失敗時印出實際的數值 */
-    if (st.period_ms != 10 || st.budget_ms != 2 || st.releases + st.misses < 6 || st.misses > 1 ||
-        st.overruns > 1) {
-        printf("  [user] rt: period %u budget %u releases %u misses %u overruns %u max used %u ms\n",
-               st.period_ms, st.budget_ms, st.releases, st.misses, st.overruns, st.max_used_ms);
+    if (sys_sysinfo(&t1) != 0)
+        return 11;
+    /* 六個週期幾乎不做事:必須都準時、不超出預算。唯一的例外要量得到:這段期間計時器一次補記了
+       >= 3 個 tick(預算是 2:虛擬 CPU 被停住、時間跳過去,補記的 tick 全算在當時正在執行的工作頭上)。
+       一次補記 2 個是常態(中斷晚到 1 毫秒),不構成例外。每一次錯過期限都必須對應到一次量到的跳躍;
+       超出預算則完全不允許 — 補記的 tick 不算成任何人的 CPU 時間(timer_tick_stolen),
+       幾乎不做事的工作不可能超出預算。印出實際的數值 */
+    unsigned jumped = 0;                                 /* 這段期間跳過 >= 3 個 tick 的次數 */
+    for (int b = 1; b < 6; b++)
+        jumped += t1.timer_burst[b] - t0.timer_burst[b];
+    if (st.period_ms != 10 || st.budget_ms != 2 || st.releases + st.misses < 6 ||
+        st.misses > jumped || st.overruns != 0) {
+        printf("  [user] rt: releases %u misses %u overruns %u max used %u ms; timer jumps of 3+ ticks "
+               "in the window: %u (ticks %llu..%llu)\n", st.releases, st.misses, st.overruns, st.max_used_ms,
+               jumped, (unsigned long long)t0.uptime_ticks, (unsigned long long)t1.uptime_ticks);
         return 6;
     }
     if (sys_waitpid(pid, &status, 0) != pid || status != 0)
@@ -2459,6 +2607,9 @@ static int umain(long mode)
 
     case UMODE_TMR:
         return mode_tmr();
+
+    case UMODE_MEMRACE:
+        return mode_memrace();
 
     case UMODE_PERM: {
         /* 同一組測試在記憶體檔案系統與磁碟上各做一次 */

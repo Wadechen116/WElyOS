@@ -28,10 +28,34 @@
  *
  * 其他情況(存取沒有對映的位址、寫入唯讀的頁)回傳 -1,呼叫者會終止行程。
  */
+/*
+ * ---- 對映的變更要序列化 ----
+ *
+ * 「判斷這個位址屬於某個區域 → 配置一頁 → 建立對映」必須和「把區域拿掉 → 解除對映」互斥。
+ * 否則:fault 判斷完、放鎖去配置的空檔裡,另一條執行緒 munmap 或縮小 heap,完成之後 fault 照樣建立
+ * 對映 — 已經歸還的區域又活過來,而且記帳(commit)已經扣掉了(Codex 以確定的交錯證實過)。
+ * 縮小 heap 的同時又有人把它長回來,也會讓剛建立的頁被縮小那一方的解除迴圈拿掉。
+ *
+ * 所以每個行程有一把 mem.mx(可以睡眠的 mutex):proc_fault 的配置路徑、sys_munmap、sys_sbrk
+ * 都整段持有它。用 mutex 而不是 spinlock:解除一大片對映可能很久,不能關著中斷做(會傷害即時工作)。
+ * 鎖的順序:mem.mx → pstate_lk → vm_lk(vm_space_* 內部)→ 頁面配置器。持有 mem.mx 時不呼叫
+ * copy_from_user / copy_to_user(它們可能需要 fault,會再拿 mem.mx)。
+ */
+static int proc_fault_locked(struct proc *p, uintptr_t addr, int write);
+
 static int proc_fault(struct proc *p, uintptr_t addr, int write)
 {
     if (write && vm_space_fault(p->space, addr, 1) == 0)
-        return 0;
+        return 0;                                /* 寫入時複製:只動自己的頁表項目,vm_lk 就夠了 */
+    mutex_lock(&p->mem.mx);
+    int rc = proc_fault_locked(p, addr, write);
+    mutex_unlock(&p->mem.mx);
+    return rc;
+}
+
+static int proc_fault_locked(struct proc *p, uintptr_t addr, int write)
+{
+    (void)write;
 
     /* heap:落在 [USER_HEAP_BASE, brk) 而還沒配置的頁,當場配置(內容為 0)。
        sbrk 只是移動結尾,不配置任何東西;程式要了很大一塊卻只用一點點時,只花用到的部分 */
@@ -104,54 +128,36 @@ int proc_page_fault(uintptr_t addr, int write)
  * 逐頁透過行程的頁表查出實體位址,並確認該頁是使用者可存取的;
  * 任何一頁不合格就回傳 -1。不直接解參考使用者的指標。
  */
-int copy_from_user(struct proc *p, void *dst, uintptr_t uaddr, size_t len)
+/*
+ * 和使用者空間交換資料。每一頁的「查表 + 複製」在 VM 的鎖之內一次完成(vm_space_copy),
+ * 所以不會讀寫到一頁「查到之後才被 munmap、釋放、給了別人」的記憶體。
+ * 查不到(還沒配置的頁、寫入時複製的唯讀頁)就先處理 fault,再試一次;第二次仍然不行
+ * (例如同一時間被另一條執行緒 munmap 了)就回傳 -1(呼叫者回報 E_FAULT)。
+ */
+static int copy_user(struct proc *p, uintptr_t uaddr, uint8_t *kbuf, size_t len, int to_user)
 {
-    uint8_t *out = dst;
-
     while (len > 0) {
-        uintptr_t pa;
-        /* 查不到對映時,先看是不是「用到才配置」的頁(還沒碰過的 stack);
-           是的話配置後再查一次 */
-        if (vm_space_query(p->space, uaddr, &pa, NULL) != 0 &&
-            (proc_fault(p, uaddr, 0) != 0 || vm_space_query(p->space, uaddr, &pa, NULL) != 0))
-            return -1;
         size_t n = PAGE_SIZE - (uaddr & (PAGE_SIZE - 1));    /* 這一頁剩下的長度 */
         if (n > len)
             n = len;
-        memcpy(out, (const void *)pa, n);
-        out += n;
+        if (vm_space_copy(p->space, uaddr, kbuf, n, to_user) != 0 &&
+            (proc_fault(p, uaddr, to_user) != 0 || vm_space_copy(p->space, uaddr, kbuf, n, to_user) != 0))
+            return -1;
+        kbuf += n;
         uaddr += n;
         len -= n;
     }
     return 0;
 }
 
-/* 反方向:把 kernel 的資料複製到使用者位址。除了要是使用者的頁,還必須是「可寫」的頁,
-   否則使用者可以請 kernel 代為寫入它自己不能寫的地方(例如它的程式碼) */
+int copy_from_user(struct proc *p, void *dst, uintptr_t uaddr, size_t len)
+{
+    return copy_user(p, uaddr, dst, len, 0);
+}
+
 int copy_to_user(struct proc *p, uintptr_t uaddr, const void *src, size_t len)
 {
-    const uint8_t *in = src;
-
-    while (len > 0) {
-        uintptr_t pa;
-        unsigned flags;
-        if (vm_space_query(p->space, uaddr, &pa, &flags) != 0 || !(flags & VM_WRITE)) {
-            /* kernel 是經由實體位址寫入的,不會像使用者程式那樣觸發 page fault,
-               所以要自己做同樣的事:這一頁若是寫入時複製的(或還沒配置的 stack),
-               先處理好再寫。否則會寫進和別的行程共用的那一頁 */
-            if (proc_fault(p, uaddr, 1) != 0 ||
-                vm_space_query(p->space, uaddr, &pa, &flags) != 0 || !(flags & VM_WRITE))
-                return -1;
-        }
-        size_t n = PAGE_SIZE - (uaddr & (PAGE_SIZE - 1));
-        if (n > len)
-            n = len;
-        memcpy((void *)pa, in, n);
-        in += n;
-        uaddr += n;
-        len -= n;
-    }
-    return 0;
+    return copy_user(p, uaddr, (uint8_t *)(uintptr_t)src, len, 1);
 }
 
 /* 從使用者位址複製一個以 0 結尾的字串(路徑)到 kernel。太長或位址不合法回傳負的錯誤碼 */
@@ -285,6 +291,8 @@ long sys_munmap(struct proc *p, uintptr_t addr)
 {
     unsigned long pages = 0;
 
+    mutex_lock(&p->mem.mx);                       /* 拿掉區域到解除完對映,整段不讓 fault 插進來 */
+
     unsigned long fl = spin_lock_irqsave(&pstate_lk);
     for (unsigned i = 0; i < PROC_MAX_MAPS; i++) {
         if (p->mem.maps[i].pages && p->mem.maps[i].start == addr) {
@@ -295,11 +303,10 @@ long sys_munmap(struct proc *p, uintptr_t addr)
         }
     }
     spin_unlock_irqrestore(&pstate_lk, fl);
-    if (!pages)
-        return -E_INVAL;
     for (unsigned long i = 0; i < pages; i++)
         vm_space_unmap(p->space, addr + i * PAGE_SIZE);
-    return 0;
+    mutex_unlock(&p->mem.mx);
+    return pages ? 0 : -E_INVAL;
 }
 
 /*
@@ -311,6 +318,7 @@ long sys_munmap(struct proc *p, uintptr_t addr)
  */
 long sys_sbrk(struct proc *p, long incr)
 {
+    mutex_lock(&p->mem.mx);                      /* 移動結尾到解除完對映,整段不讓 fault 或另一次 sbrk 插進來 */
     unsigned long fl = spin_lock_irqsave(&pstate_lk);
     uintptr_t old = p->mem.brk ? p->mem.brk : USER_HEAP_BASE;
     uintptr_t now = old + (uintptr_t)incr;
@@ -323,13 +331,16 @@ long sys_sbrk(struct proc *p, long incr)
     if (ok)
         p->mem.brk = now;
     spin_unlock_irqrestore(&pstate_lk, fl);
-    if (!ok)
+    if (!ok) {
+        mutex_unlock(&p->mem.mx);
         return -E_NOMEM;
+    }
 
     /* 縮小:釋放不再屬於 heap 的整頁(第一個「完全在新結尾之後」的頁起) */
     uintptr_t first = (now + PAGE_SIZE - 1) & ~(uintptr_t)(PAGE_SIZE - 1);
     for (uintptr_t va = first; va < old; va += PAGE_SIZE)
         vm_space_unmap(p->space, va);
+    mutex_unlock(&p->mem.mx);
     return (long)old;
 }
 
@@ -341,6 +352,7 @@ long sys_sbrk(struct proc *p, long incr)
 /* 新行程:配額沿用建立者的;由 kernel 建立的用預設值 */
 void pmem_init(struct proc *p, const struct proc *parent)
 {
+    mutex_init(&p->mem.mx);
     p->mem.limit = parent ? parent->mem.limit : PROC_DEFAULT_LIMIT_PAGES;
 }
 
@@ -357,6 +369,7 @@ void pmem_exec(struct proc *p)
    先記帳,系統給不出來就回傳非 0(不 fork);heap 與對映的紀錄照抄(內容隨位址空間複製) */
 int pmem_fork(struct proc *child, const struct proc *parent)
 {
+    mutex_init(&child->mem.mx);
     child->mem.limit = parent->mem.limit;
     unsigned long fl = spin_lock_irqsave(&pstate_lk);
     int rc = commit_change_locked(child, (long)parent->mem.commit);

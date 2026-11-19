@@ -240,6 +240,11 @@ static void rq_push(struct thread *t)
    不該因此排到同級的最後面 */
 static void rq_push_front(struct thread *t)
 {
+    /* 被搶佔的這一刻才開始等待。不重設的話,ready_since 還停在它「上一次」進入佇列的時候 —
+       一條從不睡覺的執行緒(一直在算的那種)會帶著建立時的時間,每次被搶佔都像是已經等了
+       上百毫秒,於是被防飢餓的機制提升到最高優先權、搶走一整個時間片。
+       (第 48 步以重現 40 次的量測找到:被降級的即時工作因此被擋到期限過後) */
+    t->ready_since = timer_ticks();
     t->state = T_READY;
     runq_push(&t->rq, t->prio, 1);
 }
@@ -1218,7 +1223,7 @@ void thread_exit(void)
  * 「全系統只需要做一次」的工作(喚醒休眠者、防飢餓檢查)只由第 0 顆 CPU 負責,
  * 它也是唯一推進 tick 計數的 CPU(見 timer.c);時間片則是每顆 CPU 各算各的。
  */
-void sched_tick(void)
+void sched_tick(int charge)
 {
     struct cpu *c = this_cpu();
 
@@ -1245,6 +1250,15 @@ void sched_tick(void)
         if ((unsigned)now % starve_scan_ticks == 0)
             starve_scan(now);
         rt_check_deadlines(now);
+    }
+
+    /* 補記的 tick(中斷晚到的那段時間):時間已經在上面推進過了,但這顆 CPU 當時是被停住的,
+       不是被目前這條執行緒用掉的 — 不記 CPU 時間、不扣時間片、不扣即時工作的預算。
+       否則每次模擬器停頓,剛好在執行的那條執行緒就會被誤判為用了好幾毫秒(實測過:
+       一個幾乎不做事的即時工作因此被判超出預算) */
+    if (!charge) {
+        spin_unlock(&sched_lk);
+        return;
     }
 
     /* 時間片用完:有「優先權不低於自己」的人在等才換人。

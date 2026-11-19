@@ -153,12 +153,17 @@ void irq_handler(uint32_t irq)
             uint64_t now = rdtsc();
             int n = 0;
             while (tsc_deadline <= now && n < MAX_CATCHUP) {
-                timer_tick();
+                if (n == 0)
+                    timer_tick();
+                else
+                    timer_tick_stolen();         /* 補記的:不算成誰的 CPU 時間 */
                 tsc_deadline += tsc_interval;
                 n++;
             }
-            if (tsc_deadline <= now)     /* 落後太多:放棄補記,重新對時 */
+            int resynced = tsc_deadline <= now;
+            if (resynced)                /* 落後太多:放棄補記,重新對時 */
                 tsc_deadline = now + tsc_interval;
+            timer_note_catchup(n, resynced);   /* 晚到的紀錄(見 timer.h) */
         } else {
             timer_tick();
         }

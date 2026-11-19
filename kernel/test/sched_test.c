@@ -55,7 +55,6 @@ static void coop_worker(void *arg)
 }
 
 /* 示範 2:搶佔。完全不讓出 CPU 的忙碌迴圈,只能靠計時器中斷換人 */
-static volatile uint64_t spin_deadline;
 
 /* 每條執行緒記錄兩個數字:
      iters  迴圈跑了幾圈(看得出它有在執行)
@@ -67,14 +66,23 @@ struct spin_stat {
     volatile unsigned long ticks;
 };
 
+/*
+ * 兩條忙碌的執行緒一起跑到「兩者合計用掉 spin_budget 個 tick 的 CPU 時間」為止。
+ * 以 CPU 時間、而不是牆上時間決定長度:模擬器停頓時,一段固定的牆上時間裡可能只容得下
+ * 三個多時間片,這時誰多拿一片純屬切在哪裡(實際發生過:27 對 10)。
+ */
+static struct spin_stat *spin_pair[2];
+static volatile unsigned long spin_budget;
+
 static void spin_worker(void *arg)
 {
     struct spin_stat *st = arg;
     unsigned long t0 = thread_cpu_ticks();
 
-    while (timer_ticks() < spin_deadline)
+    while (spin_pair[0]->ticks + spin_pair[1]->ticks < spin_budget) {
         st->iters++;
-    st->ticks = thread_cpu_ticks() - t0;
+        st->ticks = thread_cpu_ticks() - t0;
+    }
 }
 
 /* 示範 3:休眠。各自睡不同長度,醒來的順序應該依時間而不是建立順序 */
@@ -105,15 +113,28 @@ void sched_demo(void)
     kprintf("sched: preemptive (busy loops, no yield)\n");
     static struct spin_stat s1, s2;
     unsigned long sw0 = sched_switch_count();
-    spin_deadline = timer_ticks() + timer_hz() * 60 / 1000;   /* 各自空轉 60ms = 6 個時間片 */
+    struct timer_stats tsa, tsb;
+    timer_get_stats(&tsa);
+    unsigned slice = timer_hz() * 10 / 1000;                  /* 時間片:10 毫秒(見 sched.c 的 TIME_SLICE_MS) */
+    s1.ticks = s2.ticks = s1.iters = s2.iters = 0;
+    spin_pair[0] = &s1;
+    spin_pair[1] = &s2;
+    spin_budget = 6 * slice;                                   /* 合計 6 個時間片的 CPU 時間 */
     t[0] = thread_create("spin1", spin_worker, &s1);
     t[1] = thread_create("spin2", spin_worker, &s2);
     join_all(t, 2);
-    kprintf("  spin1: %lu ms of cpu (%lu loops), spin2: %lu ms (%lu loops), %lu context switches\n",
-            s1.ticks, s1.iters, s2.ticks, s2.iters, sched_switch_count() - sw0);
-    /* 兩條都要跑到,而且得到的 CPU 時間相近(差距在 2 倍以內) */
-    unsigned long c1 = s1.ticks, c2 = s2.ticks;
-    KASSERT(s1.iters > 0 && s2.iters > 0 && c1 > 0 && c2 > 0 && c1 < c2 * 2 && c2 < c1 * 2);
+    timer_get_stats(&tsb);
+    kprintf("  spin1: %lu ms of cpu (%lu loops), spin2: %lu ms (%lu loops), %lu context switches; "
+            "late timer interrupts in the window: %u (3+ ticks: %u, largest ever %u)\n",
+            s1.ticks, s1.iters, s2.ticks, s2.iters, sched_switch_count() - sw0,
+            timer_bursts_at_least(&tsb, 2) - timer_bursts_at_least(&tsa, 2),
+            timer_bursts_at_least(&tsb, 3) - timer_bursts_at_least(&tsa, 3), tsb.max_burst);
+    /* 輪流的保證:兩條同優先權的執行緒,任何時候拿到的 CPU 時間相差不超過一個時間片
+       (加 1:一條看到總和到了才停,另一條可能多記了最後一個 tick) */
+    unsigned long c1 = s1.ticks, c2 = s2.ticks, diff = c1 > c2 ? c1 - c2 : c2 - c1;
+    if (!s1.iters || !s2.iters || !c1 || !c2 || diff > slice + 1)
+        panic("sched fairness: cpu ticks %lu vs %lu (difference %lu, allowed %u = one time slice + 1)",
+              c1, c2, diff, slice + 1);
 
     kprintf("sched: sleep\n");
     t[0] = thread_create("s30", sleep_worker, (void *)30);
@@ -303,31 +324,64 @@ static void prio_worker(void *arg)
 }
 
 /* 示範 2:搶佔延遲。高優先權的執行緒睡 5ms,醒來時 CPU 正被別人佔用 */
-static volatile unsigned latency_ticks;
+/*
+ * 搶佔延遲:睡眠的一方醒來之後,要等多久才真的開始執行(排程延遲)。
+ *   比忙碌的一方優先:醒來就搶佔,延遲只來自計時器的抖動
+ *   同優先權:要等忙碌的一方用完它的時間片,延遲至少是時間片剩下的部分
+ *
+ * 量的是「延遲」本身,不是「總共過了多久」,而且不依賴任何固定的牆上時間:
+ *   - 忙碌的一方一直執行到睡眠的一方量完為止(不是固定空轉幾毫秒 — 模擬器停頓時,
+ *     一個時間片在牆上時間可以拉得很長,固定的長度會讓忙碌的一方提早結束,兩組量到同樣的結果)
+ *   - 睡眠的一方要睡之前發出信號,忙碌的一方立刻讓出一次、拿到一個全新的時間片(10 個 tick)。
+ *     睡眠是 6 個 tick,所以醒來時那個時間片至少還剩 2 個 tick 以上(補記的 tick 不扣時間片)
+ */
+static volatile int lat_sleeping, lat_done;
+static volatile unsigned lat_delay;
+static volatile uint64_t lat_t1;
 
 static void latency_sleeper(void *arg)
 {
     (void)arg;
-    uint64_t t0 = timer_ticks();
-    thread_sleep(5);
-    latency_ticks = (unsigned)(timer_ticks() - t0);
+    lat_sleeping = 1;
+    while (lat_sleeping == 1)                /* 等忙碌的一方確認看到了(它會改成 2 並讓出一次) */
+        thread_yield();
+    uint64_t t1 = timer_ticks();
+    lat_t1 = t1;
+    thread_sleep(5);                         /* 5 毫秒 = 6 個 tick(見 thread_sleep 的換算) */
+    uint64_t t2 = timer_ticks();
+    lat_delay = t2 > t1 + 6 ? (unsigned)(t2 - t1 - 6) : 0;
+    lat_done = 1;
 }
 
 static void latency_spinner(void *arg)
 {
     (void)arg;
-    /* 必須比「對方開始睡之前的等待(至多一個時間片)+ 睡眠 + 再一個時間片」還長,
-       對方醒來時這裡才確定還在佔用 CPU;太短的話兩組對照會得到一樣的結果 */
-    busy_ms(30);
+    while (lat_sleeping != 1)
+        ;
+    lat_sleeping = 2;
+    thread_yield();                          /* 讓對方去睡;回來時從一個全新的時間片開始 */
+    while (!lat_done)
+        ;
 }
 
-static unsigned latency_run(int sleeper_prio)
+/* 回傳排程延遲(tick);*jitter 得到這段期間計時器一次補記最多的 tick 數(依分組的下限,保守) */
+static unsigned latency_run(int sleeper_prio, unsigned *jitter)
 {
     int t[2];
+    struct timer_stats a, b;
+
+    lat_sleeping = lat_done = 0;
+    timer_get_stats(&a);
     t[0] = thread_create_prio("spinner", latency_spinner, NULL, PRIO_NORMAL);
     t[1] = thread_create_prio("sleeper", latency_sleeper, NULL, sleeper_prio);
     join_all(t, 2);
-    return latency_ticks;
+    timer_get_stats(&b);
+    static const unsigned lo[TIMER_BURST_BUCKETS] = { 2, 3, 4, 6, 7, 10 };
+    *jitter = 1;
+    for (unsigned k = 0; k < TIMER_BURST_BUCKETS; k++)
+        if (b.burst[k] != a.burst[k])
+            *jitter = k == TIMER_BURST_BUCKETS - 1 ? b.max_burst : lo[k + 1 < TIMER_BURST_BUCKETS ? k + 1 : k] - 1;
+    return lat_delay;
 }
 
 /*
@@ -462,13 +516,16 @@ void prio_demo(void)
     kprintf("  run order: %s (expected HNL)\n", prio_log);
     KASSERT(prio_log[0] == 'H' && prio_log[1] == 'N' && prio_log[2] == 'L');
 
-    unsigned same = latency_run(PRIO_NORMAL);
-    unsigned high = latency_run(PRIO_HIGH);
-    kprintf("prio: sleep(5 ms) while another thread spins: same priority woke after "
-            "%u ticks, high priority after %u\n", same, high);
-    /* 高優先權:約 6 個 tick(睡眠本身)就醒來;同優先權要多等對方的時間片。
-       不檢查絕對數字:模擬器上 tick 可能一次補記好幾個,會有 1~3 個 tick 的抖動 */
-    KASSERT(high < same);
+    unsigned jit_same, jit_high;
+    unsigned same = latency_run(PRIO_NORMAL, &jit_same);
+    unsigned high = latency_run(PRIO_HIGH, &jit_high);
+    kprintf("prio: sleep(5 ms) while another thread spins: scheduling delay after the wake-up time: "
+            "same priority %u ticks, high priority %u (timer jitter in that window: %u)\n", same, high, jit_high);
+    /* 高優先權:醒來就搶佔 — 延遲只能來自計時器的抖動(量到的),再加讀取時間的 1 個 tick。
+       同優先權:必須等對方時間片剩下的部分,至少 2 個 tick */
+    if (high > jit_high + 1 || same < 2)
+        panic("prio latency: high-priority delay %u (allowed %u), same-priority delay %u (must be >= 2)",
+              high, jit_high + 1, same);
 
     unsigned without = inversion_run(0);
     unsigned with = inversion_run(1);
@@ -786,23 +843,38 @@ static void rt_task(void *arg)
     /*
      * 超出預算:這個週期用 12 毫秒(預算 5)。仍然在 20 毫秒的期限內做完。
      *
-     * 這一段的檢查假設「空轉的 12 毫秒落在同一個週期裡」。在模擬器上,主機偶爾會讓這顆虛擬 CPU
-     * 停頓十幾毫秒,時間一口氣跳過去,空轉就跨過了週期的邊界 — 新的週期重設了預算與降級,
-     * 檢查到的就不是預期的狀態。那不是排程器的錯,所以先判斷有沒有跨過邊界(expect 是下一個
-     * 週期開始時間的下限);沒有跨過時才做嚴格的檢查,而且失敗時把實際的數值印出來。
+     * 嚴格的檢查(降級了、超出預算正好 1 次、沒有錯過期限)預設一定要成立。唯一的例外要「量得到」:
+     * 空轉從週期開始後約 2 個 tick 開始、做 12 個,離下一個週期還有約 6 個 tick 的餘裕。
+     * 只有計時器一次跳過 >= 6 個 tick(虛擬 CPU 被停住,timer_max_burst_since 量到的)才可能跨進
+     * 下一個週期。一次補記 2~3 個是常態(中斷晚到 1~2 毫秒),那不構成例外。
+     * 沒有量到夠大的跳躍卻不成立,就是排程器的錯:panic 並印出所有數值。
      */
+    struct timer_stats ts0, ts1;
+    timer_get_stats(&ts0);
     uint64_t spin_from = timer_ticks();
+    unsigned long boosts0 = sched_starve_boosts(), sw0 = sched_switch_count();
+    unsigned long cpu0 = thread_cpu_ticks();
     rt_spin_until(spin_from + 12);
+    unsigned long boosts1 = sched_starve_boosts(), sw1 = sched_switch_count();
+    unsigned long cpu1 = thread_cpu_ticks();
+    uint64_t spin_end = timer_ticks();
     int prio_after = thread_effective_prio(thread_current());
-    int crossed = timer_ticks() >= expect || spin_from + 12 >= expect;
+    timer_get_stats(&ts1);
+    unsigned jump = timer_bursts_at_least(&ts1, 6) - timer_bursts_at_least(&ts0, 6);   /* 這段期間跳過 >= 6 的次數 */
+    int stalled = jump > 0;
     KASSERT(thread_wait_period(&st) == 0);
-    if (!crossed && (prio_after != PRIO_HIGH || st.overruns != 1 || st.misses != 0 || st.max_used_ms < 5))
-        panic("rt test (overrun): prio %d, overruns %u, misses %u, max used %u ms, late %u, "
-              "spin %llu..%llu, next period at >= %llu", prio_after, st.overruns, st.misses,
-              st.max_used_ms, late, (unsigned long long)spin_from,
-              (unsigned long long)(spin_from + 12), (unsigned long long)expect);
-    if (crossed)
-        kprintf("rt: (the emulator stalled during the overrun test; its strict checks were skipped)\n");
+    if (!stalled && (prio_after != PRIO_HIGH || st.overruns != 1 || st.misses != 0 || st.max_used_ms < 5))
+        panic("rt test (overrun): prio %d (want %d), overruns %u, misses %u, max used %u ms; "
+              "spin %llu..%llu (ended %llu), deadline %llu; my cpu ticks %lu, switches %lu, "
+              "starvation boosts %lu, timer jumps 6+: %u",
+              prio_after, PRIO_HIGH, st.overruns, st.misses, st.max_used_ms,
+              (unsigned long long)spin_from, (unsigned long long)(spin_from + 12),
+              (unsigned long long)spin_end, (unsigned long long)expect, cpu1 - cpu0, sw1 - sw0,
+              boosts1 - boosts0, jump);
+    if (stalled) {
+        kprintf("rt: measured %u timer jump(s) of 6+ ticks during the overrun test (its slack is 6 ticks); "
+                "its same-period checks were skipped\n", jump);
+    }
     KASSERT(st.overruns >= 1 && st.throttled == 0);
     KASSERT(thread_effective_prio(thread_current()) == PRIO_RT);         /* 新的週期:恢復 */
 
@@ -852,13 +924,20 @@ static void rt_short_task(void *arg)
     (void)arg;
     while (!rt_long_ready)
         thread_yield();
+    struct timer_stats ts0, ts1;
+    timer_get_stats(&ts0);
     KASSERT(thread_set_periodic(10, 3) == 0);
     /* 週期短的排在比較高的層級 */
     KASSERT(thread_effective_prio(thread_current()) == PRIO_RT + 1);
     for (int i = 0; i < 20; i++)                         /* 200 毫秒:橫跨長工作的兩個忙碌區段 */
         KASSERT(thread_wait_period(&st) == 0);
     rt_short_misses = st.misses;
-    KASSERT(st.releases + st.misses >= 20 && st.misses <= 1);
+    /* 不可以錯過任何期限。例外要量得到:週期 10、預算 3,一次跳過 >= 7 個 tick 才吃得掉餘裕 */
+    timer_get_stats(&ts1);
+    unsigned jump = timer_bursts_at_least(&ts1, 7) - timer_bursts_at_least(&ts0, 7);
+    if (st.releases + st.misses < 20 || st.misses > jump)
+        panic("rt test (rate-monotonic): releases %u, misses %u, timer jumps of 7+ ticks in the window: %u",
+              st.releases, st.misses, jump);
     rt_long_stop = 1;
     KASSERT(thread_set_periodic(0, 0) == 0);
 }

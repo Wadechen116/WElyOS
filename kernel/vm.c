@@ -449,6 +449,42 @@ int vm_space_query(struct vm_space *vs, uintptr_t va, uintptr_t *pa, unsigned *f
     return rc;
 }
 
+/*
+ * 在 vm_lk 之內完成「查表 + 檢查權限 + 複製」:和使用者空間交換資料時用(copy_from_user / copy_to_user)。
+ *
+ * 為什麼不能「先查出實體位址、放開鎖、再複製」:放鎖之後,同一個行程的另一條執行緒可以 munmap
+ * 那一頁、讓它被釋放並配置給別人,複製就會讀寫到別人的資料(Codex 以確定的交錯證實過)。
+ * 移除對映(vm_space_unmap)、寫入時複製(vm_space_fault)、fork 都要拿 vm_lk,所以在鎖內複製,
+ * 這些事情就不可能插在「查到」與「用完」之間。
+ *
+ * 不跨頁;n 最多一頁,複製是記憶體對記憶體(kernel 經由實體位址存取,不會觸發 page fault),時間有界。
+ * to_user = 1 時必須是可寫的使用者頁:寫入時複製的頁在這裡是唯讀的,回傳 -1,由呼叫者先處理 fault 再重試。
+ * 回傳 0 = 複製完成;-1 = 沒有對映,或權限不符。
+ */
+int vm_space_copy(struct vm_space *vs, uintptr_t va, void *kbuf, size_t n, int to_user)
+{
+    if (!user_range(va) || n == 0 || n > PAGE_SIZE - (va & (PAGE_SIZE - 1)))
+        return -1;
+
+    unsigned long irq = spin_lock_irqsave(&vm_lk);
+    int level = 0;
+    int rc = -1;
+    pte_t *e = walk(vs->root, va, 0, 0, 0, 0, &level);
+    if (e && arch_pte_valid(*e) && level == 0) {
+        unsigned f = arch_pte_flags(*e);
+        if ((f & VM_USER) && (!to_user || (f & VM_WRITE))) {
+            uint8_t *page = (uint8_t *)(arch_pte_addr(*e) | (va & (PAGE_SIZE - 1)));
+            if (to_user)
+                memcpy(page, kbuf, n);
+            else
+                memcpy(kbuf, page, n);
+            rc = 0;
+        }
+    }
+    spin_unlock_irqrestore(&vm_lk, irq);
+    return rc;
+}
+
 int vm_space_map_new(struct vm_space *vs, uintptr_t va, uintptr_t pa, unsigned flags)
 {
     flags |= VM_USER;

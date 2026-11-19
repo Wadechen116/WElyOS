@@ -40,5 +40,6 @@ enum {
     UMODE_NET,           /* 網路:ping、UDP socket(以模擬器內建的 TFTP 伺服器驗證收送) */
     UMODE_RT,            /* 週期性的即時工作:準時、負載檢查、需要特權 */
     UMODE_TMR,           /* 三重執行加投票:注入位元翻轉、卡住的那一份、兩份都錯 */
+    UMODE_MEMRACE,       /* 同一個行程的多條執行緒同時改變對映(mmap/munmap、sbrk)並和 kernel 交換資料 */
 };
 #endif

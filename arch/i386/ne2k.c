@@ -215,6 +215,16 @@ struct netdev *arch_net_probe(void)
     uint8_t prom[32];
 
     mutex_init(&ne_lock);
+    /*
+     * 先確認那個位址上真的有東西:ISA 匯流排上沒有裝置的 I/O 位址,讀出來一律是 0xFF。
+     * 單看「重置之後 ISR 的 RST 位元」是不夠的 — 0xFF 的每個位元都是 1,RST 當然也是,
+     * 於是沒有網路卡時也會「偵測到」一張 MAC 為 ff:ff:ff:ff:ff:ff 的卡(實際發生過:
+     * QEMU_NET=none 時 i386 的自我測試因此在網路卡的測試裡 panic)。
+     * 所以寫一個已知的值到命令暫存器再讀回來:停止 + 第 0 頁 = 0x21,真的晶片會原樣讀回,空的匯流排讀到 0xFF。
+     */
+    outb(CR, CR_STOP);
+    if (inb(CR) != CR_STOP)
+        return NULL;
     /* 重置:讀出重置埠再寫回去,晶片會在 ISR 設定 RST 旗標。沒有這個反應就是沒有這張卡 */
     outb(NE_RESET, inb(NE_RESET));
     unsigned i = 0;
@@ -234,6 +244,14 @@ struct netdev *arch_net_probe(void)
     card_read(0, prom, 32);
     for (int k = 0; k < 6; k++)
         ne_dev.mac[k] = prom[k * 2];
+    /* MAC 全是 1 或全是 0 不是一張真的卡(廣播位址 / 沒有燒錄),當作沒有 */
+    int ones = 0, zeros = 0;
+    for (int k = 0; k < 6; k++) {
+        ones += ne_dev.mac[k] == 0xFF;
+        zeros += ne_dev.mac[k] == 0x00;
+    }
+    if (ones == 6 || zeros == 6)
+        return NULL;
 
     ne_dev.name = "ne2000";
     ne_dev.send = ne_send;
