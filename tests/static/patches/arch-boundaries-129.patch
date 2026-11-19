@@ -1,0 +1,61 @@
+--- a/scripts/arch-check.sh
++++ b/scripts/arch-check.sh
+@@ -14,30 +14,37 @@
+ python3 - <<'PY'
+ import re, sys, glob
+ bad = []
++# Keep literals intact while removing comments, so strings containing /* are not comments.
++lex = re.compile(r'//[^\n]*|/\*[\s\S]*?\*/|"(?:\\[\s\S]|[^"\\])*"|\'(?:\\[\s\S]|[^\'\\])*\'')
++def blanks(text):
++    return ''.join('\n' if c == '\n' else ' ' for c in text)
+ def code(path):
+     s = open(path, encoding='utf-8').read()
+-    s = re.sub(r'/\*.*?\*/', lambda m: '\n' * m.group(0).count('\n'), s, flags=re.S)   # 保留行號
+-    return s.split('\n')
++    return lex.sub(lambda m: blanks(m[0]) if m[0].startswith(('//', '/*')) else m[0], s)
+ owner = {'sig': 'kernel/proc_signal.c', 'mem': 'kernel/proc_mem.c', 'files': 'kernel/proc_fs.c'}
+-sources = sorted(glob.glob('kernel/**/*.c', recursive=True) + glob.glob('arch/**/*.c', recursive=True) + glob.glob('lib/*.c'))
+-for path in sources:
+-    lines = code(path)
+-    for n, line in enumerate(lines, 1):
+-        for grp, own in owner.items():
+-            if path != own and re.search(r'(->|\.)' + grp + r'\.(?=\w)', line) and re.search(r'\b(p|q|c|child|parent|best|st|z|self|proc)\b[^;]*(->|\.)' + grp + r'\.', line):
+-                bad.append(f"{path}:{n}: 存取了 {grp} 這一組的狀態(只有 {own} 可以): {line.strip()[:80]}")
+-        m = re.search(r'#include\s+"(proc_internal\.h|proc_calls\.h)"', line)
+-        if m:
+-            h = m.group(1)
+-            ok = (re.fullmatch(r'kernel/proc[\w]*\.c', path) is not None) if h == 'proc_internal.h' else path == 'kernel/syscall.c'
+-            if not ok:
+-                bad.append(f"{path}:{n}: 不可以引入 {h}")
+-for hdr in glob.glob('include/**/*.h', recursive=True) + glob.glob('kernel/*.h'):
+-    for n, line in enumerate(code(hdr), 1):
+-        if re.search(r'#include\s+"proc_internal\.h"', line):
+-            bad.append(f"{hdr}:{n}: 標頭不可以引入 proc_internal.h")
+-        if re.search(r'#include\s+"proc_calls\.h"', line) and hdr != 'kernel/proc_internal.h':
+-            bad.append(f"{hdr}:{n}: 只有 proc_internal.h 可以引入 proc_calls.h")
++core = {'kernel/proc.c', *owner.values()}
++sources = sorted(set(glob.glob('kernel/**/*.c', recursive=True) +
++                     glob.glob('arch/**/*.c', recursive=True) + glob.glob('lib/**/*.c', recursive=True)))
++headers = sorted(set(glob.glob('include/**/*.h', recursive=True) +
++                     glob.glob('kernel/**/*.h', recursive=True) + glob.glob('arch/**/*.h', recursive=True) +
++                     glob.glob('lib/**/*.h', recursive=True)))
++for path in sources + headers:
++    clean = code(path)
++    # Do not match documentation strings or include strings as field access.
++    fields = lex.sub(lambda m: blanks(m[0]), clean)
++    for m in re.finditer(r'(?:->|\.)\s*(sig|mem|files)\b', fields):
++        grp = m.group(1)
++        if path != owner[grp]:
++            n = fields.count('\n', 0, m.start()) + 1
++            bad.append(f"{path}:{n}: 存取了 {grp} 這一組的狀態(只有 {owner[grp]} 可以)")
++    for m in re.finditer(r'^\s*#\s*include\s*[<"]([^>"\n]+)[>"]', clean, re.M):
++        h = m.group(1).rsplit('/', 1)[-1]
++        if h not in ('proc_internal.h', 'proc_calls.h'):
++            continue
++        ok = path in core if h == 'proc_internal.h' else path in ('kernel/proc_internal.h', 'kernel/syscall.c')
++        if not ok:
++            n = clean.count('\n', 0, m.start()) + 1
++            bad.append(f"{path}:{n}: 不可以引入 {h}")
+ if bad:
+     print("架構檢查:%d 處違反模組的界線" % len(bad))
+     for b in bad:

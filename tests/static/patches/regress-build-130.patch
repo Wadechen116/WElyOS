@@ -1,0 +1,47 @@
+--- a/scripts/regress.sh
++++ b/scripts/regress.sh
+@@ -33,10 +33,24 @@
+ fail=0
+ 
+ for a in $ARCHS; do
+-  if ! cmake --preset "$a" >/dev/null 2>&1 || ! cmake --build --preset "$a" 2>&1 | grep -E " error |warning:" ; [ "${PIPESTATUS[0]}" -ne 0 ]; then
+-    : # 建置訊息已在上面列出(沒有輸出代表沒有錯誤與警告)
++  # A failed configure/build must never fall through to an old ELF.
++  if ! cmake --preset "$a" > "$OUT/$a-configure.txt" 2>&1; then
++    echo "$a: configure failed; log: $OUT/$a-configure.txt"
++    cat "$OUT/$a-configure.txt"
++    fail=1
++    continue
+   fi
+-  [ -f "build/$a/welyos.elf" ] || { echo "$a: 建置失敗"; fail=1; continue; }
++  if ! cmake --build --preset "$a" > "$OUT/$a-build.txt" 2>&1; then
++    echo "$a: build failed; log: $OUT/$a-build.txt"
++    cat "$OUT/$a-build.txt"
++    fail=1
++    continue
++  fi
++  grep -E " error |warning:" "$OUT/$a-build.txt" || true
++  [ -s "build/$a/welyos.elf" ] || { echo "$a: missing/empty ELF after build"; fail=1; continue; }
++  if [ "$a" = aarch64 ] && [ ! -s "build/$a/welyos.bin" ]; then
++    echo "$a: missing/empty binary after build"; fail=1; continue
++  fi
+ 
+   cases=("" "selftest" "selftest memtest stress")
+   if [ "$QUICK" -eq 0 ]; then
+@@ -54,12 +68,12 @@
+     timeout 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" -append "autoexit $c" > "$log" 2>&1 < /dev/null
+     rc=$?
+     t=$(echo "$(date +%s.%N) - $t0" | bc)
+-    # 結束碼 5 不是 kernel 會給的值(它只用 0 與 1;i386 是 3)。在 Windows 版的 QEMU 上偶爾出現
+-    # (幾百次一次),而且輸出都已經完整印完 — 推測是模擬器結束時自己異常終止
+-    # (0xC0000005 的最低位元組)。明確標示出來並重試一次,不默默放過,也不因此判定 kernel 失敗
++    # Unexpected exit 5 has not been attributed conclusively. Retain evidence and
++    # retry once for diagnostics, but keep the entire run failed.
+     if [ "$rc" -eq 5 ] && [ "$want" -ne 5 ]; then
+-      echo "  注意:$a ${c:-(只開機)} 的模擬器以結束碼 5 結束(不是 kernel 的結束碼),重試一次"
++      echo "  注意:$a ${c:-(只開機)} 以非預期結束碼 5 結束;保留失敗並重試一次收集證據"
+       cp "$log" "$log.exit5"
++      fail=1  # Preserve the unexpected exit even if the diagnostic retry succeeds.
+     timeout 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" -append "autoexit $c" > "$log" 2>&1 < /dev/null
+     rc=$?
+     fi

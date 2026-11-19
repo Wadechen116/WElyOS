@@ -51,7 +51,11 @@ for a in $ARCHS; do
     esac
     log="$OUT/$a-${c// /+}.txt"; [ -z "$c" ] && log="$OUT/$a-boot.txt"
     t0=$(date +%s.%N)
-    timeout 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" -append "autoexit $c" > "$log" 2>&1 < /dev/null
+    # 當機情境一律記錄 Windows 行程完整的 32 位元結束碼(每次多約 0.3 秒):
+    # 「模擬器以結束碼 5 結束」至今只出現在這類情境,而且約七百次才一次,專門去重現(500 次)沒有遇到。
+    # 讓它下次出現時自己留下證據(見下方與 docs/ISSUES.md 的 N-002)
+    wx=0; case "$c" in crash=*) wx=1 ;; esac
+    QEMU_WINEXIT=$wx timeout 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" -append "autoexit $c" > "$log" 2>&1 < /dev/null
     rc=$?
     t=$(echo "$(date +%s.%N) - $t0" | bc)
     # 結束碼 5 不是 kernel 會給的值(它只用 0 與 1;i386 是 3)。在 Windows 版的 QEMU 上偶爾出現
@@ -59,7 +63,9 @@ for a in $ARCHS; do
     # (0xC0000005 的最低位元組)。明確標示出來並重試一次,不默默放過,也不因此判定 kernel 失敗
     if [ "$rc" -eq 5 ] && [ "$want" -ne 5 ]; then
       echo "  注意:$a ${c:-(只開機)} 的模擬器以結束碼 5 結束(不是 kernel 的結束碼),重試一次"
+      echo "       完整的結束碼:$(grep -ao 'WIN_EXIT=[-0-9]* (0x[0-9A-F]*)' "$log" | tail -1 || true)(輸出保留在 $log.exit5)"
       cp "$log" "$log.exit5"
+      mkdir -p build/exit5-hunt && cp "$log" "build/exit5-hunt/regress-$(date +%Y%m%d-%H%M%S)-$a-${c// /+}.txt"
     timeout 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" -append "autoexit $c" > "$log" 2>&1 < /dev/null
     rc=$?
     fi
@@ -147,6 +153,11 @@ if [ "$QUICK" -eq 0 ] && [ -f scripts/host-test-net.sh ]; then
   else
     fail=1; echo "  網路堆疊主機測試失敗,輸出在 $OUT/host-net.txt"
   fi
+fi
+
+# 架構規則:模組之間的界線(誰可以存取哪一組狀態、誰可以引入哪個內部標頭),見 scripts/arch-check.sh
+if [ -f scripts/arch-check.sh ]; then
+  bash scripts/arch-check.sh || fail=1
 fi
 
 # 靜態檢查(約 2 秒):只看相對於「上一次提交」新增的提示,見 scripts/static-gate.sh

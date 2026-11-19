@@ -1,0 +1,752 @@
+{
+  "head": "e20248a0fd718cbaa77235d47b3ac0e086d3764b",
+  "source_hashes": {
+    "kernel/proc.c": "0cb95392cab81bdfc4e219ed9d75da543b428c8395151d4b6608c49028d8d54b",
+    "kernel/proc_mem.c": "7956553ef2801165e24c9316850ed57984087113620e06f03bb236b528061fb2",
+    "kernel/proc_signal.c": "f1ac54e500d594e601415842a5fc20ee995e1afa4c6cbc05008c20651f415fa0",
+    "kernel/proc_fs.c": "473319858b0cfbe1872d93254dcf3245ff5b3c478b9b15fcf23f3431cace1574",
+    "kernel/syscall.c": "061ad98ee166281b0cc4bf53d06bfbdd4550bb538833662fc4caa257649bc85b",
+    "kernel/proc_internal.h": "ad4c5f1b27bf2843d6232907cfada5509542a3a34c2b0de735f12872013f3cc5",
+    "kernel/proc_calls.h": "fc7c4a4fa53ec48f7c22fb3ce64eb34bdf9767ed461f66adadedebf6cec69ea0",
+    "kernel/vfs.c": "e05120ee35502c7489d13b48594b1c683c30c77ae3ca4084710c780f66e35513",
+    "scripts/arch-check.sh": "4e24c8957cbf7cb45e1334da6d3982da9e57ab94a10fc434851ab5f8559281b9"
+  },
+  "baseline_sha256": "eecf9a857c5f1d6e8938d6b0da859c45ecd39699199d75e663688a8becb4ad87",
+  "count": 3,
+  "findings": [
+    {
+      "id": "fd5f1a46a727d2fe3e611f78",
+      "path": "kernel/proc_mem.c",
+      "line": 222,
+      "symbol": "commit_release_all",
+      "source_line": "commit_change_locked(p, -(long)p->mem.commit);",
+      "old_function_sha256": "c3855a698a15a8ec323c5c1d1aeada0bf6e0cb1613512d2e2360b17ac3eb9f2e",
+      "function_sha256": "229573930c82b1e47a5270462081461d67a368d0282ac570742611ca75b0f5e2",
+      "body_equal_after_documented_renames": true,
+      "decision": "accepted exact unchecked call",
+      "reason": "Holds pstate_lk and passes -(long)p->mem.commit. Under existing bounded-memory invariants the delta is nonpositive, release clamps to current commitment and returns 0. Current commit_change_locked body was independently compared to HEAD after documented renames."
+    },
+    {
+      "id": "5be00e3472b51c46eee5e4de",
+      "path": "kernel/proc_mem.c",
+      "line": 292,
+      "symbol": "sys_munmap",
+      "source_line": "commit_change_locked(p, -(long)pages);",
+      "old_function_sha256": "ff2dd213318fceeae57b82ee5579aacffc2f2ab582708340f61522c643b2540f",
+      "function_sha256": "412447e53b6f59faf9d6ab4d44d4c10bff4678f37901fb55868df4fe35e95f45",
+      "body_equal_after_documented_renames": true,
+      "decision": "accepted exact unchecked call",
+      "reason": "Under pstate_lk, a nonzero mapping pages count is released by negative delta before unmapping outside the lock. Only positive delta can return NOMEM. Current body equals the old body after field and lock renames; host model covers release and double-unmap rejection."
+    },
+    {
+      "id": "81ccb02baa7772dd72d6b162",
+      "path": "kernel/proc.c",
+      "line": 818,
+      "symbol": "sys_fork",
+      "source_line": "vfs_exec_hold(c->exe);                   /* 子行程也在執行同一個程式檔 */",
+      "old_function_sha256": "84b45df5f91f0dad15323a7f69aefaeb226962fb3bb152344f76730db14681c4",
+      "function_sha256": "4f536a67a59304cd252685faddd14e03ddc70fde304b43dd6ae7f528990e07c5",
+      "body_equal_after_documented_renames": false,
+      "decision": "accepted exact unchecked call",
+      "reason": "Only accepts a single-threaded parent, which retains p->exe while this syscall executes. c->exe=vfs_dup(p->exe) retains the exact same regular executable; vfs_dup cannot allocate/fail and vfs_exec_hold only rejects a non-I_FILE. The helper/order changes do not alter this exact-call premise. This does not certify all fork interleavings."
+    }
+  ],
+  "function_comparison": [
+    {
+      "symbol": "cred_current",
+      "old_function_sha256": "e7ab9e4cec97396b57596761138c8e82e5abaf8b5d256d52b8fc24b441a15296",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "e7ab9e4cec97396b57596761138c8e82e5abaf8b5d256d52b8fc24b441a15296",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "proc_find",
+      "old_function_sha256": "7b9ed7b5290f89d75b4d19f9c37b2d47576a221ead2ea3ae2b7a0736eabf4ca5",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "7b9ed7b5290f89d75b4d19f9c37b2d47576a221ead2ea3ae2b7a0736eabf4ca5",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "map_page",
+      "old_function_sha256": "f90ed11c5e1d4861fd6cafa9b3e816f0910e7af835220da2fd306806877c1f66",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "f90ed11c5e1d4861fd6cafa9b3e816f0910e7af835220da2fd306806877c1f66",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "map_user_stack",
+      "old_function_sha256": "652850dbfc52a1692be722821ccf18fa60e6c37c5d84e8e1a40ea3e8bdfb0df4",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "652850dbfc52a1692be722821ccf18fa60e6c37c5d84e8e1a40ea3e8bdfb0df4",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "alloc_user_stack",
+      "old_function_sha256": "2c167890c104975137520d3f9a194671218c0d9b7869c8a9774e32138f90b2bc",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "2c167890c104975137520d3f9a194671218c0d9b7869c8a9774e32138f90b2bc",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "space_write",
+      "old_function_sha256": "7c2085c33d6b30810493cf45c3cd7bcd3c29df1df4ee39bf5992259e450b77df",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "7c2085c33d6b30810493cf45c3cd7bcd3c29df1df4ee39bf5992259e450b77df",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "args_add",
+      "old_function_sha256": "3a716ebd34fe7806ba55ec82fa1d7ade8629464513a5abe4e5dcf20a44a1565c",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "3a716ebd34fe7806ba55ec82fa1d7ade8629464513a5abe4e5dcf20a44a1565c",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "image_discard",
+      "old_function_sha256": "da44ef17a3546afd217b0b57b0a32cc2174b8652888356e2b76b76d2bb28ef1b",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "da44ef17a3546afd217b0b57b0a32cc2174b8652888356e2b76b76d2bb28ef1b",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "image_put_args",
+      "old_function_sha256": "7f9f664342a70b848aeec3528237aead6d8d6a2581cf585a64f45d7b39137f0f",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "7f9f664342a70b848aeec3528237aead6d8d6a2581cf585a64f45d7b39137f0f",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "image_build",
+      "old_function_sha256": "83e71b856857902e1b58780aa61a204a77856cfff0f8e8ff9e529e2d69e312a0",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "83e71b856857902e1b58780aa61a204a77856cfff0f8e8ff9e529e2d69e312a0",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "proc_set_name",
+      "old_function_sha256": "3998ba14233008752823d7a5e0eb262bcee8b5389eb71012dad51d7ebd730ff5",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "3998ba14233008752823d7a5e0eb262bcee8b5389eb71012dad51d7ebd730ff5",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "proc_thread_exit",
+      "old_function_sha256": "04df60eb3d1d748b6756a680fa3201b36baa710e8b8b2cfafb2ea54e51e4dbbf",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "04df60eb3d1d748b6756a680fa3201b36baa710e8b8b2cfafb2ea54e51e4dbbf",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "proc_begin_exit",
+      "old_function_sha256": "74e43649bfc0b8a2e5e2931be6705587e3b5c3cab41e2bec60e360448f9a0cd4",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "74e43649bfc0b8a2e5e2931be6705587e3b5c3cab41e2bec60e360448f9a0cd4",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "proc_exit",
+      "old_function_sha256": "320e74e0e60a3c96cff9699260680745049d8fea6001531645edf4166f2b6f28",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "320e74e0e60a3c96cff9699260680745049d8fea6001531645edf4166f2b6f28",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "user_thread_main",
+      "old_function_sha256": "863e941d4d31ea5b3b81672b71e5b14d5da7dae40bd122d9b690e0acca5cb8cd",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "863e941d4d31ea5b3b81672b71e5b14d5da7dae40bd122d9b690e0acca5cb8cd",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "proc_add_thread",
+      "old_function_sha256": "ce5c456a76e4019fba4282902b8716352f8ecbb3adbeb0bf112b24bf28f3a6d5",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "ce5c456a76e4019fba4282902b8716352f8ecbb3adbeb0bf112b24bf28f3a6d5",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "fd_install",
+      "old_function_sha256": "113c23a540e25eadb95cc52a86639a243f999ddb8d178c16514ce02f33a614a4",
+      "new_path": "kernel/proc_fs.c",
+      "new_function_sha256": "14b3db11910fb626c7e2d238e8b6f2fde757def44bec5dca155ca258ba8655d9",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "fd_get",
+      "old_function_sha256": "079964314b7ecf23f455e65f8cb8071593c92c6dd2c0e6ef30dfef22ddfb40ac",
+      "new_path": "kernel/proc_fs.c",
+      "new_function_sha256": "dedfc5d1cb4a110fec77abbed32fdd7d51046a40d7c390683a81bed0ffca3681",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "fd_remove",
+      "old_function_sha256": "fbc97d1a151282d2f9e062a676a34acc341fb25669ceb8a62dfc05b7e342da75",
+      "new_path": "kernel/proc_fs.c",
+      "new_function_sha256": "a0fea0a1abbfe54ed38b039884efb1dc04fe90f34a4b0a577566f04bd06c865d",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "fd_close_all",
+      "old_function_sha256": "a691a7d29b4ec910aa66f74a06a1974a75b0e26111f6ac80547cb7813b3780ca",
+      "new_path": "kernel/proc_fs.c",
+      "new_function_sha256": "a691a7d29b4ec910aa66f74a06a1974a75b0e26111f6ac80547cb7813b3780ca",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "fd_setup_console",
+      "old_function_sha256": "b8d1427f4f1c05f6306eadd4eeff2e690d3bacb6f78fbac4d8dbf4dec1a9b9fa",
+      "new_path": "kernel/proc_fs.c",
+      "new_function_sha256": "c0349d3c8db2fadf459a3b4ccdb5b778a3fdc18818a1c4d598a54addce4dbe64",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "fd_inherit",
+      "old_function_sha256": "2c781cbf8aaae2c5db24cfc86235751b0263d9dc6c5a10ef34200807c6d9d970",
+      "new_path": "kernel/proc_fs.c",
+      "new_function_sha256": "f6ba9beae844d16be4d28a5fc9cac32c84f11c42df5e2ae5d05e29e654428917",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "proc_create",
+      "old_function_sha256": "6f1b055fc04617e4de3bc331c2ad1ed7d0a8df71e7656ee2a9056813ffd5edff",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "f5a47c9db5cfef6be00b015d45f65e19cc02ba823ad6d3388bb16e0e5b7611b9",
+      "body_equal_after_documented_renames": false
+    },
+    {
+      "symbol": "proc_spawn",
+      "old_function_sha256": "8cc4d4465a877fd1eb6e02a72cc6375eac737fabb75e92f7a06a20db822bb0fc",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "8cc4d4465a877fd1eb6e02a72cc6375eac737fabb75e92f7a06a20db822bb0fc",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "proc_wait",
+      "old_function_sha256": "a0b2b6054d4d0596b3deea742465dfa56a7c5c2d5896724c27eb60c091347a05",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "a0b2b6054d4d0596b3deea742465dfa56a7c5c2d5896724c27eb60c091347a05",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "proc_unlink",
+      "old_function_sha256": "e697f5130d296477ad62e97bed6af766e1c6c513c88d44fe33e23e5b51ffa820",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "e697f5130d296477ad62e97bed6af766e1c6c513c88d44fe33e23e5b51ffa820",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "proc_became_zombie",
+      "old_function_sha256": "a382e50299bda3a13dadf453027d4e9e70e5c6deba3410377c95ff4c4445950c",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "b947ebbd285a72c21f471c3c313eb9305045d1a49ae48796f8f7b7281372ec6c",
+      "body_equal_after_documented_renames": false
+    },
+    {
+      "symbol": "proc_free_list",
+      "old_function_sha256": "995e5887a3fb19cad6e3e96252b7762d2f71696c54bf04e0ee95d20328805a3a",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "995e5887a3fb19cad6e3e96252b7762d2f71696c54bf04e0ee95d20328805a3a",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "proc_wait_child",
+      "old_function_sha256": "85fff4de286da06de9cd1036a293c01204d60d085b589989fd1c802ac35090bc",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "1258565be29d34f33ca7a2034825c7b0a40262cb8dd1c0c123265a219c1ef9d0",
+      "body_equal_after_documented_renames": false
+    },
+    {
+      "symbol": "sig_valid",
+      "old_function_sha256": "5449a124b49650a2fd10483174a5f052b278c9a27d4132703c96875c3c149b5a",
+      "new_path": "kernel/proc_signal.c",
+      "new_function_sha256": "5449a124b49650a2fd10483174a5f052b278c9a27d4132703c96875c3c149b5a",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sig_catchable",
+      "old_function_sha256": "29e56574de6f09c77ba59676c6ba81c43b7320764b8fbf063eb4f63aa1abf6b8",
+      "new_path": "kernel/proc_signal.c",
+      "new_function_sha256": "29e56574de6f09c77ba59676c6ba81c43b7320764b8fbf063eb4f63aa1abf6b8",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "proc_signal_locked",
+      "old_function_sha256": "80155ecb4ab961380619e7d02b388ff784be784cd46ad26109ba1fdb8a0eb62c",
+      "new_path": "kernel/proc_signal.c",
+      "new_function_sha256": "bee02179a97a296dcb57adb17d80f1aab517f5d2ad90fa08606f900e6324c281",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "proc_signal_group_locked",
+      "old_function_sha256": "a6a674be79d2884c3889f5107953e53855cefdd619d5f81243e3bb42049a7b04",
+      "new_path": "kernel/proc_signal.c",
+      "new_function_sha256": "a6a674be79d2884c3889f5107953e53855cefdd619d5f81243e3bb42049a7b04",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "proc_self_pgid",
+      "old_function_sha256": "93a325e5cd042c1d355f857942c6186f87fee6ccf9168e80ce7d880e87516058",
+      "new_path": "kernel/proc_signal.c",
+      "new_function_sha256": "93a325e5cd042c1d355f857942c6186f87fee6ccf9168e80ce7d880e87516058",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "proc_self_stopped",
+      "old_function_sha256": "fe9145b429cbf8b35d01ab7a854715ac2ff0d6b27f1b6e715070eb7c0eb03332",
+      "new_path": "kernel/proc_signal.c",
+      "new_function_sha256": "253928ad38d924fb3069e0fea2c679a60d499c79b25089a5d357662e7efff253",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "proc_group_alive_locked",
+      "old_function_sha256": "804b216e28a4e5ae92bdd22434ed0526ec21b197c53bc6b7acb4b26a6dbe0124",
+      "new_path": "kernel/proc_signal.c",
+      "new_function_sha256": "804b216e28a4e5ae92bdd22434ed0526ec21b197c53bc6b7acb4b26a6dbe0124",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "may_signal",
+      "old_function_sha256": "6b743f90d030c90f9c8ea7fa6d42e4aa5d1989fa71d7ad79559c9d138481e1d7",
+      "new_path": "kernel/proc_signal.c",
+      "new_function_sha256": "6b743f90d030c90f9c8ea7fa6d42e4aa5d1989fa71d7ad79559c9d138481e1d7",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sys_kill",
+      "old_function_sha256": "27b3183c03c1aa9fe570db56a4ba1cd4422062aa30d8339af683f6a88bc28fff",
+      "new_path": "kernel/proc_signal.c",
+      "new_function_sha256": "27b3183c03c1aa9fe570db56a4ba1cd4422062aa30d8339af683f6a88bc28fff",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sys_setpgid",
+      "old_function_sha256": "0c75b408496fced5afaf40819b98c4f416a56b674c5d90e649d12aeba68c90ad",
+      "new_path": "kernel/proc_signal.c",
+      "new_function_sha256": "0c75b408496fced5afaf40819b98c4f416a56b674c5d90e649d12aeba68c90ad",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sys_procinfo",
+      "old_function_sha256": "af86c600b588a9727c5fe41f4c7400ce2b213f73182ce485dec2fa9586b58994",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "bfd31a79d7c9612200549fa937e5cba15ed71719c136f764d639983b24ee30bf",
+      "body_equal_after_documented_renames": false
+    },
+    {
+      "symbol": "sys_sysinfo",
+      "old_function_sha256": "5d29f370b7af571fe65c1e47e64f3a466b85593560848c696d2370fcba13359d",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "5d29f370b7af571fe65c1e47e64f3a466b85593560848c696d2370fcba13359d",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "proc_kill",
+      "old_function_sha256": "fc9189700db7df4ca697a64745fd13a9f03b1ac722a0a80aa62f55ec35e1dc62",
+      "new_path": "kernel/proc_signal.c",
+      "new_function_sha256": "fc9189700db7df4ca697a64745fd13a9f03b1ac722a0a80aa62f55ec35e1dc62",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "user_fault",
+      "old_function_sha256": "6ac981a96dcf0ce159147568810df3a23c8bcb3053757574148216ab051a3ad0",
+      "new_path": "kernel/proc_signal.c",
+      "new_function_sha256": "6ac981a96dcf0ce159147568810df3a23c8bcb3053757574148216ab051a3ad0",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "deliver_signal",
+      "old_function_sha256": "d7f3463fb00ee1b8eb586514379fb6d32595d034fd6a81f0652b5ad6e5f2a8a9",
+      "new_path": "kernel/proc_signal.c",
+      "new_function_sha256": "50191f356c440506c17e0147d46d07df247ad49f27a693b83b0acbe49b6564fc",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sys_sigreturn",
+      "old_function_sha256": "a66631781d095fa93e4c1d796a3f48f4a586bc8aa4f1d2545f8b09aceceb83e6",
+      "new_path": "kernel/proc_signal.c",
+      "new_function_sha256": "a66631781d095fa93e4c1d796a3f48f4a586bc8aa4f1d2545f8b09aceceb83e6",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sys_signal",
+      "old_function_sha256": "25735c1ffc4074a09f63991440d2ef21c3a0f0c17ef326763b0568a99c205b1b",
+      "new_path": "kernel/proc_signal.c",
+      "new_function_sha256": "5bc4f53fedb4b56e176ecc855c85569c0e592473600511804ced070af4a05692",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "user_return_check",
+      "old_function_sha256": "4262a0a1c927a708624ba13e16157a80ef03b0e227e19774fba4de7d3659e298",
+      "new_path": "kernel/proc_signal.c",
+      "new_function_sha256": "1c96b414ce88a1fef70e985f4e832877292f3d68d4d51ad0ca508d46b8d3430f",
+      "body_equal_after_documented_renames": false
+    },
+    {
+      "symbol": "proc_fault",
+      "old_function_sha256": "b5f7bd5104e4bdeb036688eeec27bd2497e75e4f0c6cf31acf672b8afd00615f",
+      "new_path": "kernel/proc_mem.c",
+      "new_function_sha256": "e5cc40c5e61c1a7e0b16fd426ef7c320f0f79addf1f9d2413ee42fb7ab4a49b2",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "proc_page_fault",
+      "old_function_sha256": "288d5b69cf70ddcd881144abaa3e6590d7840df5353315673084824b6c119cda",
+      "new_path": "kernel/proc_mem.c",
+      "new_function_sha256": "288d5b69cf70ddcd881144abaa3e6590d7840df5353315673084824b6c119cda",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "copy_from_user",
+      "old_function_sha256": "d5e60ec89ad6ff010525b76c25f0cebd8dafc5bf26e16fa440e13d1f29a2e1bd",
+      "new_path": "kernel/proc_mem.c",
+      "new_function_sha256": "d5e60ec89ad6ff010525b76c25f0cebd8dafc5bf26e16fa440e13d1f29a2e1bd",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "copy_to_user",
+      "old_function_sha256": "3d5c471a2e5c32d84198645cb0aa87e4651e278dd0121a4cb7b77f8f757b5176",
+      "new_path": "kernel/proc_mem.c",
+      "new_function_sha256": "3d5c471a2e5c32d84198645cb0aa87e4651e278dd0121a4cb7b77f8f757b5176",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "copy_path_from_user",
+      "old_function_sha256": "39057aeddf40896353ee42570775994de7361d22c03a6d68ccee34983912b1f3",
+      "new_path": "kernel/proc_mem.c",
+      "new_function_sha256": "39057aeddf40896353ee42570775994de7361d22c03a6d68ccee34983912b1f3",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "path_normalize",
+      "old_function_sha256": "2b3233a4b1a750e7d294c4d3ac94288412d8b6edc871daed257cca2f7a2a5a62",
+      "new_path": "kernel/proc_fs.c",
+      "new_function_sha256": "2b3233a4b1a750e7d294c4d3ac94288412d8b6edc871daed257cca2f7a2a5a62",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "user_path",
+      "old_function_sha256": "c53531b104f8f9e68bb2a164d90db5daa0043f3eb2d02ea3b1473133ab614ba7",
+      "new_path": "kernel/proc_fs.c",
+      "new_function_sha256": "48a711d5a3a4317d246da5a85d384369ac9a6ac4550ca82132587c78f9616e41",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sys_chdir",
+      "old_function_sha256": "d931e97885b4d64e4546b54fa74f18e9eaf573b62586301a7814943d7c40254f",
+      "new_path": "kernel/proc_fs.c",
+      "new_function_sha256": "95b9580efeb6c62b6422a3da8630a0f27c685b531eeda96ccf394006a6ca877a",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sys_getcwd",
+      "old_function_sha256": "74e4a16ef4bd593dcc668d4811a4374da8deb32a4e81ce66f80dceb7a4815e80",
+      "new_path": "kernel/proc_fs.c",
+      "new_function_sha256": "c1adf54706785736566196ec1b9a7c4869fa36b1d25c06f630a41dbb04091fa8",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sys_two_paths",
+      "old_function_sha256": "ef493c6750e59b19d6c027dffb923fcf62c61e21bb42d5d12af4b90aaf043ba8",
+      "new_path": "kernel/syscall.c",
+      "new_function_sha256": "ef493c6750e59b19d6c027dffb923fcf62c61e21bb42d5d12af4b90aaf043ba8",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "commit_change_locked",
+      "old_function_sha256": "379b0314acc0a36fe179b0329c2f3d05385a69fe24ebbef0be5b594d37e870b8",
+      "new_path": "kernel/proc_mem.c",
+      "new_function_sha256": "da96a647c90bc02a31c53125968ff48016afba97b4e96d00c220739c5f73547f",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "commit_release_all",
+      "old_function_sha256": "c3855a698a15a8ec323c5c1d1aeada0bf6e0cb1613512d2e2360b17ac3eb9f2e",
+      "new_path": "kernel/proc_mem.c",
+      "new_function_sha256": "229573930c82b1e47a5270462081461d67a368d0282ac570742611ca75b0f5e2",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "pages_for",
+      "old_function_sha256": "66982b4cfca9edfafcd365ad1fe443d104b563b6db01a48499ed15d0e7ed638e",
+      "new_path": "kernel/proc_mem.c",
+      "new_function_sha256": "66982b4cfca9edfafcd365ad1fe443d104b563b6db01a48499ed15d0e7ed638e",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sys_memlimit",
+      "old_function_sha256": "935e8ce4582d51a51bc953d44fc6fdc426c184ae8b6f8af96d026fd7337b1a17",
+      "new_path": "kernel/proc_mem.c",
+      "new_function_sha256": "17ab321ee886a63a9f3e18997f32061e33925b39748ef5328a87868f4cfa8b67",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sys_mmap",
+      "old_function_sha256": "1335b39aad0d2dcd60ea8c11053368642a880ef6286910584db20c71f57a6433",
+      "new_path": "kernel/proc_mem.c",
+      "new_function_sha256": "216a9bea0b4ce57a950dbf1e958edc9fa8310c51e2997d5649c7803625ab9daa",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sys_munmap",
+      "old_function_sha256": "ff2dd213318fceeae57b82ee5579aacffc2f2ab582708340f61522c643b2540f",
+      "new_path": "kernel/proc_mem.c",
+      "new_function_sha256": "412447e53b6f59faf9d6ab4d44d4c10bff4678f37901fb55868df4fe35e95f45",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sys_sbrk",
+      "old_function_sha256": "020fbd5f424fa9ed2b96d30d1fbd1190ec615e09bec98837487770aabe3a9f48",
+      "new_path": "kernel/proc_mem.c",
+      "new_function_sha256": "30b33f8d7efb3885f0896111e7ec04ef44cfaeaf1a708ccceca45fb0f0dd2881",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sys_udp_open",
+      "old_function_sha256": "5aea825a34b43fe03380d3dcd4e95638c6757a2348a9ea0ca14306b331c88945",
+      "new_path": "kernel/syscall.c",
+      "new_function_sha256": "5aea825a34b43fe03380d3dcd4e95638c6757a2348a9ea0ca14306b331c88945",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sys_udp_io",
+      "old_function_sha256": "adb2ffea9a7de76cde5aa12c5cb4f9a16e09a3d0ed883bffdecabd74922a9597",
+      "new_path": "kernel/syscall.c",
+      "new_function_sha256": "adb2ffea9a7de76cde5aa12c5cb4f9a16e09a3d0ed883bffdecabd74922a9597",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sys_netinfo",
+      "old_function_sha256": "5a096c0c95c01f6b7ba6eeb580d35e62ae1da05587513eb5e23d43545c775a34",
+      "new_path": "kernel/syscall.c",
+      "new_function_sha256": "5a096c0c95c01f6b7ba6eeb580d35e62ae1da05587513eb5e23d43545c775a34",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sys_lseek",
+      "old_function_sha256": "38667aa2090015c7433058a964ab75e3c5978c4668b686c045133c3616007bdd",
+      "new_path": "kernel/syscall.c",
+      "new_function_sha256": "38667aa2090015c7433058a964ab75e3c5978c4668b686c045133c3616007bdd",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sys_write",
+      "old_function_sha256": "85dd9db7a90375884c4cf45db8e6da9996e972693f1f1bba26c085838d007cd0",
+      "new_path": "kernel/syscall.c",
+      "new_function_sha256": "85dd9db7a90375884c4cf45db8e6da9996e972693f1f1bba26c085838d007cd0",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sys_read",
+      "old_function_sha256": "3f76edd9a4d67c1d73a0b1fdd95ecd914764bb338ccaef54a79ee8c906e0b0e5",
+      "new_path": "kernel/syscall.c",
+      "new_function_sha256": "3f76edd9a4d67c1d73a0b1fdd95ecd914764bb338ccaef54a79ee8c906e0b0e5",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sys_open",
+      "old_function_sha256": "e0e398c95823c70ad061840830829f566597f09de0cf32030c03b68ad63cd1d5",
+      "new_path": "kernel/syscall.c",
+      "new_function_sha256": "e0e398c95823c70ad061840830829f566597f09de0cf32030c03b68ad63cd1d5",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sys_close",
+      "old_function_sha256": "90d12771d955586e189e2917bdb977bf5cea724fbe6c846b3eb46e624bda92d3",
+      "new_path": "kernel/syscall.c",
+      "new_function_sha256": "90d12771d955586e189e2917bdb977bf5cea724fbe6c846b3eb46e624bda92d3",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sys_fsync",
+      "old_function_sha256": "ef014e22ef0941b8f1dc7aa5cd05557d0e048667999d7d2591f59eba132ddd33",
+      "new_path": "kernel/syscall.c",
+      "new_function_sha256": "ef014e22ef0941b8f1dc7aa5cd05557d0e048667999d7d2591f59eba132ddd33",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sys_dup2",
+      "old_function_sha256": "251be34f4ea49bf9baef8db40e9f52e351c82f3b836e8ccd3dbd4bcf1f5d236d",
+      "new_path": "kernel/syscall.c",
+      "new_function_sha256": "f94109d227cce6e6038be77d6a890b6b5ec53e3e9bc13b78b76a84859d34faa0",
+      "body_equal_after_documented_renames": false
+    },
+    {
+      "symbol": "sys_pipe",
+      "old_function_sha256": "e7af5dd2496aff217660032ca0e6c6d595bf79ac1ecce1544bec5dbf30b7489e",
+      "new_path": "kernel/syscall.c",
+      "new_function_sha256": "e7af5dd2496aff217660032ca0e6c6d595bf79ac1ecce1544bec5dbf30b7489e",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sys_readdir",
+      "old_function_sha256": "0837e96b1a4391331a50b2531680ae01e7214b2b4bd5d75aeb0ff2c9e43d88de",
+      "new_path": "kernel/syscall.c",
+      "new_function_sha256": "0837e96b1a4391331a50b2531680ae01e7214b2b4bd5d75aeb0ff2c9e43d88de",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sys_path_op",
+      "old_function_sha256": "8cc3619e864c75c9b85f97906f6ddff7879aab4794a7f375835317210a3d1855",
+      "new_path": "kernel/syscall.c",
+      "new_function_sha256": "8cc3619e864c75c9b85f97906f6ddff7879aab4794a7f375835317210a3d1855",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "args_from_user",
+      "old_function_sha256": "ac0602005658b4f314780601e9bd4de063db9b04564ded29a9893f26f23a8c36",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "ac0602005658b4f314780601e9bd4de063db9b04564ded29a9893f26f23a8c36",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "get_path_and_args",
+      "old_function_sha256": "c5a6234ab14ffc8a1663b11754bda55cea6afd24e4abd505060fd5cbe07444d8",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "c5a6234ab14ffc8a1663b11754bda55cea6afd24e4abd505060fd5cbe07444d8",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sys_spawn",
+      "old_function_sha256": "999600d049e69c874424855d43aa516d73a65c2d4c1606c04ce47f03a38c7d34",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "999600d049e69c874424855d43aa516d73a65c2d4c1606c04ce47f03a38c7d34",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sys_exec",
+      "old_function_sha256": "b5002861f1cea156b08367690fd624ee8a448c194b044c6e73439be6509c8cf6",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "f5fbd582e21cd99384c12b191e98e022200861e667be0e9bcd12c653e26a50ee",
+      "body_equal_after_documented_renames": false
+    },
+    {
+      "symbol": "fork_child_main",
+      "old_function_sha256": "cbe23776df60a6f0b2124a36a9982e02e6e18faf6ab5267d2652391bd8f3af40",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "cbe23776df60a6f0b2124a36a9982e02e6e18faf6ab5267d2652391bd8f3af40",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sys_fork",
+      "old_function_sha256": "84b45df5f91f0dad15323a7f69aefaeb226962fb3bb152344f76730db14681c4",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "4f536a67a59304cd252685faddd14e03ddc70fde304b43dd6ae7f528990e07c5",
+      "body_equal_after_documented_renames": false
+    },
+    {
+      "symbol": "futex_bucket",
+      "old_function_sha256": "732d0d5dd39a98fcba5d10c88258d1d7d26b9151d47f73715223d3072cfe4185",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "732d0d5dd39a98fcba5d10c88258d1d7d26b9151d47f73715223d3072cfe4185",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sys_futex_wait",
+      "old_function_sha256": "c55108565ec6bdb150f6b0b1e645db4903a393f9891ca30acd2b03ff3467f608",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "c55108565ec6bdb150f6b0b1e645db4903a393f9891ca30acd2b03ff3467f608",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "sys_futex_wake",
+      "old_function_sha256": "0768f9801125c404189f46a79f7b9c937e0c0dbe6e92526a89daacae684f1964",
+      "new_path": "kernel/proc.c",
+      "new_function_sha256": "0768f9801125c404189f46a79f7b9c937e0c0dbe6e92526a89daacae684f1964",
+      "body_equal_after_documented_renames": true
+    },
+    {
+      "symbol": "syscall_dispatch",
+      "old_function_sha256": "2db00f336dcba659255f89f9f858a1d0d1cf5769aca0b552130f64891ae97a4f",
+      "new_path": "kernel/syscall.c",
+      "new_function_sha256": "57b0fdc60997aa755ee8743773fbec01cb2e4cec2b0ae9c642b18c531d9bb5eb",
+      "body_equal_after_documented_renames": false
+    }
+  ],
+  "new_functions": [
+    "fd_in_range",
+    "fd_replace",
+    "files_init_cwd",
+    "pmem_apply_injection",
+    "pmem_exec",
+    "pmem_fork",
+    "pmem_init",
+    "proc_cred_call",
+    "proc_has_cap",
+    "proc_pgid",
+    "proc_pid",
+    "proc_user_addr_ok",
+    "psig_exec",
+    "psig_fork",
+    "psig_report_stop",
+    "psig_stop_unreported",
+    "psig_stopped",
+    "sys_seu"
+  ],
+  "normalization": {
+    "sig_handler": [
+      "sig",
+      "handler"
+    ],
+    "sig_restorer": [
+      "sig",
+      "restorer"
+    ],
+    "sig_pending": [
+      "sig",
+      "pending"
+    ],
+    "stopped": [
+      "sig",
+      "stopped"
+    ],
+    "stop_reported": [
+      "sig",
+      "stop_reported"
+    ],
+    "stop_wq": [
+      "sig",
+      "stop_wq"
+    ],
+    "commit": [
+      "mem",
+      "commit"
+    ],
+    "limit": [
+      "mem",
+      "limit"
+    ],
+    "maps": [
+      "mem",
+      "maps"
+    ],
+    "mmap_next": [
+      "mem",
+      "mmap_next"
+    ],
+    "brk": [
+      "mem",
+      "brk"
+    ],
+    "seu_pending": [
+      "mem",
+      "seu_pending"
+    ],
+    "seu_addr": [
+      "mem",
+      "seu_addr"
+    ],
+    "seu_mask": [
+      "mem",
+      "seu_mask"
+    ],
+    "fd": [
+      "files",
+      "fd"
+    ],
+    "cwd": [
+      "files",
+      "cwd"
+    ]
+  },
+  "scope": "Exact baseline-call review, token-body comparison plus named helper review; not a whole-kernel concurrency proof."
+}

@@ -106,8 +106,18 @@ if [ "${QEMU_NET:-user}" != none ]; then
   fi
 fi
 
+# 診斷用:QEMU_WINEXIT=1 時(而且用的是 Windows 版的 QEMU)改由 scripts/win-exit.ps1 啟動,
+# 它會把 Windows 行程完整的 32 位元結束碼印到標準錯誤(WIN_EXIT=…)。平常不需要。
+LAUNCH=("$QEMU")
+case "$QEMU" in *.exe)
+  if [ "${QEMU_WINEXIT:-0}" = 1 ]; then
+    LAUNCH=(powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w "$(dirname "$0")/win-exit.ps1")"
+            "$(wslpath -w "$QEMU")")
+  fi ;;
+esac
+
 set +e
-"$QEMU" "${MACHINE[@]}" "${DISK_ARGS[@]}" "${NET_ARGS[@]}" -kernel "$ELF" -serial stdio \
+"${LAUNCH[@]}" "${MACHINE[@]}" "${DISK_ARGS[@]}" "${NET_ARGS[@]}" -kernel "$ELF" -serial stdio \
         -display "${QEMU_DISPLAY:-none}" -no-reboot "$@"
 rc=$?
 # i386 的 isa-debug-exit 寫入 0 時,QEMU 回傳 1,視為成功

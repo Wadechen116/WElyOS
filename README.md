@@ -3,6 +3,7 @@
 以標準 C(C11)從零開發的簡易作業系統,支援 **i386、RISC-V 64、AArch64** 三種架構,可在 QEMU(Quick Emulator) 上啟動,並可透過 GDB(GNU Debugger) 除錯追蹤。專案從最陽春的階段開始,逐步擴充。
 
 > 開發過程的逐步紀錄見 [docs/DEVLOG.md](docs/DEVLOG.md),開頭附有專業名詞的中英對照表。
+待解決的問題列在 [docs/ISSUES.md](docs/ISSUES.md)(有編號與狀態;問題不是記下來就算了,要解決並附上證據)。
 
 ## 目前功能
 
@@ -67,6 +68,7 @@
 - [x] 依 Codex 的主機端故障矩陣修正:`cat` 讀寫失敗會回報、shell 錯誤路徑上的清理(前景、檔案描述符、被打斷的等待);靜態檢查修正一個漏報,規則變更時改以完整掃描把關
 - [x] 寫入失敗傳得回來:`sys_fsync`;`close` 對可寫的檔案回報寫回失敗(描述符仍然已關閉,不可重試);`cp`、`tftp` 與 shell 的 `> 檔案` 在資料確定寫到磁碟後才算成功
 - [x] 讀不到的區塊不再被當成「內容是 0」:間接區塊讀取失敗時,讀檔、寫檔、目錄掃描都回報錯誤(Codex 以主機端的故障注入找到)
+- [x] 結構整理之四:行程管理拆成有界線的模組 — 狀態依擁有者分成核心 / 訊號 / 記憶體 / 檔案四組,系統呼叫層看不到行程結構的內容(編譯器把關),界線由 `scripts/arch-check.sh` 在回歸中檢查
 
 ## 規劃中
 
@@ -111,6 +113,7 @@ bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "safe"            
 QEMU_NET=none bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf                  # 不接網路卡(預設接上;QEMU_TFTP=目錄 可指定以 tftp 分享給客體的主機目錄,預設 rootfs/)
 bash scripts/host-test-net.sh                  # 在主機上測試網路的協定堆疊(不需要 QEMU)
 bash scripts/static-check.sh                   # 靜態檢查(快速模式約 2 秒;--mode analyze 以 GCC 分析器檢查三個架構)
+bash scripts/arch-check.sh                     # 架構規則:模組之間的界線有沒有被跨過(回歸的一部分)
 bash scripts/static-refresh.sh                 # 處理完新增的提示之後,更新回歸測試用來比較的參考報告
 QEMU_DISK=none bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf                 # 不接磁碟(預設接上 build/<架構>/disk.img,掛載在 /disk;QEMU_DISK=路徑 可指定別的映像檔)
 ```
@@ -122,6 +125,7 @@ arch/<名稱>/  各架構的開機程式、linker script、驅動(i386 / riscv64
 include/      與架構無關的標頭(arch.h 為架構介面;cred.h 為身分與特權;net.h 為網路的介面)
 include/uapi/ kernel 與使用者程式共用的定義:系統呼叫編號、傳遞的結構、錯誤碼、訊號編號(兩邊引入同一份檔案)
 kernel/       kernel 主體(main、kprintf、fdt、panic、timer、pmm、kmalloc、sched、runq_ring / runq_list、spinlock、smp、sync、vm、proc、vfs、ramfs、wfs、virtio_blk、virtio_net、blkfault、netif、blackbox、watchdog、initrd、console、pipe;net/ 為網路的協定堆疊)
+              行程管理:proc.c(核心)、proc_signal.c(訊號)、proc_mem.c(記憶體)、proc_fs.c(描述符表與工作目錄)、syscall.c(系統呼叫層);bcache.c 為區塊快取
 kernel/test/  kernel 的自我測試與示範(只在開機參數要求時執行):mem_test.c、sched_test.c、io_test.c、user_test.c
 lib/          最小字串函式庫、CRC-32
 cmake/        各架構的 toolchain 檔

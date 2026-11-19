@@ -105,6 +105,10 @@ add_executable(welyos.elf
     kernel/sync.c
     kernel/vm.c
     kernel/proc.c
+    kernel/proc_signal.c
+    kernel/proc_mem.c
+    kernel/proc_fs.c
+    kernel/syscall.c
     kernel/vfs.c
     kernel/console.c
     kernel/pipe.c
