@@ -41,6 +41,7 @@
 #define MAX_STAGES 6                             /* 一條管線最多由幾個命令組成 */
 #define SAVE_IN    14                            /* 重新導向時暫存原本標準輸入 / 輸出的描述符編號 */
 #define SAVE_OUT   15
+#define SAVE_SYNC  13                            /* 「> 檔案」的那個檔案:命令結束後由 shell 同步並確認寫入成功 */
 
 /* 從檔案描述符一次讀一塊,再一行一行交出去。
    直接一次讀一個位元組也可以,但每個位元組都要一次系統呼叫,慢很多 */
@@ -275,23 +276,47 @@ static void jobs_reap(void)
 
 /*
  * 把工作放在前景,等到它「結束」或「被暫停」(此時 Ctrl-C 會終止它、Ctrl-Z 會暫停它)。
- * 暫停中的工作會先讓它繼續。回傳 1 = 被暫停了(j->stopped 已設定),0 = 結束了(結束碼在 j->status)。
+ * 暫停中的工作會先讓它繼續。回傳 0 = 結束了(結束碼在 j->status);1 = 被暫停了(j->stopped 已設定);
+ * 2 = 等待失敗(一直被打斷,或 kernel 回報錯誤):工作與它的行程都原樣保留,沒有被標成結束或暫停 —
+ * 它可能還在執行,呼叫者不可以把它從表格拿掉。
  * j 可以是表格裡的工作,也可以是呼叫者手上暫時的一個(前景命令一開始還不算工作)。
  */
+/* 把標準輸入 / 輸出換回原本的。換不回來的話 shell 已經沒有可以用的輸入輸出了:
+   繼續執行只會把之後的命令接到錯的地方,所以直接結束 */
+static void restore_fd(int saved, int fd)
+{
+    if (sys_dup2(saved, fd) != fd)
+        sys_exit(1);
+}
+
 static int job_wait(struct job *j)
 {
     sys_tcsetfg(j->pgid);                        /* 先設為前景再讓它繼續:它也許正等著讀鍵盤 */
     if (j->stopped) {
-        j->stopped = 0;
-        sys_kill(-j->pgid, SIGCONT);
+        long rc = sys_kill(-j->pgid, SIGCONT);
+        if (rc != 0 && rc != -E_SRCH) {
+            /* 叫不動它:它還停著,這時候去等只會把 shell 自己卡住。維持「暫停」的狀態回去 */
+            puts_("sh: cannot continue the job\n");
+            sys_tcsetfg(0);                      /* 把前景還給 shell 自己:不然接下來讀鍵盤的 shell 反而成了「背景」 */
+            return 1;
+        }
+        j->stopped = 0;                          /* -E_SRCH = 整組都不在了:下面的等待會立刻收到結果 */
     }
     for (int i = 0; i < j->n && !j->stopped; i++) {
         int st = 0;
 
         if (j->pids[i] < 0)
             continue;
-        if (sys_waitpid(j->pids[i], &st, WUNTRACED) != j->pids[i])
-            st = 1;                              /* 等不到(不該發生):當作它已經結束 */
+        /* 等待被訊號打斷(-E_INTR)不是「它結束了」:再等。次數有上限,免得出了別的問題時永遠繞不出去 */
+        long w = -E_INTR;
+        for (int tries = 0; tries < 1000 && w == -E_INTR; tries++)
+            w = sys_waitpid(j->pids[i], &st, WUNTRACED);
+        if (w != j->pids[i]) {
+            /* 等不到。不可以當成「它結束了」:它可能還活著,把它從紀錄裡拿掉就再也沒有人管得到它。
+               保留這個行程與整個工作,讓呼叫者知道這次沒有等成功(回傳 2) */
+            sys_tcsetfg(0);
+            return 2;
+        }
         if (WIFSTOPPED(st))
             j->stopped = WSTOPSIG(st);           /* 整個群組一起被暫停,其餘的不必再等 */
         else
@@ -350,7 +375,13 @@ static long run(struct stage *st, int ns, int background)
 {
     long pids[MAX_STAGES];
     long prev_rd = -1;
+    long keep = -1;                              /* SAVE_SYNC:輸出檔的另一個參考,見下面「確認寫入」 */
+    const char *keep_path = 0;
     struct job *job = 0;
+
+    /* 先全部設成「沒有」:中途失敗提早離開迴圈時,後面還沒輪到的那幾格才不會是未初始化的值 */
+    for (int i = 0; i < MAX_STAGES; i++)
+        pids[i] = -1;
 
     if (background) {
         job = job_free_slot();
@@ -383,13 +414,27 @@ static long run(struct stage *st, int ns, int background)
             break;
         }
 
-        sys_dup2(0, SAVE_IN);                    /* 記住原本的標準輸入 / 輸出 */
-        sys_dup2(1, SAVE_OUT);
+        /* 記住原本的標準輸入 / 輸出。記不住就不可以去動 0 和 1:之後換不回來,shell 自己就壞了 */
         int ok = 1;
+        int saved_in = sys_dup2(0, SAVE_IN) == SAVE_IN;
+        if (!saved_in || sys_dup2(1, SAVE_OUT) != SAVE_OUT) {
+            puts_("sh: cannot save the standard input/output\n");
+            if (saved_in)
+                close_quiet(SAVE_IN);              /* 第一個存成功、第二個失敗:自己開的那一個要關掉 */
+            if (prev_rd >= 0)
+                close_quiet(prev_rd);
+            if (fds[0] >= 0)
+                close_quiet(fds[0]);
+            if (fds[1] >= 0)
+                close_quiet(fds[1]);
+            prev_rd = -1;
+            break;
+        }
 
         if (prev_rd >= 0) {                      /* 輸入:上一個命令的管線 */
-            sys_dup2(prev_rd, 0);
-            sys_close(prev_rd);
+            if (sys_dup2(prev_rd, 0) != 0)
+                ok = 0;                          /* 接不上:不可以讓命令去讀原本的輸入 */
+            close_quiet(prev_rd);
             prev_rd = -1;
         } else if (st[i].in_path) {              /* 或檔案 */
             fd = sys_open(st[i].in_path, O_RDONLY);
@@ -397,33 +442,45 @@ static long run(struct stage *st, int ns, int background)
                 complain("cannot open ", st[i].in_path);
                 ok = 0;
             } else {
-                sys_dup2(fd, 0);
-                sys_close(fd);
+                if (sys_dup2(fd, 0) != 0)
+                    ok = 0;
+                close_quiet(fd);
             }
         }
         if (fds[1] >= 0) {                       /* 輸出:接到下一個命令的管線 */
-            sys_dup2(fds[1], 1);
-            sys_close(fds[1]);                   /* 我們自己不留寫端 */
+            if (sys_dup2(fds[1], 1) != 1)
+                ok = 0;                          /* 接不上:不可以讓命令把輸出印到畫面上 */
+            close_quiet(fds[1]);                   /* 我們自己不留寫端 */
         } else if (st[i].out_path) {             /* 或檔案 */
             fd = sys_open(st[i].out_path,
                           O_CREAT | O_WRONLY | (st[i].append ? O_APPEND : O_TRUNC));
             if (fd < 0) {
-                sys_dup2(SAVE_OUT, 1);           /* 先換回來,錯誤訊息才印得出來 */
+                restore_fd(SAVE_OUT, 1);         /* 先換回來,錯誤訊息才印得出來 */
                 complain("cannot open ", st[i].out_path);
                 ok = 0;
             } else {
-                sys_dup2(fd, 1);
-                sys_close(fd);
+                if (sys_dup2(fd, 1) != 1)
+                    ok = 0;
+                /* 自己另外留一個指向同一個檔案的描述符:命令寫完之後才能替它確認資料寫成功了。
+                   (子行程只繼承 0、1、2 號,不會拿到這一個) */
+                close_quiet(keep);
+                keep = sys_dup2(fd, SAVE_SYNC) == SAVE_SYNC ? SAVE_SYNC : -1;
+                if (keep < 0)
+                    ok = 0;
+                keep_path = st[i].out_path;
+                close_quiet(fd);
             }
         }
 
         if (ok)
             pids[i] = sys_spawn(prog, st[i].argv);
 
-        sys_dup2(SAVE_IN, 0);                    /* 換回來 */
-        sys_dup2(SAVE_OUT, 1);
-        sys_close(SAVE_IN);
-        sys_close(SAVE_OUT);
+        restore_fd(SAVE_IN, 0);                  /* 換回來 */
+        restore_fd(SAVE_OUT, 1);
+        if (!ok && pids[i] < 0 && i + 1 < ns)
+            complain("cannot redirect for ", st[i].argv[0]);
+        close_quiet(SAVE_IN);
+        close_quiet(SAVE_OUT);
         prev_rd = fds[0];                        /* 留給下一個命令當輸入 */
 
         if (ok && pids[i] < 0)
@@ -432,7 +489,7 @@ static long run(struct stage *st, int ns, int background)
                      pids[i] == -E_ACCES ? ": permission denied" : ": cannot execute");
     }
     if (prev_rd >= 0)
-        sys_close(prev_rd);
+        close_quiet(prev_rd);
 
     /*
      * 把這條管線的所有行程放進同一個行程群組,並設為主控台的「前景」:
@@ -460,6 +517,7 @@ static long run(struct stage *st, int ns, int background)
 
     if (background) {
         /* 背景:記下這個工作就回去讀下一個命令。一個行程都沒啟動成功的話不算工作 */
+        close_quiet(keep);                      /* 背景工作:不等它,也就無從替它確認 */
         if (!pgid)
             return 127;
         *job = cur;
@@ -468,21 +526,50 @@ static long run(struct stage *st, int ns, int background)
     }
 
     /* 前景:全部建立完才開始等(它們是同時在執行的) */
-    while (pgid && job_wait(&cur)) {
-        /* 被 Ctrl-Z 暫停了:登記成工作,回到提示符號。表格滿了就沒辦法記住它,
-           只好讓它繼續、接著等(否則它會停在那裡,再也沒有人能讓它繼續) */
+    int w;
+    while (pgid && (w = job_wait(&cur)) != 0) {
+        /* 1 = 被 Ctrl-Z 暫停了;2 = 等待失敗(它可能還在執行)。兩種都登記成工作、回到提示符號:
+           之後可以用 jobs / fg / wait 再處理。等待失敗的不標成「暫停」— 那不是事實 */
         job = job_free_slot();
         if (job) {
             *job = cur;
-            job_report_stopped(job);
-            return 128 + cur.stopped;
+            if (w == 2)
+                job_report(job, "could not wait for it; still listed as a job, pid ", job->pids[job->n - 1]);
+            else
+                job_report_stopped(job);
+            close_quiet(keep);                  /* 它還沒寫完 */
+            return w == 2 ? 1 : 128 + cur.stopped;
         }
+        if (w == 2) {
+            puts_("sh: could not wait for the command, and the job table is full\n");
+            close_quiet(keep);
+            return 1;
+        }
+        /* 表格滿了就沒辦法記住被暫停的工作,只好讓它繼續、接著等
+           (否則它會停在那裡,再也沒有人能讓它繼續) */
         puts_("sh: too many jobs; cannot stop this one\n");
+    }
+    /*
+     * 確認寫入:命令都結束了,這時候才把「> 檔案」的那個檔案同步到磁碟,並檢查結果。
+     * 要在命令結束「之後」做(之前檔案還是空的),而且同步的必須是命令實際寫入的那個檔案
+     * (不是已經換回來的標準輸出 — 那是主控台)。
+     * 寫不成功的話,命令本身即使回報成功,整行也算失敗:使用者以為存好的東西其實沒有存好。
+     */
+    int save_failed = 0;
+    if (keep >= 0) {
+        long synced = sys_fsync(keep);
+        long closed = sys_close(keep);           /* 不論成不成功,描述符都已經關閉 */
+        if (synced == -E_INVAL)
+            synced = 0;                          /* 「> /dev/null」這類:對象沒有寫回這件事,不是錯誤 */
+        if (synced != 0 || closed != 0) {
+            complain("write error: could not save ", keep_path);
+            save_failed = 1;
+        }
     }
     /* 最後一個命令沒有啟動:重新導向失敗 1、找不到程式 127;否則是它的結束碼 */
     if (pids[ns - 1] < 0)
         return pids[ns - 1] == -1 ? 1 : 127;
-    return cur.status;
+    return save_failed && cur.status == 0 ? 1 : cur.status;
 }
 
 int main(int argc, char **argv)
@@ -591,7 +678,11 @@ int main(int argc, char **argv)
                 status = 1;
             } else {
                 job_report(j, "foreground", -1);
-                if (job_wait(j)) {               /* 又被暫停了:留在表格裡 */
+                int w = job_wait(j);
+                if (w == 2) {                    /* 等待失敗:留在表格裡,不假裝它結束或暫停了 */
+                    puts_("sh: fg: could not wait for the job; it is still listed\n");
+                    status = 1;
+                } else if (w) {                  /* 又被暫停了:留在表格裡 */
                     job_report_stopped(j);
                     status = 128 + j->stopped;
                 } else {
@@ -619,7 +710,11 @@ int main(int argc, char **argv)
             for (struct job *j = jobs; j < jobs + MAX_JOBS; j++) {
                 if (!j->used || j->stopped)
                     continue;
-                if (job_wait(j)) {
+                int w = job_wait(j);
+                if (w == 2) {
+                    puts_("sh: wait: could not wait for a job; it is still listed\n");
+                    status = 1;
+                } else if (w) {
                     job_report_stopped(j);
                 } else {
                     status = j->status;

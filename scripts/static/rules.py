@@ -172,6 +172,13 @@ def check(sources):
             if name in error_names and close+1 < len(fn.body) and fn.body[close+1].text == ';':
                 start = j
                 while start and fn.body[start-1].text not in {';', '{', '}'}:
+                    previous = start - 1
+                    if fn.body[previous].text == ')' and previous in fn.pairs:
+                        opening = fn.pairs[previous]
+                        # 控制條件中的賦值不是 body 呼叫的結果。例:
+                        # while ((n = read(...)) > 0) write(...);
+                        if opening and fn.body[opening-1].text in {'if', 'while', 'for', 'switch'}:
+                            break
                     start -= 1
                 prefix = {t.text for t in fn.body[start:j]}
                 if not prefix.intersection({'=', 'return', '+=', '-='}):

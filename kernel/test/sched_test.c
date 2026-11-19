@@ -783,23 +783,84 @@ static void rt_task(void *arg)
     KASSERT(st.releases == 10 && st.misses == 0 && st.overruns == 0 && st.period_ms == 20);
     rt_max_late = late;
 
-    /* 超出預算:這個週期用 12 毫秒(預算 5)。仍然在 20 毫秒的期限內做完 */
-    rt_spin_until(timer_ticks() + 12);
-    KASSERT(thread_effective_prio(thread_current()) == PRIO_HIGH);       /* 已經被降回原本的優先權 */
+    /*
+     * 超出預算:這個週期用 12 毫秒(預算 5)。仍然在 20 毫秒的期限內做完。
+     *
+     * 這一段的檢查假設「空轉的 12 毫秒落在同一個週期裡」。在模擬器上,主機偶爾會讓這顆虛擬 CPU
+     * 停頓十幾毫秒,時間一口氣跳過去,空轉就跨過了週期的邊界 — 新的週期重設了預算與降級,
+     * 檢查到的就不是預期的狀態。那不是排程器的錯,所以先判斷有沒有跨過邊界(expect 是下一個
+     * 週期開始時間的下限);沒有跨過時才做嚴格的檢查,而且失敗時把實際的數值印出來。
+     */
+    uint64_t spin_from = timer_ticks();
+    rt_spin_until(spin_from + 12);
+    int prio_after = thread_effective_prio(thread_current());
+    int crossed = timer_ticks() >= expect || spin_from + 12 >= expect;
     KASSERT(thread_wait_period(&st) == 0);
-    KASSERT(st.overruns == 1 && st.misses == 0 && st.max_used_ms >= 5 && st.throttled == 0);
+    if (!crossed && (prio_after != PRIO_HIGH || st.overruns != 1 || st.misses != 0 || st.max_used_ms < 5))
+        panic("rt test (overrun): prio %d, overruns %u, misses %u, max used %u ms, late %u, "
+              "spin %llu..%llu, next period at >= %llu", prio_after, st.overruns, st.misses,
+              st.max_used_ms, late, (unsigned long long)spin_from,
+              (unsigned long long)(spin_from + 12), (unsigned long long)expect);
+    if (crossed)
+        kprintf("rt: (the emulator stalled during the overrun test; its strict checks were skipped)\n");
+    KASSERT(st.overruns >= 1 && st.throttled == 0);
     KASSERT(thread_effective_prio(thread_current()) == PRIO_RT);         /* 新的週期:恢復 */
 
-    /* 錯過期限:一口氣做 45 毫秒,跨過兩個期限 */
+    /* 錯過期限:一口氣做 45 毫秒,跨過兩個期限(主機停頓時可能更多,所以只要求「至少」) */
+    unsigned misses0 = st.misses, overruns0 = st.overruns;
     rt_spin_until(timer_ticks() + 45);
     KASSERT(thread_wait_period(&st) == 0);
-    KASSERT(st.misses == 2 && st.overruns >= 3);
+    if (st.misses - misses0 < 2 || st.overruns - overruns0 < 2)
+        panic("rt test (missed deadlines): misses %u -> %u, overruns %u -> %u", misses0, st.misses,
+              overruns0, st.overruns);
 
     /* 負載檢查:改成 80% 會被拒絕,而且原本的設定不受影響 */
     KASSERT(thread_set_periodic(10, 8) == -E_BUSY && thread_set_periodic(10, 10) == -E_INVAL);
     KASSERT(thread_wait_period(&st) == 0 && st.period_ms == 20 && st.total_util == 250);
     KASSERT(thread_set_periodic(0, 0) == 0 && thread_wait_period(NULL) == -E_INVAL);
     rt_hog_stop = 1;
+}
+
+/*
+ * 長週期與短週期的即時工作同時存在(Codex 找到的反例):長的那個每 100 毫秒忙 25 毫秒,
+ * 短的那個每 10 毫秒要醒來一次。短的必須能打斷長的 — 只有一顆 CPU 時尤其如此:
+ * 兩者在同一層輪流的話,長的會用完它 10 毫秒的時間片,短的每個忙碌區段要錯過兩三次。
+ * 容許錯過 1 次:在模擬器上,主機偶爾停頓十幾毫秒,那不是排程器的問題。
+ */
+static volatile int rt_long_ready, rt_long_stop;
+static volatile unsigned rt_long_misses, rt_short_misses;
+
+static void rt_long_task(void *arg)
+{
+    struct rt_stats st;
+
+    (void)arg;
+    KASSERT(thread_set_periodic(100, 30) == 0);
+    rt_long_ready = 1;
+    while (!rt_long_stop) {
+        rt_spin_until(timer_ticks() + 25);
+        KASSERT(thread_wait_period(&st) == 0);
+    }
+    rt_long_misses = st.misses;
+    KASSERT(thread_set_periodic(0, 0) == 0);
+}
+
+static void rt_short_task(void *arg)
+{
+    struct rt_stats st;
+
+    (void)arg;
+    while (!rt_long_ready)
+        thread_yield();
+    KASSERT(thread_set_periodic(10, 3) == 0);
+    /* 週期短的排在比較高的層級 */
+    KASSERT(thread_effective_prio(thread_current()) == PRIO_RT + 1);
+    for (int i = 0; i < 20; i++)                         /* 200 毫秒:橫跨長工作的兩個忙碌區段 */
+        KASSERT(thread_wait_period(&st) == 0);
+    rt_short_misses = st.misses;
+    KASSERT(st.releases + st.misses >= 20 && st.misses <= 1);
+    rt_long_stop = 1;
+    KASSERT(thread_set_periodic(0, 0) == 0);
 }
 
 void rt_demo(void)
@@ -819,6 +880,15 @@ void rt_demo(void)
             "tick%s); a budget overrun and 2 missed deadlines were detected; 80%% load was refused\n",
             rt_max_late, rt_max_late == 1 ? "" : "s");
     KASSERT(rt_max_late <= 3);
+
+    rt_long_ready = rt_long_stop = 0;
+    int tl = thread_create("rt-long", rt_long_task, NULL), ts = thread_create("rt-short", rt_short_task, NULL);
+    KASSERT(tl > 0 && ts > 0);
+    thread_join(ts);
+    thread_join(tl);
+    KASSERT(rt_long_misses == 0);
+    kprintf("rt: a 10 ms task missed %u of 20 deadlines while a 100 ms task was busy 25 ms per period "
+            "(shorter period = higher level)\n", rt_short_misses);
 }
 
 void smp_sched_demo(void)

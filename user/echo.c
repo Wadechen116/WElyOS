@@ -18,6 +18,7 @@ int main(int argc, char **argv)
             buf[len++] = *s;
     }
     buf[len++] = '\n';
-    sys_write(1, buf, len);
+    if (sys_write(1, buf, len) != (long)len)
+        return 255;                              /* 寫不出去(例如管線另一端已關閉):不是參數個數,明確的失敗 */
     return argc;
 }

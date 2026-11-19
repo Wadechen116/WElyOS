@@ -824,6 +824,27 @@ int vfs_statfs(const char *path, struct fsinfo *out)
     return err;
 }
 
+static int flush_file(struct file *f, int durable)
+{
+    struct inode *in = f->in;
+
+    if (in->type != I_FILE && in->type != I_DIR)
+        return durable ? -E_INVAL : 0;
+    return in->ops->flush ? in->ops->flush(in, durable) : 0;
+}
+
+int vfs_fsync(struct file *f)
+{
+    return flush_file(f, 1);
+}
+
+int vfs_flush(struct file *f)
+{
+    if ((f->flags & O_ACCMODE) == O_RDONLY)
+        return 0;                            /* 唯讀的開啟沒有寫過任何東西 */
+    return flush_file(f, 0);
+}
+
 int vfs_sync(void)
 {
     int rc = 0;

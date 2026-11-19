@@ -29,8 +29,9 @@ struct thread;
 #define PRIO_NORMAL  4      /* thread_create 的預設值 */
 #define PRIO_HIGH    6
 #define PRIO_MAX     7
-#define PRIO_RT      8      /* 只給週期性的即時工作使用(見 thread_set_periodic);不能直接指定 */
-#define PRIO_LEVELS  9
+#define PRIO_RT      8      /* 8 ~ 15:只給週期性的即時工作使用(見 thread_set_periodic);不能直接指定。 */
+#define PRIO_RT_MAX  15     /*          週期越短的排在越高的層級(rate-monotonic) */
+#define PRIO_LEVELS  16
 
 /* 初始化排程器:把目前正在跑的開機流程登記為第一條執行緒(main)。
    需先完成 pmm_init() 與 timer_init()(時間片要依 tick 頻率換算);

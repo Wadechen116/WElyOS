@@ -58,23 +58,30 @@ int main(int argc, char **argv)
         fprintf(2, "usage: vote [-t MILLISECONDS] [-k REPLICA] COMMAND [ARGUMENTS...]\n");
         return 124;
     }
+    int code;
+
     if (tmr_run(run_command, &argv[i], timeout, kill_which >= 0 ? kill_one : 0, 0, res, &rep) != 0) {
         if (rep.pid[TMR_N - 1] == 0) {
             fprintf(2, "vote: could not start three replicas\n");
-            return 124;
+            code = 124;
+            goto out;
         }
         fprintf(2, "vote: no two replicas agree (exit codes %d, %d, %d)%s; no result\n",
                 res[0].status, res[1].status, res[2].status, rep.timed_out ? ", timed out" : "");
-        return 125;
+        code = 125;
+        goto out;
     }
     const struct tmr_result *w = &res[rep.winner];
     /* 相同不代表正確:三份都超過時間、都被終止,結果也是「相同」的 — 那不是答案 */
     if (rep.timed_out && w->status == 128 + SIGKILL) {
         fprintf(2, "vote: the command did not finish within %u ms; no result\n", timeout);
-        return 125;
+        code = 125;
+        goto out;
     }
-    if (w->len && sys_write(1, w->out, w->len) != (long)w->len)
-        return 124;
+    if (w->len && sys_write(1, w->out, w->len) != (long)w->len) {
+        code = 124;
+        goto out;
+    }
     if (rep.agree == 2) {
         char note[100];
         const struct tmr_result *o = &res[rep.odd];
@@ -84,5 +91,10 @@ int main(int argc, char **argv)
         if (sys_bblog(BB_NOTE, note) != 0)
             fprintf(2, "vote: (not recorded in the fault log: needs the admin capability)\n");
     }
-    return w->status;
+    code = w->status;
+out:
+    /* 三份輸出的緩衝區由 tmr_run 配置、由呼叫者釋放(沒有配置成功的是 NULL,free 不做事) */
+    for (int k = 0; k < TMR_N; k++)
+        free(res[k].out);
+    return code;
 }

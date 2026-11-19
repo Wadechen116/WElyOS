@@ -61,12 +61,18 @@ int main(int argc, char **argv)
         long n = -1;
         /* 送出(第一次是要求,之後是對上一塊的確認),然後等下一塊;等不到就重送 */
         for (int tries = 0; tries < 4 && n < 0; tries++) {
+            long sent;
             if (block == 1) {
-                sys_udp_send(sock, SERVER, 69, req, reqlen);
+                sent = sys_udp_send(sock, SERVER, 69, req, reqlen);
             } else {
                 unsigned char ack[4] = { 0, OP_ACK, (unsigned char)((block - 1) >> 8),
                                          (unsigned char)(block - 1) };
-                sys_udp_send(sock, SERVER, server_port, ack, 4);
+                sent = sys_udp_send(sock, SERVER, server_port, ack, 4);
+            }
+            if (sent < 0) {
+                /* 送不出去(佇列滿了、網路斷了):等也等不到回答。稍等一下再試,算一次嘗試 */
+                sys_sleep(100);
+                continue;
             }
             for (;;) {
                 n = sys_udp_recv(sock, pkt, sizeof(pkt), &ip, &port, 500);
@@ -78,7 +84,7 @@ int main(int argc, char **argv)
                 if (pkt[1] == OP_ERR) {
                     pkt[n < (long)sizeof(pkt) ? n : (long)sizeof(pkt) - 1] = 0;
                     fprintf(2, "tftp: server says: %s\n", n > 4 ? (char *)pkt + 4 : "error");
-                    sys_close(out);
+                    close_quiet(out);                   /* 已經失敗了:只是清理 */
                     sys_unlink(local);
                     return 1;
                 }
@@ -89,26 +95,36 @@ int main(int argc, char **argv)
         }
         if (n < 0) {
             fprintf(2, "tftp: no answer from the server\n");
-            sys_close(out);
+            close_quiet(out);                   /* 已經失敗了:只是清理 */
             sys_unlink(local);
             return 1;
         }
         server_port = port;
         if (n > 4 && sys_write(out, pkt + 4, (unsigned long)(n - 4)) != n - 4) {
             fprintf(2, "tftp: cannot write %s (no space?)\n", local);
-            sys_close(out);
+            close_quiet(out);                   /* 已經失敗了:只是清理 */
             return 1;
         }
         total += (unsigned)(n - 4);
         unsigned char ack[4] = { 0, OP_ACK, (unsigned char)(block >> 8), (unsigned char)block };
         if (n - 4 < 512) {                       /* 最後一塊:確認之後結束 */
-            sys_udp_send(sock, SERVER, server_port, ack, 4);
+            /* 這個確認送不出去也無妨:檔案已經完整收到了,伺服器等不到確認只會重送幾次後放棄 */
+            if (sys_udp_send(sock, SERVER, server_port, ack, 4) < 0)
+                break;
             break;
         }
         block++;
     }
-    sys_close(out);
-    sys_close(sock);
+    /* 收完了,但要寫到磁碟上才算數:fsync 與 close 都檢查(close 之後描述符一定已經關閉) */
+    long synced = sys_fsync(out);
+    long closed = sys_close(out);
+    close_quiet(sock);
+    if (synced == -E_INVAL)
+        synced = 0;                              /* 存到裝置(例如 /dev/null) */
+    if (synced != 0 || closed != 0) {
+        fprintf(2, "tftp: received %u bytes but could not save %s\n", total, local);
+        return 1;
+    }
     printf("%s: %u bytes\n", local, total);
     return 0;
 }

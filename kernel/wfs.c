@@ -86,6 +86,7 @@
  * 記憶體全部在掛載時配置好,之後的操作不再配置,所以不會因為記憶體不足而做到一半失敗。
  */
 #include <stddef.h>
+#include "bcache.h"
 #include "blk.h"
 #include "crc32.h"
 #include "fs.h"
@@ -98,7 +99,7 @@
 
 #define WFS_MAGIC1  0x31534657u              /* "WFS1":第 27 步的格式,沒有檢查碼(仍然可以掛載) */
 #define WFS_MAGIC   0x32534657u              /* "WFS2":第 38 步起的格式,見下方「檢查碼」 */
-#define BSIZE       PAGE_SIZE
+#define BSIZE       PAGE_SIZE                /* = BCACHE_BSIZE(bcache.c 有編譯期檢查) */
 #define BSECT       (BSIZE / BLK_SECTOR)     /* 一個區塊是幾個磁區 */
 #define NDIRECT     10u
 #define NINDIRECT   (BSIZE / 4u)
@@ -185,17 +186,8 @@ static struct wnode *wn(struct inode *in) { return (struct wnode *)in; }
 /* 區塊快取                                                            */
 /* ------------------------------------------------------------------ */
 
-#define NBUF 64u
-
-struct buf {
-    uint32_t no;
-    int valid, dirty, pins;                  /* pins:正在使用中(不可以被換掉)的次數 */
-    unsigned long used;                      /* 最後一次使用的時間(越大越新) */
-    uint8_t *data;
-};
-static struct buf bufs[NBUF];
-static unsigned long use_clock;
-static unsigned long disk_reads, disk_writes;
+/* 快取本身在 kernel/bcache.c(bget / bput / bcache_sync);這裡是檔案系統接進去的部分:
+   讀進來時核對檢查碼、寫回去後更新檢查碼、寫不進去就轉為唯讀 */
 
 /* 這個區塊有沒有記在檢查碼表裡:superblock 的兩份(自己帶檢查碼)與表格本身除外 */
 static int covered(uint32_t no)
@@ -232,83 +224,41 @@ static int csum_flush(void)
             rc = -E_IO;
         } else {
             csum_dirty[i] = 0;
-            disk_writes++;
+            bcache_count_write();
         }
     }
     return rc;
 }
 
-static int bwrite(struct buf *b)
+/* ---- 快取的三個回呼 ---- */
+
+/* 剛從磁碟讀進來:磁碟說讀成功了,但內容和當初寫進去的一樣嗎?不一樣就當作讀取失敗 */
+static int cache_verify(uint32_t no, const uint8_t *data)
 {
-    if (disk->rw(disk, (uint64_t)b->no * BSECT, BSECT, b->data, 1) != 0) {
-        if (!fs_failed)
-            kprintf("disk: write error on block %u; the file system is now read-only\n", b->no);
-        fs_failed = 1;
-        return -E_IO;
+    if (csum_verify && covered(no) && csum[no] && csum[no] != block_crc(data)) {
+        if (csum_errors++ < 3)
+            kprintf("disk: block %u is corrupted (checksum mismatch); the read is refused\n", no);
+        return -1;
     }
-    disk_writes++;
-    b->dirty = 0;
-    if (covered(b->no))
-        csum_set(b->no, block_crc(b->data));
     return 0;
 }
 
-/*
- * 取得第 no 個區塊在快取裡的那一份,並標記為使用中(用完要 bput)。
- *   load = 1:快取裡沒有的話從磁碟讀進來
- *   load = 0:呼叫者會把整個區塊覆蓋掉,不必讀;內容先清為 0
- * 失敗(讀取錯誤、編號超出範圍、全部的格子都在使用中)回傳 NULL。
- */
-static struct buf *bget(uint32_t no, int load)
+/* 成功寫回磁碟:記下新內容的檢查碼 */
+static void cache_written(uint32_t no, const uint8_t *data)
 {
-    struct buf *victim = NULL;
-
-    if (no >= sb.nblocks)
-        return NULL;
-    for (struct buf *b = bufs; b < bufs + NBUF; b++) {
-        if (b->valid && b->no == no) {
-            b->pins++;
-            b->used = ++use_clock;
-            if (!load)
-                memset(b->data, 0, BSIZE);
-            return b;
-        }
-        /* 順便找出可以讓出來的一格:沒有內容的最好,否則是最久沒用的 */
-        if (b->pins == 0 && (!victim || !b->valid || (victim->valid && b->used < victim->used)))
-            victim = b;
-    }
-    if (!victim)
-        return NULL;
-    if (victim->valid && victim->dirty && bwrite(victim) != 0)
-        return NULL;
-    victim->valid = 0;
-    if (load) {
-        if (disk->rw(disk, (uint64_t)no * BSECT, BSECT, victim->data, 0) != 0)
-            return NULL;
-        disk_reads++;
-        /* 磁碟說讀成功了,但內容和當初寫進去的一樣嗎?不一樣就當作讀取失敗 */
-        if (csum_verify && covered(no) && csum[no] && csum[no] != block_crc(victim->data)) {
-            if (csum_errors++ < 3)
-                kprintf("disk: block %u is corrupted (checksum mismatch); the read is refused\n", no);
-            return NULL;
-        }
-    } else {
-        memset(victim->data, 0, BSIZE);
-    }
-    victim->no = no;
-    victim->valid = 1;
-    victim->dirty = 0;
-    victim->pins = 1;
-    victim->used = ++use_clock;
-    return victim;
+    if (covered(no))
+        csum_set(no, block_crc(data));
 }
 
-static void bput(struct buf *b)
+/* 寫不進去:從此拒絕所有修改(見檔頭「寫入失敗之後」) */
+static void cache_write_failed(uint32_t no)
 {
-    if (b->pins <= 0)
-        panic("wfs: buffer for block %u released more often than it was taken", b->no);
-    b->pins--;
+    if (!fs_failed)
+        kprintf("disk: write error on block %u; the file system is now read-only\n", no);
+    fs_failed = 1;
 }
+
+static const struct bcache_ops cache_ops = { cache_verify, cache_written, cache_write_failed };
 
 /*
  * 把所有髒的區塊寫回磁碟:編號由大到小(資料先寫,位元圖與 superblock 最後;理由見檔頭)。
@@ -321,20 +271,8 @@ static void bput(struct buf *b)
  */
 static int bsync_opt(int barrier)
 {
-    int rc = 0;
+    int rc = bcache_sync();
 
-    for (;;) {
-        struct buf *next = NULL;
-        for (struct buf *b = bufs; b < bufs + NBUF; b++)
-            if (b->valid && b->dirty && (!next || b->no > next->no))
-                next = b;
-        if (!next)
-            break;
-        if (bwrite(next) != 0) {
-            next->dirty = 0;                 /* 寫不進去:放棄這一塊,免得永遠繞不出去 */
-            rc = -E_IO;
-        }
-    }
     /* 檢查碼表只在 barrier(sync、關機)時寫回磁碟,不是每次同步都寫:
        掛載期間以記憶體裡的那一份為準;而沒有正常關機的話,下次掛載本來就會依磁碟的內容
        整張重算(見 csum_rebuild),中途寫回去的表用不到。省下的是每個操作一次以上的磁碟寫入 */
@@ -429,10 +367,7 @@ static void bfree(uint32_t no)
                                                 轉為唯讀,讓下次掛載的檢查把它收回來 */
     if (covered(no))
         csum_set(no, 0);                     /* 不再有內容:之後的巡檢不必核對它 */
-    /* 快取裡若還有這個區塊的髒內容,不必寫回了 */
-    for (struct buf *b = bufs; b < bufs + NBUF; b++)
-        if (b->valid && b->no == no && b->pins == 0)
-            b->valid = b->dirty = 0;
+    bcache_forget(no);                       /* 快取裡若還有這個區塊的髒內容,不必寫回了 */
 }
 
 static int dinode_rw(uint32_t inum, struct dinode *d, int write)
@@ -526,16 +461,26 @@ static struct wnode *ialloc(int type, uint32_t parent)
  * 檔案的第 fb 個區塊在磁碟上的編號。alloc 時,還沒有配置就配置一個(內容為 0)。
  * 回傳 0 = 沒有配置(alloc 時表示沒有空間了)。磁碟上不合理的編號也當成 0。
  */
-static uint32_t bmap(struct wnode *n, uint32_t fb, int alloc)
+/*
+ * 檔案的第 fb 個區塊在磁碟上的編號。alloc = 1:還沒配置的話配置一個。
+ *
+ * 回傳 0 有兩種完全不同的意思,由 *err 區分(呼叫者一定要看):
+ *   *err == 0       那個位置本來就沒有配置區塊(空洞,讀起來是 0),或 alloc 時磁碟滿了
+ *   *err == -E_IO   不知道 — 間接區塊讀不到,或磁碟上記的編號不合理(內容損壞)
+ * 把第二種當成第一種,就是把「讀不到」悄悄變成「內容是 0」交給程式(Codex 以主機端的測試證實過)。
+ */
+static uint32_t bmap(struct wnode *n, uint32_t fb, int alloc, int *err)
 {
     uint32_t no;
 
+    *err = 0;
     if (fb < NDIRECT) {
         no = n->d.addr[fb];
         if (no == 0 && alloc && (no = balloc()) != 0) {
             struct buf *z = bget(no, 0);         /* 新的區塊一定清 0:不可以讓人讀到磁碟上舊的內容 */
             if (!z) {
                 bfree(no);
+                *err = -E_IO;
                 return 0;
             }
             z->dirty = 1;
@@ -549,15 +494,22 @@ static uint32_t bmap(struct wnode *n, uint32_t fb, int alloc)
             struct buf *z = bget(no, 0);
             if (!z) {
                 bfree(no);
+                *err = -E_IO;
                 return 0;
             }
             z->dirty = 1;
             bput(z);
             n->d.indirect = no;
         }
+        if (n->d.indirect < sb.data_start || n->d.indirect >= sb.nblocks) {
+            *err = -E_IO;                        /* inode 裡記的間接區塊編號不合理 */
+            return 0;
+        }
         struct buf *ib = bget(n->d.indirect, 1);
-        if (!ib || n->d.indirect < sb.data_start)
-            return ib ? (bput(ib), 0u) : 0u;
+        if (!ib) {
+            *err = -E_IO;                        /* 讀不到:不知道那個位置有沒有資料 */
+            return 0;
+        }
         uint32_t *tab = (uint32_t *)ib->data;
         no = tab[fb - NDIRECT];
         if (no == 0 && alloc && (no = balloc()) != 0) {
@@ -565,6 +517,7 @@ static uint32_t bmap(struct wnode *n, uint32_t fb, int alloc)
             if (!z) {
                 bfree(no);
                 no = 0;
+                *err = -E_IO;
             } else {
                 z->dirty = 1;
                 bput(z);
@@ -576,7 +529,11 @@ static uint32_t bmap(struct wnode *n, uint32_t fb, int alloc)
     } else {
         return 0;
     }
-    return no >= sb.data_start && no < sb.nblocks ? no : 0;
+    if (no != 0 && (no < sb.data_start || no >= sb.nblocks)) {
+        *err = -E_IO;                            /* 編號不是 0 卻不在資料區:損壞,不是空洞 */
+        return 0;
+    }
+    return no;
 }
 
 /* ------------------------------------------------------------------ */
@@ -598,7 +555,10 @@ static long file_read(struct wnode *n, void *buf, size_t len, uint64_t off)
         size_t k = BSIZE - in_blk;
         if (k > len - done)
             k = len - done;
-        uint32_t no = bmap(n, fb, 0);
+        int berr;
+        uint32_t no = bmap(n, fb, 0, &berr);
+        if (berr)
+            return done ? (long)done : berr;     /* 讀不到的地方不可以當成空洞補 0 */
         if (no == 0) {
             memset(out + done, 0, k);            /* 沒有配置的部分讀起來是 0 */
         } else {
@@ -627,7 +587,12 @@ static long file_write(struct wnode *n, const void *buf, size_t len, uint64_t of
         size_t k = BSIZE - in_blk;
         if (k > len - done)
             k = len - done;
-        uint32_t no = bmap(n, fb, 1);
+        int berr;
+        uint32_t no = bmap(n, fb, 1, &berr);
+        if (berr) {
+            err = berr;
+            break;
+        }
         if (no == 0)
             break;                               /* 磁碟滿了:回報已經寫入的部分 */
         struct buf *b = bget(no, 1);
@@ -660,9 +625,10 @@ static int file_truncate(struct wnode *n, uint64_t size)
     /* 留下的最後一個區塊中,超出新大小的部分清 0:之後檔案再變大時,那裡應該讀到 0。
        這也要在釋放任何東西之前做:讀不到那個區塊就整個失敗,不能留下「縮短了、但尾巴還是舊資料」 */
     if (size % BSIZE) {
-        uint32_t no = bmap(n, keep - 1, 0);
+        int berr;
+        uint32_t no = bmap(n, keep - 1, 0, &berr);
         struct buf *b = no ? bget(no, 1) : NULL;
-        if (no && !b) {
+        if (berr || (no && !b)) {
             if (ib)
                 bput(ib);
             return -E_IO;
@@ -715,7 +681,10 @@ static int dir_scan(struct wnode *dir, uint64_t from_slot, dir_fn fn, void *arg)
     uint64_t nslots = dir->in.size / sizeof(struct wdirent);
 
     for (uint64_t slot = from_slot; slot < nslots; ) {
-        uint32_t no = bmap(dir, (uint32_t)(slot / DPB), 0);
+        int berr;
+        uint32_t no = bmap(dir, (uint32_t)(slot / DPB), 0, &berr);
+        if (berr)
+            return berr;                         /* 目錄的這一塊讀不到:不可以當成「這裡沒有項目」 */
         if (no == 0) {
             slot = (slot / DPB + 1) * DPB;       /* 這個區塊沒有配置:整塊跳過 */
             continue;
@@ -1053,6 +1022,21 @@ static int wfs_statfs(struct inode *in, struct fsinfo *out)
     return 0;
 }
 
+/*
+ * 把修改寫回磁碟並回報結果(fsync 與關閉檔案時)。目前的粒度是「整個檔案系統」:
+ * 資料、inode、位元圖一起寫回(順序見 bsync_opt);durable 時再加上檢查碼表、superblock 與裝置的 flush。
+ * 寫入失敗過(fs_failed)之後一律回報 -E_IO,而且不會因為之後某一次剛好沒有東西要寫就變回成功 —
+ * 那個錯誤可能有別的呼叫者還沒看到。
+ */
+static int wfs_flush(struct inode *in, int durable)
+{
+    (void)in;
+    mutex_lock(&wfs_lk);
+    int r = bsync_opt(durable);
+    mutex_unlock(&wfs_lk);
+    return r;
+}
+
 static int wfs_sync_op(struct inode *in)
 {
     (void)in;
@@ -1077,6 +1061,7 @@ static const struct inode_ops wfs_ops = {
     .setattr = wfs_setattr,
     .statfs = wfs_statfs,
     .sync = wfs_sync_op,
+    .flush = wfs_flush,
 };
 
 /* ------------------------------------------------------------------ */
@@ -1302,6 +1287,10 @@ static int csum_alloc(void)
 }
 
 /* superblock 的內容是否可信:記號、檢查碼(WFS2)、大小,以及各區的位置必須和依大小算出來的完全一致 */
+/* 磁碟至少要有幾個區塊:檔案系統本身至少 64 個(sb_valid 的要求),另外留 2 個給黑盒子。
+   格式化、探測、掛載用同一個門檻 — 否則會格式化出一個自己下次不認得的檔案系統 */
+#define WFS_MIN_DEV_BLOCKS 66u
+
 static int sb_valid(const struct wsuper *s, uint64_t dev_blocks)
 {
     struct wsuper want;
@@ -1397,7 +1386,7 @@ uint32_t wfs_probe(struct blkdev *dev)
     uint32_t result = 0;
     uint8_t *buf;
 
-    if (dev_blocks < 64 || !(buf = pmm_alloc()))
+    if (dev_blocks < WFS_MIN_DEV_BLOCKS || !(buf = pmm_alloc()))
         return 0;
     if (dev_blocks > 0x100000)
         dev_blocks = 0x100000;
@@ -1429,23 +1418,20 @@ int wfs_mount(struct blkdev *dev, struct inode **root_out)
     mutex_init(&wfs_lk);
     if (mounted)
         return -E_BUSY;
-    if (dev_blocks < 64)
-        return -E_NOSPC;                         /* 磁碟太小(不到 256KB) */
+    if (dev_blocks < WFS_MIN_DEV_BLOCKS)
+        return -E_NOSPC;                         /* 磁碟太小 */
     if (dev_blocks > 0x100000)
         dev_blocks = 0x100000;                   /* 最多使用前 4GB */
 
     /* 快取的緩衝區與 inode 表:現在一次配置好,之後的操作都不再配置記憶體 */
     size_t node_pages = (MAX_INODES * sizeof(struct wnode) + PAGE_SIZE - 1) / PAGE_SIZE;
-    uint8_t *cache = pmm_alloc_pages(NBUF);
+    int cache = bcache_init(dev, &sb.nblocks, &cache_ops) == 0;
     nodes = pmm_alloc_pages(node_pages);
     if (!cache || !nodes) {
         err = -E_NOMEM;
         goto fail;
     }
     memset(nodes, 0, node_pages * PAGE_SIZE);
-    memset(bufs, 0, sizeof(bufs));
-    for (unsigned i = 0; i < NBUF; i++)
-        bufs[i].data = cache + (size_t)i * BSIZE;
 
     scratch = pmm_alloc();
     if (!scratch) {
@@ -1575,7 +1561,7 @@ fail:
     csum = NULL;
     csum_on = 0;
     if (cache)
-        pmm_free_pages(cache, NBUF);
+        bcache_free();
     if (nodes)
         pmm_free_pages(nodes, node_pages);
     nodes = NULL;
@@ -1618,8 +1604,7 @@ void wfs_stats(struct wfs_stats *st)
     st->scrub_errors = scrub_errors;
     st->scrub_blocks = scrub_blocks;
     st->sb_restored = sb_restored;
-    st->disk_reads = disk_reads;
-    st->disk_writes = disk_writes;
+    bcache_stats(&st->disk_reads, &st->disk_writes);
     mutex_unlock(&wfs_lk);
 }
 
@@ -1662,7 +1647,8 @@ uint32_t wfs_block_count(void)
 uint32_t wfs_test_file_block(struct inode *in, uint32_t fb)
 {
     mutex_lock(&wfs_lk);
-    uint32_t no = fb == 0xFFFFFFFFu ? wn(in)->d.indirect : bmap(wn(in), fb, 0);
+    int berr;
+    uint32_t no = fb == 0xFFFFFFFFu ? wn(in)->d.indirect : bmap(wn(in), fb, 0, &berr);
     mutex_unlock(&wfs_lk);
     return no;
 }
@@ -1674,9 +1660,7 @@ int wfs_test_drop_cache(void)
         return -E_INVAL;
     mutex_lock(&wfs_lk);
     int r = bsync();
-    for (struct buf *b = bufs; b < bufs + NBUF; b++)
-        if (b->pins == 0 && !b->dirty)
-            b->valid = 0;
+    bcache_drop_clean();
     mutex_unlock(&wfs_lk);
     return r;
 }

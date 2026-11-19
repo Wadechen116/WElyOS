@@ -40,7 +40,7 @@ static int show(const char *path, int quiet)
             puts_(path);
             puts_("\n");
         }
-        return 1;
+        return quiet ? 0 : 1;
     }
     long kb = (long)(fi.block_size / 1024);
     pad_str(&l, fi.type, 6);
@@ -54,19 +54,19 @@ static int show(const char *path, int quiet)
     line_str(&l, "  ");
     line_str(&l, path);
     line_str(&l, "\n");
-    line_out(&l);
-    return 0;
+    return line_write(&l) == 0 ? 0 : 1;
 }
 
 int main(int argc, char **argv)
 {
     int rc = 0;
 
-    puts_("TYPE    SIZE(KB) USED(KB) FREE(KB)  FILES  PATH\n");
+    if (out_str("TYPE    SIZE(KB) USED(KB) FREE(KB)  FILES  PATH\n") != 0)
+        return 1;
     if (argc < 2) {
-        show("/", 0);
-        show("/disk", 1);
-        return 0;
+        rc = show("/", 0);
+        rc |= show("/disk", 1);                  /* 沒有磁碟不算錯(見 show 的 quiet) */
+        return rc;
     }
     for (int i = 1; i < argc; i++)
         rc |= show(argv[i], 0);

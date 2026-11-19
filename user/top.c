@@ -53,6 +53,7 @@ static umutex_t lock;                            /* 保護以上的資料與畫�
 static int sort_key = 'c';
 static int sel_pid;                              /* 目前選到的行程 */
 static int batch;
+static int out_failed;                           /* 畫面寫不出去(見 draw) */
 static char message[60];                         /* 最下面一列的訊息(上一個動作的結果) */
 static int confirm_pid;                          /* 不為 0:正在等使用者按 y 確認終止這個行程 */
 
@@ -150,7 +151,10 @@ static void sample(void)
     long after = 0;
 
     si_prev = si;
-    sys_sysinfo(&si);
+    if (sys_sysinfo(&si) != 0) {
+        si = si_prev;                            /* 取不到:沿用上一次的,不要拿半套的資料去算使用率 */
+        return;
+    }
     interval = (unsigned)(si.uptime_ticks - si_prev.uptime_ticks);
     if (interval == 0)
         interval = 1;
@@ -330,7 +334,14 @@ static void draw(void)
         esc("\x1b[0m");
         esc("\x1b[K");
     }
-    sys_write(1, fb, fb_len);
+    /* 畫面寫不出去(輸出的另一端已經關閉…):記下來,主迴圈會結束,而不是一直畫給沒有人看 */
+    if (sys_write(1, fb, fb_len) != (long)fb_len) {
+        out_failed = 1;
+        if (!batch) {                            /* 互動模式:還原主控台後結束 */
+            sys_tcsetmode(0);
+            sys_exit(1);
+        }
+    }
 }
 
 /* ---- 更新執行緒 ---- */
@@ -381,14 +392,17 @@ int main(int argc, char **argv)
     long n;
 
     batch = argc > 1 && streq(argv[1], "-b");
-    sys_sysinfo(&si);
+    if (sys_sysinfo(&si) != 0) {
+        puts_("top: cannot read the system information\n");
+        return 1;
+    }
     sample();                                    /* 第一次取樣只是建立基準 */
     if (batch) {
         sys_sleep(100);                          /* 兩次取樣之間的間隔:夠算出使用率就好 */
         sort_key = 'p';
         sample();
         draw();
-        return 0;
+        return out_failed ? 1 : 0;
     }
 
     if (sys_tcsetmode(CON_RAW | CON_NOECHO) != 0) {

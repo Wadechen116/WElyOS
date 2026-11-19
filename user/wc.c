@@ -41,6 +41,5 @@ int main(int argc, char **argv)
     line_str(&l, " ");
     line_num(&l, bytes);
     line_str(&l, "\n");
-    line_out(&l);
-    return 0;
+    return line_write(&l) == 0 ? 0 : 1;          /* 結果寫不出去就是失敗 */
 }

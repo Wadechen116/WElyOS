@@ -110,6 +110,7 @@ add_executable(welyos.elf
     kernel/pipe.c
     kernel/ramfs.c
     kernel/wfs.c
+    kernel/bcache.c
     kernel/blkfault.c
     kernel/netif.c
     kernel/blackbox.c

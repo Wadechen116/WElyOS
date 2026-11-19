@@ -97,6 +97,7 @@ struct thread {
     int rt_waiting;            /* 這一次已經做完,正在睡到下一個週期 */
     int rt_throttled;          /* 這個週期超出預算:降回一般優先權,到下個週期為止 */
     unsigned rt_util;          /* 佔 CPU 的千分比(預算 / 週期) */
+    int rt_level;              /* 在即時工作之間的層級(0 = 週期最長的);有效優先權 = PRIO_RT + rt_level */
     unsigned rt_releases, rt_misses, rt_overruns, rt_max_used;
 };
 
@@ -144,6 +145,7 @@ static void update_prio(struct thread *t);
 static void rt_begin_period(struct thread *t);
 static void rt_check_deadlines(uint64_t now);
 static void rt_remove(struct thread *t);
+static void rt_assign_levels(void);
 
 /* ---- 排程器的鎖 ---- */
 
@@ -856,7 +858,7 @@ static void update_prio(struct thread *t)
     if (t->starve_boost)
         prio = PRIO_MAX;
     if (t->rt_period && !t->rt_throttled)
-        prio = PRIO_RT;                      /* 預算之內的即時工作:高於所有一般的執行緒 */
+        prio = PRIO_RT + t->rt_level;        /* 預算之內的即時工作:高於所有一般的執行緒;彼此之間依週期排序 */
     if (t->prio == prio)
         return;
 
@@ -1040,6 +1042,39 @@ static void rt_check_deadlines(uint64_t now)
     }
 }
 
+/*
+ * 重新排定即時工作之間的層級:週期越短,層級越高(rate-monotonic)。呼叫時持有 sched_lk。
+ *
+ * 為什麼需要:即時工作如果都在同一個層級輪流,一個週期 2 毫秒的工作可能排在一個
+ * 正在用它 10 毫秒時間片的長週期工作後面 — 還沒輪到就已經錯過好幾個期限。
+ * 「總使用率不超過約 70% 就保證趕得上期限」這個結論,前提正是短週期的工作可以打斷長週期的。
+ * 層級 = 有幾種「比我長」的週期;週期相同的在同一層輪流。最多 RT_MAX 個工作,所以層級夠用。
+ */
+static void rt_assign_levels(void)
+{
+    for (unsigned i = 0; i < RT_MAX; i++) {
+        struct thread *t = rt_tasks[i];
+        int level = 0;
+
+        if (!t)
+            continue;
+        for (unsigned j = 0; j < RT_MAX; j++) {
+            struct thread *o = rt_tasks[j];
+            int dup = 0;
+
+            if (!o || o->rt_period <= t->rt_period)
+                continue;
+            for (unsigned k = 0; k < j; k++)             /* 同一種週期只算一次 */
+                dup |= rt_tasks[k] && rt_tasks[k]->rt_period == o->rt_period;
+            level += !dup;
+        }
+        if (t->rt_level != level) {
+            t->rt_level = level;
+            update_prio(t);                  /* 正在排隊的會換到新的層級;必要時要求重新排程 */
+        }
+    }
+}
+
 /* 取消 t 的即時工作身分(本來就不是的話不做任何事)。呼叫時持有 sched_lk */
 static void rt_remove(struct thread *t)
 {
@@ -1050,7 +1085,9 @@ static void rt_remove(struct thread *t)
             rt_tasks[i] = NULL;
     rt_util_total -= t->rt_util;
     t->rt_period = 0;
+    t->rt_level = 0;
     t->rt_throttled = t->rt_waiting = 0;
+    rt_assign_levels();                      /* 其他工作的相對順序可能因此改變 */
 }
 
 int thread_set_periodic(unsigned period_ms, unsigned budget_ms)
@@ -1099,6 +1136,7 @@ int thread_set_periodic(unsigned period_ms, unsigned budget_ms)
         self->rt_throttled = self->rt_waiting = 0;
         self->rt_releases = self->rt_misses = self->rt_overruns = self->rt_max_used = 0;
         self->rt_release = timer_ticks() + period;       /* 第一個週期從現在開始 */
+        rt_assign_levels();
         update_prio(self);
     }
     sched_unlock(flags);

@@ -205,6 +205,27 @@ static inline long sys_rt_set(unsigned period_ms, unsigned budget_ms)
     return syscall3(SYS_rt_set, (long)period_ms, (long)budget_ms, 0);
 }
 static inline long sys_rt_wait(struct rt_stats *st) { return syscall3(SYS_rt_wait, (long)st, 0, 0); }
+/*
+ * 把檔案寫回儲存媒體。回傳 0 才表示資料已經保存;-E_IO = 寫入失敗;
+ * 管線、主控台、socket 回傳 -E_INVAL(它們沒有「寫回」這件事)。
+ * 記憶體檔案系統上的檔案回傳 0,但那只表示沒有待寫的東西 — 內容不會保存到下次開機。
+ *
+ * 和 sys_close 的關係:sys_close 對可寫的檔案也會回報寫入失敗(-E_IO),但它只保證資料交給了裝置;
+ * 要確定資料到了媒體上,先 sys_fsync 再 sys_close,兩個都要檢查。
+ * sys_close 不論回傳什麼,那個描述符都已經關閉:不可以對同一個編號再關一次。
+ */
+static inline long sys_fsync(long fd)             { return syscall3(SYS_fsync, fd, 0, 0); }
+/*
+ * 關閉一個「結果不需要確認」的描述符:唯讀開啟的檔案、管線的一端、socket、暫時 dup 出來的編號,
+ * 或是已經在失敗路徑上、正要回報別的錯誤時的清理。
+ * 寫過資料、而且要確定資料存好了的檔案不可以用這個:那要檢查 sys_fsync 與 sys_close 的回傳值。
+ * fd 是負的(沒有開成)就不做事。
+ */
+static inline void close_quiet(long fd)
+{
+    if (fd >= 0 && syscall3(SYS_close, fd, 0, 0) != 0)
+        return;
+}
 /* 故障注入(測試用,需要 CAP_ADMIN):把行程 pid 的記憶體 addr 處那個位元組的第 bit 個位元翻轉,
    模擬宇宙射線造成的單一位元錯誤。在對方下一次返回使用者模式之前生效 */
 static inline long sys_seu(long pid, const volatile void *addr, int bit)

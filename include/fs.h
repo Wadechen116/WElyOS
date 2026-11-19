@@ -60,6 +60,10 @@ struct inode_ops {
     /* 一次開啟被完全關閉了(flags 為那次開啟的方式)。管線用它得知讀端 / 寫端各剩幾個。
        可以不提供(NULL) */
     void (*closed)(struct inode *in, int flags);
+    /* 把這個檔案還留在記憶體裡的修改寫出去,並回報有沒有成功(0 或 -E_IO)。
+       durable = 1:還要確定資料已經到了儲存媒體上(fsync);0:寫給裝置就好(關閉檔案時)。
+       沒有「待寫的東西」的檔案系統(記憶體檔案系統)不必提供(NULL = 一律成功) */
+    int  (*flush)(struct inode *in, int durable);
     /* 沒有任何名稱、也沒有人開啟了:釋放它佔用的一切 */
     void (*release)(struct inode *in);
     /* uid、gid、mode 被 VFS 改過了:存放在別處(磁碟)的檔案系統在這裡把它們存起來。
@@ -100,6 +104,17 @@ struct file;
 void vfs_init(void);                                         /* 建立根目錄與 /dev/console */
 int  vfs_open(const char *path, int flags, struct file **out);
 void vfs_close(struct file *f);
+/*
+ * 把檔案寫回儲存裝置,並「回報結果」。這和 vfs_close 是分開的兩件事:
+ * vfs_close 只是放掉一個參考(同一次開啟可能還被 dup、fork 出來的別人拿著),沒有回傳值;
+ * 需要知道資料有沒有寫成功的人,要明確地呼叫這兩個函式之一。
+ *   vfs_fsync  資料確定到了儲存媒體上才回傳 0(sys_fsync)。管線、裝置、socket 回傳 -E_INVAL:
+ *              它們沒有「寫回」這件事,不可以回報成功讓人誤以為資料已經保存
+ *   vfs_flush  寫給裝置就好(sys_close 使用);唯讀的開啟、不是一般檔案或目錄的,回傳 0
+ * 記憶體檔案系統上的檔案回傳 0:沒有待寫的東西 — 這不表示它的內容能保存到下次開機。
+ */
+int  vfs_fsync(struct file *f);
+int  vfs_flush(struct file *f);
 struct file *vfs_dup(struct file *f);                        /* 多一個參考(同一次開啟) */
 long vfs_read(struct file *f, void *buf, size_t n);          /* 從目前位置讀,位置往後移 */
 long vfs_write(struct file *f, const void *buf, size_t n);

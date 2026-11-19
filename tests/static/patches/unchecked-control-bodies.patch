@@ -1,0 +1,51 @@
+--- a/scripts/static/rules.py
++++ b/scripts/static/rules.py
+@@ -172,6 +172,13 @@
+             if name in error_names and close+1 < len(fn.body) and fn.body[close+1].text == ';':
+                 start = j
+                 while start and fn.body[start-1].text not in {';', '{', '}'}:
++                    previous = start - 1
++                    if fn.body[previous].text == ')' and previous in fn.pairs:
++                        opening = fn.pairs[previous]
++                        # 控制條件中的賦值不是 body 呼叫的結果。例:
++                        # while ((n = read(...)) > 0) write(...);
++                        if opening and fn.body[opening-1].text in {'if', 'while', 'for', 'switch'}:
++                            break
+                     start -= 1
+                 prefix = {t.text for t in fn.body[start:j]}
+                 if not prefix.intersection({'=', 'return', '+=', '-='}):
+--- a/tests/static/test_checks.py
++++ b/tests/static/test_checks.py
+@@ -51,6 +51,32 @@
+         ''')
+         self.assertEqual(sum(f['rule']=='banned-call' for f in found), 1)
+         self.assertEqual(sum(f['rule']=='unchecked-error' for f in found), 2)
++
++    def test_unchecked_bodies_do_not_inherit_condition_assignments(self):
++        for control in ('while ((n = err()) > 0)', 'if ((n = err()) > 0)',
++                        'for (int i = 0; i < n; i++)',
++                        'while ((n = err()) > 0) if ((k = err()) > 0)'):
++            with self.subTest(control=control):
++                found = self.scan('int err(void) { return -E_IO; } '
++                                  'void caller(int n,int k) { '+control+' err(); }')
++                unchecked = [f for f in found if f['rule']=='unchecked-error']
++                self.assertEqual(len(unchecked),1)
++                self.assertEqual(unchecked[0]['symbol'],'caller')
++
++    def test_control_body_checked_results_still_count_as_used(self):
++        for body in ('{ int r=err(); use(r); }', 'n=err();', 'return err();',
++                     'if (err()) use(n);', 'CHECK(err());'):
++            with self.subTest(body=body):
++                found = self.scan('int err(void) { return -E_IO; } '
++                                  'int caller(int n) { while ((n=err()) > 0) '+body+' }')
++                self.assertFalse(any(f['rule']=='unchecked-error' for f in found))
++
++    def test_control_body_void_discard_and_else(self):
++        found = self.scan('int err(void) { return -E_IO; } '
++                          'void caller(int n) { '
++                          'if ((n=err())) (void)err(); else err(); '
++                          'do err(); while ((n=err()) > 0); }')
++        self.assertEqual(sum(f['rule']=='unchecked-error' for f in found),3)
+ 
+     def test_error_result_propagates_through_local(self):
+         found = self.scan('''

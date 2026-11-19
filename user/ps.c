@@ -33,7 +33,7 @@ int main(void)
     struct procinfo pi;
     long after = 0;
 
-    puts_("  PID  PPID  PGID   UID  THR  STATE     TIME  NAME\n");
+    int failed = out_str("  PID  PPID  PGID   UID  THR  STATE     TIME  NAME\n") != 0;
     while (sys_procinfo(after, &pi) == 0) {
         struct line l = { .len = 0 };
 
@@ -50,7 +50,8 @@ int main(void)
         line_str(&l, "  ");
         line_str(&l, pi.name);
         line_str(&l, "\n");
-        line_out(&l);
+        if (line_write(&l) != 0)
+            failed = 1;
     }
-    return 0;
+    return failed;                               /* 清單寫不出去就是失敗 */
 }

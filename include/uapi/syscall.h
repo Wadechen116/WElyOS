@@ -87,6 +87,9 @@ enum {
     SYS_rt_wait,            /* (stats)         這一次做完了,睡到下一個週期;stats 不是 0 時填入 struct rt_stats */
     /* ---- 故障注入 ---- */
     SYS_seu,                /* (pid, addr, bit) 把行程 pid 的記憶體 addr 處的一個位元翻轉(測試用;需要 CAP_ADMIN) */
+    /* ---- 檔案的持久化 ---- */
+    SYS_fsync,              /* (fd)            把這個檔案寫回儲存媒體;回傳 0 才表示資料已經保存。
+                                               管線、裝置、socket 回傳 -E_INVAL */
 };
 
 

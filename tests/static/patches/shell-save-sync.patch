@@ -1,0 +1,11 @@
+--- a/user/sh.c
++++ b/user/sh.c
+@@ -465,6 +465,8 @@
+                    (子行程只繼承 0、1、2 號,不會拿到這一個) */
+                 close_quiet(keep);
+                 keep = sys_dup2(fd, SAVE_SYNC) == SAVE_SYNC ? SAVE_SYNC : -1;
++                if (keep < 0)
++                    ok = 0;
+                 keep_path = st[i].out_path;
+                 close_quiet(fd);
+             }

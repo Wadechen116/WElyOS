@@ -153,7 +153,21 @@ struct out {
     size_t cap, len;                             /* len:緩衝區裡目前有幾個字元 */
     size_t total;                                /* 總共產生了幾個字元(回傳值) */
     long fd;                                     /* -1 = 只寫進緩衝區 */
+    int failed;                                  /* 寫出去的時候失敗過(錯誤,或只寫了一部分又寫不下去) */
 };
+
+/* 把 len 個位元組全部寫到 fd:只寫了一部分就接著寫剩下的。0 = 全部寫出;-1 = 失敗 */
+static int write_all(long fd, const char *buf, size_t len)
+{
+    while (len > 0) {
+        long n = sys_write(fd, buf, len);
+        if (n <= 0)
+            return -1;
+        buf += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
 
 static void out_char(struct out *o, char c)
 {
@@ -161,7 +175,8 @@ static void out_char(struct out *o, char c)
     if (o->len == o->cap) {
         if (o->fd < 0)
             return;
-        sys_write(o->fd, o->buf, o->len);
+        if (write_all(o->fd, o->buf, o->len) != 0)
+            o->failed = 1;                       /* 記下來:這些字元沒有送出去,最後要讓呼叫者知道 */
         o->len = 0;
     }
     o->buf[o->len++] = c;
@@ -319,7 +334,7 @@ static void format(struct out *o, const char *fmt, va_list ap)
 
 int vsnprintf(char *buf, size_t cap, const char *fmt, va_list ap)
 {
-    struct out o = { buf, cap ? cap - 1 : 0, 0, 0, -1 };     /* 留一格給結尾的 0 */
+    struct out o = { buf, cap ? cap - 1 : 0, 0, 0, -1, 0 };     /* 留一格給結尾的 0 */
 
     format(&o, fmt, ap);
     if (cap)
@@ -340,12 +355,12 @@ int snprintf(char *buf, size_t cap, const char *fmt, ...)
 static int vfdprintf(long fd, const char *fmt, va_list ap)
 {
     char buf[256];                               /* 通常整段一次寫出,不會和別的行程的輸出交錯 */
-    struct out o = { buf, sizeof(buf), 0, 0, fd };
+    struct out o = { buf, sizeof(buf), 0, 0, fd, 0 };
 
     format(&o, fmt, ap);
-    if (o.len)
-        sys_write(fd, buf, o.len);
-    return (int)o.total;
+    if (o.len && write_all(fd, buf, o.len) != 0)
+        o.failed = 1;
+    return o.failed ? -1 : (int)o.total;         /* 和標準的 printf 一樣:輸出失敗回傳負值 */
 }
 
 int printf(const char *fmt, ...)
@@ -376,8 +391,7 @@ int puts(const char *s)
 int putchar(int c)
 {
     char ch = (char)c;
-    sys_write(1, &ch, 1);
-    return c;
+    return sys_write(1, &ch, 1) == 1 ? c : -1;
 }
 
 /* ------------------------------------------------------------------ */

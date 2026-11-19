@@ -54,6 +54,15 @@ for a in $ARCHS; do
     timeout 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" -append "autoexit $c" > "$log" 2>&1 < /dev/null
     rc=$?
     t=$(echo "$(date +%s.%N) - $t0" | bc)
+    # 結束碼 5 不是 kernel 會給的值(它只用 0 與 1;i386 是 3)。在 Windows 版的 QEMU 上偶爾出現
+    # (幾百次一次),而且輸出都已經完整印完 — 推測是模擬器結束時自己異常終止
+    # (0xC0000005 的最低位元組)。明確標示出來並重試一次,不默默放過,也不因此判定 kernel 失敗
+    if [ "$rc" -eq 5 ] && [ "$want" -ne 5 ]; then
+      echo "  注意:$a ${c:-(只開機)} 的模擬器以結束碼 5 結束(不是 kernel 的結束碼),重試一次"
+      cp "$log" "$log.exit5"
+    timeout 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" -append "autoexit $c" > "$log" 2>&1 < /dev/null
+    rc=$?
+    fi
     if [ "$rc" -eq "$want" ]; then
       ok=$((ok + 1))
       case "$c" in ""|selftest|"selftest memtest stress") printf "  %-8s %-26s %.2f 秒\n" "$a" "${c:-(只開機)}" "$t" ;; esac
@@ -98,6 +107,20 @@ for a in $ARCHS; do
     done
     rm -f "$img"
     echo "$a: 安全模式測試 ${sok}/5 次開機符合預期"
+
+    # 不是我們的磁碟:整顆填滿外來的資料(0xA5)。開機後必須一個位元組都沒有被改到 —
+    # 不掛載、不格式化,黑盒子也不可以把紀錄寫在它最後的 8KB(Codex 找到的問題:第 113 號留言)
+    python3 -c "import sys; open(sys.argv[1],'wb').write(b'\\xa5' * (16 << 20))" "$img"
+    before=$(md5sum < "$img")
+    QEMU_DISK="$img" timeout 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
+         -append "autoexit" > "$OUT/$a-foreign.txt" 2>&1 < /dev/null
+    frc=$?
+    if [ "$frc" -eq 0 ] && [ "$(md5sum < "$img")" = "$before" ] && grep -q "blackbox: disabled" "$OUT/$a-foreign.txt"; then
+      echo "$a: 外來的磁碟沒有被寫入"
+    else
+      fail=1; echo "  $a 外來磁碟測試失敗(結束碼 $frc),輸出在 $OUT/$a-foreign.txt"
+    fi
+    rm -f "$img"
   fi
 
   if [ "$REPEAT" -gt 0 ]; then

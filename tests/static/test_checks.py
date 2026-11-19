@@ -52,6 +52,32 @@ class RulesTest(unittest.TestCase):
         self.assertEqual(sum(f['rule']=='banned-call' for f in found), 1)
         self.assertEqual(sum(f['rule']=='unchecked-error' for f in found), 2)
 
+    def test_unchecked_bodies_do_not_inherit_condition_assignments(self):
+        for control in ('while ((n = err()) > 0)', 'if ((n = err()) > 0)',
+                        'for (int i = 0; i < n; i++)',
+                        'while ((n = err()) > 0) if ((k = err()) > 0)'):
+            with self.subTest(control=control):
+                found = self.scan('int err(void) { return -E_IO; } '
+                                  'void caller(int n,int k) { '+control+' err(); }')
+                unchecked = [f for f in found if f['rule']=='unchecked-error']
+                self.assertEqual(len(unchecked),1)
+                self.assertEqual(unchecked[0]['symbol'],'caller')
+
+    def test_control_body_checked_results_still_count_as_used(self):
+        for body in ('{ int r=err(); use(r); }', 'n=err();', 'return err();',
+                     'if (err()) use(n);', 'CHECK(err());'):
+            with self.subTest(body=body):
+                found = self.scan('int err(void) { return -E_IO; } '
+                                  'int caller(int n) { while ((n=err()) > 0) '+body+' }')
+                self.assertFalse(any(f['rule']=='unchecked-error' for f in found))
+
+    def test_control_body_void_discard_and_else(self):
+        found = self.scan('int err(void) { return -E_IO; } '
+                          'void caller(int n) { '
+                          'if ((n=err())) (void)err(); else err(); '
+                          'do err(); while ((n=err()) > 0); }')
+        self.assertEqual(sum(f['rule']=='unchecked-error' for f in found),3)
+
     def test_error_result_propagates_through_local(self):
         found = self.scan('''
             int err(void) { return -E_IO; }

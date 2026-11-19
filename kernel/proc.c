@@ -1863,11 +1863,32 @@ static long sys_open(struct proc *p, uintptr_t upath, int flags)
 static long sys_close(struct proc *p, long fd)
 {
     struct file *f = fd_remove(p, fd);
+    int err = 0;
 
     if (!f)
         return -E_BADF;
+    /*
+     * 描述符在這裡就已經用掉了(fd_remove):不論下面有沒有錯誤,這個編號都不再屬於呼叫者。
+     * 所以 close 回報錯誤之後「不可以重試」— 那個編號可能已經被重新使用,重試會關掉別的檔案。
+     *
+     * 可寫的檔案:把還留在記憶體裡的修改寫出去,寫不成功就讓呼叫者知道。
+     * 這是 close 能回報錯誤的唯一時機:vfs_close 只是放掉參考(可能還有 dup、fork 出來的別人拿著),
+     * 沒有回傳值。要確定資料到了儲存媒體上,用 sys_fsync。
+     */
+    err = vfs_flush(f);                          /* 唯讀的開啟、管線、裝置:沒有東西要寫,回傳 0 */
     vfs_close(f);
-    return 0;
+    return err;
+}
+
+static long sys_fsync(struct proc *p, long fd)
+{
+    struct file *f = fd_get(p, fd);
+
+    if (!f)
+        return -E_BADF;
+    long r = vfs_fsync(f);
+    vfs_close(f);
+    return r;
 }
 
 /* dup2:讓 newfd 指向和 oldfd 同一次開啟。newfd 原本若開著,先關閉。
@@ -2277,6 +2298,8 @@ long syscall_dispatch(long num, long a0, long a1, long a2, void *tf)
         return sys_open(p, (uintptr_t)a0, (int)a1);
     case SYS_close:
         return sys_close(p, a0);
+    case SYS_fsync:
+        return sys_fsync(p, a0);
     case SYS_dup2:
         return sys_dup2(p, a0, a1);
     case SYS_pipe:

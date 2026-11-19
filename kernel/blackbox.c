@@ -37,6 +37,7 @@ static int rec_valid(const struct bb_record *r)
 static void load(void)
 {
     uint32_t newest = 0;
+    int have = 0;
 
     next_seq = 1;
     next_slot = 0;
@@ -49,7 +50,10 @@ static void load(void)
             memset(&recs[i], 0, sizeof(recs[i]));    /* 沒寫過、寫到一半、或損壞:當作空的 */
             continue;
         }
-        if (recs[i].seq >= newest) {
+        /* 序號以「環狀」的方式比較(相減後看正負):序號繞回 0 之後,0 仍然比 0xFFFFFFFF 新。
+           同時存在的紀錄最多 64 筆,序號的差距遠小於 2^31,所以這樣比較一定正確 */
+        if (!have || (int32_t)(recs[i].seq - newest) >= 0) {
+            have = 1;
             newest = recs[i].seq;
             next_seq = newest + 1;
             next_slot = (i + 1) % BB_RECORDS;
@@ -60,7 +64,9 @@ static void load(void)
 void blackbox_init(struct blkdev *dev, uint32_t fs_blocks)
 {
     enabled = 0;
-    if (!dev || dev->sectors < BB_SECTORS)
+    /* fs_blocks 為 0 表示「認不得這顆磁碟的內容」(見 wfs_probe):那就不是我們的磁碟,
+       最後那 8KB 可能是別人的資料 — 絕對不可以寫。0 不是「檔案系統很小」的意思 */
+    if (!dev || fs_blocks == 0 || dev->sectors < BB_SECTORS)
         return;
     base_lba = dev->sectors - BB_SECTORS;
     /* 檔案系統必須沒有用到最後這 8KB(第 37 步之後格式化的磁碟會留出來)。
@@ -72,7 +78,7 @@ void blackbox_init(struct blkdev *dev, uint32_t fs_blocks)
     this_boot = 1;                           /* 開機次數由紀錄自己推算:不依賴檔案系統有沒有掛載 */
     for (unsigned i = 0; i < BB_RECORDS; i++)
         if (recs[i].magic == BB_MAGIC && recs[i].boot >= this_boot)
-            this_boot = recs[i].boot + 1;
+            this_boot = recs[i].boot == UINT32_MAX ? UINT32_MAX : recs[i].boot + 1;   /* 到頂就停住,不繞回 0 */
     enabled = 1;
 }
 

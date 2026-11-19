@@ -333,7 +333,21 @@ void disk_stage_test(const char *cmd)
         wfs_stats(&s);
         KASSERT(!s.failed);                              /* 讀取失敗不影響檔案系統的狀態 */
 
-        /* 寫入失敗:建立目錄得到 -E_IO,檔案系統轉為唯讀 */
+        /* 寫入成功(進了快取)、之後寫回磁碟才失敗:這個錯誤要傳得回來。
+           write 回報成功時資料還在記憶體裡;fsync 與關閉時的寫回都必須回報 -E_IO,
+           而且磁碟恢復之後也不會變回成功(見 wfs_flush) */
+        KASSERT(vfs_open("/disk/wtest", O_CREAT | O_WRONLY | O_TRUNC, &f) == 0);
+        KASSERT(vfs_fsync(f) == 0);                      /* 目前還是好的 */
+        KASSERT(vfs_write(f, "written to the cache", 20) == 20);
+        blk_fault_set(0, 1);
+        KASSERT(vfs_fsync(f) == -E_IO);
+        blk_fault_set(0, 0);
+        KASSERT(vfs_fsync(f) == -E_IO && vfs_flush(f) == -E_IO);
+        vfs_close(f);
+        wfs_stats(&s);
+        KASSERT(s.failed);
+
+        /* 寫入失敗之後:建立目錄得到 -E_IO,檔案系統已經是唯讀 */
         blk_fault_set(0, 1);
         KASSERT(vfs_mkdir("/disk/broken") == -E_IO);
         blk_fault_set(0, 0);
@@ -362,7 +376,9 @@ void disk_stage_test(const char *cmd)
         KASSERT(vfs_stat("/disk/broken", &st) == -E_NOENT && vfs_stat("/disk/again", &st) == -E_NOENT);
         KASSERT(wfs_check_now() == 0);
         KASSERT(vfs_mkdir("/disk/ok") == 0 && vfs_unlink("/disk/ok") == 0);      /* 又可以寫入了 */
-        KASSERT(vfs_unlink("/disk/persist") == 0);
+int wt = vfs_unlink("/disk/wtest");              /* 上一階段建立的;內容沒寫成功,但名稱可能已經在 */
+        KASSERT(wt == 0 || wt == -E_NOENT);
+                KASSERT(vfs_unlink("/disk/persist") == 0);
         kprintf("disktest 5: /disk/persist is intact and the file system is writable again\n");
     } else if (cmdline_has(cmd, "disktest=6")) {
         KASSERT(s.mounted && blackbox_enabled());
