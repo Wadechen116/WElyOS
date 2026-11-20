@@ -3,7 +3,7 @@
 #define HOST_STUB_SPINLOCK_H
 #include <sched.h>
 struct spinlock { volatile unsigned locked; const char *name; };
-#define SPINLOCK_INIT(nm) { 0, nm }
+#define SPINLOCK_INIT(nm, rank) { 0, nm } /* rank is checked by the real kernel, not this mutex stub */
 static inline void spin_lock(struct spinlock *l)
 {
     while (__atomic_exchange_n(&l->locked, 1u, __ATOMIC_ACQUIRE))

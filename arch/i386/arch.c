@@ -61,7 +61,8 @@ void arch_idle(void)
  */
 void arch_exit(int code)
 {
-    outb(0xF4, (uint8_t)code);
+    arch_exit_announce(code);                /* 見 arch.h */
+    outb(0xF4, (uint8_t)code);              /* isa-debug-exit:模擬器以 (code << 1) | 1 結束 */
     arch_halt();
 }
 

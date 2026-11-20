@@ -117,6 +117,7 @@ static void semihosting_exit(int code)
  */
 void arch_exit(int code)
 {
+    arch_exit_announce(code);                /* 見 arch.h */
     if (code != 0)
         semihosting_exit(code);
     register uint64_t x0 __asm__("x0") = 0x84000008UL;

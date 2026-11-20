@@ -135,6 +135,7 @@ void arch_idle(void)
 
 void arch_exit(int code)
 {
+    arch_exit_announce(code);                /* 見 arch.h */
     volatile uint32_t *f = (volatile uint32_t *)FINISHER;
     *f = code ? (((uint32_t)code << 16) | FINISHER_FAIL) : FINISHER_PASS;
     arch_halt();                         /* 實機上無此裝置,落入閒置 */

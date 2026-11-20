@@ -42,7 +42,8 @@ def main():
     (out / 'kstring.h').write_text('#include <string.h>\n')
     (out / 'pmm.h').write_text('#include <stddef.h>\n#define PAGE_SIZE 4096u\nvoid *pmm_alloc(void);\nvoid pmm_free(void *);\n')
     (out / 'sync.h').write_text('''struct mutex { int unused; };
-#define MUTEX_INIT {0}
+#define MX_BLACKBOX 70
+#define MUTEX_INIT(name, rank) {0}
 static inline void mutex_lock(struct mutex *m) { (void)m; }
 static inline void mutex_unlock(struct mutex *m) { (void)m; }
 ''')

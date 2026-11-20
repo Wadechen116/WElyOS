@@ -23,6 +23,14 @@
 
 /* SYS_sysinfo 回報的內容 */
 #define SYSINFO_MAX_CPUS 8
+/* SYS_clock:高精度時鐘(效能量測用)。count 與 hz 的意義見 kernel 的 arch.h;
+   kmain / ready 是開機時記下的 count(進入 kmain、開機完成),從模擬器重置起算 */
+struct clockinfo {
+    uint64_t count;             /* 現在的計數 */
+    uint64_t hz;                /* 每秒幾個計數;0 = 沒有可用的時鐘 */
+    uint64_t kmain, ready;
+};
+
 struct sysinfo {
     uint64_t uptime_ticks;      /* 開機至今的 tick 數 */
     uint32_t hz;                /* 每秒幾個 tick */
@@ -104,6 +112,7 @@ struct rt_stats {
 
 /* 佈局的檢查:這些結構在 32 與 64 位元的架構上必須一樣大(欄位都對齊在自然的位置上) */
 _Static_assert(sizeof(struct sysinfo) == 208, "ABI: struct sysinfo");
+_Static_assert(sizeof(struct clockinfo) == 32, "ABI: struct clockinfo");
 _Static_assert(sizeof(struct scrubinfo) == 24, "ABI: struct scrubinfo");
 _Static_assert(sizeof(struct timeval) == 16, "ABI: struct timeval");
 _Static_assert(sizeof(struct procinfo) == 64, "ABI: struct procinfo");

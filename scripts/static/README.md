@@ -48,7 +48,7 @@ bash scripts/static-refresh.sh        # 處理完新增的提示之後,更新參
 
 | 規則 | 做法與限制 |
 |---|---|
-| recursion | 逐架構建立直接呼叫圖並報強連通分量；使用者與核心同名 wrapper 不混接。未解 callback、組語、預處理可行性及巨集呼叫，因此只報 possible cycle。 |
+| recursion | 只對 `kernel/`、`arch/` 的函式逐架構建立直接呼叫圖並報強連通分量；使用者程式（含 `user/*.c`、`user/*.h`）不在本規則範圍。使用者標頭仍會掃描其他適用規則，沒有遞迴提示不代表使用者函式沒有遞迴。未解 callback、組語、預處理可行性及巨集呼叫，因此只報 possible cycle。 |
 | loop-bound | 限定 `kernel/net/`（包含內部標頭），檢查條件是否有可見比較式；不是固定迭代次數、進度或 WCET 證明。其餘核心的常駐輪詢不在此規則範圍。 |
 | allocation-after-init | 有 `/* no-alloc-after-init */` 的檔案，從非 `*_init`／`init_*` 的函式做直接呼叫可達性搜尋，尋找 kmalloc/pmm_alloc 類呼叫。無法證明間接呼叫或初始化階段。 |
 | function-length | 實體原始碼行數大於 80，屬 style；這是本專案門檻。 |

@@ -12,8 +12,16 @@
 #define SIG_IGN 1
 #define PAGE_SIZE 4096
 struct file { int id; };
+struct mutex { int held; };
+#define MX_PROC_MEM 20
+static int mxheld;
+static void mutex_init(struct mutex *m,const char *name,unsigned rank) {
+    assert(!m->held && name && rank==MX_PROC_MEM);m->held=0;
+}
+static void mutex_lock(struct mutex *m) { assert(!m->held && !mxheld);m->held=1;mxheld=1; }
+static void mutex_unlock(struct mutex *m) { assert(m->held && mxheld);m->held=0;mxheld=0; }
 struct proc {
-    struct { unsigned long commit, limit;
+    struct { struct mutex mx; unsigned long commit, limit;
         struct { uintptr_t start; unsigned long pages; } maps[PROC_MAX_MAPS];
         uintptr_t mmap_next, brk;
     } mem;
@@ -36,10 +44,10 @@ static void sched_unlock(unsigned long f) { (void)f; assert(sched_held); sched_h
 static unsigned long pmm_free_count(void) { assert(held); return 4096; }
 static unsigned long pmm_total_pages(void) { assert(held); return 8192; }
 static int vm_space_unmap(void *s, uintptr_t a) {
-    (void)s; assert(!held && (a==0x10000 || a==0x11000)); unmapped++; return 0;
+    (void)s; assert(!held && mxheld && (a==0x10000 || a==0x11000)); unmapped++; return 0;
 }
 #include "functions.c"
-#define CHECK(c) do { assert(c); assert(!held && !sched_held); tests++; } while(0)
+#define CHECK(c) do { assert(c); assert(!held && !sched_held && !mxheld); tests++; } while(0)
 int main(void) {
     struct proc parent={0}, child={0};
     pmem_init(&parent, NULL); CHECK(parent.mem.limit==PROC_DEFAULT_LIMIT_PAGES);

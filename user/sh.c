@@ -16,6 +16,8 @@
  *   命令1 | 命令2 | ...     管線:前一個命令的輸出成為後一個命令的輸入
  *   命令 &                  背景執行:不等它結束,立刻回到提示符號(見下方「背景工作」)
  *   "含 空白 的 參數"       雙引號內的空白不拆開
+ *   NAME=value / $NAME / ${NAME} / $?  shell-local 變數與上一個結束碼
+ *   * / ?                   未被引號保護的路徑萬用字元
  *   # 註解                  這一行從 # 起到結尾都忽略
  * 內建命令(由 shell 自己處理,不建立行程):
  *   exit [數字]             結束 shell;沒有給數字時以上一個命令的結束碼結束
@@ -33,6 +35,8 @@
  *   Ctrl-C                  終止前景的命令
  *   Ctrl-Z                  暫停前景的命令,回到提示符號;之後用 fg 或 bg 讓它繼續
  *
+ * 互動行編輯:16 筆歷史(Up/Down)、左右/Home/End/Delete、Tab 路徑補全;
+ * 以位元組編輯,不是 Unicode grapheme 編輯器。變數不經由環境繼承給子行程。
  * shell 的結束碼:exit 指定的值,或(輸入結束時)最後一個命令的結束碼。
  */
 #include "ulib.h"
@@ -55,6 +59,7 @@ struct reader {
 static int read_line(struct reader *r, char *out, unsigned cap)
 {
     unsigned n = 0;
+    int overflow = 0;
 
     for (;;) {
         if (r->pos >= r->len) {
@@ -62,44 +67,23 @@ static int read_line(struct reader *r, char *out, unsigned cap)
             r->pos = 0;
             if (r->len <= 0) {                   /* 輸入結束(或出錯) */
                 out[n] = 0;
-                return n > 0;                    /* 最後一行沒有換行結尾時仍然算一行 */
+                return overflow ? -1 : n > 0;     /* 過長整行拒絕,不執行截斷的前綴 */
             }
         }
         char c = r->buf[r->pos++];
         if (c == '\n') {
             out[n] = 0;
-            return 1;
+            return overflow ? -1 : 1;
         }
         if (n < cap - 1)
             out[n++] = c;
+        else
+            overflow = 1;
     }
 }
 
-/* 把一行就地切成參數:在每個字的結尾寫入 0,argv 指向各個字的開頭。回傳參數個數 */
-static int split(char *s, char **argv, int max)
-{
-    int argc = 0;
-
-    while (*s && argc < max) {
-        while (*s == ' ' || *s == '\t')
-            s++;
-        if (!*s || *s == '#')                    /* 行尾,或註解的開頭 */
-            break;
-        if (*s == '"') {                         /* 引號:到下一個引號為止算同一個字 */
-            argv[argc++] = ++s;
-            while (*s && *s != '"')
-                s++;
-        } else {
-            argv[argc++] = s;
-            while (*s && *s != ' ' && *s != '\t')
-                s++;
-        }
-        if (*s)
-            *s++ = 0;
-    }
-    argv[argc] = 0;
-    return argc;
-}
+#include "sh_words.h"
+#include "sh_edit.h"
 
 static void print_num(const char *before, long v, const char *after)
 {
@@ -129,9 +113,9 @@ static int parse(char **words, int n, struct stage *st)
     st[0] = (struct stage){ .argc = 0 };
     for (int i = 0; i < n; i++) {
         struct stage *cur = &st[ns - 1];
-        int out = streq(words[i], ">"), app = streq(words[i], ">>"), in = streq(words[i], "<");
+        int out = sh_operator(words[i], ">"), app = sh_operator(words[i], ">>"), in = sh_operator(words[i], "<");
 
-        if (streq(words[i], "|")) {
+        if (sh_operator(words[i], "|")) {
             if (cur->argc == 0 || ns >= MAX_STAGES || i + 1 >= n)
                 return -1;                       /* "|" 的前後都要有命令 */
             st[ns++] = (struct stage){ .argc = 0 };
@@ -139,12 +123,18 @@ static int parse(char **words, int n, struct stage *st)
             if (i + 1 >= n)
                 return -1;                       /* 後面要接檔名 */
             if (in) {
+                if (sh_operator(words[i+1], "|") || sh_operator(words[i+1], "&") ||
+                    sh_operator(words[i+1], ">") || sh_operator(words[i+1], ">>") || sh_operator(words[i+1], "<")) return -1;
                 cur->in_path = words[++i];
             } else {
+                if (sh_operator(words[i+1], "|") || sh_operator(words[i+1], "&") ||
+                    sh_operator(words[i+1], ">") || sh_operator(words[i+1], ">>") || sh_operator(words[i+1], "<")) return -1;
                 cur->out_path = words[++i];
                 cur->append = app;
             }
-        } else if (cur->argc < MAX_ARGS) {
+        } else if (sh_operator(words[i], "&") || cur->argc >= MAX_ARGS) {
+            return -1;
+        } else {
             cur->argv[cur->argc++] = words[i];
             cur->argv[cur->argc] = 0;
         }
@@ -601,27 +591,29 @@ int main(int argc, char **argv)
                 puts_(cwd);
             puts_("$ ");
         }
-        if (!read_line(&in, linebuf, sizeof(linebuf)))
+        int got = interactive ? sh_read_edit(&in, linebuf, sizeof(linebuf)) :
+                                read_line(&in, linebuf, sizeof(linebuf));
+        if (got < 0) { puts_("sh: line too long\n"); status = 2; continue; }
+        if (!got)
             break;                               /* 輸入結束 */
-        int n = split(linebuf, words, MAX_ARGS * MAX_STAGES);
+        int n = sh_lex(linebuf, words, status);
+        if (n < 0) { puts_("sh: invalid or oversized command\n"); status = 2; continue; }
         if (n == 0)
             continue;                            /* 空行或只有註解 */
 
-        /* 最後是 "&"(單獨一個字,或黏在最後一個字後面):背景執行 */
         int background = 0;
-        char *last = words[n - 1];
-        unsigned long ll = ustrlen(last);
-        if (last[ll - 1] == '&') {
+        if (sh_operator(words[n - 1], "&")) {
             background = 1;
-            last[ll - 1] = 0;
-            if (ll == 1)
-                words[--n] = 0;
-            if (n == 0) {
-                puts_("sh: syntax error\n");
-                status = 2;
-                continue;
-            }
+            words[--n] = 0;
+            if (n == 0) { puts_("sh: syntax error\n"); status = 2; continue; }
         }
+        if (n == 1 && !background && (sh_kind[0] & SH_ASSIGN)) {
+            status = sh_assign(words[0]) == 1 ? 0 : 2;
+            if (status) puts_("sh: variable table or value too large\n");
+            continue;
+        }
+        n = sh_expand(words, n);
+        if (n < 0) { puts_("sh: pathname expansion failed or ambiguous redirect\n"); status = 2; continue; }
 
         if (streq(words[0], "exit")) {
             return n > 1 ? (int)uatoi(words[1]) : (int)status;
@@ -656,10 +648,13 @@ int main(int argc, char **argv)
                   "             periodic [PERIOD_MS BUDGET_MS COUNT WORK_MS] (run as a real-time periodic task),\n"
                   "             vote COMMAND (run three copies and take the majority result)\n"
                   "users: id, su USER (exit returns), chmod MODE FILE, chown USER FILE; ls -l shows owners\n"
+                  "variables: NAME=value, $NAME, ${NAME}, $? (shell-local; no export)\n"
+                  "quotes: single/double quotes and backslash; glob: * and ? in paths\n"
                   "redirection: command > file, command >> file, command < file\n"
                   "pipes: command | command | ...\n"
                   "background: command &   then: jobs, fg [n], wait; ps lists all processes\n"
                   "Ctrl-C ends the running command; Ctrl-Z stops it (then: fg to resume, bg to resume in background)\n"
+                  "editing: Left/Right, Home/End, Delete, Up/Down history, Tab filename completion\n"
                   "Ctrl-D at an empty prompt ends the shell\n"
                   "disk: files under /disk are kept across reboots (try: df, cp /bin/echo /disk/echo)\n");
             status = 0;

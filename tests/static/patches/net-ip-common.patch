@@ -1,0 +1,44 @@
+diff --git a/include/net.h b/include/net.h
+--- a/include/net.h
++++ b/include/net.h
+@@ -2,6 +2,7 @@
+ #define WELYOS_NET_H
+ #include <stddef.h>
+ #include <stdint.h>
++#include "uapi/net.h"
+ 
+ /*
+  * net.h - 網路:驅動程式、協定堆疊、kernel 其他部分三者之間的介面
+@@ -55,7 +56,6 @@
+ #define NET_UDP_MAX    1472u             /* 一個 UDP 封包最多帶多少資料(不做 IP 分段) */
+ #define NET_PING_MAX   1472u             /* ICMP echo 最多帶多少資料 */
+ 
+-#define NET_IP(a, b, c, d) (((uint32_t)(a) << 24) | ((uint32_t)(b) << 16) | ((uint32_t)(c) << 8) | (uint32_t)(d))
+ 
+ /*
+  * 一個網路介面。由驅動程式(或測試)填好之後交給 net_init。
+diff --git a/include/uapi/net.h b/include/uapi/net.h
+--- a/include/uapi/net.h
++++ b/include/uapi/net.h
+@@ -11,6 +11,10 @@
+  * 已經公開的編號與欄位只增不改。
+  */
+ #include <stdint.h>
++
++/* IPv4 address as a host-order 32-bit integer; shared by kernel and user tools. */
++#define NET_IP(a, b, c, d) (((uint32_t)(a) << 24) | ((uint32_t)(b) << 16) | ((uint32_t)(c) << 8) | (uint32_t)(d))
++
+ 
+ /* SYS_udp_send / SYS_udp_recv 的參數。
+    送出:ip、port 是目的,data / len 是要送的資料。
+diff --git a/user/usys.h b/user/usys.h
+--- a/user/usys.h
++++ b/user/usys.h
+@@ -161,7 +161,6 @@
+  * 網路。位址是 32 位元的整數,最高位元組在前:10.0.2.15 = NET_IP(10, 0, 2, 15)。
+  * 這台機器固定是 10.0.2.15,閘道 10.0.2.2,名稱伺服器 10.0.2.3(模擬器提供的私有網路)。
+  */
+-#define NET_IP(a, b, c, d) (((unsigned)(a) << 24) | ((unsigned)(b) << 16) | ((unsigned)(c) << 8) | (unsigned)(d))
+ /* ping:回傳來回的毫秒數;逾時回傳 -E_TIMEDOUT;沒有網路回傳 -E_NETDOWN */
+ static inline long sys_ping(unsigned ip, long timeout_ms) { return syscall3(SYS_ping, (long)ip, timeout_ms, 0); }
+ /* UDP:先以 sys_udp_open 取得一個描述符(port 0 = 自動挑一個),用完以 sys_close 關閉 */

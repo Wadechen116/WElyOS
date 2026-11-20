@@ -119,10 +119,10 @@ static int vblk_do_request(struct vblk *v, uint32_t type, uint64_t sector, void 
 
     /* 輪詢:等已用環往前走。設一個上限,裝置沒有回應時回報錯誤而不是永遠卡住 */
     /* 兩種上限:平常以時間計(5 秒);panic 時中斷是關的,時間不會前進,所以另外有次數的上限 */
-    uint64_t t0 = timer_ticks();
+    uint64_t dl = timer_deadline_ms(5000);
     unsigned long spins = 0;
     while (v->used->idx == v->last_used) {
-        if (timer_ticks() - t0 > 5000 || ++spins > 200000000ul) {
+        if (timer_expired(dl) || ++spins > 200000000ul) {
             rc = -E_IO;
             break;
         }

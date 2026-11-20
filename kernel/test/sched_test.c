@@ -120,9 +120,15 @@ void sched_demo(void)
     spin_pair[0] = &s1;
     spin_pair[1] = &s2;
     spin_budget = 6 * slice;                                   /* 合計 6 個時間片的 CPU 時間 */
+    /* 兩條要同時起跑:建立期間 main 用較高的優先權,時間片在兩次建立之間用完也不會讓 spin1 先跑。
+       第 51 步在 aarch64 量到 40 對 21:main 建立 spin1 後時間片剛好用完,spin1 先跑了一整片,
+       main 回來建立 spin2 之後 spin1 又排在前面 — 不是排程器的錯,是測試的起跑不公平。
+       在兩次建立之間故意忙等 12 毫秒可以必定重現(修正前 40 對 21,修正後 31 對 30) */
+    thread_set_priority(PRIO_HIGH);
     t[0] = thread_create("spin1", spin_worker, &s1);
     t[1] = thread_create("spin2", spin_worker, &s2);
     join_all(t, 2);
+    thread_set_priority(PRIO_NORMAL);
     timer_get_stats(&tsb);
     kprintf("  spin1: %lu ms of cpu (%lu loops), spin2: %lu ms (%lu loops), %lu context switches; "
             "late timer interrupts in the window: %u (3+ ticks: %u, largest ever %u)\n",
@@ -134,7 +140,7 @@ void sched_demo(void)
     unsigned long c1 = s1.ticks, c2 = s2.ticks, diff = c1 > c2 ? c1 - c2 : c2 - c1;
     if (!s1.iters || !s2.iters || !c1 || !c2 || diff > slice + 1) {
         kprintf("sched fairness failed; spin1 is thread %d, spin2 is thread %d\n", t[0], t[1]);
-        sched_trace_dump(sched_cpu_id(), 40);
+        (void)sched_trace_dump_all(40);
         panic("sched fairness: cpu ticks %lu vs %lu (difference %lu, allowed %u = one time slice + 1)",
               c1, c2, diff, slice + 1);
     }
@@ -527,7 +533,7 @@ void prio_demo(void)
     /* 高優先權:醒來就搶佔 — 延遲只能來自計時器的抖動(量到的),再加讀取時間的 1 個 tick。
        同優先權:必須等對方時間片剩下的部分,至少 2 個 tick */
     if (high > jit_high + 1 || same < 2) {
-        sched_trace_dump(sched_cpu_id(), 40);
+        (void)sched_trace_dump_all(40);
         panic("prio latency: high-priority delay %u (allowed %u), same-priority delay %u (must be >= 2)",
               high, jit_high + 1, same);
     }
@@ -850,7 +856,9 @@ static void rt_task(void *arg)
     thread_set_priority(PRIO_HIGH);
     /* 基準時間要在宣告「之前」讀:宣告之後才讀的話,中間剛好過了一個 tick 就會以為被提早叫醒。
        (因此量到的「晚到」可能比實際多 1 個 tick) */
-    uint64_t expect = timer_ticks() + 20;
+    /* 第一個週期以真實時間為起點(sched.c 用 timer_ticks_real,見 timer.h):預期值也要用同一個基準,
+       否則第 0 顆 CPU 的 tick 落後時,落後的量會被誤算成「晚到」 */
+    uint64_t expect = timer_ticks_real() + 20;
     KASSERT(thread_set_periodic(20, 5) == 0);
     KASSERT(thread_effective_prio(thread_current()) == PRIO_RT);
     for (int i = 0; i < 10; i++, expect += 20) {
@@ -887,8 +895,17 @@ static void rt_task(void *arg)
     unsigned jump = timer_bursts_at_least(&ts1, 6) - timer_bursts_at_least(&ts0, 6);   /* 這段期間跳過 >= 6 的次數 */
     int stalled = jump > 0;
     KASSERT(thread_wait_period(&st) == 0);
-    if (!stalled && (prio_after != PRIO_HIGH || st.overruns != 1 || st.misses != 0 || st.max_used_ms < 5)) {
-        sched_trace_dump(sched_cpu_id(), 40);
+    /* 預算以「記到的 CPU 時間」計算;中斷晚到後一次補記的 tick 不算進任何執行緒(第 48 步的設計,
+       docs/ISSUES.md I-283)。所以判斷要看實際記到多少:空轉期間沒有切換、卻只記到 <= 5 個 tick 時,
+       依這個記帳方式本來就沒有超出預算 — 印出量到的值,不當成排程器的錯 */
+    unsigned long charged = cpu1 - cpu0;
+    int under_charged = sw1 == sw0 && charged <= 5;
+    if (under_charged)
+        kprintf("rt: the 12-tick spin was charged only %lu ticks (late timer interrupts are not charged); "
+                "overrun checks skipped\n", charged);
+    if (!stalled && !under_charged &&
+        (prio_after != PRIO_HIGH || st.overruns != 1 || st.misses != 0 || st.max_used_ms < 5)) {
+        (void)sched_trace_dump_all(40);
         panic("rt test (overrun): prio %d (want %d), overruns %u, misses %u, max used %u ms; "
               "spin %llu..%llu (ended %llu), deadline %llu; my cpu ticks %lu, switches %lu, "
               "starvation boosts %lu, timer jumps 6+: %u",
@@ -901,7 +918,7 @@ static void rt_task(void *arg)
         kprintf("rt: measured %u timer jump(s) of 6+ ticks during the overrun test (its slack is 6 ticks); "
                 "its same-period checks were skipped\n", jump);
     }
-    KASSERT(st.overruns >= 1 && st.throttled == 0);
+    KASSERT((st.overruns >= 1 || under_charged) && st.throttled == 0);
     KASSERT(thread_effective_prio(thread_current()) == PRIO_RT);         /* 新的週期:恢復 */
 
     /* 錯過期限:一口氣做 45 毫秒,跨過兩個期限(主機停頓時可能更多,所以只要求「至少」) */
@@ -962,7 +979,7 @@ static void rt_short_task(void *arg)
     timer_get_stats(&ts1);
     unsigned jump = timer_bursts_at_least(&ts1, 7) - timer_bursts_at_least(&ts0, 7);
     if (st.releases + st.misses < 20 || st.misses > jump) {
-        sched_trace_dump(sched_cpu_id(), 40);
+        (void)sched_trace_dump_all(40);
         panic("rt test (rate-monotonic): releases %u, misses %u, timer jumps of 7+ ticks in the window: %u",
               st.releases, st.misses, jump);
     }
@@ -1030,4 +1047,96 @@ void smp_sched_demo(void)
             smp_counter, (unsigned long)SMP_WORKERS * SMP_ADDS);
     KASSERT(all == (1u << ncpu) - 1);                /* 每顆 CPU 都執行過執行緒 */
     KASSERT(smp_counter == (unsigned long)SMP_WORKERS * SMP_ADDS);
+    /* 排程紀錄必須涵蓋每一顆 CPU:上面已證明每顆都執行過執行緒(因此都有切換紀錄),
+       所以「有紀錄而印出來的 CPU 數」必須等於 CPU 數。只印目前這顆的舊版會在這裡得到 1 */
+    int traced = sched_trace_dump_all(1);
+    kprintf("smp: scheduler trace covers %d of %d cpus\n", traced, ncpu);
+    KASSERT(traced == ncpu);
+}
+
+/*
+ * ---- 睡眠不可以提早醒 ----
+ * thread_sleep(ms) 承諾「至少睡 ms 毫秒」。系統時間(tick)只由第 0 顆 CPU 的計時器中斷推進,
+ * 那顆 CPU 的中斷晚到時(關中斷、模擬器的主機排程),tick 會暫時落後真實時間;
+ * 若以落後的 tick 為起點算醒來的時間,醒來時真實經過的時間就會不足(第 51 步在 riscv64、4 顆 CPU
+ * 上量到 sleep(100) 只睡了 99.5 毫秒)。
+ * 這裡讓每顆 CPU 都忙著,以高精度時鐘(與 tick 無關的硬體計數器)量 300 次 sleep(1),
+ * 每一次都必須 >= 1 毫秒。比較用乘法:elapsed * 1000 >= ms * hz,不需要 64 位元除法。
+ */
+static volatile int sw_stop;
+
+static void sw_hog(void *arg)
+{
+    (void)arg;
+    while (!sw_stop)
+        ;
+}
+
+/*
+ * 必定觸發的情境:在第 0 顆 CPU(唯一推進系統時間的那顆)關中斷 5 毫秒,讓 tick 確實落後,
+ * 在落後的狀態下要一個「至少 1 毫秒」的期限,開中斷後量到期時真實經過了多久。
+ * 以落後的 tick 為起點(修正前的做法),開中斷時一次補記 5 個 tick,期限立刻就到 — 幾乎 0 毫秒。
+ * 回傳經過的時鐘計數。
+ */
+static uint64_t tick_lag_probe(uint64_t hz)
+{
+    for (int i = 0; i < 5000 && sched_cpu_id() != 0; i++)
+        thread_sleep(1);                     /* 換到第 0 顆 CPU 上(單 CPU 時本來就是) */
+    unsigned long fl = arch_irq_save();
+    if (sched_cpu_id() != 0) {
+        arch_irq_restore(fl);
+        panic("sleep test: could not get onto cpu 0");
+    }
+    uint64_t t0 = timer_clock_count();
+    while ((timer_clock_count() - t0) * 1000 < hz * 5)
+        ;                                    /* 關著中斷 5 ms:這段期間 tick 不會前進 */
+    uint64_t dl = timer_deadline_ms(1), c0 = timer_clock_count();
+    arch_irq_restore(fl);
+    while (!timer_expired(dl))
+        ;
+    return timer_clock_count() - c0;
+}
+
+void sleep_wall_test(void)
+{
+    uint64_t hz = timer_clock_hz();
+    if (hz == 0) {
+        kprintf("sleep: no high-resolution clock, wall-time sleep test skipped\n");
+        return;
+    }
+    uint64_t lag = tick_lag_probe(hz);
+    kprintf("sleep: a 1 ms deadline taken while cpu 0 had 5 ms of ticks pending expired after %llu "
+            "clock counts (clock %llu Hz)\n", (unsigned long long)lag, (unsigned long long)hz);
+    if (lag * 1000 < hz)
+        panic("timer deadline taken during a tick lag expired early (%llu counts, clock %llu Hz)",
+              (unsigned long long)lag, (unsigned long long)hz);
+    int hogs[MAX_CPUS], n = 0;
+    sw_stop = 0;
+    for (int i = 0; i < cpu_count && i < MAX_CPUS; i++)
+        if ((hogs[n] = thread_create("sw-hog", sw_hog, NULL)) > 0)
+            n++;
+    thread_set_priority(PRIO_HIGH);          /* 醒來就能上 CPU:量到的是「睡了多久」而不是「等了多久才輪到」 */
+    uint64_t min = ~0ULL;
+    unsigned short_count = 0;
+    for (int i = 0; i < 300; i++) {
+        uint64_t t0 = timer_clock_count();
+        thread_sleep(1);
+        uint64_t d = timer_clock_count() - t0;
+        if (d < min)
+            min = d;
+        if (d * 1000 < hz)
+            short_count++;
+    }
+    thread_set_priority(PRIO_NORMAL);
+    sw_stop = 1;
+    for (int i = 0; i < n; i++)
+        thread_join(hogs[i]);
+    kprintf("sleep: 300 x sleep(1 ms) with every cpu busy: shortest %llu clock counts "
+            "(clock %llu Hz), woke early %u times\n",
+            (unsigned long long)min, (unsigned long long)hz, short_count);
+    if (short_count) {
+        (void)sched_trace_dump_all(20);
+        panic("sleep woke early %u of 300 times (shortest %llu counts, clock %llu Hz)",
+              short_count, (unsigned long long)min, (unsigned long long)hz);
+    }
 }

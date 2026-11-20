@@ -12,6 +12,10 @@
  */
 #include <stdint.h>
 
+/* IPv4 address as a host-order 32-bit integer; shared by kernel and user tools. */
+#define NET_IP(a, b, c, d) (((uint32_t)(a) << 24) | ((uint32_t)(b) << 16) | ((uint32_t)(c) << 8) | (uint32_t)(d))
+
+
 /* SYS_udp_send / SYS_udp_recv 的參數。
    送出:ip、port 是目的,data / len 是要送的資料。
    接收:data / len 是緩衝區與它的大小;返回時 ip、port 是來源,len 是實際的長度 */

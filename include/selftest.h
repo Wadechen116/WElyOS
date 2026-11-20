@@ -30,6 +30,7 @@ void sync_demo(void);                    /* mutex、號誌、條件變數 */
 void prio_demo(void);                    /* 優先權、搶佔延遲、優先權繼承、防飢餓 */
 void smp_sched_demo(void);               /* 多顆 CPU 同時排程 */
 void rt_demo(void);                      /* 週期性的即時工作 */
+void sleep_wall_test(void);              /* 睡眠以真實時間計不可提早醒(高精度時鐘量) */
 void sched_stress(void);                 /* stress:大量執行緒 */
 void sched_crash_test(const char *cmd);  /* crash=<種類>:需要排程器的那些 */
 void spin_irqs_off(void *arg);           /* crash=wdog 用:關著中斷空轉的執行緒 */

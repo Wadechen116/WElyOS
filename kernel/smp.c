@@ -190,11 +190,10 @@ void smp_ap_main(void)
 /* 等條件成立或逾時。成立回傳 1 */
 static int wait_for(volatile int *v, int want, unsigned ms)
 {
-    uint64_t t0 = timer_ticks();
-    unsigned limit = ms * timer_hz() / 1000 + 1;
+    uint64_t dl = timer_deadline_ms(ms);         /* 至少等 ms(見 timer.h) */
 
     while (__atomic_load_n(v, __ATOMIC_ACQUIRE) != want) {
-        if (timer_ticks() - t0 > limit)
+        if (timer_expired(dl))
             return 0;
         arch_cpu_relax();
     }

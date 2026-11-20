@@ -89,6 +89,7 @@ unsigned sched_thread_count(void);       /* 存活的執行緒數(含 main,不�
 unsigned long sched_switch_count(void);  /* 累計的 context switch 次數 */
 unsigned long sched_starve_boosts(void); /* 累計的防飢餓提升次數 */
 void sched_trace_dump(int cpu, unsigned last); /* 印出第 cpu 顆 CPU 最近 last 次切換(測試失敗時用) */
+int sched_trace_dump_all(unsigned last);       /* 印出所有 CPU 的紀錄;回傳有紀錄的 CPU 數 */
 
 /*
  * 行程支援(kernel/proc.c 使用):

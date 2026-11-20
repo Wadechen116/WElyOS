@@ -245,6 +245,7 @@ static const char boot_logo[] =
 /* kernel 主函式。主控台此時已可使用。此函式不會返回。 */
 void kmain(const struct boot_info *bi)
 {
+    timer_clock_mark(CLOCK_MARK_KMAIN);      /* 效能量測:開機時間從這裡算起(之前是韌體與載入器) */
     kprintf("%s\n", boot_logo);
     kprintf("Hello WElyOS\n");
     kprintf("arch: %s (%u-bit)\n", arch_name(), (unsigned)(sizeof(void *) * 8));
@@ -345,6 +346,7 @@ void kmain(const struct boot_info *bi)
     if (selftest) {
         smp_sched_demo();
         rt_demo();
+        sleep_wall_test();
         fs_demo();
         disk_demo();
         nic_selftest();                      /* 驅動程式單獨的測試:要在協定堆疊開始收訊框之前 */
@@ -383,6 +385,16 @@ void kmain(const struct boot_info *bi)
        安全模式不在這裡記:要等有人看過、正常離開之後(見 shutdown) */
     if (!safe_mode)
         blackbox_log(BB_HEALTHY, "boot completed");
+    timer_clock_mark(CLOCK_MARK_READY);
+    /* 開機參數 bench:執行效能基準 /bin/bench(docs/ISSUES.md N-004;scripts/bench.sh 使用)。
+       它必須成功結束:量測途中有系統呼叫失敗,數字就不可信 */
+    if (cmdline_has(bi->cmdline, "bench")) {
+        int pid = proc_spawn("/bin/bench", NULL);
+        KASSERT(pid > 0);
+        int rc = proc_wait(pid);
+        kprintf("bench: exit %d\n", rc);
+        KASSERT(rc == 0);
+    }
     int shell = !autoexit || cmdline_has(bi->cmdline, "shell");
     if (shell) {
         kprintf("starting /bin/sh (type \"help\" for a list of commands)\n");

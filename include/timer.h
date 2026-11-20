@@ -35,4 +35,24 @@ uint32_t timer_bursts_at_least(const struct timer_stats *st, unsigned k);
    硬體沒有時鐘時,從 0(1970 年)開始算 */
 void     timer_clock_init(void);
 uint64_t timer_epoch(uint32_t *usec);
+/* 開機時間的記號(效能量測用):在 kmain 開頭與「開機完成」各記一次高精度時鐘的值,
+   SYS_clock 交給使用者程式。只記第一次,之後的呼叫不改變它 */
+enum { CLOCK_MARK_KMAIN, CLOCK_MARK_READY };
+void     timer_clock_mark(int which);
+void     timer_clock_marks(uint64_t *kmain, uint64_t *ready);
+uint64_t timer_clock_count(void);    /* 高精度時鐘的現值(架構層的計數器) */
+uint64_t timer_clock_hz(void);       /* 它每秒的計數;0 = 沒有可用的時鐘 */
+/*
+ * 以真實時間為準的 tick(第 51 步)。timer_ticks() 只由第 0 顆 CPU 的計時器中斷推進,
+ * 那顆 CPU 的中斷晚到時會暫時落後真實時間;拿它當「等多久」的起點,真正等到的時間就會不足。
+ *   timer_ticks_real()     現在「應該」是第幾個 tick:timer_ticks() 加上已經到期、還沒記的 tick
+ *                          (由高精度時鐘與第 0 顆 CPU 下一個 tick 的預定時間算出)。永遠 >= timer_ticks()
+ *   timer_deadline_ms(ms)  「至少 ms 毫秒之後」對應的 tick;ms 為 0 時回傳 0(立刻到期)
+ *   timer_expired(dl)      timer_ticks() >= dl。因為 timer_ticks() 不會超前真實時間,
+ *                          到期時真實經過的時間一定 >= 要求的時間
+ * 架構層沒有高精度時鐘時,timer_ticks_real() 等於 timer_ticks()(無從得知落後多少)。
+ */
+uint64_t timer_ticks_real(void);
+uint64_t timer_deadline_ms(unsigned ms);
+int      timer_expired(uint64_t deadline);
 #endif

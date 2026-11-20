@@ -26,6 +26,8 @@ static int sched_lk;
 static struct cpu *this_cpu(void) { return cpus; }
 static unsigned timer_hz(void) { return 1000; }
 static uint64_t timer_ticks(void) { return now; }
+/* Host model has no delayed interrupt delivery; real and accounted clocks coincide. */
+static uint64_t timer_ticks_real(void) { return now; }
 static struct thread *cur(void) { return cpus[0].current; }
 static unsigned long sched_lock(void) { return 0; }
 static void sched_unlock(unsigned long flags) { (void)flags; }
@@ -54,6 +56,11 @@ int main(void) {
         int valid=(!p && !b) || (p>=2 && p<=60000 && b && b<p && util<=RT_UTIL_MAX);
         int rc=thread_set_periodic(p,b); CHECK((rc==0)==valid);rt_remove(&pool[0]);CHECK(rt_util_total==0);
     }
+    /* A caught-up tick advances deadlines, not CPU accounting or a time slice. */
+    cpus[0].current=&pool[0];
+    unsigned slice0=pool[0].slice; unsigned long ticks0=pool[0].cpu_ticks;
+    sched_tick(0);
+    CHECK(pool[0].slice==slice0 && pool[0].cpu_ticks==ticks0);
     uint32_t rng=17;
     for (int i=0;i<20000;i++) {
         rng=rng*1664525u+1013904223u; unsigned slot=(rng>>16)%RT_MAX;
@@ -83,7 +90,7 @@ int main(void) {
     short_task.rt_waiting=1;short_task.state=T_SLEEPING;short_task.wake_tick=2;sleepers=&short_task;
     cpus[0].current=&long_task;cpus[0].need_resched=0;
     for (now=1;now<=4;now++) {
-        sched_tick();
+        sched_tick(1);
         /* 主機環境尊重 sched_tick 的搶佔要求；短工作使用一個 tick 完成後阻塞到下個 release。 */
         if (cur()==&short_task && short_task.rt_used>=short_task.rt_budget) {
             short_task.rt_waiting=1;short_task.wake_tick=short_task.rt_release;

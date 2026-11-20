@@ -165,6 +165,44 @@ void user_demo(void)
         KASSERT(vfs_unlink("/work/result") == 0 && vfs_unlink("/work") == 0);
     }
 
+    /* shell 的變數、$?、引號與萬用字元(N-005,Codex 交付、第 51 步整合):
+       /etc/n005.sh 把每一項的結果寫進 /n5/out,這裡逐位元組核對 */
+    {
+        const char *argv[] = { "sh", "/etc/n005.sh", NULL };
+        struct file *f;
+        char buf[160];
+        static const char want[] =
+            "2\n"                                 /* args "$NAME":一個參數 */
+            "3\n"                                 /* args $NAME:拆成兩個 */
+            "|  x\n"                              /* '|' '' "x":不是運算子,空字串保留 */
+            "/n5/a.txt /n5/b.txt\n"               /* 萬用字元:排序後的符合項 */
+            "/n5/*.txt\n"                         /* 引號內:字面值 */
+            "/n5/*.none\n"                        /* 沒有符合:保留字面值 */
+            "hello world!\n"                      /* ${NAME} */
+            "y\n"                                 /* ? 萬用字元 */
+            "2\n"                                 /* 重新導向對應兩個檔案:拒絕 */
+            "x\n";                                /* 而且沒有寫進任何一個 */
+        int pid = proc_spawn("/bin/sh", argv);
+        KASSERT(pid > 0);
+        int code = proc_wait(pid);
+        KASSERT(vfs_open("/n5/out", O_RDONLY, &f) == 0);
+        long n = vfs_read(f, buf, sizeof(buf));
+        vfs_close(f);
+        kprintf("user: shell script /etc/n005.sh (variables, $?, quotes, globbing) -> exit code %d, "
+                "%ld bytes of results\n", code, n);
+        if (code != 5 || n != (long)sizeof(want) - 1 || memcmp(buf, want, (size_t)n) != 0) {
+            if (n > 0 && n < (long)sizeof(buf)) {
+                buf[n] = 0;
+                kprintf("user: /n5/out was:\n%s", buf);
+            }
+            panic("shell feature script: exit %d, %ld bytes (expected 5 and %zu)", code, n, sizeof(want) - 1);
+        }
+        static const char *const files[] = { "/n5/a.txt", "/n5/b.txt", "/n5/c.dat", "/n5/o1", "/n5/o2", "/n5/out" };
+        for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); i++)
+            KASSERT(vfs_unlink(files[i]) == 0);
+        KASSERT(vfs_unlink("/n5") == 0);
+    }
+
     /* 正在等主控台輸入的行程也要能被終止:啟動一個互動式的 shell(沒有人打字,
        它會一直睡在讀取裡),過一下子把它終止,確認它真的結束了 */
     {

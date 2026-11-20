@@ -489,18 +489,52 @@ static void trace_switch(struct cpu *c, struct thread *prev, struct thread *next
     e->next_prio = (uint8_t)next->prio;
 }
 
-void sched_trace_dump(int cpu, unsigned last)
+/*
+ * 印出第 cpu 顆 CPU 最近 last 次切換,回傳實際印出的筆數。
+ * 別顆 CPU 可能正在寫自己的紀錄,所以先在 sched_lk 之下把那一段複製出來(最多 64 筆、不到 1 KB),
+ * 解鎖後才印:印字很慢,不能讓排程器的鎖等主控台。
+ */
+static unsigned trace_dump_one(int cpu, unsigned last)
 {
     static const char st[] = "RrSBZ";        /* READY / running / SLEEPING / BLOCKED / ZOMBIE */
+    struct sched_ev copy[SCHED_TRACE];
+
+    if (last > SCHED_TRACE)
+        last = SCHED_TRACE;
+    unsigned long fl = sched_lock();
     unsigned n = strace_n[cpu], k = n < last ? n : last;
+    for (unsigned i = 0; i < k; i++)
+        copy[i] = strace[cpu][(n - k + i) % SCHED_TRACE];
+    sched_unlock(fl);
 
     kprintf("sched trace, cpu %d, last %u of %u switches (tick: prev[state slice prio] -> next[prio]):\n",
             cpu, k, n);
-    for (unsigned i = n - k; i < n; i++) {
-        const struct sched_ev *e = &strace[cpu][i % SCHED_TRACE];
+    for (unsigned i = 0; i < k; i++) {
+        const struct sched_ev *e = &copy[i];
         kprintf("  %u: %d[%c %u p%u] -> %d[p%u]\n", e->tick, e->prev,
                 e->prev_state < 5 ? st[e->prev_state] : '?', e->prev_slice, e->prev_prio, e->next, e->next_prio);
     }
+    return k;
+}
+
+void sched_trace_dump(int cpu, unsigned last)
+{
+    if (cpu >= 0 && cpu < MAX_CPUS)
+        (void)trace_dump_one(cpu, last);
+}
+
+/*
+ * 印出所有參與排程的 CPU 的紀錄。多核心時,出問題的那條執行緒常常剛在別顆 CPU 上跑過,
+ * 只印自己這顆會看不到原因。回傳「有紀錄、也印出來了」的 CPU 數,供測試核對。
+ */
+int sched_trace_dump_all(unsigned last)
+{
+    int printed = 0;
+
+    for (int cpu = 0; cpu < cpu_count && cpu < MAX_CPUS; cpu++)
+        if (trace_dump_one(cpu, last) > 0)
+            printed++;
+    return printed;
 }
 
 static void schedule(void)
@@ -1032,7 +1066,7 @@ void thread_sleep(unsigned ms)
         sched_unlock(flags);
         return;
     }
-    sleep_until_locked(self, timer_ticks() + n);
+    sleep_until_locked(self, timer_ticks_real() + n);   /* 以真實時間為起點:見 timer.h 的 timer_ticks_real */
     sched_unlock(flags);
 }
 
@@ -1183,7 +1217,7 @@ int thread_set_periodic(unsigned period_ms, unsigned budget_ms)
         self->rt_used = 0;
         self->rt_throttled = self->rt_waiting = 0;
         self->rt_releases = self->rt_misses = self->rt_overruns = self->rt_max_used = 0;
-        self->rt_release = timer_ticks() + period;       /* 第一個週期從現在開始 */
+        self->rt_release = timer_ticks_real() + period;  /* 第一個週期從現在(真實時間)開始 */
         rt_assign_levels();
         update_prio(self);
     }

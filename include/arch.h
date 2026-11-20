@@ -17,6 +17,31 @@ void arch_console_irq_init(void);              /* 讓序列埠在收到字元時
                                                   要在 arch_timer_init(設定中斷控制器)之後呼叫 */
 void arch_halt(void) __attribute__((noreturn));/* 關閉中斷並永久停住(panic 用) */
 void arch_exit(int code) __attribute__((noreturn)); /* 結束模擬器(僅測試用) */
+
+/*
+ * arch_exit 結束前印出「exit: code N to the emulator」(docs/ISSUES.md N-002(a)):
+ * 偶發的模擬器結束碼 5 再出現時,配合 win-exit.ps1 記下的 Windows 完整結束碼,分得出是 kernel 給錯了值
+ * 還是模擬器自己當掉(第 51 步證實是後者:0xC0000005)。直接用 arch_putc 逐字輸出,
+ * 不經過 kprintf(不取主控台的鎖,panic 時也能用,也不讓 panic 的呼叫環多一條路)。
+ */
+static inline void arch_exit_announce(int code)
+{
+    const char *s = "exit: code ";
+    char d[12];
+    unsigned u = code < 0 ? 0u - (unsigned)code : (unsigned)code, n = 0;
+    while (*s)
+        arch_putc(*s++);
+    if (code < 0)
+        arch_putc('-');
+    do {
+        d[n++] = (char)('0' + u % 10);
+        u /= 10;
+    } while (u);
+    while (n)
+        arch_putc(d[--n]);
+    for (s = " to the emulator\n"; *s; s++)
+        arch_putc(*s);
+}
 const char *arch_name(void);                   /* 架構名稱字串 */
 uint64_t arch_rtc_read(void);                  /* 讀取硬體的即時時鐘(Real-Time Clock):現在是 1970-01-01 00:00:00 UTC
                                                   之後的第幾秒。沒有這種裝置回傳 0 */
@@ -132,6 +157,25 @@ void arch_backtrace(uintptr_t pc, uintptr_t fp);
 
 /* 目前函式的 frame pointer */
 #define arch_current_fp() ((uintptr_t)__builtin_frame_address(0))
+
+/*
+ * 高精度時鐘(效能量測用):
+ *   arch_clock_count() 一個單調遞增的 64 位元計數器(i386 TSC、RISC-V time CSR、AArch64 cntpct_el0),
+ *                      從模擬器重置起算;所有 CPU 共用同一個時間基準(QEMU 上如此)
+ *   arch_clock_hz()    它每秒增加的次數;0 = 這台機器沒有可用的計數器
+ * 只用來量「經過了多久」,不參與排程與計時器(那些以 tick 為單位)。
+ */
+uint64_t arch_clock_count(void);
+uint64_t arch_clock_hz(void);
+/*
+ * 推進系統時間的那顆 CPU(第 0 顆)「下一個 tick 的預定時間」(以 arch_clock_count 的單位)與
+ * 一個 tick 的長度。那顆 CPU 的中斷晚到時,現在的時鐘值會超過這個預定時間:
+ * 超過了多少,就是系統時間暫時落後真實時間多少(kernel/timer.c 的 timer_ticks_real 用它)。
+ * 寫入端(中斷處理)先推進 tick 計數、再推進預定時間,中間有 release 屏障;
+ * 讀取端先讀預定時間、再讀 tick 計數。兩者都回傳 0 = 沒有這個資訊(例如 i386 沒有 TSC)。
+ */
+uint64_t arch_tick_deadline(void);
+uint64_t arch_tick_interval(void);
 
 /* 測試用:執行一個非法指令,觸發「非法指令」例外 */
 void arch_test_illegal(void);

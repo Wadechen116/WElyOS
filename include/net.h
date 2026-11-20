@@ -2,6 +2,7 @@
 #define WELYOS_NET_H
 #include <stddef.h>
 #include <stdint.h>
+#include "uapi/net.h"
 
 /*
  * net.h - 網路:驅動程式、協定堆疊、kernel 其他部分三者之間的介面
@@ -55,7 +56,6 @@
 #define NET_UDP_MAX    1472u             /* 一個 UDP 封包最多帶多少資料(不做 IP 分段) */
 #define NET_PING_MAX   1472u             /* ICMP echo 最多帶多少資料 */
 
-#define NET_IP(a, b, c, d) (((uint32_t)(a) << 24) | ((uint32_t)(b) << 16) | ((uint32_t)(c) << 8) | (uint32_t)(d))
 
 /*
  * 一個網路介面。由驅動程式(或測試)填好之後交給 net_init。

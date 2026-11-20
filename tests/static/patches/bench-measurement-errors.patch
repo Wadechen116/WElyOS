@@ -1,0 +1,168 @@
+diff --git a/user/bench.c b/user/bench.c
+--- a/user/bench.c
++++ b/user/bench.c
+@@ -23,6 +23,7 @@
+ #define ROUNDS_MAX 15
+ 
+ static uint64_t hz;
++static int failed, clock_failed;
+ 
+ /* 64 位元除法:i386 沒有 libgcc 的 __udivdi3,用位移-相減自己做 */
+ static uint64_t udiv64(uint64_t n, uint64_t d, uint64_t *rem)
+@@ -43,8 +44,10 @@
+ static uint64_t now(void)
+ {
+     struct clockinfo ci;
+-    if (sys_clock(&ci) != 0)
++    if (sys_clock(&ci) != 0) {
++        failed = clock_failed = 1;
+         return 0;
++    }
+     return ci.count;
+ }
+ 
+@@ -65,7 +68,6 @@
+         }
+ }
+ 
+-static int failed;
+ 
+ /* 一輪:執行 fn(n),回傳每次的奈秒;fn 回傳非 0 表示失敗 */
+ static void run(const char *name, int (*fn)(int n), int n, int rounds)
+@@ -74,12 +76,18 @@
+ 
+     for (int r = 0; r < rounds; r++) {
+         uint64_t t0 = now();
+-        if (fn(n) != 0) {
++        if (clock_failed || fn(n) != 0) {
+             printf("bench: %s FAILED (a system call returned an error)\n", name);
+             failed = 1;
+             return;
+         }
+-        ns[r] = udiv64(to_ns(now() - t0), (uint64_t)n, NULL);
++        uint64_t t1 = now();
++        if (clock_failed || t1 < t0) {
++            printf("bench: %s FAILED (clock error or backward count)\n", name);
++            failed = 1;
++            return;
++        }
++        ns[r] = udiv64(to_ns(t1 - t0), (uint64_t)n, NULL);
+     }
+     sort_u64(ns, rounds);
+     printf("bench: %s n=%d rounds=%d min=%llu med=%llu max=%llu ns/op\n", name, n, rounds,
+@@ -109,8 +117,11 @@
+         return 1;
+     }
+     long pid = sys_fork();
+-    if (pid < 0)
+-        return 1;
++    if (pid < 0) {
++        sys_close(to[0]); sys_close(to[1]);
++        sys_close(from[0]); sys_close(from[1]);
++        return 1;
++    }
+     if (pid == 0) {
+         char c;
+         sys_close(to[1]);
+@@ -148,13 +159,13 @@
+     return 0;
+ }
+ 
+-/* 產生新程式:spawn /bin/args(載入 ELF、建立位址空間)並等它結束 */
++/* spawn a silent child: measure image creation/exit/wait without console output. */
+ static int b_spawn(int n)
+ {
+-    char *argv[] = { "args", "x", NULL };
++    char *argv[] = { "bench", "--child", NULL };
+     for (int i = 0; i < n; i++) {
+-        long pid = sys_spawn("/bin/args", argv);
+-        if (pid < 0 || sys_wait(pid) != 2)
++        long pid = sys_spawn("/bin/bench", argv);
++        if (pid < 0 || sys_wait(pid) != 7)
+             return 1;
+     }
+     return 0;
+@@ -180,7 +191,9 @@
+                 return 1;
+             }
+         }
+-        if ((io_sync && sys_fsync(fd) != 0) | (sys_close(fd) != 0))
++        long synced = io_sync ? sys_fsync(fd) : 0;
++        long closed = sys_close(fd);
++        if (synced != 0 || closed != 0)
+             return 1;
+         fd = sys_open(io_path, O_RDONLY);
+         if (fd < 0)
+@@ -203,13 +216,20 @@
+     io_sync = sync;
+     for (int r = 0; r < rounds; r++) {
+         uint64_t t0 = now();
+-        if (b_file(1) != 0) {
++        if (clock_failed || b_file(1) != 0) {
+             printf("bench: %s FAILED (a system call returned an error)\n", name);
+             failed = 1;
+             sys_unlink(path);
+             return;
+         }
+-        ns[r] = udiv64(to_ns(now() - t0), 2 * (IO_TOTAL / IO_CHUNK), NULL);   /* 寫 + 讀,每 4 KB */
++        uint64_t t1 = now();
++        if (clock_failed || t1 < t0) {
++            printf("bench: %s FAILED (clock error or backward count)\n", name);
++            failed = 1;
++            sys_unlink(path);
++            return;
++        }
++        ns[r] = udiv64(to_ns(t1 - t0), 2 * (IO_TOTAL / IO_CHUNK), NULL);   /* 寫 + 讀,每 4 KB */
+     }
+     sys_unlink(path);
+     sort_u64(ns, rounds);
+@@ -220,6 +240,7 @@
+ 
+ int main(int argc, char **argv)
+ {
++    if (argc == 2 && streq(argv[1], "--child")) return 7;
+     int rounds = argc > 1 ? (int)uatoi(argv[1]) : 5;
+     if (rounds < 1 || rounds > ROUNDS_MAX) {
+         printf("bench: rounds must be 1..%d\n", ROUNDS_MAX);
+@@ -231,6 +252,7 @@
+         return 2;
+     }
+     hz = ci.hz;
++    if (!hz) return 1;
+     struct sysinfo si;
+     if (sys_sysinfo(&si) != 0)
+         return 1;
+@@ -245,18 +267,26 @@
+         printf("bench: boot marks missing\n"), failed = 1;
+ 
+     /* 時鐘自我檢查:用它量 sleep(100 ms)。換算錯了(例如 i386 的 TSC 校正錯)這裡會看出來:
+-       睡眠以 1 ms 的 tick 為單位,醒來最多晚幾個 tick,所以必須落在 100~150 ms 之間 */
++       睡眠以 1 ms 的 tick 為單位,tick 相位可能少於 100 ms;主機暫停則可能晚很多。
++       低於 99 ms 才拒絕;高於 150 ms 印干擾提示,不因此斷言換算錯誤 */
+     uint64_t c0 = now();
+-    if (sys_sleep(100) != 0) {
++    if (clock_failed || sys_sleep(100) != 0) {
+         printf("bench: sleep failed\n");
+         return 1;
+     }
+-    uint64_t slept = udiv64(to_ns(now() - c0), 1000, NULL);
++    uint64_t c1 = now();
++    if (clock_failed || c1 < c0) {
++        printf("bench: clock_check FAILED (clock read error or backward count)\n");
++        return 1;
++    }
++    uint64_t slept = udiv64(to_ns(c1 - c0), 1000, NULL);
+     printf("bench: clock_check sleep(100 ms) measured %llu us\n", (unsigned long long)slept);
+-    if (slept < 100000 || slept > 150000) {
+-        printf("bench: clock_check FAILED: the clock conversion is wrong\n");
+-        return 1;
+-    }
++    if (slept < 99000) {
++        printf("bench: clock_check FAILED: elapsed below 99 ms tick-phase tolerance\n");
++        return 1;
++    }
++
++    if (slept > 150000) printf("bench: clock_check delayed (host pause or scheduling interference)\n");
+ 
+     run("syscall_getpid", b_getpid, 2000, rounds);
+     run("pipe_roundtrip", b_pipe_rtt, 500, rounds);

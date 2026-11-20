@@ -1,0 +1,629 @@
+diff --git a/user/sh.c b/user/sh.c
+--- a/user/sh.c
++++ b/user/sh.c
+@@ -16,6 +16,8 @@
+  *   命令1 | 命令2 | ...     管線:前一個命令的輸出成為後一個命令的輸入
+  *   命令 &                  背景執行:不等它結束,立刻回到提示符號(見下方「背景工作」)
+  *   "含 空白 的 參數"       雙引號內的空白不拆開
++ *   NAME=value / $NAME / ${NAME} / $?  shell-local 變數與上一個結束碼
++ *   * / ?                   未被引號保護的路徑萬用字元
+  *   # 註解                  這一行從 # 起到結尾都忽略
+  * 內建命令(由 shell 自己處理,不建立行程):
+  *   exit [數字]             結束 shell;沒有給數字時以上一個命令的結束碼結束
+@@ -33,6 +35,8 @@
+  *   Ctrl-C                  終止前景的命令
+  *   Ctrl-Z                  暫停前景的命令,回到提示符號;之後用 fg 或 bg 讓它繼續
+  *
++ * 互動行編輯:16 筆歷史(Up/Down)、左右/Home/End/Delete、Tab 路徑補全;
++ * 以位元組編輯,不是 Unicode grapheme 編輯器。變數不經由環境繼承給子行程。
+  * shell 的結束碼:exit 指定的值,或(輸入結束時)最後一個命令的結束碼。
+  */
+ #include "ulib.h"
+@@ -55,6 +59,7 @@
+ static int read_line(struct reader *r, char *out, unsigned cap)
+ {
+     unsigned n = 0;
++    int overflow = 0;
+ 
+     for (;;) {
+         if (r->pos >= r->len) {
+@@ -62,44 +67,23 @@
+             r->pos = 0;
+             if (r->len <= 0) {                   /* 輸入結束(或出錯) */
+                 out[n] = 0;
+-                return n > 0;                    /* 最後一行沒有換行結尾時仍然算一行 */
++                return overflow ? -1 : n > 0;     /* 過長整行拒絕,不執行截斷的前綴 */
+             }
+         }
+         char c = r->buf[r->pos++];
+         if (c == '\n') {
+             out[n] = 0;
+-            return 1;
++            return overflow ? -1 : 1;
+         }
+         if (n < cap - 1)
+             out[n++] = c;
+-    }
+-}
+-
+-/* 把一行就地切成參數:在每個字的結尾寫入 0,argv 指向各個字的開頭。回傳參數個數 */
+-static int split(char *s, char **argv, int max)
+-{
+-    int argc = 0;
+-
+-    while (*s && argc < max) {
+-        while (*s == ' ' || *s == '\t')
+-            s++;
+-        if (!*s || *s == '#')                    /* 行尾,或註解的開頭 */
+-            break;
+-        if (*s == '"') {                         /* 引號:到下一個引號為止算同一個字 */
+-            argv[argc++] = ++s;
+-            while (*s && *s != '"')
+-                s++;
+-        } else {
+-            argv[argc++] = s;
+-            while (*s && *s != ' ' && *s != '\t')
+-                s++;
+-        }
+-        if (*s)
+-            *s++ = 0;
+-    }
+-    argv[argc] = 0;
+-    return argc;
+-}
++        else
++            overflow = 1;
++    }
++}
++
++#include "sh_words.h"
++#include "sh_edit.h"
+ 
+ static void print_num(const char *before, long v, const char *after)
+ {
+@@ -129,9 +113,9 @@
+     st[0] = (struct stage){ .argc = 0 };
+     for (int i = 0; i < n; i++) {
+         struct stage *cur = &st[ns - 1];
+-        int out = streq(words[i], ">"), app = streq(words[i], ">>"), in = streq(words[i], "<");
+-
+-        if (streq(words[i], "|")) {
++        int out = sh_operator(words[i], ">"), app = sh_operator(words[i], ">>"), in = sh_operator(words[i], "<");
++
++        if (sh_operator(words[i], "|")) {
+             if (cur->argc == 0 || ns >= MAX_STAGES || i + 1 >= n)
+                 return -1;                       /* "|" 的前後都要有命令 */
+             st[ns++] = (struct stage){ .argc = 0 };
+@@ -139,12 +123,18 @@
+             if (i + 1 >= n)
+                 return -1;                       /* 後面要接檔名 */
+             if (in) {
++                if (sh_operator(words[i+1], "|") || sh_operator(words[i+1], "&") ||
++                    sh_operator(words[i+1], ">") || sh_operator(words[i+1], ">>") || sh_operator(words[i+1], "<")) return -1;
+                 cur->in_path = words[++i];
+             } else {
++                if (sh_operator(words[i+1], "|") || sh_operator(words[i+1], "&") ||
++                    sh_operator(words[i+1], ">") || sh_operator(words[i+1], ">>") || sh_operator(words[i+1], "<")) return -1;
+                 cur->out_path = words[++i];
+                 cur->append = app;
+             }
+-        } else if (cur->argc < MAX_ARGS) {
++        } else if (sh_operator(words[i], "&") || cur->argc >= MAX_ARGS) {
++            return -1;
++        } else {
+             cur->argv[cur->argc++] = words[i];
+             cur->argv[cur->argc] = 0;
+         }
+@@ -601,27 +591,29 @@
+                 puts_(cwd);
+             puts_("$ ");
+         }
+-        if (!read_line(&in, linebuf, sizeof(linebuf)))
++        int got = interactive ? sh_read_edit(&in, linebuf, sizeof(linebuf)) :
++                                read_line(&in, linebuf, sizeof(linebuf));
++        if (got < 0) { puts_("sh: line too long\n"); status = 2; continue; }
++        if (!got)
+             break;                               /* 輸入結束 */
+-        int n = split(linebuf, words, MAX_ARGS * MAX_STAGES);
++        int n = sh_lex(linebuf, words, status);
++        if (n < 0) { puts_("sh: invalid or oversized command\n"); status = 2; continue; }
+         if (n == 0)
+             continue;                            /* 空行或只有註解 */
+ 
+-        /* 最後是 "&"(單獨一個字,或黏在最後一個字後面):背景執行 */
+         int background = 0;
+-        char *last = words[n - 1];
+-        unsigned long ll = ustrlen(last);
+-        if (last[ll - 1] == '&') {
++        if (sh_operator(words[n - 1], "&")) {
+             background = 1;
+-            last[ll - 1] = 0;
+-            if (ll == 1)
+-                words[--n] = 0;
+-            if (n == 0) {
+-                puts_("sh: syntax error\n");
+-                status = 2;
+-                continue;
+-            }
+-        }
++            words[--n] = 0;
++            if (n == 0) { puts_("sh: syntax error\n"); status = 2; continue; }
++        }
++        if (n == 1 && !background && (sh_kind[0] & SH_ASSIGN)) {
++            status = sh_assign(words[0]) == 1 ? 0 : 2;
++            if (status) puts_("sh: variable table or value too large\n");
++            continue;
++        }
++        n = sh_expand(words, n);
++        if (n < 0) { puts_("sh: pathname expansion failed or ambiguous redirect\n"); status = 2; continue; }
+ 
+         if (streq(words[0], "exit")) {
+             return n > 1 ? (int)uatoi(words[1]) : (int)status;
+@@ -656,10 +648,13 @@
+                   "             periodic [PERIOD_MS BUDGET_MS COUNT WORK_MS] (run as a real-time periodic task),\n"
+                   "             vote COMMAND (run three copies and take the majority result)\n"
+                   "users: id, su USER (exit returns), chmod MODE FILE, chown USER FILE; ls -l shows owners\n"
++                  "variables: NAME=value, $NAME, ${NAME}, $? (shell-local; no export)\n"
++                  "quotes: single/double quotes and backslash; glob: * and ? in paths\n"
+                   "redirection: command > file, command >> file, command < file\n"
+                   "pipes: command | command | ...\n"
+                   "background: command &   then: jobs, fg [n], wait; ps lists all processes\n"
+                   "Ctrl-C ends the running command; Ctrl-Z stops it (then: fg to resume, bg to resume in background)\n"
++                  "editing: Left/Right, Home/End, Delete, Up/Down history, Tab filename completion\n"
+                   "Ctrl-D at an empty prompt ends the shell\n"
+                   "disk: files under /disk are kept across reboots (try: df, cp /bin/echo /disk/echo)\n");
+             status = 0;
+diff --git a/user/sh_words.h b/user/sh_words.h
+new file mode 100644
+--- /dev/null
++++ b/user/sh_words.h
+@@ -0,0 +1,283 @@
++/* Shell-local variables, quote-aware words and bounded pathname expansion.
++ * No export/environment ABI, command substitution, or recursive globstar.
++ * Bounds are explicit: errors reject the entire line before spawning anything. */
++#ifndef WELYOS_SH_WORDS_H
++#define WELYOS_SH_WORDS_H
++#define SH_WORDS (MAX_ARGS * MAX_STAGES)
++#define SH_TEXT 256
++#define SH_VARS 16
++#define SH_OP 1
++#define SH_ASSIGN 2
++struct sh_var { char name[32], value[SH_TEXT]; };
++static struct sh_var sh_vars[SH_VARS];
++static char sh_text[SH_WORDS][SH_TEXT];
++static unsigned char sh_mask[SH_WORDS][SH_TEXT], sh_kind[SH_WORDS];
++static char sh_paths[SH_WORDS][SH_TEXT];
++static unsigned sh_path_count, sh_walks;
++
++static int sh_name_start(char c)
++{
++    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
++}
++static int sh_name_char(char c)
++{
++    return sh_name_start(c) || (c >= '0' && c <= '9');
++}
++static const char *sh_value(const char *name)
++{
++    for (int i = 0; i < SH_VARS; i++)
++        if (streq(sh_vars[i].name, name))
++            return sh_vars[i].value;
++    return "";
++}
++/* 1: assignment, 0: not one, -1: invalid/over capacity; no partial updates. */
++static int sh_assign(const char *word)
++{
++    unsigned n = 0;
++    if (!sh_name_start(word[0]))
++        return 0;
++    while (sh_name_char(word[n]))
++        n++;
++    if (word[n] != '=')
++        return 0;
++    if (n >= sizeof(sh_vars[0].name) || ustrlen(word + n + 1) >= SH_TEXT)
++        return -1;
++    char name[32];
++    for (unsigned j = 0; j < n; j++)
++        name[j] = word[j];
++    name[n] = 0;
++    int slot = -1;
++    for (int i = 0; i < SH_VARS; i++) {
++        if (streq(sh_vars[i].name, name)) { slot = i; break; }
++        if (slot < 0 && !sh_vars[i].name[0]) slot = i;
++    }
++    if (slot < 0)
++        return -1;
++    for (unsigned j = 0; j <= n; j++)
++        sh_vars[slot].name[j] = name[j];
++    const char *v = word + n + 1;
++    unsigned j = 0;
++    do { sh_vars[slot].value[j] = v[j]; } while (v[j++]);
++    return 1;
++}
++static int sh_put(int w, unsigned *len, char c, int wild)
++{
++    if (*len + 1 >= SH_TEXT)
++        return -1;
++    sh_text[w][*len] = c;
++    sh_mask[w][(*len)++] = (unsigned char)(wild && (c == '*' || c == '?'));
++    sh_text[w][*len] = 0;
++    return 0;
++}
++/* Whitespace in an unquoted variable splits fields; expansions never become
++ * syntax operators. Assignment RHS is one value, even when unquoted. */
++static int sh_lex(const char *s, char **words, long status)
++{
++    int n = 0;
++    for (;;) {
++        while (*s == ' ' || *s == '\t') s++;
++        if (!*s || *s == '#') break;
++        if (n >= SH_WORDS) return -1;
++        unsigned len = 0;
++        int quote = 0, keep = 0, assignment = 0;
++        sh_text[n][0] = 0; sh_kind[n] = 0;
++        if (*s == '|' || *s == '<' || *s == '>' || *s == '&') {
++            char c = *s++;
++            if (sh_put(n, &len, c, 0)) return -1;
++            if (c == '>' && *s == '>') {
++                s++;
++                if (sh_put(n, &len, '>', 0)) return -1;
++            }
++            sh_kind[n] = SH_OP;
++        } else {
++            /* Only a literal NAME= prefix is an assignment, not "$X". */
++            const char *p = s;
++            if (sh_name_start(*p)) {
++                while (sh_name_char(*p)) p++;
++                assignment = *p == '=';
++            }
++            if (assignment) sh_kind[n] = SH_ASSIGN;
++            while (*s) {
++                char c = *s;
++                if (!quote && (c == ' ' || c == '\t' || c == '|' || c == '<' || c == '>' || c == '&')) break;
++                s++;
++                if ((c == '\'' || c == '"') && (!quote || quote == c)) {
++                    quote = quote ? 0 : c; keep = 1; continue;
++                }
++                if (c == '\\' && quote != '\'') {
++                    if (!*s) return -1;
++                    if (quote == '"' && *s != '$' && *s != '"' && *s != '\\') {
++                        if (sh_put(n, &len, c, 0)) return -1;
++                        continue;
++                    }
++                    if (sh_put(n, &len, *s++, 0)) return -1;
++                    keep = 1; continue;
++                }
++                if (c == '$' && quote != '\'') {
++                    char name[32], num[24]; unsigned k = 0;
++                    const char *v;
++                    if (*s == '?') {
++                        s++;
++                        unsigned long u = status < 0 ? 0UL - (unsigned long)status : (unsigned long)status;
++                        unsigned d = 0;
++                        do { num[d++] = (char)('0' + u % 10); u /= 10; } while (u);
++                        if (status < 0) num[d++] = '-';
++                        for (unsigned a = 0; a < d / 2; a++) { char t = num[a]; num[a] = num[d-1-a]; num[d-1-a] = t; }
++                        num[d] = 0; v = num;
++                    } else {
++                        int brace = *s == '{';
++                        if (brace) s++;
++                        if (!sh_name_start(*s)) {
++                            if (brace) return -1;
++                            if (sh_put(n, &len, '$', 0)) return -1;
++                            keep = 1; continue;
++                        }
++                        while (sh_name_char(*s)) {
++                            if (k + 1 >= sizeof(name)) return -1;
++                            name[k++] = *s++;
++                        }
++                        if (brace && *s++ != '}') return -1;
++                        name[k] = 0; v = sh_value(name);
++                    }
++                    while (*v) {
++                        if (!quote && !assignment && (*v == ' ' || *v == '\t')) {
++                            if (len || keep) {
++                                words[n] = sh_text[n]; n++;
++                                if (n >= SH_WORDS) return -1;
++                                len = 0; keep = 0; sh_kind[n] = 0; sh_text[n][0] = 0;
++                            }
++                            v++; continue;
++                        }
++                        if (sh_put(n, &len, *v++, !quote && !assignment)) return -1;
++                    }
++                    continue;
++                }
++                keep = 1;
++                if (sh_put(n, &len, c, !quote && !assignment)) return -1;
++            }
++            if (quote) return -1;
++            if (!len && !keep) continue;
++        }
++        words[n] = sh_text[n]; n++;
++    }
++    words[n] = 0;
++    return n;
++}
++static int sh_operator(const char *word, const char *op)
++{
++    for (int i = 0; i < SH_WORDS; i++)
++        if (word == sh_text[i])
++            return (sh_kind[i] & SH_OP) && streq(word, op);
++    return 0;
++}
++/* Iterative wildcard matcher: literal quoted/escaped * and ? retain their mask. */
++static int sh_match(const char *p, const unsigned char *mask, unsigned plen, const char *s)
++{
++    unsigned i = 0, j = 0, star = plen, retry = 0;
++    while (s[j]) {
++        if (i < plen && mask[i] && p[i] == '*') { star = i++; retry = j; }
++        else if (i < plen && ((mask[i] && p[i] == '?') || p[i] == s[j])) { i++; j++; }
++        else if (star < plen) { i = star + 1; j = ++retry; }
++        else return 0;
++    }
++    while (i < plen && mask[i] && p[i] == '*') i++;
++    return i == plen;
++}
++static int sh_path_add(const char *s)
++{
++    if (sh_path_count >= SH_WORDS || ustrlen(s) >= SH_TEXT) return -1;
++    unsigned n = 0;
++    do { sh_paths[sh_path_count][n] = s[n]; } while (s[n++]);
++    sh_path_count++;
++    return 0;
++}
++/* Recursion is bounded by path components (16), visits (4096), and matches. */
++static int sh_glob_walk(const char *pattern, const unsigned char *mask,
++                        const char *prefix, unsigned depth)
++{
++    if (depth >= 16 || ++sh_walks > 4096) return -1;
++    unsigned plen = 0;
++    while (pattern[plen] && pattern[plen] != '/') plen++;
++    int wild = 0;
++    for (unsigned i = 0; i < plen; i++) wild |= mask[i];
++    if (!wild) {
++        char path[SH_TEXT]; unsigned n = 0;
++        for (const char *p = prefix; *p; p++) { if (n + 1 >= sizeof(path)) return -1; path[n++] = *p; }
++        for (unsigned i = 0; i < plen; i++) { if (n + 1 >= sizeof(path)) return -1; path[n++] = pattern[i]; }
++        path[n] = 0;
++        if (pattern[plen] == '/') {
++            if (n + 1 >= sizeof(path)) return -1;
++            path[n++] = '/'; path[n] = 0;
++            return sh_glob_walk(pattern + plen + 1, mask + plen + 1, path, depth + 1);
++        }
++        struct stat st;
++        long rc = sys_stat(path, &st);
++        if (rc == -E_NOENT || rc == -E_NOTDIR) return 0;
++        if (rc != 0) return -1;
++        return sh_path_add(path);
++    }
++    long fd = sys_open(*prefix ? prefix : ".", O_RDONLY);
++    if (fd == -E_NOENT || fd == -E_NOTDIR) return 0;
++    if (fd < 0) return -1;
++    struct dirent e; int err = 0;
++    for (;;) {
++        long rc = sys_readdir(fd, &e);
++        if (rc == 1) break;
++        if (rc != 0) { err = -1; break; }
++        if ((e.name[0] == '.' && pattern[0] != '.') || streq(e.name, ".") || streq(e.name, "..")) continue;
++        if (!sh_match(pattern, mask, plen, e.name)) continue;
++        char path[SH_TEXT]; unsigned n = 0;
++        for (const char *p = prefix; *p; p++) { if (n + 1 >= sizeof(path)) { err = -1; break; } path[n++] = *p; }
++        for (const char *p = e.name; !err && *p; p++) { if (n + 1 >= sizeof(path)) { err = -1; break; } path[n++] = *p; }
++        if (err) break;
++        path[n] = 0;
++        if (pattern[plen] == '/') {
++            if (e.type != I_DIR) continue;
++            if (n + 1 >= sizeof(path)) { err = -1; break; }
++            path[n++] = '/'; path[n] = 0;
++            err = sh_glob_walk(pattern + plen + 1, mask + plen + 1, path, depth + 1);
++        } else err = sh_path_add(path);
++        if (err) break;
++    }
++    long closed = sys_close(fd);
++    return err || closed != 0 ? -1 : 0;
++}
++static int sh_compare(const char *a, const char *b)
++{
++    while (*a && *a == *b) { a++; b++; }
++    return (unsigned char)*a - (unsigned char)*b;
++}
++/* Expand into stable storage; operators come only from the lexer. */
++static int sh_expand(char **words, int n)
++{
++    char *expanded[SH_WORDS + 1]; int count = 0;
++    sh_path_count = 0; sh_walks = 0;
++    for (int w = 0; w < n; w++) {
++        int wild = 0;
++        for (unsigned j = 0; words[w][j]; j++) wild |= sh_mask[w][j];
++        unsigned first = sh_path_count;
++        if (wild && !(sh_kind[w] & (SH_OP | SH_ASSIGN))) {
++            if (sh_glob_walk(words[w], sh_mask[w], "", 0)) return -1;
++            /* Redirection must designate one path, not silently lose matches. */
++            if (w && (sh_operator(words[w-1], ">") || sh_operator(words[w-1], ">>") || sh_operator(words[w-1], "<")) && sh_path_count - first > 1) return -1;
++            for (unsigned i = first + 1; i < sh_path_count; i++)
++                for (unsigned j = i; j > first && sh_compare(sh_paths[j-1], sh_paths[j]) > 0; j--) {
++                    char tmp[SH_TEXT];
++                    for (unsigned k = 0; k < SH_TEXT; k++) { tmp[k] = sh_paths[j-1][k]; sh_paths[j-1][k] = sh_paths[j][k]; sh_paths[j][k] = tmp[k]; }
++                }
++        }
++        if (sh_path_count == first) {
++            if (count >= SH_WORDS) return -1;
++            expanded[count++] = words[w];
++        } else {
++            for (unsigned j = first; j < sh_path_count; j++) {
++                if (count >= SH_WORDS) return -1;
++                expanded[count++] = sh_paths[j];
++            }
++        }
++    }
++    for (int i = 0; i < count; i++) words[i] = expanded[i];
++    words[count] = 0;
++    return count;
++}
++#endif
+diff --git a/user/sh_edit.h b/user/sh_edit.h
+new file mode 100644
+--- /dev/null
++++ b/user/sh_edit.h
+@@ -0,0 +1,161 @@
++/* Byte-oriented line editor, 16 in-memory history entries. Console raw mode
++ * exists already; restore canonical mode before executing any command. */
++#ifndef WELYOS_SH_EDIT_H
++#define WELYOS_SH_EDIT_H
++#define SH_HISTORY 16
++static char sh_history[SH_HISTORY][SH_TEXT];
++static unsigned sh_history_count;
++static void sh_copy(char *dst, const char *src)
++{
++    unsigned i = 0;
++    do { dst[i] = src[i]; } while (src[i++]);
++}
++static void sh_history_add(const char *line)
++{
++    if (!*line || (sh_history_count && streq(line, sh_history[sh_history_count - 1]))) return;
++    if (sh_history_count == SH_HISTORY) {
++        for (unsigned i = 1; i < SH_HISTORY; i++) sh_copy(sh_history[i-1], sh_history[i]);
++        sh_history_count--;
++    }
++    sh_copy(sh_history[sh_history_count++], line);
++}
++static void sh_redraw(const char *s, unsigned oldpos, unsigned oldlen, unsigned pos)
++{
++    for (unsigned i = 0; i < oldpos; i++) puts_("\b");
++    puts_(s);
++    unsigned len = (unsigned)ustrlen(s), end = len > oldlen ? len : oldlen;
++    for (unsigned i = len; i < oldlen; i++) puts_(" ");
++    for (unsigned i = pos; i < end; i++) puts_("\b");
++}
++/* Complete plain tokens only. Reject quoting/syntax rather than rewriting its
++ * meaning. Insert escaped names; one directory match gets a trailing slash. */
++static int sh_complete(char *line, unsigned *cursor, unsigned cap)
++{
++    unsigned start = *cursor;
++    while (start && line[start-1] != ' ' && line[start-1] != '\t' && line[start-1] != '|') start--;
++    if (*cursor != ustrlen(line)) return 0;
++    unsigned len = *cursor - start;
++    if (!len) return 0;
++    char dir[SH_TEXT], prefix[SH_TEXT], common[SH_TEXT];
++    unsigned slash = 0;
++    for (unsigned i = start; i < *cursor; i++) {
++        char c = line[i];
++        if (c == '"' || c == '\'' || c == '\\' || c == '$' || c == '*' || c == '?' || c == '<' || c == '>' || c == '&') return 0;
++        if (c == '/') slash = i - start + 1;
++    }
++    unsigned pn = len - slash;
++    for (unsigned i = 0; i < pn; i++) prefix[i] = line[start + slash + i];
++    prefix[pn] = 0;
++    int command = 1;
++    for (unsigned i = 0; i < start; i++)
++        if (line[i] != ' ' && line[i] != '\t') command = 0;
++    /* after a pipe the next token is a command too */
++    unsigned prev = start;
++    while (prev && (line[prev-1] == ' ' || line[prev-1] == '\t')) prev--;
++    if (prev && line[prev-1] == '|') command = 1;
++    if (slash) {
++        for (unsigned i = 0; i < slash; i++) dir[i] = line[start+i];
++        dir[slash] = 0;
++    } else sh_copy(dir, command ? "/bin" : ".");
++    long fd = sys_open(dir, O_RDONLY);
++    if (fd < 0) return -1;
++    struct dirent e; unsigned matches = 0; int isdir = 0, err = 0;
++    for (;;) {
++        long rc = sys_readdir(fd, &e);
++        if (rc == 1) break;
++        if (rc != 0) { err = -1; break; }
++        if (e.name[0] == '.' && prefix[0] != '.') continue;
++        unsigned j = 0;
++        while (j < pn && e.name[j] == prefix[j]) j++;
++        if (j != pn) continue;
++        if (!matches) { sh_copy(common, e.name); isdir = e.type == I_DIR; }
++        else {
++            j = 0;
++            while (common[j] && common[j] == e.name[j]) j++;
++            common[j] = 0;
++        }
++        matches++;
++    }
++    if (sys_close(fd) != 0) err = -1;
++    if (err || !matches) return err;
++    char addition[SH_TEXT]; unsigned an = 0;
++    for (unsigned j = pn; common[j]; j++) {
++        char c = common[j];
++        if (c == ' ' || c == '\t' || c == '\\' || c == '\'' || c == '"' || c == '$' || c == '*' || c == '?' || c == '#' || c == '|' || c == '<' || c == '>' || c == '&') {
++            if (an + 1 >= sizeof(addition)) return -1;
++            addition[an++] = '\\';
++        }
++        if (an + 1 >= sizeof(addition)) return -1;
++        addition[an++] = c;
++    }
++    if (matches == 1) {
++        if (an + 1 >= sizeof(addition)) return -1;
++        addition[an++] = isdir ? '/' : ' ';
++    }
++    if (*cursor + an >= cap) return -1;
++    for (unsigned j = 0; j < an; j++) line[(*cursor)++] = addition[j];
++    line[*cursor] = 0;
++    return 0;
++}
++static int sh_read_edit(struct reader *r, char *out, unsigned cap)
++{
++    if (sys_tcsetmode(CON_RAW | CON_NOECHO) != 0) return read_line(r, out, cap);
++    unsigned n = 0, pos = 0, history = sh_history_count;
++    char draft[SH_TEXT]; draft[0] = 0; out[0] = 0;
++    int escape = 0, result = 1;
++    for (;;) {
++        char c;
++        long got = sys_read(r->fd, &c, 1);
++        if (got == -E_INTR) continue;
++        if (got <= 0) { result = n != 0; break; }
++        unsigned oldpos = pos, oldlen = n;
++        if (escape) {
++            if (escape == 1) { escape = c == '[' || c == 'O' ? 2 : 0; continue; }
++            if (escape == 3) {
++                escape = 0;
++                if (c != '~') continue;
++                if (pos < n) { for (unsigned i = pos; i < n; i++) out[i] = out[i+1]; n--; }
++            } else {
++                escape = 0;
++                if (c == 'D' && pos) pos--;
++                else if (c == 'C' && pos < n) pos++;
++                else if (c == 'H') pos = 0;
++                else if (c == 'F') pos = n;
++                else if (c == '3') { escape = 3; continue; }
++                else if (c == 'A' || c == 'B') {
++                    if (history == sh_history_count) sh_copy(draft, out);
++                    if (c == 'A' && history) history--;
++                    if (c == 'B' && history < sh_history_count) history++;
++                    sh_copy(out, history == sh_history_count ? draft : sh_history[history]);
++                    n = pos = (unsigned)ustrlen(out);
++                }
++            }
++        } else if (c == 27) { escape = 1; continue; }
++        else if (c == '\n' || c == '\r') break;
++        else if (c == 3) { out[0] = 0; n = pos = 0; puts_("^C"); break; }
++        else if (c == 4 && n == 0) { result = 0; break; }
++        else if (c == 1) pos = 0;
++        else if (c == 5) pos = n;
++        else if (c == 11) { n = pos; out[n] = 0; }
++        else if (c == 21) { n = pos = 0; out[0] = 0; }
++        else if ((c == '\b' || c == 127) && pos) {
++            for (unsigned i = pos; i <= n; i++) out[i-1] = out[i];
++            pos--; n--;
++        } else if (c == 4 && pos < n) {
++            for (unsigned i = pos; i < n; i++) out[i] = out[i+1];
++            n--;
++        } else if (c == '\t') {
++            if (sh_complete(out, &pos, cap) != 0) puts_("\a");
++            n = (unsigned)ustrlen(out);
++        } else if ((unsigned char)c >= 32 && c != 127 && n + 1 < cap) {
++            for (unsigned i = n + 1; i > pos; i--) out[i] = out[i-1];
++            out[pos++] = c; n++;
++        }
++        sh_redraw(out, oldpos, oldlen, pos);
++    }
++    if (sys_tcsetmode(0) != 0) sys_exit(1);
++    puts_("\n");
++    if (result) sh_history_add(out);
++    return result;
++}
++#endif

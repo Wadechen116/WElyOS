@@ -2,13 +2,13 @@
 # 回歸測試:建置三個架構,逐一執行各種開機參數,核對 QEMU 的結束碼。
 #
 # 用法: bash scripts/regress.sh [選項]
-#   (不帶選項)   每個架構跑完整的 23 個情境
+#   (不帶選項)   每個架構跑完整的 24 個情境(含效能基準 bench:只確認它能跑完,數字不做門檻)
 #   -r N          另外重複執行「全部測試」N 次,分別以 1、4、8 顆 CPU(找偶發的錯誤)
 #   -a "架構..."  只測指定的架構,例如 -a "riscv64"
-#   -q            只跑最基本的三個情境(只開機、selftest、全部測試)
-# 環境變數 QEMU_SMP 決定 22 個情境使用的 CPU 數(預設 4)。
+#   -q            只跑最基本的四個情境(只開機、selftest、全部測試、bench)
+# 環境變數 QEMU_SMP 決定 23 個情境使用的 CPU 數(預設 4)。
 # 另外每個架構做一次「磁碟跨開機測試」(15 次開機,使用獨立的映像檔;-q 時略過)。
-# 22 個情境使用預設的磁碟映像 build/<架構>/disk.img(測試結束時會把自己建立的東西刪掉)。
+# 23 個情境使用預設的磁碟映像 build/<架構>/disk.img(測試結束時會把自己建立的東西刪掉)。
 #
 # 預期的結束碼:
 #   正常結束                    0
@@ -31,6 +31,8 @@ done
 OUT=build/regress; mkdir -p "$OUT"
 CRASH="panic fault illegal break dfree stack mainstack thread relock null wtext exec uaccess uexec spin spinsleep lockorder mxorder smp wdog"
 fail=0
+. scripts/exit5-class.sh
+hostcrash=0                  # 已證實是模擬器結束時當掉、重試後通過的次數
 
 for a in $ARCHS; do
   # A failed configure/build must never fall through to an old ELF.
@@ -52,7 +54,7 @@ for a in $ARCHS; do
     echo "$a: missing/empty binary after build"; fail=1; continue
   fi
 
-  cases=("" "selftest" "selftest memtest stress")
+  cases=("" "selftest" "selftest memtest stress" "bench")
   if [ "$QUICK" -eq 0 ]; then
     for c in $CRASH; do cases+=("crash=$c"); done
   fi
@@ -72,15 +74,25 @@ for a in $ARCHS; do
     QEMU_WINEXIT=$wx timeout 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" -append "autoexit $c" > "$log" 2>&1 < /dev/null
     rc=$?
     t=$(echo "$(date +%s.%N) - $t0" | bc)
-    # Exit 5 has no proven cause. Preserve failure and evidence; retry only for diagnostics.
+    # 結束碼 5(docs/ISSUES.md N-002(a))。第 51 步的追查(1400 次當機情境)抓到兩次,都在 aarch64:
+    # kernel 印出「exit: code 1」(給的值正確),Windows 行程的完整結束碼卻是 0xC0000005(存取違規)—
+    # 是 Windows 版 QEMU 在結束時自己當掉,最低位元組 5 被 WSL 看成「結束碼 5」。
+    # 判定規則:只有「kernel 確實印出了預期的值」而且「完整結束碼是 0xC0000005」兩者同時成立,
+    # 才認定是模擬器的問題:保留證據、重試一次,重試符合預期就算通過並在最後列出次數。
+    # 其他任何結束碼 5(例如 i386 的 kernel 寫了 2,或沒有記到完整結束碼)一律算失敗。
     if [ "$rc" -eq 5 ] && [ "$want" -ne 5 ]; then
-      echo "  注意:$a ${c:-(只開機)} 的模擬器以結束碼 5 結束(不是 kernel 的結束碼),重試一次"
-      echo "       完整的結束碼:$(grep -ao 'WIN_EXIT=[-0-9]* (0x[0-9A-F]*)' "$log" | tail -1 || true)(輸出保留在 $log.exit5)"
-      fail=1  # Keep unexpected exit 5 failed even if the diagnostic retry succeeds.
+      win=$(grep -ao 'WIN_EXIT=[-0-9]* (0x[0-9A-F]*)' "$log" | tail -1 || true)
       cp "$log" "$log.exit5"
       mkdir -p build/exit5-hunt && cp "$log" "build/exit5-hunt/regress-$(date +%Y%m%d-%H%M%S)-$a-${c// /+}.txt"
-    timeout 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" -append "autoexit $c" > "$log" 2>&1 < /dev/null
-    rc=$?
+      if exit5_is_host_crash "$log"; then
+        echo "  注意:$a ${c:-(只開機)}:kernel 給了正確的值,模擬器結束時當掉($win),重試一次(輸出保留在 $log.exit5)"
+        QEMU_WINEXIT=1 timeout 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" -append "autoexit $c" > "$log" 2>&1 < /dev/null
+        rc=$?
+        [ "$rc" -eq "$want" ] && hostcrash=$((hostcrash + 1))
+      else
+        echo "  $a ${c:-(只開機)}:結束碼 5 但不符合「模擬器當掉」的條件($win),算失敗;輸出保留在 $log.exit5"
+        fail=1
+      fi
     fi
     if [ "$rc" -eq "$want" ]; then
       ok=$((ok + 1))
@@ -191,5 +203,7 @@ fi
 
 # Windows 版 QEMU 逾時被中止時可能殘留行程
 command -v taskkill.exe >/dev/null && taskkill.exe /F /IM qemu-system-i386.exe /IM qemu-system-riscv64.exe /IM qemu-system-aarch64.exe >/dev/null 2>&1
+bash scripts/test-exit5-class.sh || fail=1
+[ "$hostcrash" -gt 0 ] && echo "模擬器結束時當掉(0xC0000005,kernel 給的值正確)後重試通過:$hostcrash 次(證據在 build/exit5-hunt/)"
 [ "$fail" -eq 0 ] && echo "全部符合預期" || echo "有不符合預期的結果"
 exit $fail

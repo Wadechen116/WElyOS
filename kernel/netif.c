@@ -153,10 +153,10 @@ void netif_start(struct netdev *dev)
 /* 等到 *flag 不為 0、逾時、或呼叫者被訊號打斷。回傳 1 = 等到了 */
 static int wait_flag(volatile int *flag, unsigned timeout_ms)
 {
-    uint64_t t0 = timer_ticks();
+    uint64_t dl = timer_deadline_ms(timeout_ms);  /* 至少等 timeout_ms(見 timer.h) */
 
     while (!*flag) {
-        if (timer_ticks() - t0 >= timeout_ms || thread_interrupted())
+        if (timer_expired(dl) || thread_interrupted())
             return 0;
         thread_sleep(1);
     }
@@ -284,7 +284,7 @@ long netif_udp_recv(struct file *f, uint32_t *ip, uint16_t *port, void *buf, siz
                     unsigned timeout_ms)
 {
     struct usock *s = sock_of(f);
-    uint64_t t0 = timer_ticks();
+    uint64_t dl = timer_deadline_ms(timeout_ms);  /* 0 = 只看一次;否則至少等 timeout_ms */
     long rc = -E_TIMEDOUT;
 
     if (!s)
@@ -302,7 +302,7 @@ long netif_udp_recv(struct file *f, uint32_t *ip, uint16_t *port, void *buf, siz
             rc = (long)n;
         }
         mutex_unlock(&net_lk);
-        if (rc >= 0 || timer_ticks() - t0 >= timeout_ms)
+        if (rc >= 0 || timer_expired(dl))
             break;
         if (thread_interrupted()) {
             rc = -E_INTR;

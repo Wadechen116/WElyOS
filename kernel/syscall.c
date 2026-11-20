@@ -214,6 +214,19 @@ static long sys_close(struct proc *p, long fd)
     return err;
 }
 
+/* 高精度時鐘:只讀取一個硬體計數器,不上任何鎖,也是量「系統呼叫本身要多久」的基準 */
+static long sys_clock(struct proc *p, uintptr_t uinfo)
+{
+    struct clockinfo ci;
+
+    ci.hz = timer_clock_hz();
+    if (ci.hz == 0)
+        return -E_NOSYS;
+    ci.count = timer_clock_count();
+    timer_clock_marks(&ci.kmain, &ci.ready);
+    return copy_to_user(p, uinfo, &ci, sizeof(ci)) == 0 ? 0 : -E_FAULT;
+}
+
 static long sys_fsync(struct proc *p, long fd)
 {
     struct file *f = fd_get(p, fd);
@@ -336,6 +349,8 @@ long syscall_dispatch(long num, long a0, long a1, long a2, void *tf)
         return sys_close(p, a0);
     case SYS_fsync:
         return sys_fsync(p, a0);
+    case SYS_clock:
+        return sys_clock(p, (uintptr_t)a0);
     case SYS_dup2:
         return sys_dup2(p, a0, a1);
     case SYS_pipe:

@@ -140,3 +140,66 @@ uint64_t timer_epoch(uint32_t *usec)
         *usec = tick_hz ? rem * (1000000u / tick_hz) : 0;
     return boot_epoch + sec;
 }
+
+/* ---- 開機時間的記號 ---- */
+static uint64_t mark_kmain, mark_ready;
+
+void timer_clock_mark(int which)
+{
+    uint64_t *m = which == CLOCK_MARK_KMAIN ? &mark_kmain : &mark_ready;
+    if (*m == 0)
+        *m = arch_clock_count();
+}
+
+void timer_clock_marks(uint64_t *kmain, uint64_t *ready)
+{
+    *kmain = mark_kmain;
+    *ready = mark_ready;
+}
+
+uint64_t timer_clock_count(void)
+{
+    return arch_clock_count();
+}
+
+uint64_t timer_clock_hz(void)
+{
+    return arch_clock_hz();
+}
+
+/* 一次最多補算幾個 tick:和架構層中斷裡的補記上限相同(超過時架構層放棄補記、重新對時,
+   那些 tick 永遠不會被記上;這裡也不算它們,兩邊才一致) */
+#define REAL_CATCHUP_MAX 100
+
+uint64_t timer_ticks_real(void)
+{
+    /* 先讀預定時間、再讀 tick 計數(寫入端的順序相反,見 arch.h):
+       讀到新的預定時間就一定讀到新的計數;交錯時頂多多算 1 個 tick — 只會讓等待變長,不會變短 */
+    uint64_t d = arch_tick_deadline();
+    uint64_t t = timer_ticks();
+    uint64_t iv = arch_tick_interval();
+    if (d == 0 || iv == 0)
+        return t;
+    uint64_t now = arch_clock_count();
+    unsigned k = 0;
+    while (now >= d && k < REAL_CATCHUP_MAX) {   /* 每一個已經過去的預定時間 = 一個該記而還沒記的 tick */
+        d += iv;
+        k++;
+    }
+    return t + k;
+}
+
+uint64_t timer_deadline_ms(unsigned ms)
+{
+    if (ms == 0)
+        return 0;
+    /* 現在位在第 r 個 tick 之中的某處;到第 r + n 個 tick 時,真實經過的時間至少 n - 1 個 tick,
+       所以 n = 無條件進位的 tick 數 + 1(與 thread_sleep 相同;32 位元運算,避開 i386 的 __udivdi3) */
+    unsigned n = (ms * timer_hz() + 999) / 1000 + 1;
+    return timer_ticks_real() + n;
+}
+
+int timer_expired(uint64_t deadline)
+{
+    return timer_ticks() >= deadline;
+}

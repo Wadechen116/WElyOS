@@ -59,6 +59,7 @@ static inline uint32_t mmio_r32(uintptr_t addr)
 }
 
 static uint64_t interval;          /* 每個 tick 的計數值 */
+static uint64_t counter_hz;        /* cntfrq_el0:計數器每秒的計數 */
 /* 下一個 tick 應該發生的絕對時間:每顆 CPU 有自己的計時器,記在各自的 struct cpu 裡 */
 #define deadline (this_cpu()->timer_deadline)
 
@@ -69,6 +70,26 @@ static uint64_t read_counter(void)
     uint64_t t;
     __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t));
     return t;
+}
+
+uint64_t arch_clock_count(void)
+{
+    return read_counter();
+}
+
+uint64_t arch_clock_hz(void)
+{
+    return counter_hz;
+}
+
+uint64_t arch_tick_deadline(void)
+{
+    return __atomic_load_n(&cpus[0].timer_deadline, __ATOMIC_ACQUIRE);
+}
+
+uint64_t arch_tick_interval(void)
+{
+    return interval;
 }
 
 /*
@@ -95,6 +116,7 @@ void arch_timer_init(unsigned hz)
     gic_cpu_init();
 
     __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+    counter_hz = freq;
     interval = freq / hz;                        /* 每個 tick 的計數 */
     arch_timer_init_cpu();
 }
@@ -165,6 +187,7 @@ void irq_handler(void)
                 timer_tick();
             else
                 timer_tick_stolen();         /* 補記的:不算成誰的 CPU 時間 */
+            __atomic_thread_fence(__ATOMIC_RELEASE);   /* tick 計數先於預定時間被看見(見 arch.h) */
             deadline += interval;
             n++;
         }

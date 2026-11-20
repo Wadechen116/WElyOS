@@ -90,6 +90,9 @@ enum {
     /* ---- 檔案的持久化 ---- */
     SYS_fsync,              /* (fd)            把這個檔案寫回儲存媒體;回傳 0 才表示資料已經保存。
                                                管線、裝置、socket 回傳 -E_INVAL */
+    /* ---- 效能量測 ---- */
+    SYS_clock,              /* (info)          讀取高精度時鐘(struct clockinfo,見 uapi/proc.h);
+                                               沒有可用的時鐘時回傳 -E_NOSYS */
 };
 
 

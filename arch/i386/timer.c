@@ -49,6 +49,7 @@
 
 static uint64_t tsc_interval;  /* 一個 tick 相當於多少 TSC 計數;0 = 不使用 TSC */
 static uint64_t tsc_deadline;  /* 下一個 tick 應該發生的 TSC 值 */
+static uint64_t tsc_hz;        /* TSC 每秒的計數(校正得到);0 = 沒有 TSC */
 
 static uint64_t rdtsc(void)
 {
@@ -92,6 +93,41 @@ uint64_t arch_tsc_per_tick(void)
     return tsc_interval;
 }
 
+/* 開機最早期(kmain 開頭)計時器還沒校正,也要能讀:是否有 TSC 第一次用到時才問 CPUID */
+uint64_t arch_clock_count(void)
+{
+    static int have = -1;
+    if (have < 0)
+        have = cpu_has_tsc();
+    return have ? rdtsc() : 0;
+}
+
+/*
+ * PIT 的中斷只送到第 0 顆 CPU,tsc_deadline 只有它在中斷裡改。別顆 CPU 讀這個 64 位元的值
+ * 要兩條指令,可能剛好讀到改到一半的:連讀兩次直到相同(和 timer_ticks 的做法一樣)
+ */
+uint64_t arch_tick_deadline(void)
+{
+    uint64_t a, b;
+    do {
+        a = *(volatile uint64_t *)&tsc_deadline;
+        b = *(volatile uint64_t *)&tsc_deadline;
+    } while (a != b);
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    return tsc_interval ? a : 0;
+}
+
+uint64_t arch_tick_interval(void)
+{
+    return tsc_interval;
+}
+
+/* 校正是以 PIT 量 10ms 得到的:精度受 PIT 的 1 個計數(約 0.84 微秒)與輪詢延遲限制,約千分之一 */
+uint64_t arch_clock_hz(void)
+{
+    return tsc_hz;
+}
+
 static void pic_remap(void)
 {
     /* ICW1:開始初始化序列(之後要連續寫入 ICW2~ICW4) */
@@ -123,6 +159,7 @@ void arch_timer_init(unsigned hz)
 
     if (cpu_has_tsc()) {
         uint32_t d = tsc_per_10ms();
+        tsc_hz = (uint64_t)d * 100;
         /* 換算成一個 tick 的計數:d * 100 / hz。拆成兩步避免 32 位元溢位,
            也避開 64 位元除法(i386 上需要 libgcc 的 __udivdi3) */
         tsc_interval = (uint64_t)(d / hz) * 100 + (d % hz) * 100 / hz;
@@ -157,6 +194,7 @@ void irq_handler(uint32_t irq)
                     timer_tick();
                 else
                     timer_tick_stolen();         /* 補記的:不算成誰的 CPU 時間 */
+                __atomic_thread_fence(__ATOMIC_RELEASE);   /* tick 計數先於預定時間被看見(見 arch.h) */
                 tsc_deadline += tsc_interval;
                 n++;
             }

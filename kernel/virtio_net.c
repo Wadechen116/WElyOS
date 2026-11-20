@@ -136,9 +136,9 @@ static int vnet_send(struct netdev *d, const void *frame, size_t len)
     __sync_synchronize();
     wr(v, R_QUEUE_NOTIFY, 1);
     /* 等裝置把它取走(通常立刻完成);有上限,裝置沒有回應時回報錯誤 */
-    uint64_t t0 = timer_ticks();
+    uint64_t dl = timer_deadline_ms(1000);
     while (v->tx.used->idx == v->tx.last_used) {
-        if (timer_ticks() - t0 > 1000) {
+        if (timer_expired(dl)) {
             rc = -E_IO;
             break;
         }

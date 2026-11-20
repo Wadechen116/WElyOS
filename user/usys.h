@@ -136,6 +136,8 @@ static inline long sys_stat(const char *path, struct stat *st)
 }
 /* 整個系統的狀態(top 用) */
 static inline long sys_sysinfo(struct sysinfo *info) { return syscall3(SYS_sysinfo, (long)info, 0, 0); }
+/* 高精度時鐘(bench 用);沒有可用的時鐘時回傳 -E_NOSYS */
+static inline long sys_clock(struct clockinfo *info) { return syscall3(SYS_clock, (long)info, 0, 0); }
 /* 設定主控台的輸入模式。只有前景的行程可以設定;shell 每次回到提示符號時會設回一般模式 */
 static inline long sys_tcsetmode(long mode)       { return syscall3(SYS_tcsetmode, mode, 0, 0); }
 /*
@@ -159,7 +161,6 @@ static inline long sys_chown(const char *path, long uid, long gid)
  * 網路。位址是 32 位元的整數,最高位元組在前:10.0.2.15 = NET_IP(10, 0, 2, 15)。
  * 這台機器固定是 10.0.2.15,閘道 10.0.2.2,名稱伺服器 10.0.2.3(模擬器提供的私有網路)。
  */
-#define NET_IP(a, b, c, d) (((unsigned)(a) << 24) | ((unsigned)(b) << 16) | ((unsigned)(c) << 8) | (unsigned)(d))
 /* ping:回傳來回的毫秒數;逾時回傳 -E_TIMEDOUT;沒有網路回傳 -E_NETDOWN */
 static inline long sys_ping(unsigned ip, long timeout_ms) { return syscall3(SYS_ping, (long)ip, timeout_ms, 0); }
 /* UDP:先以 sys_udp_open 取得一個描述符(port 0 = 自動挑一個),用完以 sys_close 關閉 */

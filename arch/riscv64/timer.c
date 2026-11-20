@@ -42,6 +42,26 @@ static uint64_t read_time(void)
     return t;
 }
 
+uint64_t arch_clock_count(void)
+{
+    return read_time();
+}
+
+uint64_t arch_clock_hz(void)
+{
+    return TIMEBASE_HZ;
+}
+
+uint64_t arch_tick_deadline(void)
+{
+    return __atomic_load_n(&cpus[0].timer_deadline, __ATOMIC_ACQUIRE);
+}
+
+uint64_t arch_tick_interval(void)
+{
+    return interval;
+}
+
 /* SBI 呼叫慣例:a7 = 擴充 ID,a6 = 功能 ID,a0.. = 參數;ecall 後 a0 = 錯誤碼 */
 static void sbi_set_timer(uint64_t when)
 {
@@ -87,6 +107,7 @@ void timer_interrupt(void)
             timer_tick();
         else
             timer_tick_stolen();         /* 補記的:不算成誰的 CPU 時間 */
+        __atomic_thread_fence(__ATOMIC_RELEASE);   /* tick 計數先於預定時間被看見(見 arch.h) */
         deadline += interval;
         n++;
     }

@@ -39,4 +39,5 @@
 #define E_NETDOWN      100   /* 沒有網路(沒有網路卡) */
 #define E_TIMEDOUT     110   /* 等了指定的時間,沒有等到 */
 #define E_NOTEMPTY     39    /* 目錄不是空的 */
+#define E_NOSYS        38    /* 這台機器不支援這個功能(例如沒有高精度時鐘) */
 #endif
