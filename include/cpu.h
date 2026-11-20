@@ -21,6 +21,9 @@
  */
 #define MAX_CPUS 8
 
+/* 跨 CPU 的遮罩使用 unsigned;上限變更時不可讓位移超出位寬。 */
+_Static_assert(MAX_CPUS > 0 && MAX_CPUS <= sizeof(unsigned) * 8, "MAX_CPUS exceeds CPU mask width");
+
 struct thread;
 struct spinlock;
 struct vm_space;

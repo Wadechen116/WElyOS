@@ -13,6 +13,8 @@
 #include "cpu.h"
 #include "fs.h"
 #include "kmalloc.h"
+#include "uapi/errno.h"
+#include "membudget.h"
 #include "kprintf.h"
 #include "kstring.h"
 #include "panic.h"
@@ -583,4 +585,76 @@ void pmm_reservation_test(void)
     KASSERT(s.reserved == 0 && s.free == s0.free);
     kprintf("pmm: reservation test ok: %zu pages reserved, emergency allocations stopped at the "
             "reservation (%zu pages), reserved pages still allocatable\n", room, ne);
+}
+
+/*
+ * I-240 C3.2 (b1):membudget 的純計數規則。排程器啟動前執行,結果確定。
+ * 負對照:把 fits_locked 的「total <= limit」拿掉(第 53 步實測),limit 被調到 used 以下時
+ * limit - total 下溢,「調低後正增量被拒絕」那條斷言失敗。
+ */
+void membudget_test(void)
+{
+    unsigned long err0 = mb_accounting_errors(), err_start = err0;
+    struct mb_domain *d = mb_domain_new(10);
+    struct mb_stats st;
+    KASSERT(d);
+
+    KASSERT(mb_quota_add(d, MB_ANON, 0) == 0);                    /* 0:成功、不改 */
+    KASSERT(mb_quota_add(d, MB_ANON, 6) == 0 && mb_quota_add(d, MB_KOBJ, 4) == 0);
+    KASSERT(mb_quota_add(d, MB_ANON, 1) == -E_NOMEM);             /* 剛好滿,再 1 拒絕 */
+    KASSERT(mb_quota_add(d, MB_ANON, (unsigned long)-1) == -E_NOMEM);
+    KASSERT(mb_quota_add(d, (enum mb_class)MB_NCLASS, 1) == -E_INVAL);
+
+    /* 配額調到已用量以下:已記的不撤銷;正增量一律拒絕(不可因下溢而放行);歸還照常 */
+    mb_set_limit(d, 5);
+    KASSERT(mb_quota_add(d, MB_ANON, 1) == -E_NOMEM && mb_quota_add(d, MB_ANON, 0) == 0);
+    KASSERT(mb_quota_sub(d, MB_ANON, 6) == 0);                    /* total 4 < limit 5 */
+    KASSERT(mb_quota_add(d, MB_ANON, 1) == 0 && mb_quota_add(d, MB_ANON, 1) == -E_NOMEM);
+
+    /* bundle:配額與預留一起;任一不成立都不改狀態 */
+    mb_set_limit(d, 100);
+    size_t r0 = pmm_reserved_count();
+    struct mb_bundle big = { .reserve = 0 };
+    big.quota[MB_ANON] = (unsigned long)-1;
+    big.quota[MB_PGTABLE] = 2;                                     /* 總和溢位 */
+    KASSERT(mb_commit_bundle(d, &big) == -E_NOMEM);
+    struct mb_bundle nores = { .reserve = (size_t)-1 };
+    nores.quota[MB_ANON] = 3;                                      /* 配額放得下,預留放不下 */
+    KASSERT(mb_commit_bundle(d, &nores) == -E_NOMEM);
+    mb_stats(d, &st);
+    KASSERT(st.total == 5 && st.used[MB_ANON] == 1 && pmm_reserved_count() == r0);
+    struct mb_bundle ok = { .reserve = 7 };
+    ok.quota[MB_ANON] = 5;
+    ok.quota[MB_PGTABLE] = 2;
+    KASSERT(mb_commit_bundle(d, &ok) == 0);
+    mb_stats(d, &st);
+    KASSERT(st.total == 12 && st.used[MB_PGTABLE] == 2 && pmm_reserved_count() == r0 + 7);
+    KASSERT(mb_release_bundle(d, &ok) == 0);
+    mb_stats(d, &st);
+    KASSERT(st.total == 5 && pmm_reserved_count() == r0);
+
+    /* 整批歸還有一類超量:整批拒絕,配額與預留都不變(Codex 173 的反例 1) */
+    KASSERT(mb_commit_bundle(d, &ok) == 0);
+    struct mb_bundle bad = { .reserve = 1 };
+    bad.quota[MB_ANON] = 1;
+    bad.quota[MB_RAMFS] = 1;                                       /* RAMFS 從沒記過 */
+    KASSERT(mb_release_bundle(d, &bad) == -1 && mb_accounting_errors() == err0 + 1);
+    mb_stats(d, &st);
+    KASSERT(st.total == 12 && st.used[MB_ANON] == 6 && pmm_reserved_count() == r0 + 7);
+    KASSERT(mb_release_bundle(d, &ok) == 0 && pmm_reserved_count() == r0);
+    err0++;
+
+    /* 單類超量歸還:夾到 0、回傳 -1、計數 */
+    KASSERT(mb_quota_sub(d, MB_IMAGE, 1) == -1 && mb_accounting_errors() == err0 + 1);
+    mb_stats(d, &st);
+    KASSERT(st.used[MB_IMAGE] == 0 && st.total == 5);
+
+    /* 參考計數;帶著用量釋放 → -1、計數 */
+    KASSERT(mb_domain_get(d) == 0);
+    KASSERT(mb_domain_put(d) == 0);
+    KASSERT(mb_domain_put(d) == -1 && mb_accounting_errors() == err0 + 2);
+    struct mb_domain *e = mb_domain_new(1);
+    KASSERT(e && mb_domain_put(e) == 0);
+    kprintf("membudget: selftest ok (limit below used refuses, bundles all-or-nothing, "
+            "%lu deliberate accounting errors counted)\n", mb_accounting_errors() - err_start);
 }

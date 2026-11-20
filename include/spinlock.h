@@ -44,6 +44,7 @@ enum lock_rank {
     LK_VM         = 60,          /* 頁表(vm.c 的 vm_lk) */
     LK_SMP_CALL   = 70,          /* 跨 CPU 呼叫(TLB shootdown 在 vm_lk 之內發出) */
     LK_SMP_TEST   = 71,
+    LK_MB         = 75,          /* 記憶體配額(membudget.c);vm_lk 之內取得,之內只呼叫 pmm 的純記帳函式 */
     LK_HEAP       = 80,          /* kmalloc */
     LK_PMM        = 90,          /* 實體頁配置器 */
     LK_TSTAT      = 100,         /* 計時器的統計 */

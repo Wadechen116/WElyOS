@@ -295,6 +295,7 @@ void kmain(const struct boot_info *bi)
     if (selftest) {
         pmm_floor_test();
         pmm_reservation_test();
+        membudget_test();
     }
 
     /* 啟動計時器(1000Hz,一個 tick 1ms)與排程器,再開中斷。

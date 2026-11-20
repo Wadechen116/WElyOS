@@ -1,0 +1,535 @@
+{
+  "head": "5bc28059f241294271f31fd838c279228c5f4a21",
+  "scope": "37 historical boundary proposals; independent source review, no automatic issue closure",
+  "counts": {
+    "accept-scope": 26,
+    "revise-scope": 8,
+    "retain-open": 3
+  },
+  "total": 37,
+  "rows": [
+    {
+      "id": "I-038",
+      "original_requirement": "i386 的 #DF 一律走工作閘,不是 stack 溢位造成的 double fault 也會進到這裡;處理程式會註明原因不是溢位。",
+      "verdict": "accept-scope",
+      "review": "工作閘及非溢位診斷符合目前實作；不代表所有DF能恢復，也不解決共用DF TSS/stack的多CPU同時故障限制。",
+      "evidence": [
+        "arch/i386/trap.c:209",
+        "arch/i386/trap.c:294"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-043",
+      "original_requirement": "semaphore 沒有擁有者的概念,無法做優先權繼承;需要保護共用資料時應使用 mutex。",
+      "verdict": "accept-scope",
+      "review": "semaphore只記count/wq，mutex有owner及PI傳遞。接受把計數通知與互斥保護分開，不把所有semaphore用途改mutex。",
+      "evidence": [
+        "kernel/sync.c:36",
+        "kernel/sync.c:103",
+        "include/sync.h"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-066",
+      "original_requirement": "**環的容量固定為 64**。同一優先權、同一顆 CPU 上超過 64 個可執行的工作時走溢出串列,那時的行為和串列版相同(有鎖)。壓力測試的 1000 條執行緒就是這種情況。",
+      "verdict": "accept-scope",
+      "review": "RING_SIZE=64且有ovf_add/ovf_take，64是快速路徑容量，不是執行緒數上限；仍保留溢出競態/公平性驗證。",
+      "evidence": [
+        "include/ring.h:37",
+        "kernel/runq_ring.c:139",
+        "kernel/runq_ring.c:275"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-067",
+      "original_requirement": "**多顆 CPU 之間不保證嚴格的先進先出**:同優先權的工作分散在各自的環與溢出串列裡。",
+      "verdict": "accept-scope",
+      "review": "runq_pop依本機、overflow、其他CPU依序取，沒有全域enqueue順序；不宣稱跨CPU FIFO。",
+      "evidence": [
+        "kernel/runq_ring.c:275"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-069",
+      "original_requirement": "**`runq_highest()` 是參考值**:別顆 CPU 的提示可能過期(它下次取出時才更新),偶爾會造成一次不必要的重新排程,不影響正確性。",
+      "verdict": "accept-scope",
+      "review": "highest由提示mask計算，pop仍檢查ticket_current/claim/prio；接受提示語意，不從此條推出整個排程器完全正確或有期限上界。",
+      "evidence": [
+        "kernel/runq_ring.c:275",
+        "kernel/runq_ring.c:327",
+        "kernel/sched.c:255"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-135",
+      "original_requirement": "**kernel 模式的 page fault 仍然一律是致命錯誤**。kernel 不直接存取使用者的位址(都經由實體位址),所以目前不需要。",
+      "verdict": "accept-scope",
+      "review": "三架構只有user fault進proc_page_fault，kernel例外走fatal路徑；沒有宣稱kernel fault fixup。現有copy_user經vm_space_copy檢查，未知kernel故障不能任意重試。",
+      "evidence": [
+        "arch/i386/trap.c:424",
+        "arch/aarch64/trap.c:150",
+        "arch/riscv64/trap.c:179",
+        "kernel/proc_mem.c"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-138",
+      "original_requirement": "**shell 仍然用 `spawn` 而不是 fork + exec**(比較快,也不需要改)。",
+      "verdict": "revise-scope",
+      "review": "保留shell使用spawn的契約；移除未有同工作負載對照的「比較快」。bench的fork/spawn不是同一條shell管線的性能證明。",
+      "evidence": [
+        "user/sh.c",
+        "user/bench.c",
+        "kernel/proc.c:404"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-141",
+      "original_requirement": "遮罩是 32 位元,目前最多 8 顆 CPU,足夠。",
+      "verdict": "revise-scope",
+      "review": "目前MAX_CPUS=8且unsigned mask足夠，但原碼只有BOOT_MAX_CPUS==MAX_CPUS，缺遮罩位寬上限guard。交cpu-mask-bound.patch，8/32通過、33拒絕；不表示其餘架構已支援32CPU。",
+      "evidence": [
+        "include/cpu.h:24",
+        "kernel/smp.c:16",
+        "kernel/smp.c:67"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-144",
+      "original_requirement": "以上的時間都是模擬器上的數字。「少發中斷、少廣播」在實機上同樣是好事,但倍數不會相同。",
+      "verdict": "revise-scope",
+      "review": "保留QEMU量測標示及不得外推倍率；「實機同樣是好事」也不應當作未量測的性能保證，須列平台/負載/CPU數。",
+      "evidence": [
+        "docs/DEVLOG.md",
+        "user/bench.c",
+        "scripts/bench.sh"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-149",
+      "original_requirement": "**`spawn` 只繼承 0、1、2 號**。需要把其他描述符交給新程式時,目前只能用 `fork`。",
+      "verdict": "accept-scope",
+      "review": "proc_create明確fd_inherit(parent,3)，fork繼承全部fd表；這是spawn現有契約。額外file-actions為新能力，不假稱已提供。",
+      "evidence": [
+        "kernel/proc.c:418",
+        "kernel/proc.c:832",
+        "kernel/proc_fs.c:95"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-158",
+      "original_requirement": "**被終止的行程不會被強行打斷**,要等它下一次進入 kernel(系統呼叫或計時器中斷)。在使用者模式中空轉的程式最多延遲 1ms。",
+      "verdict": "revise-scope",
+      "review": "接受安全checkpoint終止，但刪掉「最多1ms」硬保證。user_return_check在返回user時交付，timer_nominal tick不是關中斷/guest停頓/鎖競爭的wall-clock上界。",
+      "evidence": [
+        "kernel/proc_signal.c:313",
+        "kernel/proc.c:326",
+        "kernel/timer.c"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-160",
+      "original_requirement": "**由 kernel 建立的行程**(開機時的 shell、自我測試的程式)沒有父行程,由 kernel 自己等待。",
+      "verdict": "accept-scope",
+      "review": "kernel建立時ppid=0，proc_wait(pid)由kernel等待並摘鏈回收；所有權明確，仍需保留實際等待者。",
+      "evidence": [
+        "kernel/proc.c:404",
+        "kernel/proc.c:479",
+        "kernel/main.c"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-173",
+      "original_requirement": "**暫停期間時間照算**:`sleep 30` 暫停再繼續,仍在原本的時間點結束。正睡在 kernel 裡的執行緒也要等它醒來才算真的停下(但在那之前它本來就沒有在執行)。",
+      "verdict": "accept-scope",
+      "review": "thread_sleep以timer_ticks_real()+n設定到期，停止在user_return_check等待，不重設原sleep期限。原期限到達不保證即刻完成/取得CPU。",
+      "evidence": [
+        "kernel/sched.c:1062",
+        "kernel/proc_signal.c:313"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-174",
+      "original_requirement": "**終止類的訊號不會等行程繼續才生效**,和 Unix 不同。",
+      "verdict": "revise-scope",
+      "review": "必須區分預設致命/不可攔截與自訂handler：proc_signal_locked對catchable+handler先置pending；停止者在user_return_check等待CONT後才deliver_signal。不能說所有終止類訊號均立刻交付；刪除籠統「和Unix不同」，本審查不作外部相容性判定。",
+      "evidence": [
+        "kernel/proc_signal.c:56",
+        "kernel/proc_signal.c:313"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-198",
+      "original_requirement": "**每秒切換次數與 CPU% 都包含 `top` 自己造成的部分**(它每秒做數十次系統呼叫)。",
+      "verdict": "accept-scope",
+      "review": "top取sysinfo與procinfo，調用者沒有從busy/switch計數排除；計入觀察者工作符合當前計數範圍，不宣稱觀察開銷可忽略。",
+      "evidence": [
+        "user/top.c",
+        "kernel/proc.c:1034",
+        "kernel/sched.c"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-215",
+      "original_requirement": "**同一個訊號在交付前來了好幾次,只算一次**(每個訊號只有一個待處理的位元)。",
+      "verdict": "accept-scope",
+      "review": "pending|=1u<<sig，deliver清單一bit，相同signal合併而非排隊；不可用於要求逐事件計數的通知。",
+      "evidence": [
+        "kernel/proc_signal.c:63",
+        "kernel/proc_signal.c:242"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-218",
+      "original_requirement": "**被打斷的系統呼叫不會自動重來**,程式要自己處理 `E_INTR`。",
+      "verdict": "accept-scope",
+      "review": "signal保存/還原frame並保留系統呼叫回傳值，沒有自動重播syscall的路徑；呼叫端要處理E_INTR/部分完成，不假稱每個阻塞服務都相同。",
+      "evidence": [
+        "kernel/proc_signal.c:280",
+        "kernel/syscall.c",
+        "user/sh.c"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-236",
+      "original_requirement": "**開啟之後不再檢查權限**:撤銷權限不影響已經開啟的檔案。",
+      "verdict": "accept-scope",
+      "review": "vfs_open做may權限檢查，既有file讀寫依開啟flags而非每次may；接受開啟參考保留授權的模型，不擴大成所有狀態變更都無效(例如唯讀/exec鎖仍有自己的檢查)。",
+      "evidence": [
+        "kernel/vfs.c:257",
+        "kernel/vfs.c:366",
+        "kernel/vfs.c:406"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-245",
+      "original_requirement": "**root 的 shell 可以把配額再調高**(它有 `CAP_ADMIN`);要讓限制不可逆,先用 `su` 降為一般使用者。",
+      "verdict": "accept-scope",
+      "review": "memlimit升高檢CAP_ADMIN，非零uid的setuid清caps；能力而非僅uid決定可否提高。可選capdrop去掉管理能力，不聲稱root uid永遠有CAP_ADMIN。",
+      "evidence": [
+        "kernel/proc_mem.c:244",
+        "kernel/proc.c:969",
+        "user/su.c"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-254",
+      "original_requirement": "**`ping` 任何人都可以用**(傳統 Unix 需要特權);沒有限制送出的頻率。",
+      "verdict": "retain-open",
+      "review": "無CAP檢查是可選API政策，但沒有送出頻率限制是獨立資源控制缺口；MAX_PINGS只限同時pending，不等於每秒速率限制。不能用「任何人可ping」當作已處理濫用控制的理由。",
+      "evidence": [
+        "kernel/syscall.c:456",
+        "kernel/netif.c:166",
+        "user/ping.c"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-262",
+      "original_requirement": "**panic 時的寫入是盡力而為**:磁碟驅動程式本身正是出問題的地方時,可能寫不進去。",
+      "verdict": "accept-scope",
+      "review": "blackbox_panic走write_now並忽略失敗；panic/裝置故障不可能由這段程式推得可靠寫入保證。保留best-effort，不冒稱磁碟已持久化。",
+      "evidence": [
+        "kernel/blackbox.c:159",
+        "kernel/panic.c:59",
+        "kernel/virtio_blk.c:84"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-269",
+      "original_requirement": "**CRC-32 是為了偵測意外的損壞,不能防止刻意的竄改**(改資料的人可以一併改檢查碼)。",
+      "verdict": "accept-scope",
+      "review": "WFS用無key的crc32，寫回後重算checksum；修改資料與對應checksum可通過同一檢查。接受意外損壞偵測範圍，不宣稱防惡意修改。",
+      "evidence": [
+        "kernel/wfs.c:199",
+        "kernel/wfs.c:237",
+        "kernel/wfs.c:247",
+        "lib/crc32.c"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-270",
+      "original_requirement": "**記憶體裡的資料沒有保護**:區塊在快取裡、或在程式手上時發生的位元錯誤不會被發現(需要 ECC 記憶體)。",
+      "verdict": "retain-open",
+      "review": "bcache cache-hit不再跑verify；dirty寫回後重算新CRC，因此RAM損壞覆蓋確有缺口。不能把「目前未保護」改成「只能ECC、軟體無法改善」並結案；可另評估cache完整性檢查，仍不承諾任意位元錯誤可修。",
+      "evidence": [
+        "kernel/bcache.c:69",
+        "kernel/bcache.c:99",
+        "kernel/bcache.c:47",
+        "kernel/wfs.c:247"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-280",
+      "original_requirement": "**不是硬即時(hard real-time)**:計時的精度是一個 tick(1 毫秒);kernel 裡關閉中斷或持有排程器的鎖的區段沒有量測過上限;在模擬器上,主機的排程也會造成延遲。量到的「最晚 2 個 tick」是觀察值,不是保證。",
+      "verdict": "accept-scope",
+      "review": "保留非hard-real-time範圍，tick取樣及全域鎖沒有最壞延遲證明。測試觀察值不得改寫成deadline保證。",
+      "evidence": [
+        "kernel/sched.c:1183",
+        "kernel/spinlock.c",
+        "kernel/timer.c",
+        "scripts/qemu.sh"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-285",
+      "original_requirement": "**以執行緒為單位**:行程裡的其他執行緒不受影響;`fork` 出來的子行程不繼承。",
+      "verdict": "accept-scope",
+      "review": "rt參數放thread，thread_struct_alloc清零，fork用一般thread_create，不自動取得RT admission。接受thread-level且新申請的政策，不擴大成全process保證。",
+      "evidence": [
+        "kernel/sched.c:93",
+        "kernel/sched.c:411",
+        "kernel/proc.c:843"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-287",
+      "original_requirement": "**擋不住三份都會犯的錯**:程式本身的錯誤、錯的輸入、三份讀到的同一個壞檔案。備援對付的是「獨立發生」的故障。",
+      "verdict": "accept-scope",
+      "review": "tmr_same僅比較valid/status/len/bytes，三份一致的錯誤仍會被接受；只能提供結果一致性與有限故障遮蔽，不保證答案正確。",
+      "evidence": [
+        "user/tmr.h:83",
+        "user/tmr.h:185",
+        "user/vote.c"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-288",
+      "original_requirement": "**投票者自己沒有備援**:它的記憶體被翻轉的話,結果不可信。真實的系統用硬體投票電路,或讓投票者小到可以用其他方式保護。",
+      "verdict": "accept-scope",
+      "review": "vote本身一份、結果選擇與輸出沒有獨立voter冗餘；接受單點限制。不要泛稱所有真實系統必用某種硬體，這裡只描述本產品。",
+      "evidence": [
+        "user/vote.c",
+        "user/tmr.h:185"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-289",
+      "original_requirement": "**三份在同一台機器、同一個 kernel 上**:kernel 或硬體的共同故障會同時影響三份。真實的飛行電腦是三台獨立的機器。",
+      "verdict": "accept-scope",
+      "review": "tmr_run在同一kernel fork三份，系統層故障域共用；不宣稱獨立機器容錯，也不以其他領域的典型配置當本產品證據。",
+      "evidence": [
+        "user/tmr.h:106",
+        "user/tmr.h:139",
+        "user/vote.c"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-290",
+      "original_requirement": "**只適用於「重複執行會得到相同結果」的工作**:會修改檔案、輸出目前時間、或依賴執行順序的命令,三份本來就可能不同(`vote date` 跨秒時就會不一致)。",
+      "verdict": "accept-scope",
+      "review": "三份執行同一callback/argv，未隔離外部副作用；只對可重複工作適用。命令確定性由使用者選擇，未宣稱程式能自動判定。",
+      "evidence": [
+        "user/vote.c:14",
+        "user/tmr.h:90"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-291",
+      "original_requirement": "**比較的是輸出與結束碼**:被翻轉的位元若沒有影響到輸出,不會被發現(也不需要被發現);但它也不會被修復 — 沒有對記憶體做定期的檢查與更正(記憶體巡檢)。",
+      "verdict": "retain-open",
+      "review": "只能核對本次輸出與status，不代表所有RAM內容正確；輸出未受影響的翻轉可能稍後才影響結果。「也不需要被發現」應刪，記憶體巡檢/修復仍是獨立未提供能力，不隨輸出比較結案。",
+      "evidence": [
+        "user/tmr.h:83",
+        "kernel/proc_mem.c:416",
+        "user/vote.c"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-292",
+      "original_requirement": "**每一份的輸出上限 8KB**;執行時間與記憶體用量是三倍以上。",
+      "verdict": "revise-scope",
+      "review": "8192-byte上限與超限invalid正確，程式會讀完額外輸出再丟棄；接受有界輸出。刪「執行時間與記憶體三倍以上」通則：三份可並行且fork/COW共頁，wall-clock和實體RAM必須量測。",
+      "evidence": [
+        "user/tmr.h:31",
+        "user/tmr.h:156",
+        "user/tmr.h:139"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-293",
+      "original_requirement": "**注入只能翻轉使用者行程的記憶體**,不能注入到 kernel 自己的資料或 CPU 的暫存器。",
+      "verdict": "accept-scope",
+      "review": "sys_seu檢CAP_ADMIN，目標自行在return checkpoint經copy_from/to_user翻轉；不提供任意kernel位址或CPU暫存器寫入。接受注入測試範圍，不宣稱覆蓋完整硬體故障模型。",
+      "evidence": [
+        "kernel/proc_mem.c:398",
+        "kernel/proc_mem.c:416",
+        "kernel/proc_signal.c:331"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-296",
+      "original_requirement": "**沒有版本**:`uapi` 一改,所有的使用者程式都要重新編譯。目前它們和 kernel 一起建置、一起放進開機檔案包,所以不是問題;若要支援「舊的程式在新的 kernel 上執行」,就需要嚴格遵守只增不改,並考慮結構的版本欄位。",
+      "verdict": "accept-scope",
+      "review": "CMake同次編譯user並打包rootfs嵌入kernel，沒有ABI版本協商。保留不承諾任意舊binary的範圍；uapi只增不改規則仍要遵守。",
+      "evidence": [
+        "CMakeLists.txt:53",
+        "CMakeLists.txt:69",
+        "include/uapi/proc.h"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-315",
+      "original_requirement": "**`fsync` 不是原子的**:它保證「回傳成功時資料已經在磁碟上」,不保證「斷電時不會只寫了一半」。一致性仍然靠寫回的順序與掛載時的檢查。",
+      "verdict": "revise-scope",
+      "review": "接受fsync非整筆斷電原子的邊界；但「成功=已在媒體」需列裝置flush支援/履約前提。vblk_flush在can_flush=false時直接回0，不能把未發flush當持久性證明。",
+      "evidence": [
+        "kernel/wfs.c:269",
+        "kernel/wfs.c:1045",
+        "kernel/virtio_blk.c:147",
+        "kernel/vfs.c"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-317",
+      "original_requirement": "**每個 `> 檔案` 現在多一次完整的同步**(在模擬器上數十毫秒)。",
+      "verdict": "revise-scope",
+      "review": "C1後是在工作全部子行程完成時對有效輸出fd同步一次，背景延後由wait/reap確認；不是啟動每一個 > 字樣就同步。device可接受EINVAL，數十毫秒屬特定QEMU舊量測。",
+      "evidence": [
+        "user/sh.c:357",
+        "user/sh.c:262",
+        "user/sh.c:380",
+        "tests/static/REVIEW-C1-20261120.md"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-324",
+      "original_requirement": "**核心與訊號、核心與記憶體之間是雙向的呼叫**:核心在生命週期的時刻通知它們,它們也回頭呼叫核心(找行程、結束行程)。這是「一個東西的幾個面向」常見的形狀,但嚴格來說它們不是可以單獨拿出來的模組。要變成單向,得把「結束行程」做成訊號模組向核心登記的回呼。",
+      "verdict": "accept-scope",
+      "review": "proc核心與pmem/psig互調確實存在，內部所有權巨集與pstate/mem.mx等契約比函式依賴圖更重要。接受現有協作，不把callback替換本身當正確性修正。",
+      "evidence": [
+        "kernel/proc_internal.h",
+        "kernel/proc.c",
+        "kernel/proc_mem.c",
+        "kernel/proc_signal.c"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    },
+    {
+      "id": "I-328",
+      "original_requirement": "**`sys_` 開頭的函式散在四個模組**:它們各自在擁有狀態的模組裡,這是對的;但「系統呼叫的參數檢查」因此一部分在 `syscall.c`、一部分在各模組,沒有統一的地方。",
+      "verdict": "accept-scope",
+      "review": "syscall dispatcher與狀態擁有者共同驗證參數是現有分層；集中函式前綴不保證缺漏消失。接受分層理由，但不從本審查推得所有syscall參數均完整驗證。",
+      "evidence": [
+        "kernel/syscall.c",
+        "kernel/proc_fs.c",
+        "kernel/proc_mem.c",
+        "kernel/proc_signal.c"
+      ],
+      "method": "source-inspection",
+      "issue_status_changed": false
+    }
+  ],
+  "source_sha256": {
+    "CMakeLists.txt": "9364e0ef84401e8fa57ff884126cf167421f21caf1b9a24386011e48b74d5f81",
+    "arch/aarch64/trap.c": "7e048c677cb23d5210d6da6716ac3d957b2b329840ea2c7bc7ed6e6eed6dd4c0",
+    "arch/i386/trap.c": "514f26dc8394b383900d0be87471395e51469b34133d9ee6f2e5982c82d488ca",
+    "arch/riscv64/trap.c": "e404b2b3922064fbd6a350c20715186bf53b3bb3e70a488632ceb2f88a9eef9a",
+    "docs/DEVLOG.md": "8d8f9c31c4dddb76860f17132ad4eb905cb3c01c2ed661f04dce1ff513cc5537",
+    "include/cpu.h": "06812c3cb63932d3d754f263e9abf7e02cf51ef1155033e84a1798157a8e4a46",
+    "include/ring.h": "f9bb9f249837fc07f3992e9103e00d773994e99678e5812b9f7f76aece913499",
+    "include/sync.h": "95ace3698adb671b344f4780fc26256e7611b20bb6e991dda1294693bbfcbab5",
+    "include/uapi/proc.h": "9b8826aaa68be06597e96fdbcce8e49cd59281b19874614e7bc5bdf96220018d",
+    "kernel/bcache.c": "a8ec870b1dbf042061b908215204edd1d474fe00c36464e8c9725dfd2f969b31",
+    "kernel/blackbox.c": "f525d9743fbb9971fcac4aebd7d5d7f126fcaf169e104ddfa1afaf9f47edb342",
+    "kernel/main.c": "17c1f8d7ab40c6916e95a72cb9d83f8783a43cef984325a11728f3820c56424f",
+    "kernel/netif.c": "b06673f49e4640f35f7e5a8d9dd2d9ca8801f0dd5e4c04d9f5a32f6e74217500",
+    "kernel/panic.c": "ed5d2a553b5ea663c53def03fbeee1fb48ef4f64de8e50db18e2bf2d7f964d47",
+    "kernel/proc.c": "f9b43d7888b5d77e6f537dff760c09a39c5a8345b5fcc6a9a61ef6b63abf95a8",
+    "kernel/proc_fs.c": "01be2e9b57172cbbdd450dca8e2e5f3a6d50e4273a7057106b98fdd3ad49b768",
+    "kernel/proc_internal.h": "c06d391508be9b537a6a2b18f85dc97a41ee44fa389dec9591a0ef2333318003",
+    "kernel/proc_mem.c": "ff35f128cf5bc257648fc541c3d07b1c05c2f234a817173096af8c6581b36993",
+    "kernel/proc_signal.c": "3ed8c2294aaefd39e896a28627934912d3335396f43476cf1f4a1f36da0f42ed",
+    "kernel/runq_ring.c": "83b6cec5ebe70790578ea822444e6d2f9d6187a8d91be4cdccc24f2166aa8cb6",
+    "kernel/sched.c": "569ff3e4523834f4d9f2a75dbb5df42a5f64e7e5587122d1ac276ece7917b7cd",
+    "kernel/smp.c": "d5d12a5192e365811e0d42799f1fa6ecf2eca259d25e5a022d2f05718ba10491",
+    "kernel/spinlock.c": "45686604101896fa4027d5e6bc59074a77e78557462bf225b6b5b7f3c1f70e8e",
+    "kernel/sync.c": "8fc38ea882a8f5b69455d581380575d8df4c2dfc28e3aa304b3167f15225e9b9",
+    "kernel/syscall.c": "f2ffe68bbe0f3a262d24ce91f90cbfc59078b2049144b48e970990a6fd957ac4",
+    "kernel/timer.c": "1397a8bc95ca84efbc52e726e9e59b0b4f9b4fe0b255c4a3b236e31d45ecd8c2",
+    "kernel/vfs.c": "92943e8c79c9007bba3362acf5eeaceea31b43f9e93c03c7109051807f05e796",
+    "kernel/virtio_blk.c": "6a58e6b45b311f25f6502d3f8da825dcf1f6f7a6dd2ed5a52e7a56a8725f2f8c",
+    "kernel/wfs.c": "ff6b1e62994162d19302fa68d321914495847c185072bc5b611b7ec06b514480",
+    "lib/crc32.c": "4fe31da4f459362d9a1949cbd72c2e848063be60a562bdef7fa4f8cd7c280d1b",
+    "scripts/bench.sh": "de569d55ca356f8b912af8b20f661b928fca1a3e1b605466dfc27d5594e6d900",
+    "scripts/qemu.sh": "b9cafd1149b947048e02f15f924a77ed6436e74e36b290bb780794fb14e16586",
+    "tests/static/REVIEW-C1-20261120.md": "8d8330f25522534ca4d71be3fb9cbd2fcab75c7c68404b94c2fc42e0f6ded02e",
+    "user/bench.c": "e70873d5075b73a3315747f183eb9b9e4791497304c6fc754b70d5716a15971d",
+    "user/ping.c": "46a1878bb3a3d3f023e90928c13e0f8420a62e21ba0cadc6bb3c347f497583af",
+    "user/sh.c": "421404cd15384b41c9bf8980112d0d6c978c0da458963a1933212dac3ab9306c",
+    "user/su.c": "37ce11a4a99cee13b07e766decd4df5829c4dbc941f3482ef7a5f1bd99e30535",
+    "user/tmr.h": "3622528a2a2798ef137a4966442a3fa4dd290c75f5eb6f8ce18f4e0cace25a6f",
+    "user/top.c": "70049e4c277cdb23c2249a0fa81086ede56355e81f06babb3d6477218e1a1cfa",
+    "user/vote.c": "978dd1ea99923a1267475fe10cf8034727bae8362a0654fa8f4f664b93d43101"
+  }
+}

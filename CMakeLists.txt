@@ -97,6 +97,7 @@ add_executable(welyos.elf
     kernel/panic.c
     kernel/timer.c
     kernel/pmm.c
+    kernel/membudget.c
     kernel/kmalloc.c
     kernel/sched.c
     kernel/runq_${WELYOS_RUNQ}.c

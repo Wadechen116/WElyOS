@@ -1,0 +1,57 @@
+--- a/kernel/membudget.c
++++ b/kernel/membudget.c
+@@ -138,13 +138,23 @@
+ int mb_release_bundle(struct mb_domain *d, const struct mb_bundle *b)
+ {
+     unsigned long f = spin_lock_irqsave(&mb_lk);
+-    int rc = 0;
+-    for (unsigned i = 0; i < MB_NCLASS; i++)
+-        if (sub_locked(d, (enum mb_class)i, b->quota[i]) != 0)
+-            rc = -1;
+-    pmm_unreserve(b->reserve);               /* 超過預留量 = 帳務錯誤,pmm 會 panic(先判斷不改) */
++    /* 整批先檢查:不能先退前幾類,才在後面的類別發現超量。 */
++    for (unsigned i = 0; i < MB_NCLASS; i++) {
++        if (b->quota[i] > d->used[i]) {
++            errors++;
++            spin_unlock_irqrestore(&mb_lk, f);
++            return -1;
++        }
++    }
++    /* 先交由 PMM 檢查與退票;若帳務錯誤而停止,配額仍未改變。
++       呼叫者必須持有並驗證這筆 bundle 自己的未兌現票,不可借用其他 owner 的票。 */
++    pmm_unreserve(b->reserve);
++    for (unsigned i = 0; i < MB_NCLASS; i++) {
++        d->used[i] -= b->quota[i];
++        d->total -= b->quota[i];
++    }
+     spin_unlock_irqrestore(&mb_lk, f);
+-    return rc;
++    return 0;
+ }
+ 
+ unsigned long mb_limit(struct mb_domain *d)
+--- a/include/membudget.h
++++ b/include/membudget.h
+@@ -12,8 +12,8 @@
+  * 規則:
+  *   - 只有正增量檢查 limit;limit 可以被調到 used 以下(之後不再接受正增量),已記的不撤銷
+  *   - 加 0 成功且什麼都不改;任何失敗都不改變狀態
+- *   - 歸還超過已記的量是帳務錯誤:夾到 0、計數,並回傳 -1 讓呼叫者記入黑盒子
+- * 鎖:mb_lk(LK_MB),鎖內只做加減比較,唯一的外部呼叫是 pmm_reserve(純記帳)
++ *   - 單類歸還超過已記的量是帳務錯誤:夾到 0、計數,並回傳 -1 讓呼叫者記入黑盒子
++ * 鎖:mb_lk(LK_MB),鎖內只做加減比較,唯一的外部呼叫是 pmm_reserve / pmm_unreserve(純記帳)
+  */
+ enum mb_class { MB_ANON, MB_STACK, MB_IMAGE, MB_PGTABLE, MB_KOBJ, MB_RAMFS, MB_NCLASS };
+ 
+@@ -40,7 +40,10 @@
+ 
+ /* 多類別配額 + 實體預留,一次完成;失敗回傳 -E_NOMEM 且不改任何狀態 */
+ int  mb_commit_bundle(struct mb_domain *d, const struct mb_bundle *b);
+-int  mb_release_bundle(struct mb_domain *d, const struct mb_bundle *b);   /* 0;超量 -1 */
++/* 整批歸還:任一類超量則整批拒絕(-1、計數),配額與預留都不變。
++   呼叫者必須持有並驗證自己這筆 bundle 的未兌現票;PMM 只檢查全系統總數。
++   全系統退票超量會先停止,配額尚未修改。正常歸還回傳 0。 */
++int  mb_release_bundle(struct mb_domain *d, const struct mb_bundle *b);
+ 
+ unsigned long mb_limit(struct mb_domain *d);
+ void mb_set_limit(struct mb_domain *d, unsigned long limit);
