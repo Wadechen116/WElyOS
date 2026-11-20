@@ -56,6 +56,7 @@ for a in $ARCHS; do
 
   cases=("" "selftest" "selftest memtest stress" "bench")
   if [ "$QUICK" -eq 0 ]; then
+    cases+=("memhog=file" "memhog=fork")      # I-240:使用者把記憶體用到被拒絕,kernel 保留底線守住
     for c in $CRASH; do cases+=("crash=$c"); done
   fi
   ok=0
@@ -109,7 +110,7 @@ for a in $ARCHS; do
   # 見 kernel/main.c 的 disk_stage_test
   if [ "$QUICK" -eq 0 ]; then
     img="$OUT/disk-$a.img"; rm -f "$img"; dok=0
-    for s in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    for s in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 16 15; do
       log="$OUT/$a-disktest$s.txt"
       # 第 6 階段故意 panic(測試黑盒子):預期的結束碼和其他當機情境相同
       dwant=0; [ "$s" -eq 6 ] && { [ "$a" = i386 ] && dwant=3 || dwant=1; }
@@ -122,7 +123,7 @@ for a in $ARCHS; do
       fi
     done
     rm -f "$img"
-    echo "$a: 磁碟跨開機測試 ${dok}/15 個階段通過"
+    echo "$a: 磁碟跨開機測試 ${dok}/16 個階段通過"
 
     # 安全模式:連續三次開機失敗(故意在開機途中 panic),第四次應該自動以安全模式開機;
     # 在安全模式裡正常結束之後,第五次回到一般的開機

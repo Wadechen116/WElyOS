@@ -15,7 +15,8 @@ struct proc *procs;                  /* 所有行程(含 zombie);上鎖的規則
  *     查到描述符表裡的指標之後,要在放開 pstate_lk 之前拿到參考)。順序固定為 pstate_lk 在外。
  *     反方向不可能發生:inode_lk 只在 vfs.c 內部使用,而 vfs.c 看不到 pstate_lk。
  *   - 其餘區段在鎖裡只做欄位的讀寫、memcpy / strlen,以及 commit_change_locked
- *     (它查詢頁面配置器的兩個數字 pmm_free_count / pmm_total_pages — 那兩個函式只是讀變數,不上鎖)。
+ *     (它查詢頁面配置器的 pmm_free_count / pmm_reserve_count / pmm_total_pages;前兩者會短暫取得 pmm_lk,
+ *     層級 LK_PMM 高於 LK_PSTATE,順序合法)。
  * 新增持有這把鎖的程式時必須維持這個清單;目前沒有機制在執行時檢查鎖的順序(見 docs/ISSUES.md)。
  */
 struct spinlock pstate_lk = SPINLOCK_INIT("pstate", LK_PSTATE);

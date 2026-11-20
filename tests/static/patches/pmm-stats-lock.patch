@@ -1,0 +1,37 @@
+--- a/kernel/pmm.c
++++ b/kernel/pmm.c
+@@ -171,8 +171,20 @@
+     return rc;
+ }
+ 
+-size_t pmm_reserve_count(void) { return floor_pages; }
+-unsigned long pmm_reserve_refusals(void) { return floor_refusals; }
++size_t pmm_reserve_count(void)
++{
++    unsigned long flags = spin_lock_irqsave(&pmm_lk);
++    size_t value = floor_pages;
++    spin_unlock_irqrestore(&pmm_lk, flags);
++    return value;
++}
++unsigned long pmm_reserve_refusals(void)
++{
++    unsigned long flags = spin_lock_irqsave(&pmm_lk);
++    unsigned long value = floor_refusals;
++    spin_unlock_irqrestore(&pmm_lk, flags);
++    return value;
++}
+ 
+ /* 實際的配置邏輯;呼叫時已持有 pmm_lk */
+ static void *alloc_pages_locked(size_t n, int use_reserve)
+@@ -291,4 +303,10 @@
+ 
+ size_t pmm_total_pages(void) { return npages; }
+ uintptr_t pmm_mem_start(void) { return mem_start; }
+-size_t pmm_free_count(void)  { return nfree; }
++size_t pmm_free_count(void)
++{
++    unsigned long flags = spin_lock_irqsave(&pmm_lk);
++    size_t value = nfree;
++    spin_unlock_irqrestore(&pmm_lk, flags);
++    return value;
++}

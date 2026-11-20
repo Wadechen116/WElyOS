@@ -104,9 +104,79 @@ def finding(fn, rule, category, message, line=None, detail=''):
             'function_sha256': fn.digest}
 
 
+
+def pte_direct_stores(fs, sources):
+    """針對 vm.c 的具名 pte_t 指標寫入 guard;不是完整 C 型別分析。
+
+    指標宣告與重新指向可用;經解參考/索引的項目寫入須走 arch_pte_set。
+    cast、void alias、巨集展開及 bulk write 仍須人工核對。
+    """
+    path = 'kernel/vm.c'
+    if path not in sources:
+        return []
+    def pointer_names(ts):
+        names = set()
+        for i, t in enumerate(ts):
+            if t.text != 'pte_t':
+                continue
+            j = i + 1
+            while j < len(ts) and ts[j].text in {'const', 'volatile', '*'}:
+                j += 1
+            if j > i + 1 and any(x.text == '*' for x in ts[i+1:j]) and j < len(ts):
+                names.add(ts[j].text)
+        return names
+    all_ts = tokens(sources[path])
+    all_pairs = pair_tokens(all_ts)
+    excluded = set()
+    for i, t in enumerate(all_ts):
+        if t.text == '{' and i and all_ts[i-1].text == ')' and i-1 in all_pairs:
+            opening = all_pairs[i-1]
+            name = all_ts[opening-1].text if opening else ''
+            if IDENT.match(name) and name not in CONTROL and i in all_pairs:
+                excluded.update(range(opening-1, all_pairs[i]+1))
+    globals_names = pointer_names([t for i, t in enumerate(all_ts) if i not in excluded])
+    out = []
+    ops = {'=', '+=', '-=', '|=', '&=', '^=', '*=', '/=', '%=', '++', '--'}
+    for fn in fs:
+        if fn.path != path:
+            continue
+        body, pairs = fn.body, fn.pairs
+        names = globals_names | pointer_names(fn.params + body)
+        for i, op in enumerate(body):
+            # The tokenizer emits some compound operators as two tokens.
+            text = op.text
+            if i + 1 < len(body) and body[i+1].text == '=' and text in {'|', '&', '^', '*', '/', '%'}:
+                text += '='
+            if text not in ops:
+                continue
+            end = i - 1
+            while end >= 0 and body[end].text == ')' and end in pairs:
+                opening = pairs[end]
+                # Parenthesized lvalue; do not descend into a call's arguments.
+                if opening and IDENT.match(body[opening-1].text) and body[opening-1].text not in CONTROL:
+                    break
+                end -= 1
+            hit = False
+            if end >= 0 and body[end].text == ']' and end in pairs:
+                opening = pairs[end]
+                hit = opening > 0 and body[opening-1].text in names
+            elif end >= 1 and body[end].text in names and body[end-1].text == '*':
+                before = end - 2
+                while before >= 0 and body[before].text in {'const', 'volatile'}:
+                    before -= 1
+                hit = before < 0 or body[before].text != 'pte_t'
+            # Prefix ++*e / --*e is also a store.
+            if text in {'++', '--'} and i + 2 < len(body) and body[i+1].text == '*' and body[i+2].text in names:
+                hit = True
+            if hit:
+                out.append(finding(fn, 'pte-direct-store', 'candidate',
+                    'direct write through a named pte_t pointer; use arch_pte_set', op.line, str(i)))
+    return out
+
+
 def check(sources):
     fs = [f for path, text in sorted(sources.items()) for f in functions(path, text)]
-    output, by_name = [], {}
+    output, by_name = pte_direct_stores(fs, sources), {}
     for fn in fs:
         by_name.setdefault(fn.name, []).append(fn)
 

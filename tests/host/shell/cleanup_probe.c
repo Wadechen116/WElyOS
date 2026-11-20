@@ -5,6 +5,10 @@ _Noreturn void _Exit(int);
 #include "errno.h"
 #include "uapi_proc.h"
 #include "shell_types.h"
+/* Legacy fixed output slot, retained only to test pre-C1 source. */
+#ifndef SAVE_SYNC
+#define SAVE_SYNC 13
+#endif
 static int fds[16],foreground,waits,spawns,reaped;
 static int syncs,sync_fd=-1,sync_before_wait,keep_closes;
 static const char *fault;
@@ -23,7 +27,7 @@ static long sys_waitpid(long pid,int *status,int flags) {
     *status=0;reaped++;return pid;
 }
 static long sys_dup2(long from,long to) {
-    if (!strcmp(fault,"redirect-save-error") && to==SAVE_SYNC) return -E_MFILE;
+    if (!strcmp(fault,"redirect-save-error") && (to==SAVE_SYNC || (to==1 && from>=3 && fds[from]==500))) return -E_MFILE;
     if (from<0 || from>=16 || to<0 || to>=16 || fds[from]<0) return -E_BADF;
     fds[to]=fds[from];return to;
 }
@@ -32,8 +36,9 @@ static long sys_close(long fd) {
     fds[fd]=-1;return 0;
 }
 static long sync_close(long fd) {
+    int kept=fd>=3 && fd<16 && fds[fd]==500;
     long rc=sys_close(fd);
-    if (fd==SAVE_SYNC) {
+    if ((SH_DYNAMIC_OUTPUT && kept) || (!SH_DYNAMIC_OUTPUT && fd==SAVE_SYNC)) {
         keep_closes++;
         if (!strcmp(fault,"redirect-close-error")) return -E_IO;
     }
@@ -47,8 +52,8 @@ static long sys_fsync(long fd) {
     return 0;
 }
 static long sys_open(const char *path,int flags) {
-    (void)path;(void)flags;
-    for (int i=0;i<16;i++) if (fds[i]<0) { fds[i]=100+i;return i; }
+    (void)flags;
+    for (int i=0;i<16;i++) if (fds[i]<0) { fds[i]=!strcmp(path,"/disk/out")?500:100+i;return i; }
     return -E_MFILE;
 }
 static long sys_pipe(int out[2]) {
@@ -91,8 +96,14 @@ int main(int argc,char **argv) {
         struct stage st={.argc=1,.argv={"echo",NULL},.out_path=redirect?"/disk/out":NULL};
         int background=!strcmp(fault,"redirect-background");
         rc=run(&st,1,background);
+        if (background) {
+            /* 背景輸出在 run 返回時必須仍持有,完成後才同步/關閉。 */
+            errors|=syncs!=0 || keep_closes!=0 || open_count()!=before+1;
+            errors|=job_wait(&jobs[0])!=0;
+            jobs[0].used=0;
+        }
         int failed=!redirect && strcmp(fault,"run-normal")!=0;
-        errors=open_count()!=before || memcmp(before_fds,fds,sizeof(fds)) || (failed && (spawns || rc==0));
+        errors|=open_count()!=before || memcmp(before_fds,fds,sizeof(fds)) || (failed && (spawns || rc==0));
         if (!failed && !redirect) errors|=rc!=0 || spawns!=1 || foreground!=0;
         if (redirect) {
             int save_error=!strcmp(fault,"redirect-save-error");
@@ -100,7 +111,7 @@ int main(int argc,char **argv) {
             if (save_error) errors|=spawns!=0 || rc==0;
             else {
                 errors|=spawns!=1 || rc!=(output_error?1:0) || foreground!=0 || keep_closes!=1;
-                errors|=background?syncs!=0:(syncs!=1 || sync_fd!=SAVE_SYNC || sync_before_wait);
+                errors|=syncs!=1 || sync_fd<3 || sync_before_wait;
             }
         }
     }

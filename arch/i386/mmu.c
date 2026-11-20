@@ -66,6 +66,8 @@ void arch_mmu_init(void)
     cpuid(1, 0, &a, &b, &c, &d);
     if (!(d & (1u << 6)))
         panic("this CPU does not support PAE paging");
+    if (!(d & (1u << 8)))                    /* arch_pte_set 的 64 位元一次寫入需要它 */
+        panic("this CPU does not support CMPXCHG8B");
     has_pge = (d >> 13) & 1;
     int has_msr = (d >> 5) & 1;
 

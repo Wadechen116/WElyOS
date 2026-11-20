@@ -200,9 +200,11 @@ static int commit_change_locked(struct proc *p, long delta)
 {
     if (!commit_cap) {
         /* 保留給 kernel 的部分:至少 2MB,或全部記憶體的 1/16(取大的) */
+        /* 再加上 pmm 的保留底線:承諾出去的頁必須配置得到,而一般配置拿不到底線以下的頁 */
         unsigned long freep = pmm_free_count(), reserve = pmm_total_pages() / 16;
         if (reserve < 512)
             reserve = 512;
+        reserve += pmm_reserve_count();
         commit_cap = freep > reserve ? freep - reserve : 1;
     }
     if (delta > 0) {

@@ -228,6 +228,8 @@
 | time CSR | time Control and Status Register | RISC-V 的時間暫存器:以固定頻率(QEMU virt 為 10 MHz)遞增的計數器 |
 | generic timer | Arm Generic Timer | AArch64 的計時器;`cntpct_el0` 是它的實體計數值 |
 | release / acquire 屏障 | release / acquire memory barrier | 記憶體屏障:確保「之前的寫入」先被別的 CPU 看見(release),或「之後的讀取」不會提早(acquire) |
+| 撕裂寫入 | torn write | 一個大於 CPU 單次儲存寬度的值被拆成多道指令寫入,別的 CPU 可能讀到「一半新、一半舊」 |
+| CMPXCHG8B | Compare and Exchange 8 Bytes | x86 的 64 位元比較並交換指令;加上 lock 前綴時對所有 CPU 是一次完成的原子操作 |
 | UBSan | Undefined Behavior Sanitizer | 未定義行為檢查器:編譯器在執行時抓出有號數溢位等 C 語言未定義的行為 |
 | linker script | linker script | 連結器腳本:決定各區段的位址 |
 | lost wakeup | lost wakeup | 遺失的喚醒:喚醒發生在睡下去之前 |
@@ -7671,3 +7673,80 @@ QEMU 上的證據:
 
 - 最後一次完整回歸(`regress.sh -r 3`,5 分鐘):三個架構各 24 個情境、磁碟 15 個階段、安全模式、外來磁碟、無磁碟無網路卡、1/4/8 顆 CPU 各 3 次全部通過;網路堆疊主機測試、架構檢查、`exit5-class` 5/5、靜態把關(新增 0)通過。
 - 靜態把關第一次報出 11 個新提示,都是 `bench.c` 沒有檢查 `close` 的結果。沒有登記成例外,而是改成檢查(失敗時這一輪不算數),重跑新增 0 個。
+
+## 第 52 步:Codex 分配 C1~C4;C2 — i386 頁表項目的撕裂寫入(I-090、I-059、I-081)
+
+Codex 分配下一批(memory 訊息 153):C1 背景工作的輸出檔(I-318,Codex 實作 shell 補丁)、**C2 PAE 撕裂寫入(Claude)**、C3 保留量涵蓋所有配置路徑(I-240,Claude,接在 C2 之後)、C4 逐條核對 37 條「設計邊界理由」(Codex)。
+
+### 先證明問題存在
+
+i386 的 PAE(Physical Address Extension)頁表項目有 64 位元,32 位元 CPU 一次只寫 32 位元。反組譯修正前的 `vm_map`:
+
+```
+604: mov %eax,(%ecx)       ; 低半:實體位址 + P(存在)位元
+606: mov %edx,0x4(%ecx)    ; 高半:NX(不可執行)位元
+```
+
+兩道指令之間,別顆 CPU 的頁表走訪可以看到「已存在、但沒有 NX」—— 資料頁短暫變成可執行;取代既有對映時更會看到「新位址配舊權限」。`vm_unmap` 剛好先清低半(安全的順序),但那是編譯器的選擇,不是保證。
+
+### 修正:單一寫入原語
+
+- 每個架構的 `mmu.h` 新增 `arch_pte_set(e, v)`(以及測試用的 `arch_pte_get`)。i386 用 `lock cmpxchg8b` 迴圈:64 位元一次寫入,所有 CPU 看到的不是舊值就是新值;它也是完整的屏障,填好的下一層表格一定先於指向它的項目被看見。迴圈是因為硬體可能同時以 locked 操作設定 A/D(Accessed / Dirty)位元。RISC-V 與 AArch64 是對齊的 64 位元 release 儲存(本來就不會撕裂,補上順序保證)。
+- `kernel/vm.c` 所有 13 個項目寫入點(對映、移除、拆大分頁、建中間層、fork 的 COW 降權、COW 複製)都改經這個原語;反組譯確認 `vm_map`、`vm_unmap`、`vm_space_map`、`vm_space_fault`、`fork_table`、`walk` 都是 `cmpxchg8b`。仍保留直接寫入的只有「還沒發布」的新表格(`table_alloc` 的清零、`vm_space_create` 複製 kernel 最上層),沒有別的 CPU 看得到。
+- `arch_mmu_init` 檢查 CPUID 的 CX8 位元,沒有就 panic(不靜默退回會撕裂的寫法)。
+- 速度:一次 locked 操作約數十個時脈,頁表寫入本來就伴隨 TLB(Translation Lookaside Buffer)失效與跨 CPU 通知,成本可忽略;安全性是消除一個可執行窗口。
+
+### 測試與負對照
+
+`pte_tear_test`(selftest,需 2 顆以上 CPU):寫入者與讀取者各自關中斷、釘在不同 CPU 上同時跑 20 ms,寫入者在 A(存在、無 NX)與 B(另一位址、有 NX)之間來回寫,讀取者每次一次讀出 64 位元,看到第三種值就 panic;另要求雙方各至少 1000 次,證明真的同時執行。
+
+| 情況 | 結果 |
+|---|---|
+| 修正後 i386 4 / 8 顆 | 寫 212912 / 180948 次,讀 100899 / 121818 次,撕裂 0 |
+| 修正後 riscv64、aarch64 4 / 8 顆 | 撕裂 0(正向控制) |
+| 1 顆 CPU | 明確印出「skipped」(單顆看不到撕裂) |
+| **負對照**:i386 的 `arch_pte_set` 換回 `*e = v` | 4 顆:撕裂 1 次,讀到 `0000000022222003`(新位址、存在、**NX 消失**)→ panic;8 顆:撕裂 3 次,讀到 `8000000011111003` |
+
+### 界線(不宣稱 QEMU 證明了什麼)
+
+- 測試驗證的是寫入原語在多 CPU 下不撕裂(QEMU 多執行緒 TCG 下撕裂確實觀察得到,負對照就是證據)。QEMU 的頁表走訪不模擬真實硬體的走訪時序;「真實 CPU 的硬體走訪只會讀到完整的 64 位元項目」依據的是 Intel SDM 對 PAE 項目以 64 位元讀取的規定,而這裡保證每次寫入是原子的。
+- 取代 / 移除對映之後,其他 CPU 的 TLB 舊紀錄要等 `tlb_shootdown` 完成才消失;所有路徑都在持有 `vm_lk` 的期間完成失效,實體頁在失效之後才可能被真正釋放(COW 複製時先減參考計數,但對方釋放也要拿 `vm_lk`)。這部分是第 18 步的既有機制,沒有改。
+
+### C1:背景工作的輸出檔(I-318,Codex 補丁)
+
+以前 `cmd > 檔案 &` 啟動後,shell 立刻關掉自己那一份參考,沒有人在工作結束後替它 fsync、檢查結果:寫回失敗也看起來成功。Codex 的補丁(`tests/static/patches/shell-job-output.patch`,只改 `user/sh.c`)讓每個工作持有自己的輸出檔描述符與路徑,所有子行程真正結束後才 fsync + close 一次;背景工作被回收時把錯誤留給 `wait` / `exit`,之後成功的工作不會蓋掉較早的錯誤;還有未確認的輸出就 `exit` 或輸入結束時,結束碼非 0 並提示先 `wait`(不無限等可能永遠不結束的背景工作)。描述符或工作表不足時在啟動前拒絕。整合時移除了已經不用的 `SAVE_SYNC` 定義。
+
+| 測試(三架構 QEMU) | 結果 |
+|---|---|
+| 磁碟第 16 階段(新):資料區寫回失敗時 `echo saved > /disk/bgfail &`、`sleep 300ms`(期間已回收)、`wait` | `sh: write error: could not save /disk/bgfail`,wait 回 1 |
+| 第 15 階段對照:兩個背景工作寫兩個檔案、`wait` | 回 0,兩個檔案內容完整 |
+| 第 15 階段:`sleep 1 > /tmp/slow &` 之後直接 `exit` | 結束碼 1(輸出還沒確認) |
+| 互動:前景 `sleep 2 > /z`、Ctrl-Z、`jobs`、`fg` | stopped → foreground,完成後 `$?` = 0 |
+| 互動:兩個背景工作、`wait`、`exit` 時仍有背景輸出 | w=0、內容 a / b;`output is still pending`,結束碼 1 |
+| **負對照**:換回舊的 `user/sh.c` | 第 16 階段 wait 回 0(假成功)、第 15 階段 exit 回 0,兩條斷言都失敗 |
+
+Codex 的主機端證據:`probe_shell_jobs.py` 13/13(ASan + UBSan),四種突變(太早關閉、忽略同步結果、借用會被覆寫的路徑、丟失已回收的狀態)都被抓到。
+
+### C3.1:kernel 的保留底線(I-240 的第一階段)
+
+Codex 審查 C3 的方案後(memory 訊息 156)分成兩段:C3.1 先在頁面配置器守住一條物理底線,C3.2 再做每一類配置的記帳與配額(要先定好帳戶的生命週期與鎖序)。
+
+**做法**:`pmm_reserve_enable(n)` 啟用之後,一般的 `pmm_alloc` / `pmm_alloc_pages` 在同一把鎖裡先檢查「n 不超過空閒頁數,而且配置後仍不低於底線」才配置,不足就回傳 NULL、什麼都不變。預設就受保護,而不是另外給使用者一個會檢查的函式:那種做法只要漏掉一條間接路徑(kmalloc 擴充、頁表、ramfs 的區塊表、kernel stack…),底線就形同虛設。只有明確命名的 `pmm_alloc_pages_reserve` 能動用底線以下,目前沒有任何呼叫者(只有測試用到),留給之後經過審查的 kernel 復原路徑。
+
+- 底線的大小:在分頁、kernel 映像、位元圖都配置好、排程器與使用者程式都還沒開始時取樣空閒頁數(可用量),保留 1/8,至少 1024 頁(4MB),但不超過一半;可用量不到 2 頁就拒絕開機。128MB 的機器上約 4000 頁(16MB)。
+- 承諾上限(heap / mmap 的記帳)再扣掉底線:承諾出去的頁必須配置得到,而一般配置拿不到底線以下的頁。
+- 速度:配置多一次比較;安全性:使用者再怎麼用,kernel 都還有 16MB 可以印診斷、結束行程、處理中斷。
+- 界線:底線只保證「一般配置不會吃掉它」,不保證 kernel 自己的每一次配置都成功(kernel 的配置同樣會在底線處失敗,各呼叫點本來就要處理 NULL)。
+
+**測試**
+
+| 測試(三架構) | 結果 |
+|---|---|
+| `pmm_floor_test`(selftest,排程器啟動前、結果確定):一頁一頁拿到被拒絕 | 剛好停在底線(i386 拿了 28243 頁後停在 4034);floor+1 時要 2 頁被拒絕;超大的 n 被拒絕且不改變任何東西;應急配置能拿底線以下的一頁(floor-1);只能啟用一次;全部歸還後計數恢復 |
+| `memhog=file`(新的使用者程式 `/bin/memhog` 在 `/` 寫檔案直到被拒絕) | 寫了約 110MB 後被拒絕(結束碼 0 = 明確的錯誤);另一條執行緒每 1ms 量到的最低空閒頁數剛好等於底線;刪檔後「空閒 + heap + 頁表 + stack 快取」與開始時完全相同 |
+| `memhog=fork`(不斷 fork 直到失敗) | 最低空閒頁數 ≥ 底線、頁數完全平衡;**但**行程是在 page fault 時被終止(i386、aarch64 的父行程碰到 stack 新的一頁;riscv64 的子行程寫入時複製),而不是 fork 回傳 -E_NOMEM — stack 增長與寫入時複製的頁沒有事先記帳,這是 C3.2 要解決的,測試如實印出這一行而不當成通過 |
+| **負對照**:拿掉底線檢查 | `pmm_floor_test` 在 floor+1 那條斷言失敗;`memhog=file` 量到最低空閒頁數 **0**(kernel 的保留被吃光),斷言失敗 |
+
+另外量到:一次 fork 風暴之後 kernel heap 多了約 980 頁(行程結構等),heap 從不把頁還給配置器 — 這部分列入 C3.2 的記帳範圍。回歸加入 `memhog=file`、`memhog=fork` 兩個情境(每架構 26 個)。
+
+**Codex 的 C3.1 審查**(`tests/static/REVIEW-C31-20261120.md`):以真的 `pmm.c`(只把關中斷的鎖換成 pthread)窮舉 25851 組位元圖 / 底線 / 請求(含碎片、0、`SIZE_MAX`)、8 條執行緒在底線附近搶 1000 輪、160000 次配置釋放混合,沒有找到繞過底線的路徑;三種突變(拿掉底線、差一、一般配置走應急)都被抓到。**找到一個真問題**:`pmm_free_count` 與新加的 `pmm_reserve_refusals` 不上鎖就讀配置時在鎖內更新的變數 — memhog 的量測執行緒在別顆 CPU 上讀,就是資料競爭(TSan 實際報出 4 筆)。整合 Codex 的補丁:三個查詢函式都在 `pmm_lk` 裡讀。`commit_change_locked` 在 `pstate_lk` 裡呼叫它們,層級 LK_PMM(90)高於 LK_PSTATE(20),順序合法;`proc.c` 的鎖說明同步更新。驗證:不加 `--fix-getters` 重跑探針全部通過(ASan / UBSan / TSan);負對照用未加鎖的版本跑 TSan,報出 `nfree` 與 `floor_refusals` 的資料競爭;三架構 QEMU 的 `selftest memtest stress`、`memhog=file`、`memhog=fork` 都通過,鎖順序檢查沒有報錯。

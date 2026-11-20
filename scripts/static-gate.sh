@@ -32,7 +32,7 @@ if [ "$?" -ge 2 ]; then
     python3 - "$dir/out/findings.json" <<'PYEOF'
 import json, sys
 d = json.load(open(sys.argv[1]))
-hard = [f for f in d['findings'] if not f['accepted'] and f['rule'] in ('recursion', 'banned-call', 'unchecked-error')]
+hard = [f for f in d['findings'] if not f['accepted'] and f['rule'] in ('recursion', 'banned-call', 'unchecked-error', 'pte-direct-store')]
 style = sum(1 for f in d['findings'] if not f['accepted']) - len(hard)
 print(f"靜態檢查:規則已變更,無法和上一次提交比較;改用完整掃描:{len(hard)} 個未審查的需要處理的提示"
       f"(必須為 0)、{style} 個風格提示、{len(d['baseline_stale_ids'])} 筆過期的基準紀錄")
@@ -49,7 +49,7 @@ python3 - "$dir/out/findings.json" <<'PYEOF'
 import json, sys
 d = json.load(open(sys.argv[1]))
 new = set(d['comparison']['newly_unreviewed_ids'])
-hard = [f for f in d['findings'] if f['id'] in new and f['rule'] in ('recursion', 'banned-call', 'unchecked-error')]
+hard = [f for f in d['findings'] if f['id'] in new and f['rule'] in ('recursion', 'banned-call', 'unchecked-error', 'pte-direct-store')]
 print(f"靜態檢查:相對於上一次提交,新增 {len(hard)} 個需要處理的提示、{len(new) - len(hard)} 個風格提示"
       f"(既有尚未審查 {len(d['comparison']['existing_unreviewed_ids'])} 個)")
 for f in hard:

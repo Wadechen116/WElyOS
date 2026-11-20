@@ -45,7 +45,7 @@ set(COMMON_LINK_FLAGS ${ARCH_LINK_FLAGS} -ffreestanding -nostdlib -static -no-pi
 # ---- 使用者程式 ----
 # 每個程式(user/<名稱>.c)與共用的啟動程式 crt0.c 一起,獨立連結在 USER_BASE
 # (各架構的使用者位址範圍起點),再轉成原始二進位,放進開機檔案包的 /bin/<名稱>。
-set(USER_PROGRAMS init echo args cat ls mkdir rm mv wc sort date sleep kill ps cp df sync top id su chmod chown ping net tftp host faultlog supervise scrub periodic vote bench sh)
+set(USER_PROGRAMS init echo args cat ls mkdir rm mv wc sort date sleep kill ps cp df sync top id su chmod chown ping net tftp host faultlog supervise scrub periodic vote bench memhog sh)
 set(USER_BINS "")
 foreach(prog ${USER_PROGRAMS})
     # libc.c 是共用的小型函式庫。-ffunction-sections 讓每個函式各自一個區段,

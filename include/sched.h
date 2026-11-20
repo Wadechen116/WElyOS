@@ -77,6 +77,7 @@ void thread_join(int tid);
 int thread_set_periodic(unsigned period_ms, unsigned budget_ms);
 int thread_wait_period(struct rt_stats *st);
 
+size_t sched_stack_cache_pages(void);    /* 閒置 stack 快取佔住的實體頁數 */
 void thread_yield(void);                 /* 主動讓出 CPU,排到隊伍最後 */
 void thread_sleep(unsigned ms);          /* 休眠至少 ms 毫秒(精度為一個 tick) */
 void thread_exit(void) __attribute__((noreturn));   /* 結束目前的執行緒 */

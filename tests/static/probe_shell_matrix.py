@@ -26,12 +26,13 @@ def main():
     source = data['user/sh.c'].decode()
     selected = {f.name: f for f in functions('user/sh.c', source)}
     lines = source.splitlines(keepends=True)
-    names = ('restore_fd', 'job_mark_done', 'job_wait', 'run')
+    names = tuple(n for n in ('restore_fd', 'job_mark_done', 'job_finish', 'job_wait', 'run') if n in selected)
     (out / 'shell_functions.c').write_text('\n'.join(''.join(lines[selected[n].line-1:selected[n].end]) for n in names))
     types = re.findall(r'^#define\s+(?:MAX_ARGS|MAX_STAGES|MAX_JOBS|SAVE_IN|SAVE_OUT|SAVE_SYNC)\b[^\n]*', source, re.M)
     for name in ('stage', 'job'):
         start = source.index('struct '+name+' {')
         types.append(source[start:source.index('};', start)+2])
+    types.append('#define SH_DYNAMIC_OUTPUT '+str(int('save_pending' in source)))
     (out / 'shell_types.h').write_text('\n'.join(types))
     for p, content in data.items():
         if p != 'user/sh.c':

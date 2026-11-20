@@ -28,6 +28,38 @@ typedef uint64_t pte_t;
 #define USER_BASE   0x40000000u
 #define USER_TOP    0x80000000u
 
+/*
+ * 頁表項目的單一寫入點(I-090)。PAE 項目有 64 位元,但 32 位元 CPU 的一般
+ * 儲存指令一次只寫 32 位元:編譯器把 *e = v 拆成「先低半(含 P 位元)、
+ * 再高半(含 NX)」兩道指令(第 52 步反組譯 vm_map 證實)。兩道之間,別顆 CPU
+ * 的頁表走訪可能看到「已存在但沒有 NX」或「新位址配舊權限」的半新半舊項目。
+ * 這裡改用 lock cmpxchg8b:64 位元一次寫入、所有 CPU 看到的不是舊值就是新值;
+ * 它也是完整的記憶體屏障,填好的下一層表格一定先於指向它的項目被看見。
+ * 迴圈是因為硬體可能同時以 locked 操作設定 A/D 位元,比較失敗就用最新值重試。
+ * CPU 必須有 CMPXCHG8B(CPUID.1:EDX bit 8),arch_mmu_init 會檢查。
+ */
+static inline void arch_pte_set(volatile pte_t *e, pte_t v)
+{
+    uint64_t old = *e;                       /* 只是猜測值;撕裂也沒關係,比較失敗會換成真值 */
+    __asm__ volatile("1: lock cmpxchg8b %0\n\tjnz 1b"
+                     : "+m"(*e), "+A"(old)
+                     : "b"((uint32_t)v), "c"((uint32_t)(v >> 32))
+                     : "memory", "cc");
+}
+
+/* 64 位元一次讀出(測試用來檢查有沒有看到半新半舊的值)。
+   cmpxchg8b 以 edx:eax 與 ecx:ebx 相同的值比較:相等時寫回同一個值、不等時載入目前值,
+   兩種情況 edx:eax 都是記憶體裡完整的 64 位元 */
+static inline pte_t arch_pte_get(volatile pte_t *e)
+{
+    uint64_t v = 0;
+    __asm__ volatile("lock cmpxchg8b %0"
+                     : "+m"(*e), "+A"(v)
+                     : "b"(0u), "c"(0u)
+                     : "memory", "cc");
+    return v;
+}
+
 int       arch_mmu_has_nx(void);
 void      arch_mmu_init(void);                           /* 偵測 CPU 功能;建立頁表之前呼叫 */
 /* 產生「對映」項目。level 0 = 4KB 頁;level MMU_LARGE_LEVEL = 大分頁 */

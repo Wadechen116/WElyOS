@@ -1,0 +1,277 @@
+--- a/user/sh.c
++++ b/user/sh.c
+@@ -37,7 +37,9 @@
+  *
+  * 互動行編輯:16 筆歷史(Up/Down)、左右/Home/End/Delete、Tab 路徑補全;
+  * 以位元組編輯,不是 Unicode grapheme 編輯器。變數不經由環境繼承給子行程。
+- * shell 的結束碼:exit 指定的值,或(輸入結束時)最後一個命令的結束碼。
++ * 背景輸出由工作持有,完成後確認寫回;wait 會回報已回收工作的寫回錯誤。
++ * 帶尚未確認的輸出就 exit/EOF 時回報非0並提示先 wait,不替未完成工作宣稱保存成功。
++ * shell 的結束碼:exit 指定的值或最後一個命令的結束碼;未確認輸出/背景錯誤不會以0離開。
+  */
+ #include "ulib.h"
+ 
+@@ -45,7 +47,7 @@
+ #define MAX_STAGES 6                             /* 一條管線最多由幾個命令組成 */
+ #define SAVE_IN    14                            /* 重新導向時暫存原本標準輸入 / 輸出的描述符編號 */
+ #define SAVE_OUT   15
+-#define SAVE_SYNC  13                            /* 「> 檔案」的那個檔案:命令結束後由 shell 同步並確認寫入成功 */
++#define SAVE_SYNC  13                            /* 舊固定槽;輸出參考現在由各 job 個別持有 */
+ 
+ /* 從檔案描述符一次讀一塊,再一行一行交出去。
+    直接一次讀一個位元組也可以,但每個位元組都要一次系統呼叫,慢很多 */
+@@ -170,10 +172,15 @@
+     int n, left;                                 /* 行程總數、還沒結束的個數 */
+     int stopped;                                 /* 暫停中(值為造成暫停的訊號編號) */
+     long status;                                 /* 最後一個命令的結束碼 */
++    int save_pending;                           /* 輸出參考仍由這個 job 擁有 */
++    long save_fd, launch_error;
++    char save_path[256];                         /* 不能借用下一行會覆寫的 lexer 儲存區 */
+     char cmd[64];                                /* 命令的文字,列表與通知時顯示 */
+ };
+ 
+ static struct job jobs[MAX_JOBS];
++static long async_status;                      /* 已回收背景工作的錯誤,留給 wait/exit */
++static void job_finish(struct job *j);
+ 
+ /* 把命令的文字組回來("ls /bin | wc"),太長就截斷 */
+ static void job_describe(struct job *j, struct stage *st, int ns)
+@@ -255,6 +262,8 @@
+         }
+         job_mark_done(j, i, st);
+         if (j->left == 0) {
++            job_finish(j);
++            if (j->status) async_status = j->status;
+             if (j->status == 0)
+                 job_report(j, "done", -1);
+             else
+@@ -313,6 +322,7 @@
+             job_mark_done(j, i, st);
+     }
+     sys_tcsetfg(0);
++    if (!j->left) job_finish(j);
+     return j->stopped != 0;
+ }
+ 
+@@ -345,6 +355,61 @@
+     puts_(what);
+     puts_(name);
+     puts_("\n");
++}
++
++/* 全部子行程結束後才確認寫入;先消耗所有權,close 出錯也不重試。 */
++static void job_finish(struct job *j)
++{
++    if (j->left) return;
++    if (j->save_pending) {
++        long fd = j->save_fd;
++        j->save_pending = 0;
++        j->save_fd = -1;
++        long synced = sys_fsync(fd);
++        long closed = sys_close(fd);
++        if (synced == -E_INVAL) synced = 0;       /* /dev/null 等沒有持久化語意 */
++        if (synced != 0 || closed != 0) {
++            complain("write error: could not save ", j->save_path);
++            if (!j->status) j->status = 1;
++        }
++    }
++    if (j->launch_error) j->status = j->launch_error;
++}
++
++static long job_wait_all(void)
++{
++    long result = async_status;
++    async_status = 0;
++    for (struct job *j = jobs; j < jobs + MAX_JOBS; j++) {
++        if (!j->used) continue;
++        if (j->stopped) { if (!result) result = 128 + j->stopped; continue; }
++        int w = job_wait(j);
++        if (w == 2) {
++            puts_("sh: wait: could not wait for a job; it is still listed\n");
++            result = 1;
++        } else if (w) {
++            job_report_stopped(j);
++            if (!result) result = 128 + j->stopped;
++        } else {
++            if (j->status) result = j->status;    /* 成功的後一個工作不能蓋掉較早的錯誤 */
++            j->used = 0;
++        }
++    }
++    return result;
++}
++
++/* 不替仍在執行的輸出謊稱成功;不強制等可能永不結束的背景工作。 */
++static int sh_exit_status(long status)
++{
++    if (!status && async_status) status = async_status;
++    for (struct job *j = jobs; j < jobs + MAX_JOBS; j++) {
++        if (j->used && j->save_pending) {
++            puts_("sh: output is still pending; use wait before exit\n");
++            if (!status) status = 1;
++            break;
++        }
++    }
++    return (int)status;
+ }
+ 
+ /*
+@@ -365,7 +430,7 @@
+ {
+     long pids[MAX_STAGES];
+     long prev_rd = -1;
+-    long keep = -1;                              /* SAVE_SYNC:輸出檔的另一個參考,見下面「確認寫入」 */
++    long keep = -1;                              /* 輸出檔的另一個參考,稍後交給 job 確認寫回 */
+     const char *keep_path = 0;
+     struct job *job = 0;
+ 
+@@ -373,13 +438,13 @@
+     for (int i = 0; i < MAX_STAGES; i++)
+         pids[i] = -1;
+ 
+-    if (background) {
++    if (background || st[ns - 1].out_path) {
+         job = job_free_slot();
+         if (!job) {
+-            puts_("sh: too many background jobs\n");
++            puts_("sh: too many jobs to track output\n");
+             return 1;
+         }
+-        if (!st[0].in_path)
++        if (background && !st[0].in_path)
+             st[0].in_path = "/dev/null";         /* 背景的命令不讀鍵盤 */
+     }
+ 
+@@ -401,6 +466,12 @@
+         }
+         if (i + 1 < ns && sys_pipe(fds) != 0) {
+             puts_("sh: cannot create a pipe\n");
++            break;
++        }
++        if (fds[0] >= SAVE_IN || fds[1] >= SAVE_IN) {
++            /* 多個背景輸出已占用描述符時,pipe 不得撞到稍後保存 0/1 的槽。 */
++            close_quiet(fds[0]); close_quiet(fds[1]);
++            puts_("sh: too few descriptors for another pipe\n");
+             break;
+         }
+ 
+@@ -451,14 +522,11 @@
+             } else {
+                 if (sys_dup2(fd, 1) != 1)
+                     ok = 0;
+-                /* 自己另外留一個指向同一個檔案的描述符:命令寫完之後才能替它確認資料寫成功了。
+-                   (子行程只繼承 0、1、2 號,不會拿到這一個) */
++                /* open 的參考直接交給 job;spawn 只繼承 0/1/2,不拿走它。
++                   不固定用 SAVE_SYNC,否則下一個背景命令會覆蓋尚未寫完的輸出。 */
+                 close_quiet(keep);
+-                keep = sys_dup2(fd, SAVE_SYNC) == SAVE_SYNC ? SAVE_SYNC : -1;
+-                if (keep < 0)
+-                    ok = 0;
++                keep = fd;
+                 keep_path = st[i].out_path;
+-                close_quiet(fd);
+             }
+         }
+ 
+@@ -504,12 +572,21 @@
+         cur.left++;
+     }
+     job_describe(&cur, st, ns);
++    cur.launch_error = pids[ns - 1] < 0 ? (pids[ns - 1] == -1 ? 1 : 127) : 0;
++    if (keep >= 0) {
++        cur.save_fd = keep;
++        cur.save_pending = 1;
++        unsigned k = 0;
++        for (; k + 1 < sizeof(cur.save_path) && keep_path[k]; k++)
++            cur.save_path[k] = keep_path[k];
++        cur.save_path[k] = 0;
++    }
++    if (!pgid) job_finish(&cur);
+ 
+     if (background) {
+         /* 背景:記下這個工作就回去讀下一個命令。一個行程都沒啟動成功的話不算工作 */
+-        close_quiet(keep);                      /* 背景工作:不等它,也就無從替它確認 */
+         if (!pgid)
+-            return 127;
++            return cur.launch_error ? cur.launch_error : 127;
+         *job = cur;
+         job_report(job, "started, pid ", job->pids[job->n - 1]);
+         return 0;
+@@ -527,7 +604,7 @@
+                 job_report(job, "could not wait for it; still listed as a job, pid ", job->pids[job->n - 1]);
+             else
+                 job_report_stopped(job);
+-            close_quiet(keep);                  /* 它還沒寫完 */
++            /* save_pending 與 fd 已隨 cur 轉交工作表。 */
+             return w == 2 ? 1 : 128 + cur.stopped;
+         }
+         if (w == 2) {
+@@ -539,27 +616,8 @@
+            (否則它會停在那裡,再也沒有人能讓它繼續) */
+         puts_("sh: too many jobs; cannot stop this one\n");
+     }
+-    /*
+-     * 確認寫入:命令都結束了,這時候才把「> 檔案」的那個檔案同步到磁碟,並檢查結果。
+-     * 要在命令結束「之後」做(之前檔案還是空的),而且同步的必須是命令實際寫入的那個檔案
+-     * (不是已經換回來的標準輸出 — 那是主控台)。
+-     * 寫不成功的話,命令本身即使回報成功,整行也算失敗:使用者以為存好的東西其實沒有存好。
+-     */
+-    int save_failed = 0;
+-    if (keep >= 0) {
+-        long synced = sys_fsync(keep);
+-        long closed = sys_close(keep);           /* 不論成不成功,描述符都已經關閉 */
+-        if (synced == -E_INVAL)
+-            synced = 0;                          /* 「> /dev/null」這類:對象沒有寫回這件事,不是錯誤 */
+-        if (synced != 0 || closed != 0) {
+-            complain("write error: could not save ", keep_path);
+-            save_failed = 1;
+-        }
+-    }
+-    /* 最後一個命令沒有啟動:重新導向失敗 1、找不到程式 127;否則是它的結束碼 */
+-    if (pids[ns - 1] < 0)
+-        return pids[ns - 1] == -1 ? 1 : 127;
+-    return save_failed && cur.status == 0 ? 1 : cur.status;
++    job_finish(&cur);
++    return cur.status;
+ }
+ 
+ int main(int argc, char **argv)
+@@ -616,7 +674,7 @@
+         if (n < 0) { puts_("sh: pathname expansion failed or ambiguous redirect\n"); status = 2; continue; }
+ 
+         if (streq(words[0], "exit")) {
+-            return n > 1 ? (int)uatoi(words[1]) : (int)status;
++            return sh_exit_status(n > 1 ? uatoi(words[1]) : status);
+         } else if (streq(words[0], "cd")) {
+             long rc = sys_chdir(n > 1 ? words[1] : "/");
+             if (rc != 0)
+@@ -701,21 +759,7 @@
+                 }
+             }
+         } else if (streq(words[0], "wait")) {
+-            /* 暫停中的工作不會自己結束,不等它們 */
+-            for (struct job *j = jobs; j < jobs + MAX_JOBS; j++) {
+-                if (!j->used || j->stopped)
+-                    continue;
+-                int w = job_wait(j);
+-                if (w == 2) {
+-                    puts_("sh: wait: could not wait for a job; it is still listed\n");
+-                    status = 1;
+-                } else if (w) {
+-                    job_report_stopped(j);
+-                } else {
+-                    status = j->status;
+-                    j->used = 0;
+-                }
+-            }
++            status = job_wait_all();
+         } else {
+             int ns = parse(words, n, stages);
+             if (ns < 0) {
+@@ -726,5 +770,5 @@
+             }
+         }
+     }
+-    return (int)status;
+-}
++    return sh_exit_status(status);
++}

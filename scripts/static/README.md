@@ -54,6 +54,7 @@ bash scripts/static-refresh.sh        # 處理完新增的提示之後,更新參
 | function-length | 實體原始碼行數大於 80，屬 style；這是本專案門檻。 |
 | missing-check | 沒有 assertion 或引用參數的 if 條件，屬 style；由呼叫端保證前提的小函式常會被提示。 |
 | unchecked-error | 由明確 `return -E_*` 與簡單返回傳播推導錯誤函式，找獨立丟棄的回傳值，包含 `(void)`。不完整的型別／資料流分析，不能涵蓋全部 callback 或 syscall。 |
+| pte-direct-store | 限 `kernel/vm.c`，對宣告為 `pte_t *` 的具名指標，攔截直接解參考／索引的賦值及常見複合更新，要求用 `arch_pte_set`；指標宣告及重新指向不受禁止。這是詞法 guard，不能取代型別分析，cast／void alias／巨集與 bulk write 仍需人工審查。 |
 | banned-call | 提議禁用 gets、strcpy、strcat、sprintf、vsprintf、scanf、sscanf、vscanf、vsscanf、alloca、__builtin_alloca。找到呼叫不等於已證實越界；例如已知常值的安全測試案例需逐筆審查。 |
 
 不做註解／字串中的假呼叫比對；函式抽取不是完整 C parser，特殊 attributes／巨集語法可能漏掉。

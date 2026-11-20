@@ -126,9 +126,9 @@ static int split_large(pte_t *e, int level, uintptr_t base)
     unsigned flags = arch_pte_flags(*e);
     uintptr_t step = (uintptr_t)PAGE_SIZE << ((level - 1) * MMU_BITS);
     for (unsigned i = 0; i < ENTRIES; i++)
-        t[i] = arch_pte_leaf(pa + i * step, flags, level - 1);
+        arch_pte_set(&t[i], arch_pte_leaf(pa + i * step, flags, level - 1));
 
-    *e = arch_pte_table((uintptr_t)t, 0, level);
+    arch_pte_set(e, arch_pte_table((uintptr_t)t, 0, level));
     /* 拆開前後的轉換結果相同,但 TLB 裡還留著「一整塊」的舊紀錄;
        先清掉,之後對單一頁的修改才不會被舊紀錄蓋過 */
     if (enabled)
@@ -161,7 +161,7 @@ static pte_t *walk(pte_t *t, uintptr_t va, int target, int create, int split,
             pte_t *next = table_alloc();
             if (!next)
                 return NULL;
-            *e = arch_pte_table((uintptr_t)next, user, level);
+            arch_pte_set(e, arch_pte_table((uintptr_t)next, user, level));
             if (enabled && level == MMU_LEVELS - 1)
                 arch_mmu_root_changed(t);    /* i386 PAE:最上層的修改要重新載入才生效 */
         } else if (!arch_pte_is_table(*e, level)) {
@@ -247,7 +247,7 @@ int vm_map(uintptr_t va, uintptr_t pa, unsigned flags)
     int rc = -1;
     if (e) {
         int was_valid = arch_pte_valid(*e);
-        *e = arch_pte_leaf(pa, flags & ~VM_USER, 0);     /* kernel 頁表不放使用者頁 */
+        arch_pte_set(e, arch_pte_leaf(pa, flags & ~VM_USER, 0));     /* kernel 頁表不放使用者頁 */
         /* CPU 會把查過的轉換結果快取在 TLB;改了 PTE 要讓那一筆失效,
            否則 CPU 可能繼續用舊的對映。取代既有的對映時,所有 CPU 都要失效 */
         if (enabled) {
@@ -268,7 +268,7 @@ static int map_large(uintptr_t va, uintptr_t pa, unsigned flags)
     pte_t *e = walk(root, va, MMU_LARGE_LEVEL, 1, 0, 0, NULL);
     if (!e)
         return -1;
-    *e = arch_pte_leaf(pa, flags, MMU_LARGE_LEVEL);
+    arch_pte_set(e, arch_pte_leaf(pa, flags, MMU_LARGE_LEVEL));
     large_pages++;
     return 0;
 }
@@ -289,7 +289,7 @@ int vm_unmap(uintptr_t va)
     pte_t *e = walk(root, va, 0, 0, 1, 0, NULL);   /* 落在大分頁裡就先拆開,只移除這一頁 */
     int rc = -1;
     if (e && arch_pte_valid(*e)) {
-        *e = 0;
+        arch_pte_set(e, 0);
         if (enabled)
             tlb_shootdown(va);               /* 移除對映:每顆 CPU 的舊紀錄都要清掉 */
         rc = 0;
@@ -415,7 +415,7 @@ int vm_space_map(struct vm_space *vs, uintptr_t va, uintptr_t pa, unsigned flags
     int rc = -1;
     if (e) {
         int was_valid = arch_pte_valid(*e);
-        *e = arch_pte_leaf(pa, flags, 0);
+        arch_pte_set(e, arch_pte_leaf(pa, flags, 0));
         vs->pages += !was_valid;
         if (enabled) {
             if (was_valid)
@@ -497,7 +497,7 @@ int vm_space_map_new(struct vm_space *vs, uintptr_t va, uintptr_t pa, unsigned f
     if (e && arch_pte_valid(*e)) {
         rc = 1;                              /* 別人已經先對映了 */
     } else if (e) {
-        *e = arch_pte_leaf(pa, flags, 0);
+        arch_pte_set(e, arch_pte_leaf(pa, flags, 0));
         vs->pages++;
         if (enabled)
             arch_tlb_flush(va);
@@ -521,7 +521,7 @@ int vm_space_unmap(struct vm_space *vs, uintptr_t va)
     if (e && arch_pte_valid(*e) && level == 0) {
         uintptr_t pa = arch_pte_addr(*e);
         unsigned flags = arch_pte_flags(*e);
-        *e = 0;
+        arch_pte_set(e, 0);
         vs->pages--;
         if (enabled)
             tlb_shootdown_space(vs, va);     /* 同一行程的其他執行緒可能正在別顆 CPU 上使用這一頁 */
@@ -583,7 +583,7 @@ static int fork_table(struct vm_space *child, pte_t *t, int level, uintptr_t bas
                在兩邊都變成「唯讀 + COW」:任何一邊寫入都會觸發 page fault */
             if (flags & (VM_WRITE | VM_COW)) {
                 flags = (flags & ~VM_WRITE) | VM_COW;
-                t[i] = arch_pte_leaf(pa, flags, 0);
+                arch_pte_set(&t[i], arch_pte_leaf(pa, flags, 0));
             }
         }
         pte_t *e = walk(child->root, va, 0, 1, 0, 1, NULL);
@@ -591,7 +591,7 @@ static int fork_table(struct vm_space *child, pte_t *t, int level, uintptr_t bas
             return -1;                       /* 記憶體不足(配置不出頁表) */
         if (!(flags & VM_SHARED))
             pmm_ref((void *)pa);             /* 對映成功才算數:失敗時 child 會被整個釋放 */
-        *e = arch_pte_leaf(pa, flags, 0);
+        arch_pte_set(e, arch_pte_leaf(pa, flags, 0));
         child->pages++;
     }
     return 0;
@@ -650,14 +650,14 @@ int vm_space_fault(struct vm_space *vs, uintptr_t va, int write)
 
             if (pmm_refcount((void *)pa) == 1) {
                 /* 只剩自己在用(其他人都已經複製走或結束了):不必複製,改回可寫即可 */
-                *e = arch_pte_leaf(pa, nflags, 0);
+                arch_pte_set(e, arch_pte_leaf(pa, nflags, 0));
                 cow_reuses++;
                 rc = 0;
             } else {
                 void *copy = pmm_alloc();
                 if (copy) {
                     memcpy(copy, (const void *)pa, PAGE_SIZE);
-                    *e = arch_pte_leaf((uintptr_t)copy, nflags, 0);
+                    arch_pte_set(e, arch_pte_leaf((uintptr_t)copy, nflags, 0));
                     pmm_free((void *)pa);    /* 放棄原本那一頁的參考;別人還在用,不會被釋放 */
                     cow_copies++;
                     rc = 0;

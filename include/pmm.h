@@ -38,4 +38,16 @@ void pmm_free_pages(void *page, size_t n);
 size_t pmm_total_pages(void);   /* 管理的總頁數 */
 uintptr_t pmm_mem_start(void);  /* 第 0 頁的實體位址(管理範圍的起點) */
 size_t pmm_free_count(void);    /* 目前可用的頁數 */
+
+/*
+ * kernel 的保留底線。pmm_reserve_enable(n) 之後,一般配置(上面的 pmm_alloc /
+ * pmm_alloc_pages)一律不能讓空閒頁數低於 n,不足就回傳 NULL、什麼都不變。
+ * 只能啟用一次,n 不可為 0 或超過目前的空閒頁數(回傳 -1)。
+ * pmm_alloc_pages_reserve 可以動用底線以下的頁:只給經過審查的 kernel 復原路徑,
+ * 不可用在使用者能觸發的配置上。
+ */
+int    pmm_reserve_enable(size_t pages);
+size_t pmm_reserve_count(void);              /* 底線頁數;0 = 尚未啟用 */
+unsigned long pmm_reserve_refusals(void);    /* 因為底線被拒絕的配置次數 */
+void  *pmm_alloc_pages_reserve(size_t n);
 #endif

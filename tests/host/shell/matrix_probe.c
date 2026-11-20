@@ -8,6 +8,10 @@ _Noreturn void abort(void);
 #include "fs.h"
 #include "proc.h"
 #include "shell_types.h"
+/* Legacy fixed output slot, retained only to test pre-C1 source. */
+#ifndef SAVE_SYNC
+#define SAVE_SYNC 13
+#endif
 enum { DUP, OPEN, PIPE, SPAWN, SYNC, CLOSE, OPS };
 static const char *op_names[]={"dup2","open","pipe","spawn","fsync","close"};
 static int fds[16],counts[OPS],target=-1,nth,forced_open,ns,redirects;
@@ -35,7 +39,7 @@ static long sys_dup2(long from,long to) {
 static long sys_close(long fd) {
     int error=fail(CLOSE);
     if (fd<0 || fd>=16 || !fds[fd]) return -E_BADF;
-    if (error && fd==SAVE_SYNC) keep_close_failed=1;
+    if (error && (SH_DYNAMIC_OUTPUT ? (fd>=3 && fd<16 && fds[fd]==201) : fd==SAVE_SYNC)) keep_close_failed=1;
     fds[fd]=0;return error?-E_IO:0;
 }
 static void close_quiet(long fd) { if (fd>=0) (void)sys_close(fd); }
@@ -66,7 +70,7 @@ static long sys_waitpid(long pid,int *status,int flags) {
     reaped[i]=1;*status=0;return pid;
 }
 static long sys_fsync(long fd) {
-    if (fd!=SAVE_SYNC || fds[fd]!=201) bad_sync++;
+    if (fd<3 || fd>=16 || fds[fd]!=201) bad_sync++;
     for (int i=0;i<ns;i++) if (spawned[i] && !reaped[i]) bad_sync++;
     return fail(SYNC)?-E_IO:0;
 }

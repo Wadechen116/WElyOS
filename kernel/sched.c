@@ -360,6 +360,15 @@ static char *stack_alloc(void)
     return st;
 }
 
+/* 閒置 stack 快取目前佔住的實體頁數(測試核對「記憶體全部回來了」時要扣掉) */
+size_t sched_stack_cache_pages(void)
+{
+    unsigned long flags = spin_lock_irqsave(&stack_lk);
+    size_t n = (size_t)stack_cached * (STACK_PAGES + 1);
+    spin_unlock_irqrestore(&stack_lk, flags);
+    return n;
+}
+
 /* 把一條 stack 真正還給 pmm:保護頁要先對映回來,否則下一個拿到這頁的人無法使用 */
 static void stack_release(char *st)
 {

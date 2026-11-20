@@ -523,6 +523,17 @@ static void write_tmp(const char *path, const char *text)
     vfs_close(f);
 }
 
+/* 讀出一個小檔案的內容(以 0 結尾),供核對 shell 腳本寫下的結果 */
+static void read_small(const char *path, char *buf, size_t cap)
+{
+    struct file *f;
+    KASSERT(vfs_open(path, O_RDONLY, &f) == 0);
+    long n = vfs_pread(f, buf, cap - 1, 0);
+    vfs_close(f);
+    KASSERT(n >= 0);
+    buf[n] = '\0';
+}
+
 /* 在「資料區塊寫不進去」的情況下執行一個程式,回傳它的結束碼;之後檔案系統必須已經轉為唯讀。
    metadata(inode 表、位元圖)照常寫得進去:開檔、截斷都會成功,失敗只發生在內容寫回的時候 —
    也就是 write 回報成功、資料還在快取裡,要到 fsync / close 才知道沒存好的那種情況 */
@@ -565,6 +576,17 @@ void disk_user_stage_test(const char *cmd)
         int rc = run_with_write_faults("/bin/tftp", (const char *const[]){ "tftp", "etc/motd", "/disk/tfail", NULL });
         kprintf("disktest 14: tftp to the disk while write-back failed exited with %d\n", rc);
         KASSERT(rc != 0);
+    } else if (cmdline_has(cmd, "disktest=16")) {
+        /* I-318:背景工作的重新導向。寫回失敗時,不能因為 shell 沒有等它就當成成功:
+           背景工作結束、被回收(sleep 那一行之前就回收了)之後,wait 仍要回報非 0 */
+        KASSERT(s.mounted && !s.failed);
+        precreate("/disk/bgfail");
+        write_tmp("/tmp/bg.sh", "echo saved > /disk/bgfail &\nsleep 300ms\nwait\necho $? > /tmp/w16\n");
+        int rc = run_with_write_faults("/bin/sh", (const char *const[]){ "sh", "/tmp/bg.sh", NULL });
+        char w[16];
+        read_small("/tmp/w16", w, sizeof(w));
+        kprintf("disktest 16: background redirect while write-back failed: wait returned %s", w);
+        KASSERT(rc == 0 && strcmp(w, "0\n") != 0);
     } else if (cmdline_has(cmd, "disktest=15")) {
         KASSERT(s.mounted && !s.failed);
         /* 對照:同樣三個命令在磁碟正常時都成功,檔案確實存在 */
@@ -582,6 +604,22 @@ void disk_user_stage_test(const char *cmd)
         wfs_stats(&s);
         KASSERT(!s.failed);
         kprintf("disktest 15: with a healthy disk cp, the shell redirect and tftp all succeeded\n");
+
+        /* I-318 對照:兩個背景工作各寫一個檔案,wait 回報 0、內容都完整 */
+        write_tmp("/tmp/bg.sh", "echo one > /disk/bg1 &\necho two > /disk/bg2 &\nwait\necho $? > /tmp/w15\n");
+        int r4 = run_prog("/bin/sh", (const char *const[]){ "sh", "/tmp/bg.sh", NULL });
+        char w[16];
+        read_small("/tmp/w15", w, sizeof(w));
+        KASSERT(r4 == 0 && strcmp(w, "0\n") == 0);
+        KASSERT(vfs_stat("/disk/bg1", &st) == 0 && st.size == 4 && vfs_stat("/disk/bg2", &st) == 0 && st.size == 4);
+        KASSERT(vfs_unlink("/disk/bg1") == 0 && vfs_unlink("/disk/bg2") == 0);
+        /* 輸出還沒確認寫回就 exit:shell 不能以 0 結束(背景工作仍在跑,不替它宣稱存好了) */
+        write_tmp("/tmp/bg.sh", "sleep 1 > /tmp/slow &\nexit\n");
+        int r5 = run_prog("/bin/sh", (const char *const[]){ "sh", "/tmp/bg.sh", NULL });
+        kprintf("disktest 15: two background redirects, wait 0; exit with output pending -> %d\n", r5);
+        KASSERT(r5 != 0);
+        wfs_stats(&s);
+        KASSERT(!s.failed);
     }
 }
 

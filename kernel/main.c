@@ -274,6 +274,27 @@ void kmain(const struct boot_info *bi)
 
     crash_test(bi->cmdline);
 
+    /*
+     * kernel 的保留底線(I-240,第 52 步 C3.1)。取樣時點:分頁與 kernel 映像、位元圖、
+     * 開機頁表都已配置,排程器、檔案系統、使用者程式都還沒開始 — 這時的空閒頁數就是
+     * 「可用量」。保留 1/8,至少 1024 頁(4MB),但不超過一半:記憶體很小的機器上
+     * 使用者仍有一半可用,而且算式不會下溢。可用量不到 2 頁時沒有可行的分法,拒絕開機。
+     * 之後一般的配置都不能讓空閒頁數低於它(見 pmm.h);底線之上的部分照常使用。
+     */
+    {
+        size_t usable = pmm_free_count(), floor = usable / 8;
+        if (floor < 1024)
+            floor = 1024;
+        if (floor > usable / 2)
+            floor = usable / 2;
+        if (floor == 0 || pmm_reserve_enable(floor) != 0)
+            panic("pmm: too little memory to keep a kernel reserve (%zu pages usable)", usable);
+        kprintf("pmm: kernel reserve %zu pages (%zu KB) of %zu usable\n",
+                floor, floor * (PAGE_SIZE / 1024), usable);
+    }
+    if (selftest)
+        pmm_floor_test();
+
     /* 啟動計時器(1000Hz,一個 tick 1ms)與排程器,再開中斷。
        timer_init 只是設定硬體,中斷要到 arch_irq_enable 才會真的進來。
        從開中斷那一刻起,main 也會和其他執行緒一樣被搶佔 */
@@ -347,6 +368,7 @@ void kmain(const struct boot_info *bi)
         smp_sched_demo();
         rt_demo();
         sleep_wall_test();
+        pte_tear_test();
         fs_demo();
         disk_demo();
         nic_selftest();                      /* 驅動程式單獨的測試:要在協定堆疊開始收訊框之前 */
@@ -395,6 +417,10 @@ void kmain(const struct boot_info *bi)
         kprintf("bench: exit %d\n", rc);
         KASSERT(rc == 0);
     }
+    if (cmdline_has(bi->cmdline, "memhog=file"))
+        memhog_test("file");
+    if (cmdline_has(bi->cmdline, "memhog=fork"))
+        memhog_test("fork");
     int shell = !autoexit || cmdline_has(bi->cmdline, "shell");
     if (shell) {
         kprintf("starting /bin/sh (type \"help\" for a list of commands)\n");

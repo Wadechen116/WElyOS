@@ -33,6 +33,17 @@ static uintptr_t mem_start;   /* 第 0 頁的實體位址 */
 static size_t    npages;      /* 管理的總頁數 */
 static size_t    nfree;       /* 目前空閒頁數 */
 static size_t    hint;        /* 比它小的頁都不是空閒的:掃描的起點 */
+/*
+ * kernel 的保留底線(I-240、第 52 步 C3.1)。啟用之後,一般的配置(pmm_alloc /
+ * pmm_alloc_pages,以及經由它們的 kmalloc、頁表、stack…)不能讓空閒頁數低於它:
+ * 檢查與配置在同一把鎖裡完成,多顆 CPU 同時配置也不會一起跌破。
+ * 只有明確命名的 pmm_alloc_pages_reserve 可以動用這一塊。
+ * 預設保護而不是「使用者的配置另外走一個會檢查的函式」:後者只要漏掉一條
+ * 間接的路徑(kmalloc 擴充、頁表、ramfs 的區塊表…)底線就形同虛設。
+ */
+static size_t    floor_pages; /* 0 = 尚未啟用 */
+static int       floor_on;
+static unsigned long floor_refusals;   /* 因為底線而拒絕的配置次數(診斷用) */
 
 #define ALIGN_UP(x)   (((x) + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1))
 #define ALIGN_DOWN(x) ((x) & ~(uint64_t)(PAGE_SIZE - 1))
@@ -42,7 +53,7 @@ static void bit_set(size_t i)   { bitmap[i / 8] |= (uint8_t)(1u << (i % 8)); }
 static void bit_clear(size_t i) { bitmap[i / 8] &= (uint8_t)~(1u << (i % 8)); }
 
 /* 兩個範圍 [a, a+alen) 與 [b, b+blen) 是否重疊 */
-static void *alloc_pages_locked(size_t n);
+static void *alloc_pages_locked(size_t n, int use_reserve);
 
 static int overlaps(uint64_t a, uint64_t alen, uint64_t b, uint64_t blen)
 {
@@ -124,10 +135,10 @@ void pmm_init(const struct boot_info *bi)
             npages, nfree, nfree * (PAGE_SIZE / 1024));
 }
 
-void *pmm_alloc_pages(size_t n)
+static void *alloc_pages_ref(size_t n, int use_reserve)
 {
     unsigned long flags = spin_lock_irqsave(&pmm_lk);
-    void *p = alloc_pages_locked(n);
+    void *p = alloc_pages_locked(n, use_reserve);
     if (p) {
         size_t first = ((uintptr_t)p - mem_start) >> PAGE_SHIFT;
         for (size_t i = first; i < first + n; i++)
@@ -137,11 +148,54 @@ void *pmm_alloc_pages(size_t n)
     return p;
 }
 
+void *pmm_alloc_pages(size_t n)
+{
+    return alloc_pages_ref(n, 0);
+}
+
+void *pmm_alloc_pages_reserve(size_t n)
+{
+    return alloc_pages_ref(n, 1);
+}
+
+int pmm_reserve_enable(size_t pages)
+{
+    unsigned long flags = spin_lock_irqsave(&pmm_lk);
+    int rc = -1;
+    if (!floor_on && pages > 0 && pages <= nfree) {   /* 只能啟用一次;不能設成比現有的還多 */
+        floor_pages = pages;
+        floor_on = 1;
+        rc = 0;
+    }
+    spin_unlock_irqrestore(&pmm_lk, flags);
+    return rc;
+}
+
+size_t pmm_reserve_count(void)
+{
+    unsigned long flags = spin_lock_irqsave(&pmm_lk);
+    size_t value = floor_pages;
+    spin_unlock_irqrestore(&pmm_lk, flags);
+    return value;
+}
+unsigned long pmm_reserve_refusals(void)
+{
+    unsigned long flags = spin_lock_irqsave(&pmm_lk);
+    unsigned long value = floor_refusals;
+    spin_unlock_irqrestore(&pmm_lk, flags);
+    return value;
+}
+
 /* 實際的配置邏輯;呼叫時已持有 pmm_lk */
-static void *alloc_pages_locked(size_t n)
+static void *alloc_pages_locked(size_t n, int use_reserve)
 {
     if (n == 0 || n > nfree)
         return NULL;
+    /* n <= nfree 已確定,nfree - n 不會下溢 */
+    if (floor_on && !use_reserve && nfree - n < floor_pages) {
+        floor_refusals++;
+        return NULL;
+    }
 
     /* first-fit:從 hint 往後找第一段連續 n 個 0 */
     size_t run = 0;                        /* 目前連續空閒的頁數 */
@@ -249,4 +303,10 @@ void pmm_free(void *page)
 
 size_t pmm_total_pages(void) { return npages; }
 uintptr_t pmm_mem_start(void) { return mem_start; }
-size_t pmm_free_count(void)  { return nfree; }
+size_t pmm_free_count(void)
+{
+    unsigned long flags = spin_lock_irqsave(&pmm_lk);
+    size_t value = nfree;
+    spin_unlock_irqrestore(&pmm_lk, flags);
+    return value;
+}

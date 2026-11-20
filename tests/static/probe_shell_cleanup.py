@@ -25,8 +25,8 @@ def main():
     lines=source.splitlines(keepends=True)
     out=Path(tempfile.mkdtemp(prefix='welyos-shell-cleanup-'))
     parts=[]
-    for name in ('restore_fd','job_mark_done','job_wait','run'):
-        if name=='restore_fd' and name not in selected:
+    for name in ('restore_fd','job_mark_done','job_finish','job_wait','run'):
+        if name in ('restore_fd','job_finish') and name not in selected:
             continue
         fn=selected[name];parts.append(''.join(lines[fn.line-1:fn.end]))
     (out/'shell_functions.c').write_text('\n'.join(parts))
@@ -34,6 +34,7 @@ def main():
     for name in ('stage','job'):
         start=source.index('struct '+name+' {');end=source.index('};',start)+2
         declarations.append(source[start:end])
+    declarations.append('#define SH_DYNAMIC_OUTPUT '+str(int('save_pending' in source)))
     (out/'shell_types.h').write_text('\n'.join(declarations)+'\n#include "uapi_fs.h"\n')
     for name in ('errno','proc','fs'):
         dest='errno.h' if name=='errno' else 'uapi_'+name+'.h'

@@ -91,6 +91,9 @@ static struct job *job_pick(const char *s,int stopped) { (void)s;(void)stopped;r
 static void job_report_stopped(struct job *j) { (void)j; }
 static void job_report(struct job *j,const char *s,long n) { (void)j;(void)s;(void)n; }
 static int job_wait(struct job *j) { (void)j;return 0; }
+/* Job persistence is exercised by jobs_probe.c, not this words/editor fixture. */
+static inline long job_wait_all(void) { return 0; }
+static inline int sh_exit_status(long status) { return (int)status; }
 static long sys_getuid(void) { return 0; }
 static long sys_getcwd(char *out,unsigned long n) { (void)n;strcpy(out,"/");return 1; }
 static long sys_chdir(const char *s) { return strcmp(s,"missing") ? 0 : -2; }

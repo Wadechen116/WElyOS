@@ -46,4 +46,8 @@ static inline void arch_mmu_root_changed(pte_t *root) { (void)root; }
 void      arch_tlb_flush(uintptr_t va);                  /* 讓一頁的 TLB 快取失效(僅這顆 CPU) */
 void      arch_tlb_flush_broadcast(uintptr_t va);        /* 同上,但由硬體通知所有 CPU */
 void      arch_mmu_map_devices(void);                    /* 對映本架構的裝置 */
+/* 頁表項目的單一寫入點:64 位元 CPU 的對齊 64 位元儲存本身不會撕裂;
+   release 讓填好的下一層表格先於指向它的項目被看見(與 i386 的 cmpxchg8b 同一契約) */
+static inline void arch_pte_set(volatile pte_t *e, pte_t v) { __atomic_store_n(e, v, __ATOMIC_RELEASE); }
+static inline pte_t arch_pte_get(volatile pte_t *e) { return __atomic_load_n(e, __ATOMIC_ACQUIRE); }
 #endif

@@ -86,6 +86,29 @@ class RulesTest(unittest.TestCase):
         ''')
         self.assertTrue(any(f['rule']=='unchecked-error' and f['symbol']=='caller' for f in found))
 
+    def test_pte_direct_store_guard(self):
+        for statement in ('*entry = v;', 'entry[i] = v;', '(*entry) = v;',
+                          '*entry |= v;', 'entry[i]++;', '++*entry;',
+                          'vs->root[i] = v;'):
+            with self.subTest(statement=statement):
+                found = self.scan('pte_t *root; void f(pte_t *entry, int i, int v) { '
+                                  + statement + ' }', path='kernel/vm.c')
+                self.assertTrue(any(f['rule']=='pte-direct-store' for f in found))
+        good = self.scan('pte_t *root; void f(pte_t *entry, int v) { '
+                         'pte_t *next = entry; next = root; '
+                         'arch_pte_set(entry,v); read(entry[0]); }', path='kernel/vm.c')
+        self.assertFalse(any(f['rule']=='pte-direct-store' for f in good))
+
+    def test_pte_store_guard_alias_comments_scope(self):
+        source = 'void f(pte_t *entry) { pte_t *alias=entry; alias[0]=1; }'
+        found = self.scan(source, path='kernel/vm.c')
+        self.assertTrue(any(f['rule']=='pte-direct-store' for f in found))
+        other = self.scan(source, path='user/example.c')
+        self.assertFalse(any(f['rule']=='pte-direct-store' for f in other))
+        comments = self.scan('void f(pte_t *entry) { '
+                             '// *entry=1;\n use("entry[0]=1;"); }', path='kernel/vm.c')
+        self.assertFalse(any(f['rule']=='pte-direct-store' for f in comments))
+
     def test_cycle_and_user_core_separation(self):
         found, _ = rules.check({
             'kernel/a.c': 'void a(void){b();} void b(void){a();}',
