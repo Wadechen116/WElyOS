@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real PMM with synthetic preinitialized page map and pthread lock (C3.1)."""
+"""Real PMM floor/reservations with synthetic page map and pthread lock (C3.1/C3.2a)."""
 import argparse
 import difflib
 import hashlib
@@ -32,30 +32,50 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--source', type=Path, default=ROOT)
     ap.add_argument('--fix-getters', action='store_true', help='isolated proposed product change')
-    ap.add_argument('--mutate', choices=('none', 'remove-floor', 'off-by-one', 'ordinary-bypass'), default='none')
+    ap.add_argument('--mutate', choices=('none', 'remove-floor', 'off-by-one', 'ordinary-bypass', 'ignore-reservations', 'emergency-steal', 'consume-no-debit', 'enable-ignore-reserved', 'reserve-no-credit'), default='none')
     ap.add_argument('--sanitizer', choices=('address', 'thread'), default='address')
-    ap.add_argument('--case', choices=('all', 'exhaustive', 'boundaries', 'parallel', 'getters'), default='all')
+    ap.add_argument('--suite', choices=('floor', 'reservations'), default='floor')
+    ap.add_argument('--case', choices=('all', 'exhaustive', 'boundaries', 'parallel', 'getters', 'invalid'), default='all')
     a = ap.parse_args()
     root = a.source.resolve()
-    paths = ('kernel/pmm.c', 'include/pmm.h', 'include/boot_info.h')
+    paths = ('kernel/pmm.c', 'include/pmm.h', 'include/boot_info.h', 'include/uapi/errno.h')
     data = {p: (root / p).read_bytes() for p in paths}
     src = data['kernel/pmm.c'].decode()
     if a.fix_getters:
         src = locked_getters(src)
+    modern = 'pmm_alloc_reserved(void)' in src
+    if a.suite == 'reservations' and not modern:
+        raise ValueError('source lacks reservation implementation')
     if a.mutate != 'none':
-        old, new = {
+        changes = {
             'remove-floor': ('floor_on && !use_reserve && nfree - n < floor_pages', '0 && floor_on && !use_reserve && nfree - n < floor_pages'),
             'off-by-one': ('nfree - n < floor_pages', 'nfree - n <= floor_pages'),
             'ordinary-bypass': ('return alloc_pages_ref(n, 0);', 'return alloc_pages_ref(n, 1);'),
-        }[a.mutate]
+        }
+        if modern:
+            changes.update({
+                'remove-floor': ('floor_pages <= avail && n <= avail - floor_pages', 'n <= avail'),
+                'off-by-one': ('n <= avail - floor_pages', 'n < avail - floor_pages'),
+                'ordinary-bypass': ('return alloc_pages_ref(n, ALLOC_NORMAL);', 'return alloc_pages_ref(n, ALLOC_EMERGENCY);'),
+                'ignore-reservations': ('size_t avail = nfree - nreserved;', 'size_t avail = nfree;'),
+                'emergency-steal': ('mode == ALLOC_EMERGENCY && n > nfree - nreserved', 'mode == ALLOC_EMERGENCY && n > nfree'),
+                'consume-no-debit': ('    nreserved--;', '    /* mutation: no reservation debit */'),
+                'enable-ignore-reserved': ('pages <= nfree - nreserved', 'pages <= nfree'),
+                'reserve-no-credit': ('        nreserved += n;', '        /* mutation: lost credit */'),
+            })
+        old, new = changes[a.mutate]
         if src.count(old) != 1:
             raise ValueError('mutation source did not match exactly once')
         src = src.replace(old, new)
     out = Path(tempfile.mkdtemp(prefix='welyos-pmm-floor-'))
     (out / 'pmm.c').write_text(src)
     for p in paths[1:]:
-        (out / Path(p).name).write_bytes(data[p])
-    (out / 'probe.c').write_bytes((ROOT / 'tests/host/pmm/floor_probe.c').read_bytes())
+        dest = out / ('uapi/errno.h' if p.endswith('uapi/errno.h') else Path(p).name)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data[p])
+    fixture = 'reservations_probe.c' if a.suite == 'reservations' else 'floor_probe.c'
+    (out / 'probe.c').write_bytes((ROOT / 'tests/host/pmm' / fixture).read_bytes())
+    (out / 'floor_probe.c').write_bytes((ROOT / 'tests/host/pmm/floor_probe.c').read_bytes())
     (out / 'spinlock.h').write_text('''
 struct spinlock { pthread_mutex_t mutex; };
 #define LK_PMM 1
@@ -72,6 +92,9 @@ static void spin_unlock_irqrestore(struct spinlock *s,unsigned long flags) {
     (out / 'kprintf.h').write_text('static inline int kprintf(const char *fmt,...) { (void)fmt;return 0; }\n')
     (out / 'panic.h').write_text('''
 _Noreturn static inline void panic(const char *fmt,...) {
+#ifdef PMM_TEST_PANIC_HOOK
+    PMM_TEST_PANIC_HOOK();
+#endif
     va_list ap;va_start(ap,fmt);vfprintf(stderr,fmt,ap);va_end(ap);abort();
 }
 ''')
@@ -80,10 +103,11 @@ _Noreturn static inline void panic(const char *fmt,...) {
             data['kernel/pmm.c'].decode().splitlines(True), src.splitlines(True),
             fromfile='a/kernel/pmm.c', tofile='b/kernel/pmm.c')))
     subprocess.run(['gcc', '-std=c11', '-O1', '-g', '-Wall', '-Wextra', '-Werror', '-pthread',
-                    '-fno-pie', '-no-pie', '-fsanitize=' + ('address,undefined' if a.sanitizer == 'address' else 'thread'),
+                    '-fno-pie', '-no-pie', *(['-DPMM_HAS_RESERVATIONS=1'] if modern else []), '-fsanitize=' + ('address,undefined' if a.sanitizer == 'address' else 'thread'),
                     '-fno-sanitize-recover=all', str(out / 'probe.c'), '-o', str(out / 'probe')], check=True)
     rows = []
-    cases = ('exhaustive', 'boundaries', 'parallel', 'getters') if a.case == 'all' else (a.case,)
+    defaults = ('exhaustive', 'boundaries', 'parallel', 'getters') + (('invalid',) if a.suite == 'reservations' else ())
+    cases = defaults if a.case == 'all' else (a.case,)
     for case in cases:
         p = subprocess.run([str(out / 'probe'), case], capture_output=True, text=True, timeout=60)
         rows.append(dict(case=case, returncode=p.returncode, stdout=p.stdout, stderr=p.stderr))
@@ -91,7 +115,7 @@ _Noreturn static inline void panic(const char *fmt,...) {
     hashes = {p: hashlib.sha256(b).hexdigest() for p, b in data.items()}
     changed = [p for p, h in hashes.items() if hashlib.sha256((root / p).read_bytes()).hexdigest() != h]
     (out / 'results.json').write_text(json.dumps(dict(results=rows, source_hashes=hashes,
-        changed_inputs=changed, fix_getters=a.fix_getters, mutation=a.mutate, sanitizer=a.sanitizer,
+        changed_inputs=changed, suite=a.suite, fix_getters=a.fix_getters, mutation=a.mutate, sanitizer=a.sanitizer,
         model='full real pmm.c; synthetic preinitialized bitmap, refs, arena; pthread lock replacing IRQ/spin; no boot/MMU'), indent=2))
     print('artifacts:', out, 'changed_inputs:', changed)
     return 2 if changed else int(any(r['returncode'] for r in rows))

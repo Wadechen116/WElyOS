@@ -22,7 +22,8 @@ void vm_demo(void);                      /* 分頁:權限、別名對映 */
 void mem_selftest(void);                 /* 頁面配置器與 kmalloc */
 void mem_fulltest(void);                 /* memtest:把所有可用的記憶體寫過讀回 */
 void spin_selftest(void);                /* spinlock 與每顆 CPU 的記帳 */
-void pmm_floor_test(void);               /* I-240 C3.1:一般配置不能跌破 kernel 保留底線 */
+void pmm_floor_test(void);
+void pmm_reservation_test(void);         /* I-240 C3.2 (a):預留不被一般 / 應急配置吃掉,兌現永遠成功 */               /* I-240 C3.1:一般配置不能跌破 kernel 保留底線 */
 void memhog_test(const char *mode);      /* I-240 C3.1:使用者把記憶體用到被拒絕,底線守住、全部歸還 */
 void pte_tear_test(void);                /* I-090:頁表項目 64 位元寫入不撕裂(需要 2 顆 CPU) */
 void crash_test(const char *cmd);        /* crash=<種類>:故意觸發錯誤(排程器啟動之前可以做的那些) */

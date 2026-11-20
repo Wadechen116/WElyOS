@@ -49,5 +49,26 @@ size_t pmm_free_count(void);    /* 目前可用的頁數 */
 int    pmm_reserve_enable(size_t pages);
 size_t pmm_reserve_count(void);              /* 底線頁數;0 = 尚未啟用 */
 unsigned long pmm_reserve_refusals(void);    /* 因為底線被拒絕的配置次數 */
-void  *pmm_alloc_pages_reserve(size_t n);
+void  *pmm_alloc_pages_reserve(size_t n);   /* 應急:可以動用底線,但不能動用預留 */
+
+/*
+ * 預留(I-240 C3.2 第 (a) 批):先答應、之後才真正配置的頁。
+ *   pmm_reserve(n)      預留 n 頁:之後未預留的空閒頁仍不低於底線才成功(0),否則 -E_NOMEM、不改狀態;
+ *                       n == 0 成功且什麼都不做
+ *   pmm_unreserve(n)    放棄 n 頁尚未兌現的預留;超過目前的預留量是帳務錯誤 → panic(不先改狀態)
+ *   pmm_alloc_reserved  兌現一頁預留:一定成功(預留量為 0 時呼叫是帳務錯誤 → panic)
+ * 一般配置拿不到預留的頁;應急配置也拿不到。所以持有預留的一方兌現時永遠有頁可拿。
+ * 誰持有多少預留由上層記帳,pmm 只知道總數。
+ */
+int    pmm_reserve(size_t n);
+void   pmm_unreserve(size_t n);
+void  *pmm_alloc_reserved(void);
+size_t pmm_reserved_count(void);
+
+/* 在同一把鎖裡讀出的一組數字(測試核對不變量用,不同時間分別讀取的值不能互相比較) */
+struct pmm_snapshot {
+    size_t free, reserved, floor;
+    unsigned long refusals;
+};
+void   pmm_snapshot(struct pmm_snapshot *out);
 #endif

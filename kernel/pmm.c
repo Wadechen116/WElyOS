@@ -20,6 +20,7 @@
 #include "kprintf.h"
 #include "kstring.h"
 #include "panic.h"
+#include "uapi/errno.h"
 
 /* 保護位元圖與相關計數。多顆 CPU 可能同時配置,只關中斷已經不夠 */
 static struct spinlock pmm_lk = SPINLOCK_INIT("pmm", LK_PMM);
@@ -43,7 +44,18 @@ static size_t    hint;        /* 比它小的頁都不是空閒的:掃描的起�
  */
 static size_t    floor_pages; /* 0 = 尚未啟用 */
 static int       floor_on;
-static unsigned long floor_refusals;   /* 因為底線而拒絕的配置次數(診斷用) */
+static unsigned long floor_refusals;   /* 因為底線(或預留)而拒絕的配置次數(診斷用) */
+/*
+ * 預留(I-240 C3.2 第 (a) 批):已經承諾、但還沒真正配置的頁數。
+ * 不變量 N1:nreserved <= nfree,永遠成立 — 持有預留的一方兌現一頁一定拿得到。
+ * 不變量 N2:nfree >= floor + nreserved,在沒有應急配置欠帳時成立。
+ *   一般配置與新的預留:配置 / 預留之後 N2 仍要成立;
+ *   應急配置(pmm_alloc_pages_reserve):只要求 N1 — 可以吃進底線,不能吃進別人的預留;
+ *   兌現預留:nfree 與 nreserved 同時減一,兩條都不受影響。
+ * 檢查一律寫成「先算 avail = nfree - nreserved(由 N1 保證不下溢),再和 floor、n 比較」,
+ * 不做 floor + nreserved 的加法。
+ */
+static size_t    nreserved;
 
 #define ALIGN_UP(x)   (((x) + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1))
 #define ALIGN_DOWN(x) ((x) & ~(uint64_t)(PAGE_SIZE - 1))
@@ -53,7 +65,8 @@ static void bit_set(size_t i)   { bitmap[i / 8] |= (uint8_t)(1u << (i % 8)); }
 static void bit_clear(size_t i) { bitmap[i / 8] &= (uint8_t)~(1u << (i % 8)); }
 
 /* 兩個範圍 [a, a+alen) 與 [b, b+blen) 是否重疊 */
-static void *alloc_pages_locked(size_t n, int use_reserve);
+enum { ALLOC_NORMAL, ALLOC_EMERGENCY, ALLOC_RESERVED };
+static void *alloc_pages_locked(size_t n, int mode);
 
 static int overlaps(uint64_t a, uint64_t alen, uint64_t b, uint64_t blen)
 {
@@ -135,10 +148,10 @@ void pmm_init(const struct boot_info *bi)
             npages, nfree, nfree * (PAGE_SIZE / 1024));
 }
 
-static void *alloc_pages_ref(size_t n, int use_reserve)
+static void *alloc_pages_ref(size_t n, int mode)
 {
     unsigned long flags = spin_lock_irqsave(&pmm_lk);
-    void *p = alloc_pages_locked(n, use_reserve);
+    void *p = alloc_pages_locked(n, mode);
     if (p) {
         size_t first = ((uintptr_t)p - mem_start) >> PAGE_SHIFT;
         for (size_t i = first; i < first + n; i++)
@@ -150,19 +163,89 @@ static void *alloc_pages_ref(size_t n, int use_reserve)
 
 void *pmm_alloc_pages(size_t n)
 {
-    return alloc_pages_ref(n, 0);
+    return alloc_pages_ref(n, ALLOC_NORMAL);
 }
 
 void *pmm_alloc_pages_reserve(size_t n)
 {
-    return alloc_pages_ref(n, 1);
+    return alloc_pages_ref(n, ALLOC_EMERGENCY);
+}
+
+/* 一般配置與新的預留共用的判斷:拿走 n 頁之後,未預留的空閒頁仍不低於底線(N2)。持有 pmm_lk */
+static int fits_normal_locked(size_t n)
+{
+    size_t avail = nfree - nreserved;          /* N1 保證不下溢 */
+    if (floor_on)
+        return floor_pages <= avail && n <= avail - floor_pages;
+    return n <= avail;
+}
+
+int pmm_reserve(size_t n)
+{
+    if (n == 0)
+        return 0;                              /* 什麼都不預留:成功,不改任何狀態 */
+    unsigned long flags = spin_lock_irqsave(&pmm_lk);
+    int rc = -E_NOMEM;
+    if (fits_normal_locked(n)) {               /* n <= avail - floor <= nfree - nreserved:加總不溢位 */
+        nreserved += n;
+        rc = 0;
+    } else {
+        floor_refusals++;
+    }
+    spin_unlock_irqrestore(&pmm_lk, flags);
+    return rc;
+}
+
+void pmm_unreserve(size_t n)
+{
+    if (n == 0)
+        return;
+    unsigned long flags = spin_lock_irqsave(&pmm_lk);
+    if (n > nreserved)                         /* 帳務錯誤:先判斷,不改任何狀態就停下 */
+        panic("pmm: unreserve of %zu pages but only %zu are reserved", n, nreserved);
+    nreserved -= n;
+    spin_unlock_irqrestore(&pmm_lk, flags);
+}
+
+void *pmm_alloc_reserved(void)
+{
+    unsigned long flags = spin_lock_irqsave(&pmm_lk);
+    if (nreserved == 0)
+        panic("pmm: allocation from an empty reservation");
+    /* N1:nfree >= nreserved >= 1,一定有一頁空閒;單頁不受碎片影響 */
+    void *p = alloc_pages_locked(1, ALLOC_RESERVED);
+    if (!p)
+        panic("pmm: reserved page missing (free %zu, reserved %zu)", nfree, nreserved);
+    nreserved--;
+    refs[((uintptr_t)p - mem_start) >> PAGE_SHIFT] = 1;
+    spin_unlock_irqrestore(&pmm_lk, flags);
+    return p;
+}
+
+size_t pmm_reserved_count(void)
+{
+    unsigned long flags = spin_lock_irqsave(&pmm_lk);
+    size_t value = nreserved;
+    spin_unlock_irqrestore(&pmm_lk, flags);
+    return value;
+}
+
+void pmm_snapshot(struct pmm_snapshot *out)
+{
+    unsigned long flags = spin_lock_irqsave(&pmm_lk);
+    out->free = nfree;
+    out->reserved = nreserved;
+    out->floor = floor_pages;
+    out->refusals = floor_refusals;
+    spin_unlock_irqrestore(&pmm_lk, flags);
 }
 
 int pmm_reserve_enable(size_t pages)
 {
     unsigned long flags = spin_lock_irqsave(&pmm_lk);
     int rc = -1;
-    if (!floor_on && pages > 0 && pages <= nfree) {   /* 只能啟用一次;不能設成比現有的還多 */
+    /* 只能啟用一次;不能設成比「未預留的空閒頁」還多,否則一啟用 N2 就不成立 */
+    if (!floor_on && pages > 0 && pages <= nfree - nreserved) {
         floor_pages = pages;
         floor_on = 1;
         rc = 0;
@@ -187,15 +270,19 @@ unsigned long pmm_reserve_refusals(void)
 }
 
 /* 實際的配置邏輯;呼叫時已持有 pmm_lk */
-static void *alloc_pages_locked(size_t n, int use_reserve)
+static void *alloc_pages_locked(size_t n, int mode)
 {
     if (n == 0 || n > nfree)
         return NULL;
-    /* n <= nfree 已確定,nfree - n 不會下溢 */
-    if (floor_on && !use_reserve && nfree - n < floor_pages) {
+    if (mode == ALLOC_NORMAL && !fits_normal_locked(n)) {
         floor_refusals++;
         return NULL;
     }
+    if (mode == ALLOC_EMERGENCY && n > nfree - nreserved) {   /* 應急:可以吃底線,不能吃預留(N1) */
+        floor_refusals++;
+        return NULL;
+    }
+    /* ALLOC_RESERVED:呼叫者已確認 nreserved > 0,兌現的這一頁本來就算在預留裡 */
 
     /* first-fit:從 hint 往後找第一段連續 n 個 0 */
     size_t run = 0;                        /* 目前連續空閒的頁數 */

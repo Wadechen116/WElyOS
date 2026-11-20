@@ -503,3 +503,84 @@ void memhog_test(const char *mode)
     KASSERT(refusals > 0);                            /* 真的用到了底線,而不是別的上限先擋下 */
     KASSERT(free1 + kept1 == free0 + kept0);          /* 其餘全部歸還(快取也可能縮小,所以兩邊相加比較) */
 }
+
+/*
+ * I-240 C3.2 第 (a) 批:pmm 的預留。排程器啟動前執行,結果確定。
+ * 預留到剛好滿、一般配置與應急配置都拿不到預留的頁、應急配置把底線用完(欠帳)時
+ * 新預留與一般配置都被拒絕但兌現照常、全部歸還後計數恢復。
+ * 負對照:一般配置不扣預留(第 52 步實測)時「預留剛好滿之後一般配置被拒絕」那條斷言失敗。
+ */
+static void *chain_take(void **chain, void *(*take)(void))
+{
+    void **pg = take();
+    if (pg) {
+        *pg = *chain;
+        *chain = pg;
+    }
+    return pg;
+}
+static void *take_normal(void)    { return pmm_alloc(); }
+static void *take_emergency(void) { return pmm_alloc_pages_reserve(1); }
+static void *take_reserved(void)  { return pmm_alloc_reserved(); }
+static size_t chain_free(void **chain)
+{
+    size_t n = 0;
+    while (*chain) {
+        void **pg = *chain;
+        *chain = *pg;
+        pmm_free(pg);
+        n++;
+    }
+    return n;
+}
+
+void pmm_reservation_test(void)
+{
+    struct pmm_snapshot s0, s;
+    pmm_snapshot(&s0);
+    KASSERT(s0.reserved == 0 && s0.floor > 0 && s0.free > s0.floor);
+
+    KASSERT(pmm_reserve(0) == 0 && pmm_reserved_count() == 0);          /* 0:成功、不改狀態 */
+    KASSERT(pmm_reserve((size_t)-1) == -E_NOMEM && pmm_reserved_count() == 0);
+    pmm_unreserve(0);
+
+    /* 預留到剛好滿:未預留的空閒頁 = 底線 */
+    size_t room = s0.free - s0.floor;
+    KASSERT(pmm_reserve(room + 1) == -E_NOMEM && pmm_reserved_count() == 0);
+    KASSERT(pmm_reserve(room) == 0);
+    pmm_snapshot(&s);
+    KASSERT(s.reserved == room && s.free == s0.free);                     /* 預留不配置任何頁 */
+    KASSERT(pmm_reserve(1) == -E_NOMEM);
+    KASSERT(pmm_alloc() == NULL);                                         /* 一般配置拿不到預留 */
+
+    /* 應急配置:把底線用完,但拿不到預留 */
+    void *emerg = NULL, *resv = NULL;
+    size_t ne = 0;
+    while (chain_take(&emerg, take_emergency))
+        ne++;
+    pmm_snapshot(&s);
+    KASSERT(ne == s0.floor && s.free == s.reserved && s.reserved == room); /* N1 剛好成立,N2 欠帳 */
+
+    /* 欠帳期間:新預留、一般配置拒絕;兌現照常(N1) */
+    KASSERT(pmm_reserve(1) == -E_NOMEM && pmm_alloc() == NULL);
+    for (int i = 0; i < 3; i++)
+        KASSERT(chain_take(&resv, take_reserved));
+    pmm_snapshot(&s);
+    KASSERT(s.free == s.reserved && s.reserved == room - 3);
+
+    /* 還掉應急配置:欠帳解除,但預留仍佔著 → 一般配置還是拿不到 */
+    KASSERT(chain_free(&emerg) == ne);
+    KASSERT(pmm_alloc() == NULL && pmm_reserve(1) == -E_NOMEM);
+    /* 放棄一頁預留:一般配置剛好能拿一頁 */
+    pmm_unreserve(1);
+    void *one = NULL;
+    KASSERT(chain_take(&one, take_normal) && pmm_alloc() == NULL);
+
+    /* 全部歸還 */
+    KASSERT(chain_free(&one) == 1 && chain_free(&resv) == 3);
+    pmm_unreserve(room - 4);
+    pmm_snapshot(&s);
+    KASSERT(s.reserved == 0 && s.free == s0.free);
+    kprintf("pmm: reservation test ok: %zu pages reserved, emergency allocations stopped at the "
+            "reservation (%zu pages), reserved pages still allocatable\n", room, ne);
+}

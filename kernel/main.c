@@ -292,8 +292,10 @@ void kmain(const struct boot_info *bi)
         kprintf("pmm: kernel reserve %zu pages (%zu KB) of %zu usable\n",
                 floor, floor * (PAGE_SIZE / 1024), usable);
     }
-    if (selftest)
+    if (selftest) {
         pmm_floor_test();
+        pmm_reservation_test();
+    }
 
     /* 啟動計時器(1000Hz,一個 tick 1ms)與排程器,再開中斷。
        timer_init 只是設定硬體,中斷要到 arch_irq_enable 才會真的進來。

@@ -25,12 +25,20 @@ static void check_locked(void) {
         if(i<hint)assert(bit_test(i));
     }
     assert(freep==nfree && hint<=npages);
+#ifdef PMM_HAS_RESERVATIONS
+    assert(nreserved<=nfree);
+    if(check_floor&&floor_on)assert(nfree-nreserved>=floor_pages);
+#else
     if(check_floor&&floor_on)assert(nfree>=floor_pages);
+#endif
 }
 static void reset(size_t n, unsigned mask) {
     npages=n;bitmap=bits;refs=counts;mem_start=(uintptr_t)arena;
     memset(bits,0,sizeof(bits));memset(counts,0,sizeof(counts));
     nfree=0;hint=n;floor_on=0;floor_pages=0;floor_refusals=0;
+#ifdef PMM_HAS_RESERVATIONS
+    nreserved=0;
+#endif
     for(size_t i=0;i<n;i++) {
         if(i<32 && (mask&(1u<<i))){bit_set(i);refs[i]=1;}
         else {nfree++;if(hint==n)hint=i;}

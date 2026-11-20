@@ -230,6 +230,8 @@
 | release / acquire 屏障 | release / acquire memory barrier | 記憶體屏障:確保「之前的寫入」先被別的 CPU 看見(release),或「之後的讀取」不會提早(acquire) |
 | 撕裂寫入 | torn write | 一個大於 CPU 單次儲存寬度的值被拆成多道指令寫入,別的 CPU 可能讀到「一半新、一半舊」 |
 | CMPXCHG8B | Compare and Exchange 8 Bytes | x86 的 64 位元比較並交換指令;加上 lock 前綴時對所有 CPU 是一次完成的原子操作 |
+| 預留 | reservation | 先答應、之後才真正配置的頁;一般配置拿不到預留的頁,持有者兌現時一定拿得到 |
+| 完成點 | linearization point | 一個操作在這一刻「生效」;在這之前失敗,什麼狀態都沒有改變 |
 | UBSan | Undefined Behavior Sanitizer | 未定義行為檢查器:編譯器在執行時抓出有號數溢位等 C 語言未定義的行為 |
 | linker script | linker script | 連結器腳本:決定各區段的位址 |
 | lost wakeup | lost wakeup | 遺失的喚醒:喚醒發生在睡下去之前 |
@@ -7750,3 +7752,38 @@ Codex 審查 C3 的方案後(memory 訊息 156)分成兩段:C3.1 先在頁面配
 另外量到:一次 fork 風暴之後 kernel heap 多了約 980 頁(行程結構等),heap 從不把頁還給配置器 — 這部分列入 C3.2 的記帳範圍。回歸加入 `memhog=file`、`memhog=fork` 兩個情境(每架構 26 個)。
 
 **Codex 的 C3.1 審查**(`tests/static/REVIEW-C31-20261120.md`):以真的 `pmm.c`(只把關中斷的鎖換成 pthread)窮舉 25851 組位元圖 / 底線 / 請求(含碎片、0、`SIZE_MAX`)、8 條執行緒在底線附近搶 1000 輪、160000 次配置釋放混合,沒有找到繞過底線的路徑;三種突變(拿掉底線、差一、一般配置走應急)都被抓到。**找到一個真問題**:`pmm_free_count` 與新加的 `pmm_reserve_refusals` 不上鎖就讀配置時在鎖內更新的變數 — memhog 的量測執行緒在別顆 CPU 上讀,就是資料競爭(TSan 實際報出 4 筆)。整合 Codex 的補丁:三個查詢函式都在 `pmm_lk` 裡讀。`commit_change_locked` 在 `pstate_lk` 裡呼叫它們,層級 LK_PMM(90)高於 LK_PSTATE(20),順序合法;`proc.c` 的鎖說明同步更新。驗證:不加 `--fix-getters` 重跑探針全部通過(ASan / UBSan / TSan);負對照用未加鎖的版本跑 TSan,報出 `nfree` 與 `floor_refusals` 的資料競爭;三架構 QEMU 的 `selftest memtest stress`、`memhog=file`、`memhog=fork` 都通過,鎖順序檢查沒有報錯。
+
+## 第 53 步:C3.2 的設計與第 (a) 批 — pmm 的預留
+
+### 設計經過三輪審查
+
+C3.2(I-240 的分類記帳)的設計放在 `docs/design/C3.2-memory-accounting.md`,和 Codex 來回三輪才開工:
+
+- **第 1 版**:在 pmm 之外另算全系統總量(使用者已記帳 + kernel 佔用 + 固定的保留量)。Codex 的審查(`tests/static/REVIEW-C32-DESIGN-20261120.md`)證明它保證不了「承諾必兌現」:kernel heap 在自己的鎖裡長大,外面的計數永遠慢一步;計數的來源還互相重疊。
+- **第 2 版**:把實體保證放回唯一知道真相的地方 — pmm 本身。「承諾 n 頁」就是在 pmm 裡預留 n 頁,一般配置(含 kernel 自己的)拿不到預留的頁。每個行程的配額只是邏輯上的限制,不拿來推算實體用量。
+- **第 3 版**:Codex 指出第 2 版用 refcount 判斷寫入時複製(COW, Copy-On-Write)的頁該退誰的票是錯的(父先釋放時會退掉不屬於自己的票)。改成「每一筆映射一張票,只看自己的 PTE」:承諾了但還沒配置、或標著 COW 的映射持有一張票,獨佔的不持有。另外寫清楚底線與應急配置的兩條不變量、每個操作的完成點,以及 exec 用交易憑證而不是一個寬鬆的旗標。
+
+分四批做:(a) pmm 的預留;(b) 頁表的票、kernel 物件的記帳、`thread_prepare` / `thread_start`;(c) stack、映像、fork、exec;(d) ramfs。這一步只做 (a)。
+
+### 第 (a) 批:pmm 的預留
+
+- 新增 `nreserved`(已承諾、還沒配置的頁數)與兩條不變量:**N1** `nfree ≥ nreserved` 永遠成立 — 持有預留的一方兌現時一定拿得到頁;**N2** `nfree ≥ floor + nreserved` 在沒有應急配置欠帳時成立。
+- 一般配置與新的預留:之後 N2 仍要成立。應急配置(C3.1 的 `pmm_alloc_pages_reserve`):只要求 N1 — 可以吃進底線,不能吃進別人的預留。兌現一頁:`nfree` 與 `nreserved` 同時減一。檢查都寫成「先算未預留的空閒頁 `avail = nfree − nreserved`,再和底線、n 比較」,不做會溢位的加法。
+- 介面:`pmm_reserve(n)`、`pmm_unreserve(n)`(超過預留量是帳務錯誤 → panic,先判斷再改)、`pmm_alloc_reserved()`(一定成功)、`pmm_reserved_count()`、`pmm_snapshot()`(在同一把鎖裡讀出空閒、預留、底線、拒絕次數)。
+- 還沒有任何呼叫者使用預留:預留量為 0 時,行為與 C3.1 完全相同。
+- 速度:配置多一次減法;安全性:之後的批次接上之後,已承諾的頁在記憶體吃緊時仍然拿得到,行程不會在 page fault 時被終止。
+
+| 測試(三架構,`pmm_reservation_test`,排程器啟動前,結果確定) | 結果 |
+|---|---|
+| 預留剛好填滿「空閒 − 底線」;再多 1 頁被拒絕;0 頁成功不改狀態;超大的 n 被拒絕 | 通過(i386 預留 28243 頁) |
+| 預留滿了之後一般配置拿不到頁 | 通過 |
+| 應急配置把底線用完,停在「空閒 = 預留」 | 停在 4034 頁(i386,= 底線) |
+| 欠帳期間:新的預留與一般配置被拒絕,兌現 3 頁成功 | 通過 |
+| 還掉應急配置後仍拿不到(預留還佔著);放棄 1 頁預留後剛好能拿 1 頁;全部歸還後計數恢復 | 通過 |
+| **負對照**:一般配置不扣預留 | 「預留滿後再預留 1 頁被拒絕」的斷言失敗 |
+
+依 Codex 的要求,另外盤點了 kernel 一般配置的全部 36 個呼叫點(設計文件附錄 A):每一點都有失敗處理;panic、黑盒子、kprintf、訊號、watchdog、主控台、網路堆疊都不配置記憶體,行程結束的路徑只釋放 — 預留佔滿時 kernel 仍能收拾與診斷。
+
+名詞:預留(reservation)、寫入時複製(COW, Copy-On-Write)、完成點(linearization point,一個操作在這一刻「生效」,之前失敗就什麼都沒改)。
+
+**Codex 的第 (a) 批審查**(`tests/static/REVIEW-C32A-20261120.md`):以真的 `pmm.c` 跑 208895 次操作(其中 106504 次在應急欠帳狀態)、8 條執行緒搶最後幾張票 1000 輪加 160000 次一般 / 應急混合配置,零、溢位、啟用順序、碎片、參考計數、帳務錯誤(panic 前不改狀態)全部通過;五種突變(一般配置忽略預留、應急配置偷用預留、兌現不扣預留、啟用底線時忽略預留、預留不記帳)都被抓到。沒有需要修改產品的缺陷。另外指出:結束路徑上的 `stack_release` 把保護頁對映回去時可能配置中間表(既有契約),要在耗盡狀態下實測,列入 (b) 的驗收。整合後重跑 `probe_pmm_floor.py --suite reservations`、TSan 並行與原本的底線測試,全部通過。
