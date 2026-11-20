@@ -27,6 +27,8 @@
 #include "arch.h"
 #include "panic.h"
 #include "sync.h"
+#include "spinlock.h"     /* LOCK_ORDER_LEARN */
+#include "kprintf.h"
 
 void sem_init(struct semaphore *s, int count)
 {
@@ -103,12 +105,58 @@ static void propagate_priority(struct mutex *m, int prio)
     }
 }
 
-void mutex_init(struct mutex *m)
+void mutex_init(struct mutex *m, const char *name, unsigned rank)
 {
     m->owner = NULL;
     m->inherit = 1;
     m->wq.head = m->wq.tail = NULL;
     m->next_held = NULL;
+    m->name = name;
+    m->rank = rank;
+}
+
+#if LOCK_ORDER_LEARN
+struct mx_pair { const char *outer, *inner; unsigned ro, ri, count; };
+static struct mx_pair mx_learned[64];
+static unsigned mx_nlearned, mx_bad;
+#endif
+
+void mutex_order_report(void)
+{
+#if LOCK_ORDER_LEARN
+    kprintf("mutex order: %u distinct nesting(s), %u violating acquisition(s)\n", mx_nlearned, mx_bad);
+    for (unsigned i = 0; i < mx_nlearned; i++)
+        kprintf("  MXORDER %s holding \"%s\"(%u) then \"%s\"(%u) x%u\n",
+                mx_learned[i].ro > mx_learned[i].ri ||
+                (mx_learned[i].ro == mx_learned[i].ri && mx_learned[i].ro != MX_INODE) ? "BAD" : "ok ",
+                mx_learned[i].outer, mx_learned[i].ro, mx_learned[i].inner, mx_learned[i].ri, mx_learned[i].count);
+#endif
+}
+
+/* mutex 的層級:要拿 m 時,自己持有的每一個都必須比它低;只有 inode 可以同類巢狀(見 sync.h)。
+   呼叫時持有排程器的鎖 */
+static void mutex_order_check(struct thread *self, struct mutex *m)
+{
+    if (!m->name)
+        panic("mutex %p: locked before mutex_init (no name / rank)", (void *)m);
+    for (struct mutex *h = *(struct mutex **)thread_held_list(self); h; h = h->next_held) {
+        int bad = h->rank > m->rank || (h->rank == m->rank && m->rank != MX_INODE);
+#if LOCK_ORDER_LEARN
+        unsigned i;
+        for (i = 0; i < mx_nlearned; i++)
+            if (mx_learned[i].outer == h->name && mx_learned[i].inner == m->name)
+                break;
+        if (i < mx_nlearned)
+            mx_learned[i].count++;
+        else if (mx_nlearned < 64)
+            mx_learned[mx_nlearned++] = (struct mx_pair){ h->name, m->name, h->rank, m->rank, 1 };
+        mx_bad += bad;
+#else
+        if (bad)
+            panic("mutex order: thread %d (%s) locking \"%s\" (rank %u) while holding \"%s\" (rank %u)",
+                  thread_id(), thread_name(), m->name, m->rank, h->name, h->rank);
+#endif
+    }
 }
 
 void mutex_lock(struct mutex *m)
@@ -118,6 +166,7 @@ void mutex_lock(struct mutex *m)
 
     if (m->owner == self)
         panic("mutex: recursive lock by thread %d (%s)", thread_id(), thread_name());
+    mutex_order_check(self, m);
     while (m->owner) {
         /*
          * 優先權繼承:持有鎖的人優先權比我低時,把它暫時提高到和我一樣。

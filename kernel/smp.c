@@ -26,7 +26,7 @@ static volatile int phase = PH_WAIT;
 
 /* ---- 處理器間中斷與跨 CPU 呼叫 ---- */
 
-static struct spinlock call_lk = SPINLOCK_INIT("smp-call");   /* 同一時間只進行一個跨 CPU 呼叫 */
+static struct spinlock call_lk = SPINLOCK_INIT("smp-call", LK_SMP_CALL);   /* 同一時間只進行一個跨 CPU 呼叫 */
 static void (*volatile call_fn)(void *);
 static void *volatile call_arg;
 static volatile int call_acks;               /* 已經執行完 call_fn 的 CPU 數 */
@@ -112,7 +112,7 @@ void smp_stop_others(void)
 /* ---- 並行測試用的共用資料 ---- */
 #define TEST_ROUNDS 20000u
 #define TEST_ITEMS  (RING_SIZE - 1)
-static struct spinlock test_lk = SPINLOCK_INIT("smp-test");
+static struct spinlock test_lk = SPINLOCK_INIT("smp-test", LK_SMP_TEST);
 static volatile unsigned long locked_counter;        /* 持有鎖時遞增:不應該少 */
 static volatile unsigned long racy_counter;          /* 不上鎖遞增:預期會少(示範用) */
 static struct ring test_ring;                        /* 開機的 CPU 放入,所有 CPU 一起取 */

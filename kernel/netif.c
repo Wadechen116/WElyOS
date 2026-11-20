@@ -49,7 +49,7 @@ struct pinger {
     uint16_t id, seq;
 };
 
-static struct mutex net_lk = MUTEX_INIT;
+static struct mutex net_lk = MUTEX_INIT("net", MX_NET);
 static struct netdev *nic;
 static struct netif nif;
 static int up;

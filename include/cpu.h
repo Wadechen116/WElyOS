@@ -22,6 +22,7 @@
 #define MAX_CPUS 8
 
 struct thread;
+struct spinlock;
 struct vm_space;
 
 struct cpu {
@@ -39,6 +40,7 @@ struct cpu {
     int in_irq;                  /* 正在中斷處理程式中 */
     volatile int need_resched;   /* 需要重新排程(可由別顆 CPU 設定) */
     int nlocks;                  /* 這顆 CPU 目前持有幾把 spinlock(檢查用) */
+    struct spinlock *held[8];    /* 持有中的 spinlock(依取得的順序;檢查鎖的層級用,見 spinlock.h) */
     struct thread *current;      /* 正在執行的執行緒;NULL = 排程器尚未啟動 */
     struct thread *idle;         /* 這顆 CPU 的 idle 執行緒 */
     struct thread *zombie;       /* 剛在這顆 CPU 上結束、等待回收的執行緒 */

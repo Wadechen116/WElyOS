@@ -191,8 +191,8 @@ struct netdev *virtio_net_probe(uintptr_t base, uintptr_t stride, unsigned slots
         v->reg = (volatile uint32_t *)(base + i * stride);
         if (rd(v, R_MAGIC) != 0x74726976u || rd(v, R_DEVICE_ID) != 1 || rd(v, R_VERSION) != 2)
             continue;                        /* 裝置編號 1 = 網路卡 */
-        mutex_init(&v->rx_lock);
-        mutex_init(&v->tx_lock);
+        mutex_init(&v->rx_lock, "virtio-net-rx", MX_DEVICE);
+        mutex_init(&v->tx_lock, "virtio-net-tx", MX_DEVICE);
         v->dev.name = "virtio-net";
         v->dev.send = vnet_send;
         v->dev.recv = vnet_recv;

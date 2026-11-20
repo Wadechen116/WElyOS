@@ -30,6 +30,8 @@ struct rq_node {
     volatile unsigned queued;        /* ring:1 = 在佇列中、尚未被取走(見 runq_ring.c) */
     volatile unsigned where;         /* ring:是否串在溢出串列上 */
     int ovf_prio;                    /* ring:串在哪一條溢出串列 */
+    const volatile void *volatile tkt_where;  /* ring:目前有效的那張號碼牌在哪裡(哪個環、插隊位或溢出串列) */
+    volatile unsigned tkt_seq;       /* ring:有效的牌在環裡的序號(環的 tail 計數器,不會重複) */
 };
 
 void runq_init(void);

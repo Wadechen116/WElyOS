@@ -22,7 +22,7 @@
 #include "panic.h"
 
 /* 保護位元圖與相關計數。多顆 CPU 可能同時配置,只關中斷已經不夠 */
-static struct spinlock pmm_lk = SPINLOCK_INIT("pmm");
+static struct spinlock pmm_lk = SPINLOCK_INIT("pmm", LK_PMM);
 
 /* linker script 定義的符號:kernel 映像的範圍。只取位址,不讀內容 */
 extern char __kernel_start[], __kernel_end[];

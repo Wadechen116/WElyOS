@@ -167,13 +167,13 @@ static void idle_worker(long arg)
 static int mode_proc(void)
 {
     struct line l = { .len = 0 };
-    char *echo_argv[] = { "echo", "  [user] hello from a spawned /bin/echo:", "one", "two", 0 };
+    char *echo_argv[] = { "args", "  [user] hello from a spawned /bin/args:", "one", "two", 0 };
     char *cat_argv[] = { "cat", "/etc/motd", 0 };
     char *ls_argv[] = { "ls", "/bin", 0 };
     long pid, code;
 
-    /* 1. 建立行程並等待。echo 的結束碼是它收到的參數個數 */
-    pid = sys_spawn("/bin/echo", echo_argv);
+    /* 1. 建立行程並等待。args 的結束碼是它收到的參數個數 */
+    pid = sys_spawn("/bin/args", echo_argv);
     if (pid <= 0)
         return 201;
     code = sys_wait(pid);
@@ -202,8 +202,8 @@ static int mode_proc(void)
     sys_close(1);
     if (sys_open("/out.txt", O_CREAT | O_WRONLY | O_TRUNC) != 1)   /* 最小的空位就是 1 */
         return 210;
-    char *redir_argv[] = { "echo", "captured", "output", 0 };
-    pid = sys_spawn("/bin/echo", redir_argv);
+    char *redir_argv[] = { "args", "captured", "output", 0 };
+    pid = sys_spawn("/bin/args", redir_argv);
     code = sys_wait(pid);
     if (sys_close(1) != 0)                               /* echo 寫進去的那個檔案 */
         return 2110;
@@ -342,8 +342,8 @@ static int mode_fork(void)
     /* 2. 傳統的 fork + exec:子行程把自己換成另一個程式 */
     pid = sys_fork();
     if (pid == 0) {
-        char *argv[] = { "echo", "  [user] fork + exec:", "this is /bin/echo", 0 };
-        sys_exec("/bin/echo", argv);
+        char *argv[] = { "args", "  [user] fork + exec:", "this is /bin/args", 0 };
+        sys_exec("/bin/args", argv);
         sys_exit(99);                            /* exec 失敗才會到這裡 */
     }
     if (sys_wait(pid) != 3)
@@ -2036,11 +2036,11 @@ static int mode_disk(void)
         sys_statfs("/nope", &fr) != -E_NOENT)
         return 803;
 
-    /* 把 /bin/echo 複製到磁碟上 */
+    /* 把 /bin/args 複製到磁碟上(結束碼 = 參數個數,看得出確實執行了磁碟上的這一份) */
     sys_unlink("/disk/echo-test");                       /* 上次測試被打斷時留下的 */
     if (sys_statfs("/disk", &f0) != 0)
         return 804;
-    in = sys_open("/bin/echo", O_RDONLY);
+    in = sys_open("/bin/args", O_RDONLY);
     out = sys_open("/disk/echo-test", O_CREAT | O_WRONLY | O_TRUNC);
     if (in < 0 || out < 0)
         return 805;
@@ -2064,7 +2064,7 @@ static int mode_disk(void)
 
     /* 從磁碟執行它 */
     long pid = sys_spawn("/disk/echo-test", argv);
-    if (pid <= 0 || sys_wait(pid) != 2)                  /* echo 的結束碼是它收到的參數個數 */
+    if (pid <= 0 || sys_wait(pid) != 2)                  /* args 的結束碼是它收到的參數個數 */
         return 809;
     /* 正在執行的程式檔不可修改的規則,在磁碟上也一樣(這裡它已經結束,所以可以刪除) */
     if (sys_sync() != 0)
@@ -2347,8 +2347,8 @@ static int mode_pipe(void)
     if (sys_dup2(fds[1], 1) != 1)
         return 422;
     sys_close(fds[1]);
-    char *argv[] = { "echo", "captured", "by", "a", "pipe", 0 };
-    pid = sys_spawn("/bin/echo", argv);
+    char *argv[] = { "args", "captured", "by", "a", "pipe", 0 };
+    pid = sys_spawn("/bin/args", argv);
     /* 換回來;同時也關掉了我們手上的寫端 — 沒換成功的話,下面的讀取永遠等不到結尾 */
     if (sys_dup2(10, 1) != 1)
         return 423;
@@ -2553,10 +2553,10 @@ static int umain(long mode)
         return mode_proc();
 
     case UMODE_EXEC: {
-        /* 成功的話不會返回:這個行程接下來執行的是 /bin/echo,
-           結束碼也由它決定(echo 回傳它收到的參數個數) */
-        char *argv[] = { "echo", "  [user] this line is printed by /bin/echo after exec,", "same pid", 0 };
-        long er = sys_exec("/bin/echo", argv);
+        /* 成功的話不會返回:這個行程接下來執行的是 /bin/args,
+           結束碼也由它決定(args 回傳它收到的參數個數) */
+        char *argv[] = { "args", "  [user] this line is printed by /bin/args after exec,", "same pid", 0 };
+        long er = sys_exec("/bin/args", argv);
         return er < 0 ? 1 : 2;                           /* 走到這裡表示 exec 失敗(不論它回傳什麼) */
     }
 

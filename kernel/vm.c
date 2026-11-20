@@ -34,7 +34,7 @@
 
 /* 保護 kernel 頁表、所有位址空間的頁表與 ASID 的分配。
    持有期間可能再取得 pmm 的鎖(配置表格時),順序固定為 vm -> pmm */
-static struct spinlock vm_lk = SPINLOCK_INIT("vm");
+static struct spinlock vm_lk = SPINLOCK_INIT("vm", LK_VM);
 
 #define ENTRIES   (1u << MMU_BITS)           /* 每個表格的項目數 */
 #define IDX_MASK  (ENTRIES - 1)

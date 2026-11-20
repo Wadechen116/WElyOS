@@ -123,7 +123,7 @@ struct blkdev *arch_blk_probe(void)
 {
     uint16_t id[256];
 
-    mutex_init(&ata_lock);
+    mutex_init(&ata_lock, "ata", MX_DEVICE);
     if (inb(ATA_CMD) == 0xFF)
         return NULL;                                 /* 匯流排上什麼都沒有 */
     outb(ATA_CTRL, 0x02);                            /* 不要發中斷:我們用輪詢 */

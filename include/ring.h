@@ -74,6 +74,31 @@ static inline void *ring_take(struct ring *r)
     }
 }
 
+/* 取出最早放入的一個,並告訴呼叫者它是第幾個放入的(*seq = 當時的 head 計數器)。
+   同一個環裡,序號在「這一格被取走」之前不會被別的內容再用到:環最多 RING_SIZE 格,
+   tail 不可能超過 head + RING_SIZE,所以序號相同就代表是同一次放入 */
+static inline void *ring_take_seq(struct ring *r, uint32_t *seq)
+{
+    for (;;) {
+        uint32_t h = __atomic_load_n(&r->head, __ATOMIC_ACQUIRE);
+        uint32_t t = __atomic_load_n(&r->tail, __ATOMIC_ACQUIRE);
+        if (h == t)
+            return NULL;
+        void *p = __atomic_load_n(&r->slot[h & RING_MASK], __ATOMIC_RELAXED);
+        if (__atomic_compare_exchange_n(&r->head, &h, h + 1, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            *seq = h;
+            return p;
+        }
+    }
+}
+
+/* 下一個放入的會拿到的序號(僅擁有者;和 ring_push 搭配,先記下再放入) */
+static inline uint32_t ring_next_seq(struct ring *r)
+{
+    return __atomic_load_n(&r->tail, __ATOMIC_RELAXED);
+}
+
 /* 偷看最早放入的一個,不取出。結果只是參考(回傳時可能已經被取走) */
 static inline void *ring_peek(struct ring *r)
 {

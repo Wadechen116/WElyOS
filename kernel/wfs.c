@@ -333,8 +333,9 @@ static int bitmap_op(uint32_t no, int set, int value)
     return old;
 }
 
-/* 配置一個資料區塊,回傳編號;沒有空間(或出錯)回傳 0 */
-static uint32_t balloc(void)
+/* 配置一個資料區塊,回傳編號。回傳 0 時看 *err:0 = 沒有空間;-E_IO = 位元圖讀不到
+   (第 50 步:以前兩者都回報成「沒有空間」— 讀不到被當成「沒有」) */
+static uint32_t balloc(int *err)
 {
     uint32_t span = sb.nblocks - sb.data_start;
 
@@ -343,8 +344,10 @@ static uint32_t balloc(void)
     for (uint32_t i = 0; i < span; i++) {
         uint32_t no = sb.data_start + (balloc_hint + i) % span;
         int used = bitmap_op(no, 0, 0);
-        if (used < 0)
+        if (used < 0) {
+            *err = -E_IO;
             return 0;
+        }
         if (!used) {
             bitmap_op(no, 1, 1);
             balloc_hint = (balloc_hint + i + 1) % span;
@@ -429,11 +432,13 @@ static struct wnode *nget(uint32_t inum)
     return n;
 }
 
-/* 配置一個新的 inode;沒有空位回傳 NULL */
-static struct wnode *ialloc(int type, uint32_t parent)
+/* 配置一個新的 inode。回傳 NULL 時看 *err:-E_NOSPC = 沒有空位;-E_IO = 讀寫不到
+   (第 50 步:以前讀不到 inode 表也回報成「沒有空位」) */
+static struct wnode *ialloc(int type, uint32_t parent, int *err)
 {
     struct dinode d;
 
+    *err = -E_IO;
     for (uint32_t i = 0; i < sb.ninodes; i++) {
         uint32_t inum = (ialloc_hint + i) % sb.ninodes;
         if (inum == 0 || nodes[inum].loaded)
@@ -452,8 +457,9 @@ static struct wnode *ialloc(int type, uint32_t parent)
             return NULL;
         ialloc_hint = inum + 1;
         free_inodes--;
-        return nget(inum);
+        return nget(inum);                       /* 剛寫進去的一定讀得到(在快取裡) */
     }
+    *err = -E_NOSPC;
     return NULL;
 }
 
@@ -476,7 +482,7 @@ static uint32_t bmap(struct wnode *n, uint32_t fb, int alloc, int *err)
     *err = 0;
     if (fb < NDIRECT) {
         no = n->d.addr[fb];
-        if (no == 0 && alloc && (no = balloc()) != 0) {
+        if (no == 0 && alloc && (no = balloc(err)) != 0) {
             struct buf *z = bget(no, 0);         /* 新的區塊一定清 0:不可以讓人讀到磁碟上舊的內容 */
             if (!z) {
                 bfree(no);
@@ -489,7 +495,7 @@ static uint32_t bmap(struct wnode *n, uint32_t fb, int alloc, int *err)
         }
     } else if (fb < MAX_FBLOCKS) {
         if (n->d.indirect == 0) {
-            if (!alloc || (no = balloc()) == 0)
+            if (!alloc || (no = balloc(err)) == 0)
                 return 0;
             struct buf *z = bget(no, 0);
             if (!z) {
@@ -512,7 +518,7 @@ static uint32_t bmap(struct wnode *n, uint32_t fb, int alloc, int *err)
         }
         uint32_t *tab = (uint32_t *)ib->data;
         no = tab[fb - NDIRECT];
-        if (no == 0 && alloc && (no = balloc()) != 0) {
+        if (no == 0 && alloc && (no = balloc(err)) != 0) {
             struct buf *z = bget(no, 0);
             if (!z) {
                 bfree(no);
@@ -817,11 +823,11 @@ static int wfs_create(struct inode *dir, const char *name, int type, struct inod
     if (type != I_FILE && type != I_DIR)
         return -E_INVAL;                         /* 裝置節點只存在於記憶體檔案系統 */
     mutex_lock(&wfs_lk);
-    n = fs_failed ? NULL : ialloc(type, d->inum);
+    n = fs_failed ? NULL : ialloc(type, d->inum, &err);
     if (fs_failed) {
         err = -E_IO;                             /* 唯讀:見檔頭「寫入失敗之後」 */
     } else if (!n) {
-        err = -E_NOSPC;
+        /* err 由 ialloc 給:沒有空位,或讀不到 inode 表 */
     } else if ((err = dir_add(d, name, n->inum)) != 0) {
         n->d.type = 0;                           /* 目錄放不下:把剛配置的 inode 還回去 */
         dinode_rw(n->inum, &n->d, 1);
@@ -893,6 +899,7 @@ static int wfs_unlink(struct inode *dir, const char *name, struct inode **victim
 struct list_arg {
     struct dirent *out;
     uint64_t next;
+    int err;                                     /* 這一筆指向的 inode 讀不到(或不存在) */
 };
 
 static int list_fn(struct wdirent *e, uint64_t slot, void *arg)
@@ -904,14 +911,20 @@ static int list_fn(struct wdirent *e, uint64_t slot, void *arg)
     struct wnode *n = nget(e->inum);
     memset(la->out, 0, sizeof(*la->out));
     memcpy(la->out->name, e->name, FS_NAME_MAX);
-    la->out->type = n ? (uint32_t)n->d.type : 0;
     la->next = slot + 1;
+    if (!n) {
+        /* 第 50 步:以前回報成「類型 0」的一般項目,呼叫者看不出出了錯。
+           現在回報 -E_IO;位置照樣往後移,呼叫者可以印出錯誤後繼續列下一筆 */
+        la->err = -E_IO;
+        return 1;
+    }
+    la->out->type = (uint32_t)n->d.type;
     return 1;
 }
 
 static int wfs_readdir(struct inode *dir, uint64_t *pos, struct dirent *out)
 {
-    struct list_arg la = { out, 0 };
+    struct list_arg la = { out, 0, 0 };
 
     mutex_lock(&wfs_lk);
     int r = dir_scan(wn(dir), *pos, list_fn, &la);
@@ -921,15 +934,16 @@ static int wfs_readdir(struct inode *dir, uint64_t *pos, struct dirent *out)
     if (r == 0)
         return 1;                                /* 沒有更多了 */
     *pos = la.next;
-    return 0;
+    return la.err;
 }
 
+/* 1 = 空的,0 = 不是空的,負值 = 讀不到(不知道)— 見 fs.h 的 is_empty */
 static int wfs_is_empty(struct inode *dir)
 {
     mutex_lock(&wfs_lk);
     int r = dir_scan(wn(dir), 0, used_fn, NULL);
     mutex_unlock(&wfs_lk);
-    return r == 0;
+    return r < 0 ? r : r == 0;
 }
 
 static long wfs_read(struct inode *in, void *buf, size_t n, uint64_t off)
@@ -1074,6 +1088,7 @@ struct check {
     uint32_t *queue;                             /* 還沒走過的目錄 */
     uint32_t qhead, qtail;
     unsigned fixes;
+    int err;                                     /* 走訪途中讀不到東西:整個檢查放棄,不做任何修正 */
 };
 
 static int claim(struct check *c, uint32_t no)
@@ -1093,7 +1108,13 @@ static int check_entry(struct wdirent *e, uint64_t slot, void *arg)
     (void)slot;
     if (e->inum == 0)
         return 0;
-    int ok = e->inum < sb.ninodes && e->name[0] && dinode_rw(e->inum, &d, 0) == 0 &&
+    /* 第 50 步:讀不到它指向的 inode 時,以前會把這筆名稱當成「指向不存在的 inode」清掉 —
+       一次暫時的讀取錯誤就讓修復刪掉一個正常檔案的名稱。讀不到就是「不知道」:停下整個檢查 */
+    if (e->inum < sb.ninodes && e->name[0] && dinode_rw(e->inum, &d, 0) != 0) {
+        c->err = -E_IO;
+        return 1;
+    }
+    int ok = e->inum < sb.ninodes && e->name[0] &&
              (d.type == I_FILE || d.type == I_DIR) &&
              !(d.type == I_DIR && c->refs[e->inum] > 0);     /* 目錄只能有一個名稱 */
     if (!ok) {
@@ -1156,7 +1177,7 @@ static int wfs_check(int at_mount)
     c.queue[c.qtail++] = ROOT_INUM;
     while (c.qhead < c.qtail) {
         struct wnode *dir = nget(c.queue[c.qhead++]);
-        if (!dir || dir_scan(dir, 0, check_entry, &c) < 0)
+        if (!dir || dir_scan(dir, 0, check_entry, &c) < 0 || c.err)
             goto out;
     }
 
@@ -1415,7 +1436,7 @@ int wfs_mount(struct blkdev *dev, struct inode **root_out)
     int err = -E_IO, formatted = 0;
     uint64_t dev_blocks = dev->sectors / BSECT;
 
-    mutex_init(&wfs_lk);
+    mutex_init(&wfs_lk, "wfs", MX_WFS);
     if (mounted)
         return -E_BUSY;
     if (dev_blocks < WFS_MIN_DEV_BLOCKS)
@@ -1592,6 +1613,7 @@ void wfs_stats(struct wfs_stats *st)
         return;
     mutex_lock(&wfs_lk);
     st->mounted = 1;
+    st->data_start = sb.data_start;
     st->blocks = sb.nblocks;
     st->free_blocks = free_blocks;
     st->inodes = sb.ninodes - 1;
@@ -1698,10 +1720,11 @@ int wfs_test_damage(const char *victim_name)
     struct wnode *root = nget(ROOT_INUM);
     if (!root || dir_scan(root, 0, find_fn, &fa) != 1)
         goto out;
+    int aerr = 0;
     for (int i = 0; i < 3; i++)
-        if (!balloc())
+        if (!balloc(&aerr))
             goto out;
-    struct wnode *orphan = ialloc(I_FILE, ROOT_INUM);
+    struct wnode *orphan = ialloc(I_FILE, ROOT_INUM, &aerr);
     if (!orphan || file_write(orphan, "orphan", 6, 0) != 6)
         goto out;
     orphan->loaded = 0;

@@ -1,7 +1,9 @@
 /*
  * echo.c - 把參數印出來(以空白分隔,最後換行)
  *
- * 回傳值是收到的參數個數(含程式名稱),測試用它確認參數有正確傳到。
+ * 成功回傳 0;寫不出去回傳 1。
+ * (第 50 步以前回傳參數個數給測試用,結果在 shell 裡每一個 echo 都被當成失敗;
+ *  那個用途改由 /bin/args 負責,見 args.c)
  */
 #include "ulib.h"
 
@@ -18,7 +20,8 @@ int main(int argc, char **argv)
             buf[len++] = *s;
     }
     buf[len++] = '\n';
+    (void)argc;
     if (sys_write(1, buf, len) != (long)len)
-        return 255;                              /* 寫不出去(例如管線另一端已關閉):不是參數個數,明確的失敗 */
-    return argc;
+        return 1;                                /* 寫不出去(例如管線另一端已關閉、磁碟滿了) */
+    return 0;
 }

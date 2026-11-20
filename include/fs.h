@@ -43,10 +43,13 @@ struct inode_ops {
     /* 目錄:多一個名稱 name 指向「已經存在」的 inode in(同一個檔案系統)。
        in 是目錄時,它的上層目錄改成 dir。改名與硬連結都靠它。可以不提供(NULL) */
     int  (*link)(struct inode *dir, const char *name, struct inode *in);
-    /* 目錄:從位置 *pos 起的下一筆紀錄,並把 *pos 移到它之後。0 = 成功,1 = 已經沒有了。
+    /* 目錄:從位置 *pos 起的下一筆紀錄,並把 *pos 移到它之後。0 = 成功,1 = 已經沒有了,
+       負值 = 錯誤。錯誤若只關於「這一筆」(例如它指向的 inode 讀不到),*pos 照樣移到它之後,
+       呼叫者可以回報後繼續列下一筆。
        位置的意義由檔案系統自己決定(從 0 開始);呼叫者只負責原樣保存 */
     int  (*readdir)(struct inode *dir, uint64_t *pos, struct dirent *out);
-    /* 目錄:是否沒有任何紀錄 */
+    /* 目錄:是否沒有任何紀錄。1 = 空的,0 = 不是,負值 = 讀不到(不知道;呼叫者必須當成失敗,
+       不可以當成「空的」或「不是空的」之一) */
     int  (*is_empty)(struct inode *dir);
     /* 檔案:從 off 開始讀 / 寫 n 個位元組;回傳實際的數量 */
     long (*read)(struct inode *in, void *buf, size_t n, uint64_t off);
@@ -209,6 +212,7 @@ struct wfs_stats {
     unsigned long scrub_blocks;  /* 巡檢核對過的區塊數(累計) */
     int sb_restored;             /* 這次掛載時,superblock 是從備份救回來的 */
     unsigned long disk_reads, disk_writes;   /* 實際對磁碟讀寫的區塊數 */
+    uint32_t data_start;         /* 第一個資料區塊(之前是 superblock、位元圖、inode 表) */
 };
 uint32_t wfs_probe(struct blkdev *dev);      /* 不掛載,只回報檔案系統佔幾個區塊(0 = 認不得的內容) */
 int  wfs_mount(struct blkdev *dev, struct inode **root);

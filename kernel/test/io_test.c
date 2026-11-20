@@ -485,6 +485,106 @@ int wt = vfs_unlink("/disk/wtest");              /* 上一階段建立的;內容
     }
 }
 
+/*
+ * 第 12~15 階段(第 50 步,D5 / ISSUES N-003):使用者程式在「寫進快取成功、寫回磁碟失敗」時
+ * 必須回報失敗。以前只在 kernel 裡直接呼叫 VFS 驗證過 fsync 會回報錯誤,從沒有讓真的程式
+ * 在這種情況下跑過 — 程式若忽略 fsync / close 的結果,使用者會以為檔案存好了。
+ *   12  cp      複製到磁碟,寫回失敗           -> 結束碼不是 0
+ *   13  sh      「echo ... > 磁碟上的檔案」      -> 整行的結束碼不是 0
+ *   14  tftp    下載到磁碟(需要網路)          -> 結束碼不是 0
+ *   15  對照:磁碟正常時三者都成功,內容正確
+ * 每一階段之後檔案系統都轉為唯讀(寫入失敗過),下一次開機的檢查讓它恢復,所以各自一次開機。
+ */
+static int run_prog(const char *path, const char *const argv[])
+{
+    int pid = proc_spawn(path, argv);
+    KASSERT(pid > 0);
+    return proc_wait(pid);
+}
+
+/* 先在磁碟上建好(空的)目的檔並同步:之後注入的寫入失敗只會落在「寫回內容」這一步,
+   而不是建立檔案的時候(建立本身也要寫磁碟,那條路徑已由第 4 階段涵蓋) */
+static void precreate(const char *path)
+{
+    struct file *f;
+    KASSERT(vfs_open(path, O_CREAT | O_WRONLY | O_TRUNC, &f) == 0);
+    vfs_close(f);
+    KASSERT(vfs_sync() == 0);
+}
+
+static void write_tmp(const char *path, const char *text)
+{
+    int mk = vfs_mkdir("/tmp");                  /* 開機到這裡時 /tmp 不一定已經建立 */
+    KASSERT(mk == 0 || mk == -E_EXIST);
+    struct file *f;
+    size_t len = strlen(text);
+    KASSERT(vfs_open(path, O_CREAT | O_WRONLY | O_TRUNC, &f) == 0);
+    KASSERT(vfs_write(f, text, len) == (long)len);
+    vfs_close(f);
+}
+
+/* 在「資料區塊寫不進去」的情況下執行一個程式,回傳它的結束碼;之後檔案系統必須已經轉為唯讀。
+   metadata(inode 表、位元圖)照常寫得進去:開檔、截斷都會成功,失敗只發生在內容寫回的時候 —
+   也就是 write 回報成功、資料還在快取裡,要到 fsync / close 才知道沒存好的那種情況 */
+static int run_with_write_faults(const char *path, const char *const argv[])
+{
+    struct wfs_stats s;
+    unsigned long n0 = blk_fault_count();
+
+    wfs_stats(&s);
+    blk_fault_set_write_from((uint64_t)s.data_start * (PAGE_SIZE / BLK_SECTOR));
+    int rc = run_prog(path, argv);
+    blk_fault_set(0, 0);
+    wfs_stats(&s);
+    KASSERT(blk_fault_count() > n0 && s.failed);     /* 確實寫回過、而且失敗了 */
+    return rc;
+}
+
+void disk_user_stage_test(const char *cmd)
+{
+    struct wfs_stats s;
+    struct stat st;
+
+    wfs_stats(&s);
+    if (cmdline_has(cmd, "disktest=12")) {
+        KASSERT(s.mounted && !s.failed);
+        precreate("/disk/cpfail");
+        int rc = run_with_write_faults("/bin/cp", (const char *const[]){ "cp", "/bin/echo", "/disk/cpfail", NULL });
+        kprintf("disktest 12: cp to the disk while write-back failed exited with %d\n", rc);
+        KASSERT(rc != 0);
+    } else if (cmdline_has(cmd, "disktest=13")) {
+        KASSERT(s.mounted && !s.failed);
+        precreate("/disk/shfail");
+        write_tmp("/tmp/save.sh", "echo saved > /disk/shfail\n");
+        int rc = run_with_write_faults("/bin/sh", (const char *const[]){ "sh", "/tmp/save.sh", NULL });
+        kprintf("disktest 13: the shell redirect to the disk while write-back failed exited with %d\n", rc);
+        KASSERT(rc != 0);
+    } else if (cmdline_has(cmd, "disktest=14")) {
+        KASSERT(s.mounted && !s.failed);
+        precreate("/disk/tfail");
+        int rc = run_with_write_faults("/bin/tftp", (const char *const[]){ "tftp", "etc/motd", "/disk/tfail", NULL });
+        kprintf("disktest 14: tftp to the disk while write-back failed exited with %d\n", rc);
+        KASSERT(rc != 0);
+    } else if (cmdline_has(cmd, "disktest=15")) {
+        KASSERT(s.mounted && !s.failed);
+        /* 對照:同樣三個命令在磁碟正常時都成功,檔案確實存在 */
+        write_tmp("/tmp/save.sh", "echo saved > /disk/shfail\n");
+        int r1 = run_prog("/bin/cp", (const char *const[]){ "cp", "/bin/echo", "/disk/cpfail", NULL });
+        int r2 = run_prog("/bin/sh", (const char *const[]){ "sh", "/tmp/save.sh", NULL });
+        int r3 = run_prog("/bin/tftp", (const char *const[]){ "tftp", "etc/motd", "/disk/tfail", NULL });
+        kprintf("disktest 15: exit codes cp %d, sh %d, tftp %d\n", r1, r2, r3);
+        KASSERT(r1 == 0 && r2 == 0 && r3 == 0);
+        struct stat src;
+        KASSERT(vfs_stat("/bin/echo", &src) == 0 && vfs_stat("/disk/cpfail", &st) == 0 && st.size == src.size);
+        KASSERT(vfs_stat("/disk/shfail", &st) == 0 && st.size == 6);         /* "saved\n" */
+        KASSERT(vfs_stat("/disk/tfail", &st) == 0 && st.size > 0);
+        KASSERT(vfs_unlink("/disk/cpfail") == 0 && vfs_unlink("/disk/shfail") == 0 && vfs_unlink("/disk/tfail") == 0);
+        wfs_stats(&s);
+        KASSERT(!s.failed);
+        kprintf("disktest 15: with a healthy disk cp, the shell redirect and tftp all succeeded\n");
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* 檔案系統的示範與測試(kernel 內部直接呼叫 VFS)                        */
 /* ------------------------------------------------------------------ */

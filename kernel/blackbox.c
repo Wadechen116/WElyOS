@@ -25,7 +25,7 @@ static uint32_t next_seq = 1;
 static unsigned next_slot;                   /* 下一筆要寫在哪一格 */
 static uint32_t this_boot;
 static int enabled;
-static struct mutex bb_lock = MUTEX_INIT;
+static struct mutex bb_lock = MUTEX_INIT("blackbox", MX_BLACKBOX);
 
 static int rec_valid(const struct bb_record *r)
 {

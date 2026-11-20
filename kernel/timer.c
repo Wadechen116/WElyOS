@@ -55,7 +55,7 @@ uint64_t timer_ticks(void)
 
 /* 晚到的紀錄(見 timer.h)。中斷處理程式(各 CPU 都可能)寫入,以一把 spinlock 保護;只有幾條指令 */
 static struct timer_stats tstats;
-static struct spinlock tstat_lk = SPINLOCK_INIT("timer-stats");
+static struct spinlock tstat_lk = SPINLOCK_INIT("timer-stats", LK_TSTAT);
 static const unsigned bucket_lo[TIMER_BURST_BUCKETS] = { 2, 3, 4, 6, 7, 10 };
 
 void timer_note_catchup(int n, int resynced)

@@ -18,7 +18,7 @@ struct proc *procs;                  /* 所有行程(含 zombie);上鎖的規則
  *     (它查詢頁面配置器的兩個數字 pmm_free_count / pmm_total_pages — 那兩個函式只是讀變數,不上鎖)。
  * 新增持有這把鎖的程式時必須維持這個清單;目前沒有機制在執行時檢查鎖的順序(見 docs/ISSUES.md)。
  */
-struct spinlock pstate_lk = SPINLOCK_INIT("pstate");
+struct spinlock pstate_lk = SPINLOCK_INIT("pstate", LK_PSTATE);
 int next_pid = 1;
 
 static struct proc *proc_became_zombie(struct proc *p);

@@ -18,7 +18,23 @@ int main(int argc, char **argv)
         printf("ls: cannot open %s\n", path);
         return 1;
     }
-    while (sys_readdir(fd, &d) == 0) {
+    int status = 0;
+    for (;;) {
+        d.name[0] = 0;
+        long r = sys_readdir(fd, &d);
+        if (r == 1)
+            break;                               /* 列完了 */
+        if (r < 0) {
+            /* 名稱有填:只有這一筆讀不到(例如磁碟上它的 inode 壞了),回報後繼續;
+               名稱是空的:整個目錄讀不下去 */
+            status = 1;
+            if (!d.name[0]) {
+                printf("%sls: %s: read error (%ld)\n", longfmt ? "" : "\n", path, r);
+                break;
+            }
+            printf("%sls: %s/%s: cannot read (%ld)\n", longfmt ? "" : "\n", path, d.name, r);
+            continue;
+        }
         if (!longfmt) {
             printf("%s%s", d.name, d.type == I_DIR ? "/  " : "  ");
             continue;
@@ -48,5 +64,5 @@ int main(int argc, char **argv)
     if (!longfmt)
         printf("\n");
     sys_close(fd);
-    return 0;
+    return status;
 }

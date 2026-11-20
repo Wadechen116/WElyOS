@@ -26,6 +26,7 @@
  *         失敗代表這張牌已經作廢(工作早被別人經由另一張牌取走了),丟掉再拿下一張
  *
  * 所以同一個工作可以有好幾張號碼牌,只有第一個兌換的人成功:
+ * (第 50 步修正:「只看 queued」不夠,見下面「作廢的牌不可以復活」)
  *   提高優先權:不移除舊的牌,直接在新優先權的環再放一張。舊的那張之後被拿到時作廢
  *   降低優先權:什麼都不做。之後從舊的(較高的)環被拿到時,發現優先權不符,
  *               重新放進正確的環
@@ -35,6 +36,22 @@
  * sched.c 把結束的 struct thread 放回自己的池子重複使用,不還給 heap。
  * 如果那塊記憶體已經被新的執行緒重複使用,而新執行緒正好也在排隊,
  * 經由舊牌把它取走也是正確的:它本來就該被執行,只是提早了一點。
+ *
+ * ---- 作廢的牌不可以復活(第 50 步,ISSUES N-009)----
+ *
+ * queued 只是 0 / 1。工作被取走(queued = 0)之後再次排隊(queued = 1),那些還留在
+ * 環裡的舊牌就又「兌換得了」了:這個工作在同一個優先權有兩個位置,每輪被排到兩次。
+ * 主機端重現(tests/host/runq_fair.c):提高過優先權的節點被重複使用之後,兩條同優先權
+ * 一直在算的執行緒排出 X X Y X X Y ...,CPU 時間 40 對 20 — 正是回歸中偶發的 40 對 21。
+ * 舊的說明寫「經由舊牌把它取走也是正確的,只是提早了一點」:互斥確實沒問題,
+ * 但「提早」就是插隊,破壞了同優先權輪流的保證。
+ *
+ * 所以節點記住「目前有效的那張牌在哪裡」(tkt_where,環裡的再加序號 tkt_seq)。
+ * 每次放牌都更新它;拿到的牌和它不符就是作廢的牌,直接丟掉,不去碰 queued。
+ *   環      位置 = 那個環,序號 = 放入時的 tail 計數器(同一個環裡在被取走前不會重複)
+ *   插隊位  位置 = 那一格。一格只放一個;有效的牌在插隊位時,那一格裡的就是它
+ *   溢出串列 位置 = 那條串列。節點自己串在上面,最多一次
+ * 互斥仍然只靠 queued 的 CAS:位置的檢查只決定「這張牌算不算數」。
  *
  * ---- 溢出串列與號碼牌的配合 ----
  *
@@ -68,7 +85,7 @@ struct cpu_rq {
 };
 static struct cpu_rq rqs[MAX_CPUS];
 
-static struct spinlock ovf_lk = SPINLOCK_INIT("runq-overflow");
+static struct spinlock ovf_lk = SPINLOCK_INIT("runq-overflow", LK_RUNQ);
 static struct rq_node *ovf_head[RUNQ_LEVELS], *ovf_tail[RUNQ_LEVELS];
 static volatile unsigned ovf_count[RUNQ_LEVELS];     /* 各串列的長度(鎖外只當提示讀) */
 static volatile unsigned ovf_mask;                   /* bit p = 1:優先權 p 的溢出串列非空 */
@@ -146,6 +163,20 @@ static struct rq_node *ovf_take(int p)
 
 /* ---- 號碼牌 ---- */
 
+/* 這張牌(從 where 拿到,環裡的序號 seq)是不是節點目前有效的那一張 */
+static int ticket_current(struct rq_node *n, const volatile void *where, uint32_t seq, int ring)
+{
+    return __atomic_load_n(&n->tkt_where, SEQ) == where &&
+           (!ring || __atomic_load_n(&n->tkt_seq, SEQ) == seq);
+}
+
+/* 記下節點目前有效的牌在哪裡。必須在牌放出去之前做:牌一放出去就可能被兌換 */
+static void ticket_set(struct rq_node *n, const volatile void *where, uint32_t seq)
+{
+    __atomic_store_n(&n->tkt_seq, seq, SEQ);
+    __atomic_store_n(&n->tkt_where, where, SEQ);
+}
+
 /* 兌換一張號碼牌。成功回傳 1,之後這個節點歸呼叫者所有 */
 static int claim(struct rq_node *n)
 {
@@ -168,12 +199,17 @@ static void put_ticket(struct cpu_rq *q, struct rq_node *n, int p, int front)
     __atomic_store_n(&q->mask, __atomic_load_n(&q->mask, RLX) | (1u << p), RLX);
     if (front && !__atomic_load_n(&q->front[p], RLX)) {
         /* 只有擁有者會把插隊位從空改成非空,所以先看再寫是安全的 */
+        ticket_set(n, &q->front[p], 0);
         __atomic_store_n(&q->front[p], n, SEQ);
         return;
     }
     /* 溢出串列有東西時,新來的也排到它後面,維持先進先出;否則放進自己的環 */
-    if (__atomic_load_n(&ovf_count[p], RLX) == 0 && ring_push(&q->ring[p], n))
-        return;
+    if (__atomic_load_n(&ovf_count[p], RLX) == 0) {
+        ticket_set(n, &q->ring[p], ring_next_seq(&q->ring[p]));
+        if (ring_push(&q->ring[p], n))
+            return;
+    }
+    ticket_set(n, &ovf_head[p], 0);
     ovf_add(n, p);
 }
 
@@ -219,14 +255,21 @@ static unsigned others_mask(int self)
 }
 
 /* 從某顆 CPU 的佇列拿一張優先權 p 的號碼牌(自己的或別人的都用這個) */
-static struct rq_node *take_from(struct cpu_rq *q, int p)
+static struct rq_node *take_from(struct cpu_rq *q, int p, int *cur)
 {
+    uint32_t seq;
+
     if (__atomic_load_n(&q->front[p], RLX)) {
         struct rq_node *n = __atomic_exchange_n(&q->front[p], NULL, SEQ);
-        if (n)
+        if (n) {
+            *cur = ticket_current(n, &q->front[p], 0, 0);
             return n;
+        }
     }
-    return ring_take(&q->ring[p]);
+    struct rq_node *n = ring_take_seq(&q->ring[p], &seq);
+    if (n)
+        *cur = ticket_current(n, &q->ring[p], seq, 1);
+    return n;
 }
 
 struct rq_node *runq_pop(void)
@@ -247,22 +290,24 @@ struct rq_node *runq_pop(void)
             /* 依序嘗試各個來源;每個來源拿到作廢的牌就繼續拿,直到它空了 */
             for (int src = -2; src < cpu_count && !requeued; src++) {
                 struct rq_node *n;
+                int cur = 0;
 
                 if (src == self)
                     continue;
                 for (;;) {
                     if (src == -2)
-                        n = take_from(q, p);             /* 自己的插隊位與環 */
-                    else if (src == -1)
+                        n = take_from(q, p, &cur);       /* 自己的插隊位與環 */
+                    else if (src == -1) {
                         n = ovf_take(p);                 /* 溢出串列 */
-                    else if (__atomic_load_n(&rqs[src].mask, RLX) & (1u << p))
-                        n = take_from(&rqs[src], p);     /* 竊取 */
+                        cur = n && ticket_current(n, &ovf_head[p], 0, 0);
+                    } else if (__atomic_load_n(&rqs[src].mask, RLX) & (1u << p))
+                        n = take_from(&rqs[src], p, &cur);   /* 竊取 */
                     else
                         n = NULL;
                     if (!n)
                         break;
-                    if (!claim(n))
-                        continue;                        /* 作廢的牌:再拿一張 */
+                    if (!cur || !claim(n))
+                        continue;                        /* 作廢的牌(不是目前有效的那張,或工作已被取走):再拿一張 */
                     int np = __atomic_load_n(&n->prio, RLX);
                     if (np < p) {
                         /* 優先權在排隊期間被調低了:放回正確的位置,整個重新找 */

@@ -28,7 +28,7 @@
 #include "pmm.h"
 
 /* 保護空閒串列。持有期間可能再取得 pmm 的鎖(heap 擴充時),順序固定為 heap -> pmm */
-static struct spinlock heap_lk = SPINLOCK_INIT("heap");
+static struct spinlock heap_lk = SPINLOCK_INIT("heap", LK_HEAP);
 
 #define KM_ALIGN       16u            /* 回傳位址與區塊大小的對齊單位 */
 #define KM_GROW_PAGES  4u             /* 每次至少向 pmm 要幾頁(16KB) */

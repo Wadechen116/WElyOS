@@ -34,7 +34,7 @@ struct file {
 };
 
 static struct inode *root;
-static struct spinlock inode_lk = SPINLOCK_INIT("inode");
+static struct spinlock inode_lk = SPINLOCK_INIT("inode", LK_INODE);
 
 void inode_init(struct inode *in, const struct inode_ops *ops, int type)
 {
@@ -51,7 +51,7 @@ void inode_init(struct inode *in, const struct inode_ops *ops, int type)
     in->mtime = 0;
     in->mounted = NULL;
     in->covered = NULL;
-    mutex_init(&in->lock);
+    mutex_init(&in->lock, "inode", MX_INODE);
 }
 
 static struct inode *iget(struct inode *in)
@@ -306,7 +306,7 @@ struct file *vfs_file_new(struct inode *in, int flags)
     f->in = iget(in);
     f->flags = flags;
     f->refs = 1;
-    mutex_init(&f->lock);
+    mutex_init(&f->lock, "file", MX_FILE);
     return f;
 }
 
@@ -527,8 +527,9 @@ int vfs_unlink(const char *path)
         /* 先鎖上層、再鎖下層。鎖著要刪除的目錄檢查它是不是空的,
            並一直鎖到名稱移除為止:這段期間沒有人能在裡面建立新的東西 */
         mutex_lock(&in->lock);
-        if (in->type == I_DIR && !in->ops->is_empty(in)) {
-            err = -E_NOTEMPTY;
+        int empty = in->type == I_DIR ? in->ops->is_empty(in) : 1;
+        if (empty <= 0) {
+            err = empty < 0 ? empty : -E_NOTEMPTY;   /* 讀不到就不知道是不是空的:不可以刪 */
         } else {
             dir->mtime = timer_epoch(NULL);
             err = dir->ops->unlink(dir, last, &victim);
@@ -562,7 +563,7 @@ int vfs_unlink(const char *path)
  * 檢查的方法是從目的目錄一路往上走到根目錄,途中不可以遇到被搬的那個目錄。
  * 這個檢查和實際的搬移之間不能有別的改名插進來,所以所有的改名由一把鎖排成一次一個。
  */
-static struct mutex rename_mx = MUTEX_INIT;
+static struct mutex rename_mx = MUTEX_INIT("rename", MX_RENAME);
 
 /* dir 是不是 in 本身或它底下的某一層。兩者都已經有參考 */
 static int is_inside(struct inode *dir, struct inode *in)
@@ -797,8 +798,10 @@ int vfs_mount(const char *path, struct inode *fsroot)
         err = -E_NOTDIR;
     else if (at->mounted || at->covered || at == root || nmounts >= MAX_MOUNTS)
         err = -E_BUSY;
-    else if (!at->ops->is_empty(at))
-        err = -E_NOTEMPTY;
+    else if ((err = at->ops->is_empty(at)) <= 0)
+        err = err < 0 ? err : -E_NOTEMPTY;
+    else
+        err = 0;
     if (err == 0) {
         /* 兩邊各多拿一個參考,永遠不放:掛載點與掛上來的根目錄都不會消失 */
         iget(fsroot);

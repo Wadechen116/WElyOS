@@ -280,9 +280,12 @@ static long sys_readdir(struct proc *p, long fd, uintptr_t uent)
 
     if (!f)
         return -E_BADF;
+    memset(&d, 0, sizeof(d));
     long rc = vfs_readdir(f, &d);
     vfs_close(f);
-    if (rc == 0 && copy_to_user(p, uent, &d, sizeof(d)) != 0)
+    /* 錯誤只關於「這一筆」時(名稱有填,位置已經移到它之後),也把名稱交給程式:
+       它可以回報「哪一筆」讀不到,然後繼續列下一筆。名稱是空的 = 整個目錄讀不下去 */
+    if ((rc == 0 || (rc < 0 && d.name[0])) && copy_to_user(p, uent, &d, sizeof(d)) != 0)
         rc = -E_FAULT;
     return rc;
 }

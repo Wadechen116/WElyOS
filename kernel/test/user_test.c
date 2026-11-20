@@ -76,15 +76,15 @@ void user_demo(void)
     KASSERT(proc_spawn("/bin/nope", NULL) == -1);
     KASSERT(proc_spawn("/etc/motd", NULL) == -1);
 
-    /* 參數傳遞:kernel 直接啟動 /bin/echo,它的結束碼是收到的參數個數 */
+    /* 參數傳遞:kernel 直接啟動 /bin/args,它的結束碼是收到的參數個數 */
     {
-        const char *argv[] = { "echo", "  [user] /bin/echo started by the kernel with", "3 arguments", NULL };
-        int pid = proc_spawn("/bin/echo", argv);
+        const char *argv[] = { "args", "  [user] /bin/args started by the kernel with", "3 arguments", NULL };
+        int pid = proc_spawn("/bin/args", argv);
         KASSERT(pid > 0 && proc_wait(pid) == 3);
     }
     /* 使用者程式自己建立行程、等待、重新導向輸出;以及各種應該被拒絕的情況 */
     run_user("spawn, wait, arguments, redirection", UMODE_PROC, 12);
-    /* exec:行程把自己換成 /bin/echo。結束碼來自 echo(3 個參數),不是原本的程式 */
+    /* exec:行程把自己換成 /bin/args。結束碼來自 args(3 個參數),不是原本的程式 */
     run_user("exec replaces the program", UMODE_EXEC, 3);
     run_user("exec and fork with a second thread are refused", UMODE_EXEC_THREADS, 13);
 

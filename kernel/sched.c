@@ -107,7 +107,7 @@ extern char stack_guard[], stack_bottom[], stack_top[];
 static struct thread main_thread;            /* 開機流程本身 */
 
 /* 排程器的鎖:保護本檔所有的共用資料(見檔案開頭的上鎖規則) */
-static struct spinlock sched_lk = SPINLOCK_INIT("sched");
+static struct spinlock sched_lk = SPINLOCK_INIT("sched", LK_SCHED);
 
 /* 目前這顆 CPU 正在執行的執行緒。只能在中斷關閉時使用(見 cpu.h) */
 static inline struct thread *cur(void) { return this_cpu()->current; }
@@ -334,7 +334,7 @@ int wq_wake_all(struct wait_queue *wq)
  * 省下的不只是頁面配置,還有「移除保護頁對映 + 清 TLB」與結束時的「對映回來 + 清 TLB」,
  * 這兩個才是比較貴的操作。閒置的 stack 用它自己的第一個可用位元組串成串列。
  */
-static struct spinlock stack_lk = SPINLOCK_INIT("stack-cache");
+static struct spinlock stack_lk = SPINLOCK_INIT("stack-cache", LK_STACKS);
 static char *stack_cache;                    /* 閒置 stack 的串列(存的是配置區塊起點) */
 static unsigned stack_cached;
 
@@ -461,6 +461,48 @@ void sched_trim(void)
  * 這段期間別人會一直等那把鎖(若對方關著中斷自旋,整個系統就卡住了)。
  * 目前的執行緒若還能跑(RUNNING)就排回佇列;若已改成 SLEEPING / BLOCKED / ZOMBIE 則不排。
  */
+/*
+ * ---- 排程紀錄 ----
+ * 每顆 CPU 保留最近 SCHED_TRACE 次切換:什麼時候、換下誰(狀態、剩餘的時間片、優先權)、換上誰。
+ * 用途是讓偶發的排程問題「下次發生時自己說明原因」(docs/ISSUES.md 的 N-009):
+ * 測試失敗時呼叫 sched_trace_dump() 印出來。寫入在 sched_lk 之下,每次只是幾個欄位,成本可以忽略。
+ */
+#define SCHED_TRACE 64u
+struct sched_ev {
+    uint32_t tick;                       /* 低 32 位元就夠看出先後與間隔 */
+    int16_t prev, next;                  /* 執行緒編號;idle 記為 -1(開機的主執行緒是 0) */
+    uint8_t prev_state, prev_slice, prev_prio, next_prio;
+};
+static struct sched_ev strace[MAX_CPUS][SCHED_TRACE];
+static unsigned strace_n[MAX_CPUS];
+
+static void trace_switch(struct cpu *c, struct thread *prev, struct thread *next)
+{
+    struct sched_ev *e = &strace[c->id][strace_n[c->id]++ % SCHED_TRACE];
+
+    e->tick = (uint32_t)timer_ticks();
+    e->prev = (int16_t)(prev == c->idle ? -1 : prev->id);
+    e->next = (int16_t)(next == c->idle ? -1 : next->id);
+    e->prev_state = (uint8_t)prev->state;
+    e->prev_slice = (uint8_t)(prev->slice > 255 ? 255 : prev->slice);
+    e->prev_prio = (uint8_t)prev->prio;
+    e->next_prio = (uint8_t)next->prio;
+}
+
+void sched_trace_dump(int cpu, unsigned last)
+{
+    static const char st[] = "RrSBZ";        /* READY / running / SLEEPING / BLOCKED / ZOMBIE */
+    unsigned n = strace_n[cpu], k = n < last ? n : last;
+
+    kprintf("sched trace, cpu %d, last %u of %u switches (tick: prev[state slice prio] -> next[prio]):\n",
+            cpu, k, n);
+    for (unsigned i = n - k; i < n; i++) {
+        const struct sched_ev *e = &strace[cpu][i % SCHED_TRACE];
+        kprintf("  %u: %d[%c %u p%u] -> %d[p%u]\n", e->tick, e->prev,
+                e->prev_state < 5 ? st[e->prev_state] : '?', e->prev_slice, e->prev_prio, e->next, e->next_prio);
+    }
+}
+
 static void schedule(void)
 {
     struct cpu *c = this_cpu();
@@ -498,6 +540,7 @@ static void schedule(void)
     if (next == prev)
         return;                              /* 仍然是自己最優先,不必切換 */
 
+    trace_switch(c, prev, next);
     c->current = next;
     c->kstack_limit = next->stack_lo;        /* 例外入口用它檢查 stack 是否溢位 */
     c->kstack_top = next->stack_hi;

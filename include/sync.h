@@ -33,16 +33,43 @@ void sem_post(struct semaphore *s);      /* 可在中斷處理程式中呼叫 */
  *   - 同一條重複上鎖會被偵測出來(否則會自己等自己,永遠卡住)
  * 兩種錯誤都會 panic。
  * 另外支援優先權繼承:高優先權的執行緒在等鎖時,持有者暫時繼承它的優先權。
+ *
+ * ---- mutex 的層級(第 50 步)----
+ * 和 spinlock 一樣(見 spinlock.h):每個 mutex 有名稱與層級,持有某些 mutex 時只能再拿
+ * 層級更高的,違反時立刻 panic。mutex 一定在所有 spinlock 之外(持有 spinlock 時不能睡,
+ * schedule() 會檢查),所以兩張表各自獨立。沒有初始化(沒有名稱)的 mutex 一上鎖就 panic,
+ * 確保每一個都被分類。
+ * 同一類可以巢狀的只有 inode:目錄由上而下鎖(上層目錄 -> 其中的項目),樹狀的順序本身
+ * 不會形成循環;唯一會同時鎖兩個不相干目錄的 rename 先拿全系統一把 rename_mx 序列化。
+ * 依據是實際量到的巢狀關係(三個架構的所有自我測試、磁碟與網路測試),由外到內:
  */
+enum mutex_rank {
+    MX_TEST       = 10,          /* 自我測試(單獨使用) */
+    MX_TEST_PI_B  = 11,          /* 優先權繼承的連鎖測試:B -> A -> C */
+    MX_TEST_PI_A  = 12,
+    MX_TEST_PI_C  = 13,
+    MX_PROC_MEM   = 20,          /* 行程的記憶體對映(proc_mem.c 的 mem.mx) */
+    MX_RENAME     = 30,          /* rename 的全系統序列化 */
+    MX_FILE       = 40,          /* 開啟中的檔案(位置) */
+    MX_INODE      = 50,          /* inode 的內容(可同類巢狀,見上) */
+    MX_WFS        = 60,          /* 磁碟檔案系統 */
+    MX_NET        = 65,          /* 網路堆疊 */
+    MX_BLACKBOX   = 70,          /* 黑盒子紀錄 */
+    MX_DEVICE     = 80,          /* 裝置驅動程式(磁碟、網路卡):最內層 */
+};
+
 struct mutex {
     struct thread *owner;                /* NULL = 沒有人持有 */
     int inherit;                         /* 1 = 啟用優先權繼承(預設)。0 僅供示範反轉現象 */
     struct wait_queue wq;
     struct mutex *next_held;             /* 串在擁有者「持有的 mutex」串列中 */
+    const char *name;                    /* 診斷訊息用;NULL = 沒有初始化 */
+    unsigned rank;                       /* 層級(enum mutex_rank) */
 };
-#define MUTEX_INIT { 0, 1, WAIT_QUEUE_INIT, 0 }
+#define MUTEX_INIT(nm, rk) { 0, 1, WAIT_QUEUE_INIT, 0, nm, rk }
 
-void mutex_init(struct mutex *m);
+void mutex_init(struct mutex *m, const char *name, unsigned rank);
+void mutex_order_report(void);           /* 量測模式(LOCK_ORDER_LEARN)時印出巢狀關係 */
 void mutex_lock(struct mutex *m);
 void mutex_unlock(struct mutex *m);
 #endif

@@ -214,7 +214,7 @@ struct netdev *arch_net_probe(void)
 {
     uint8_t prom[32];
 
-    mutex_init(&ne_lock);
+    mutex_init(&ne_lock, "ne2000", MX_DEVICE);
     /*
      * 先確認那個位址上真的有東西:ISA 匯流排上沒有裝置的 I/O 位址,讀出來一律是 0xFF。
      * 單看「重置之後 ISR 的 RST 位元」是不夠的 — 0xFF 的每個位元都是 1,RST 當然也是,

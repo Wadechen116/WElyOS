@@ -180,7 +180,7 @@ void vm_demo(void)
  */
 void spin_selftest(void)
 {
-    static struct spinlock a = SPINLOCK_INIT("test-a"), b = SPINLOCK_INIT("test-b");
+    static struct spinlock a = SPINLOCK_INIT("test-a", LK_TEST_OUTER), b = SPINLOCK_INIT("test-b", LK_TEST_INNER);
 
     unsigned long fa = spin_lock_irqsave(&a);
     struct cpu *c = this_cpu();              /* 中斷已關閉,可以安全使用 */

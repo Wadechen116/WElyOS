@@ -12,6 +12,9 @@ for impl in ring list; do
   SRC="tests/host/runq_test.c kernel/runq_${impl}.c"
   INC="-iquote tests/host/stub -iquote include"   # -iquote:只影響 "..." 形式,<sched.h> 仍是系統的
   gcc -std=c11 -O2 -g -Wall -Wextra -pthread $INC $SRC -o "$OUT/runq_${impl}"
+  # 同優先權輪流的性質(第 50 步:作廢的號碼牌不可以讓一個工作佔兩個位置)
+  gcc -std=c11 -O1 -g -Wall -Wextra -Werror $INC tests/host/runq_fair.c kernel/runq_${impl}.c -o "$OUT/runq_fair_${impl}"
+  "$OUT/runq_fair_${impl}" || rc=1
   "$OUT/runq_${impl}" "$N" || rc=1          # 節點很多:大量使用溢出串列
   "$OUT/runq_${impl}" "$N" 200 || rc=1      # 節點少:幾乎只用到無鎖的環與竊取
   if gcc -std=c11 -O1 -g -fsanitize=thread -pthread $INC $SRC -o "$OUT/runq_${impl}_tsan" 2>/dev/null; then

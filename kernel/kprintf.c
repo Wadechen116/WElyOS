@@ -189,7 +189,7 @@ int kvprintf(const char *fmt, va_list ap)
  * 這把鎖是「最內層」的鎖:持有它的期間不會再去拿別的鎖,
  * 所以在任何地方(包括持有其他鎖時)都可以安全地呼叫 kprintf。
  */
-static struct spinlock console_lk = SPINLOCK_INIT("console");
+static struct spinlock console_lk = SPINLOCK_INIT("console", LK_CONSOLE);
 
 int kprintf(const char *fmt, ...)
 {

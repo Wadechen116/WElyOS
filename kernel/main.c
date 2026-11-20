@@ -219,6 +219,8 @@ static void shutdown(int code)
         blackbox_log(BB_DISK, "shutting down with the file system read-only after a write error");
     if (safe_mode)
         blackbox_log(BB_HEALTHY, "safe mode session ended normally; the next boot will be a normal one");
+    spin_order_report();                     /* 量測模式時印出鎖的巢狀關係(平常不印任何東西) */
+    mutex_order_report();
     blackbox_log(BB_SHUTDOWN, "clean shutdown, exit code %d", code);
     wfs_shutdown();
     arch_exit(code);
@@ -348,6 +350,8 @@ void kmain(const struct boot_info *bi)
         nic_selftest();                      /* 驅動程式單獨的測試:要在協定堆疊開始收訊框之前 */
     }
     netif_start(boot_nic);                   /* 啟動網路(沒有網路卡時不做任何事) */
+    if (!safe_mode)
+        disk_user_stage_test(bi->cmdline);   /* 需要使用者程式與網路(tftp)的磁碟階段 */
     if (selftest) {
         pipe_demo();
         user_demo();

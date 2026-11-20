@@ -213,7 +213,10 @@ static int commit_change_locked(struct proc *p, long delta)
         p->mem.commit += d;
         commit_total += d;
     } else {
-        unsigned long d = (unsigned long)-delta;
+        /* 以無號數取絕對值:delta == LONG_MIN 時 -delta 是未定義行為,0UL - (unsigned long)delta 不是。
+           這一支(歸還)永遠回傳 0 — sys_munmap、sbrk 縮小、commit_release_all 依賴這一點
+           (第 50 步以主機端測試 probe_commit_release.py 窮舉驗證) */
+        unsigned long d = 0UL - (unsigned long)delta;
         if (d > p->mem.commit)
             d = p->mem.commit;
         p->mem.commit -= d;
@@ -352,7 +355,7 @@ long sys_sbrk(struct proc *p, long incr)
 /* 新行程:配額沿用建立者的;由 kernel 建立的用預設值 */
 void pmem_init(struct proc *p, const struct proc *parent)
 {
-    mutex_init(&p->mem.mx);
+    mutex_init(&p->mem.mx, "proc-mem", MX_PROC_MEM);
     p->mem.limit = parent ? parent->mem.limit : PROC_DEFAULT_LIMIT_PAGES;
 }
 
@@ -369,7 +372,7 @@ void pmem_exec(struct proc *p)
    先記帳,系統給不出來就回傳非 0(不 fork);heap 與對映的紀錄照抄(內容隨位址空間複製) */
 int pmem_fork(struct proc *child, const struct proc *parent)
 {
-    mutex_init(&child->mem.mx);
+    mutex_init(&child->mem.mx, "proc-mem", MX_PROC_MEM);
     child->mem.limit = parent->mem.limit;
     unsigned long fl = spin_lock_irqsave(&pstate_lk);
     int rc = commit_change_locked(child, (long)parent->mem.commit);

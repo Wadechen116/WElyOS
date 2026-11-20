@@ -20,11 +20,12 @@ static struct blkdev wrapper;
 static struct blkdev *real;
 static volatile int fail_reads, fail_writes;     /* 不為 0:該類要求一律回報失敗 */
 static volatile unsigned long injected;          /* 總共回報了幾次故意的失敗 */
+static volatile uint64_t fail_write_from = UINT64_MAX;  /* 這個磁區(含)之後的寫入回報失敗 */
 
 static int fault_rw(struct blkdev *d, uint64_t lba, unsigned count, void *buf, int write)
 {
     (void)d;
-    if (write ? fail_writes : fail_reads) {
+    if (write ? fail_writes || lba + count > fail_write_from : fail_reads) {
         injected++;
         return -E_IO;
     }
@@ -44,7 +45,7 @@ static int fault_flush(struct blkdev *d)
 static int fault_write_now(struct blkdev *d, uint64_t lba, const void *buf)
 {
     (void)d;
-    if (fail_writes || !real->write_now)
+    if (fail_writes || lba >= fail_write_from || !real->write_now)
         return -E_IO;
     return real->write_now(real, lba, buf);
 }
@@ -66,6 +67,12 @@ void blk_fault_set(int reads, int writes)
 {
     fail_reads = reads;
     fail_writes = writes;
+    fail_write_from = UINT64_MAX;
+}
+
+void blk_fault_set_write_from(uint64_t first_lba)
+{
+    fail_write_from = first_lba;
 }
 
 int blk_fault_flip(uint64_t lba, unsigned byte, unsigned bit)

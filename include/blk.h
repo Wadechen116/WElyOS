@@ -34,6 +34,9 @@ struct blkdev *arch_blk_probe(void);
    blk_fault_set(讀, 寫):不為 0 表示之後該類要求一律回報失敗;blk_fault_count:回報過幾次 */
 struct blkdev *blk_fault_wrap(struct blkdev *dev);
 void blk_fault_set(int fail_reads, int fail_writes);
+/* 只讓「磁區編號 >= first_lba」的寫入失敗(其餘照常;UINT64_MAX = 關閉)。用來只打掉檔案內容的
+   寫回、而讓 metadata 寫得進去(第 50 步:使用者程式在寫回失敗時的測試)。blk_fault_set 會一併清除它 */
+void blk_fault_set_write_from(uint64_t first_lba);
 unsigned long blk_fault_count(void);
 /* 測試用:把磁碟上第 lba 個磁區的第 byte 個位元組翻轉一個位元(模擬儲存媒體上的位元錯誤)。
    直接改底下的裝置,不經過任何快取 */

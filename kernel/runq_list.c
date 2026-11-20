@@ -12,7 +12,7 @@
 #include "runq.h"
 #include "spinlock.h"
 
-static struct spinlock rq_lk = SPINLOCK_INIT("runq");
+static struct spinlock rq_lk = SPINLOCK_INIT("runq", LK_RUNQ);
 static struct rq_node *head[RUNQ_LEVELS], *tail[RUNQ_LEVELS];
 static unsigned bitmap;                      /* bit p = 1:優先權 p 的串列非空 */
 

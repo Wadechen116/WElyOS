@@ -6,11 +6,83 @@
 #include "panic.h"
 #include "smp.h"
 #include "spinlock.h"
+#include "kprintf.h"
 
 struct cpu cpus[MAX_CPUS];
 int cpu_count = 1;
 
 static volatile int panic_mode;
+
+_Static_assert(LOCK_DEPTH_MAX == sizeof(((struct cpu *)0)->held) / sizeof(((struct cpu *)0)->held[0]),
+               "cpu.held size");
+
+#if LOCK_ORDER_LEARN
+/* 量測模式:每一組不同的違反(外層名稱、內層名稱)記一次 */
+struct learned_pair { const char *outer, *inner; unsigned ro, ri, count; };
+static struct learned_pair learned[64];
+static unsigned nlearned, learned_bad;
+
+static void learn(struct spinlock *h, struct spinlock *l)
+{
+    for (unsigned i = 0; i < nlearned; i++)
+        if (learned[i].outer == h->name && learned[i].inner == l->name) {
+            learned[i].count++;
+            return;
+        }
+    if (nlearned < 64)
+        learned[nlearned++] = (struct learned_pair){ h->name, l->name, h->rank, l->rank, 1 };
+}
+#endif
+
+void spin_order_report(void)
+{
+#if LOCK_ORDER_LEARN
+    kprintf("lock order: %u distinct nesting(s), %u violating acquisition(s)\n", nlearned, learned_bad);
+    for (unsigned i = 0; i < nlearned; i++)
+        kprintf("  LOCKORDER %s holding \"%s\"(%u) then \"%s\"(%u) x%u\n",
+                learned[i].ro >= learned[i].ri ? "BAD" : "ok ", learned[i].outer, learned[i].ro,
+                learned[i].inner, learned[i].ri, learned[i].count);
+#endif
+}
+
+/* 鎖的層級:要拿 l 時,目前持有的每一把都必須比它低(見 spinlock.h) */
+static void order_check(struct cpu *c, struct spinlock *l)
+{
+    for (int i = 0; i < c->nlocks; i++) {
+        struct spinlock *h = c->held[i];
+#if LOCK_ORDER_LEARN
+        learn(h, l);                         /* 量測模式:每一組巢狀關係都記下(合法的也記) */
+#endif
+        if (h->rank >= l->rank) {
+#if LOCK_ORDER_LEARN
+            learned_bad++;
+#else
+            panic("lock order: cpu %d acquiring \"%s\" (rank %u) while holding \"%s\" (rank %u)",
+                  c->id, l->name, l->rank, h->name, h->rank);
+#endif
+        }
+    }
+}
+
+/* 記入 / 移出「持有中」。解鎖不一定依相反的順序,所以移出時要找 */
+static void held_push(struct cpu *c, struct spinlock *l)
+{
+    if (c->nlocks >= LOCK_DEPTH_MAX)
+        panic("spinlock \"%s\": cpu %d already holds %d spinlocks", l->name, c->id, c->nlocks);
+    c->held[c->nlocks++] = l;
+}
+
+static void held_remove(struct cpu *c, struct spinlock *l)
+{
+    for (int i = c->nlocks - 1; i >= 0; i--)
+        if (c->held[i] == l) {
+            for (int j = i; j < c->nlocks - 1; j++)
+                c->held[j] = c->held[j + 1];
+            c->nlocks--;
+            return;
+        }
+    panic("spinlock \"%s\": released on cpu %d but missing from its held list", l->name, c->id);
+}
 
 void spin_panic_mode(void)
 {
@@ -26,6 +98,7 @@ void spin_lock(struct spinlock *l)
     /* 別顆 CPU 持有時 l->cpu 不會等於自己的編號,所以這個檢查不需要先上鎖 */
     if (l->locked && l->cpu == c->id)
         panic("spinlock \"%s\": recursive acquire on cpu %d", l->name, c->id);
+    order_check(c, l);
 
     /*
      * 原子交換:把 1 寫進去並取回舊值,整個動作不會被別顆 CPU 插入。
@@ -46,7 +119,7 @@ void spin_lock(struct spinlock *l)
         }
     }
     l->cpu = c->id;
-    c->nlocks++;
+    held_push(c, l);
 }
 
 int spin_trylock(struct spinlock *l)
@@ -58,7 +131,7 @@ int spin_trylock(struct spinlock *l)
     if (__atomic_exchange_n(&l->locked, 1u, __ATOMIC_ACQUIRE))
         return 0;
     l->cpu = c->id;
-    c->nlocks++;
+    held_push(c, l);
     return 1;
 }
 
@@ -71,7 +144,7 @@ void spin_unlock(struct spinlock *l)
     if (!l->locked || l->cpu != c->id)
         panic("spinlock \"%s\": released on cpu %d but not held by it", l->name, c->id);
     l->cpu = -1;
-    c->nlocks--;
+    held_remove(c, l);
     __atomic_store_n(&l->locked, 0u, __ATOMIC_RELEASE);
 }
 

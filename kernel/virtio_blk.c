@@ -213,7 +213,7 @@ struct blkdev *virtio_blk_probe(uintptr_t base, uintptr_t stride, unsigned slots
                     "-global virtio-mmio.force-legacy=false)\n", i);
             continue;
         }
-        mutex_init(&v->lock);
+        mutex_init(&v->lock, "virtio-blk", MX_DEVICE);
         v->dev.name = "virtio-blk";
         v->dev.rw = vblk_rw;
         v->dev.flush = vblk_flush;

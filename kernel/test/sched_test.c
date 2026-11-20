@@ -132,9 +132,12 @@ void sched_demo(void)
     /* 輪流的保證:兩條同優先權的執行緒,任何時候拿到的 CPU 時間相差不超過一個時間片
        (加 1:一條看到總和到了才停,另一條可能多記了最後一個 tick) */
     unsigned long c1 = s1.ticks, c2 = s2.ticks, diff = c1 > c2 ? c1 - c2 : c2 - c1;
-    if (!s1.iters || !s2.iters || !c1 || !c2 || diff > slice + 1)
+    if (!s1.iters || !s2.iters || !c1 || !c2 || diff > slice + 1) {
+        kprintf("sched fairness failed; spin1 is thread %d, spin2 is thread %d\n", t[0], t[1]);
+        sched_trace_dump(sched_cpu_id(), 40);
         panic("sched fairness: cpu ticks %lu vs %lu (difference %lu, allowed %u = one time slice + 1)",
               c1, c2, diff, slice + 1);
+    }
 
     kprintf("sched: sleep\n");
     t[0] = thread_create("s30", sleep_worker, (void *)30);
@@ -168,7 +171,7 @@ void sched_demo(void)
 #define RACE_ROUNDS  100
 
 static volatile int race_counter;
-static struct mutex race_mutex = MUTEX_INIT;
+static struct mutex race_mutex = MUTEX_INIT("test-race", MX_TEST);
 
 static void race_worker(void *arg)
 {
@@ -211,7 +214,7 @@ static int race_run(int use_mutex)
 static int pc_buf[PC_SLOTS];
 static unsigned pc_head, pc_tail;
 static struct semaphore pc_slots, pc_items;
-static struct mutex pc_mutex = MUTEX_INIT;
+static struct mutex pc_mutex = MUTEX_INIT("test-pc", MX_TEST);
 static int pc_sum, pc_count[PC_CONSUMERS];
 
 static void pc_put(int v)
@@ -424,7 +427,7 @@ static unsigned inversion_run(int inherit)
 {
     int t[3];
 
-    mutex_init(&inv_mutex);
+    mutex_init(&inv_mutex, "test-inversion", MX_TEST);
     inv_mutex.inherit = inherit;
     inv_locked = 0;
 
@@ -523,9 +526,11 @@ void prio_demo(void)
             "same priority %u ticks, high priority %u (timer jitter in that window: %u)\n", same, high, jit_high);
     /* 高優先權:醒來就搶佔 — 延遲只能來自計時器的抖動(量到的),再加讀取時間的 1 個 tick。
        同優先權:必須等對方時間片剩下的部分,至少 2 個 tick */
-    if (high > jit_high + 1 || same < 2)
+    if (high > jit_high + 1 || same < 2) {
+        sched_trace_dump(sched_cpu_id(), 40);
         panic("prio latency: high-priority delay %u (allowed %u), same-priority delay %u (must be >= 2)",
               high, jit_high + 1, same);
+    }
 
     unsigned without = inversion_run(0);
     unsigned with = inversion_run(1);
@@ -534,9 +539,9 @@ void prio_demo(void)
     KASSERT(with < without && with <= 10 && without >= 15);
 
     /* 完整的繼承。此時 main 是最高優先權,各執行緒靠 main 睡覺的空檔依序就位 */
-    mutex_init(&pi_a);
-    mutex_init(&pi_b);
-    mutex_init(&pi_c);
+    mutex_init(&pi_a, "test-pi-a", MX_TEST_PI_A);
+    mutex_init(&pi_b, "test-pi-b", MX_TEST_PI_B);
+    mutex_init(&pi_c, "test-pi-c", MX_TEST_PI_C);
     pi_stage = 0;
     t[0] = thread_create_prio("pi-low", pi_low, NULL, PRIO_LOW);
     while (pi_stage < 1)
@@ -738,20 +743,39 @@ void sched_crash_test(const char *cmd)
         }
     } else if (cmdline_has(cmd, "crash=relock")) {
         /* 同一條執行緒對同一個 mutex 上鎖兩次:不偵測的話會自己等自己 */
-        static struct mutex m = MUTEX_INIT;
+        static struct mutex m = MUTEX_INIT("test-relock", MX_TEST);
         kprintf("locking a mutex twice...\n");
         mutex_lock(&m);
         mutex_lock(&m);
     } else if (cmdline_has(cmd, "crash=spinsleep")) {
         /* 持有 spinlock 時切換執行緒:別人會關著中斷一直等這把鎖,所以禁止 */
-        static struct spinlock l = SPINLOCK_INIT("test");
+        static struct spinlock l = SPINLOCK_INIT("test", LK_TEST_OUTER);
         kprintf("yielding the CPU while holding a spinlock...\n");
         unsigned long flags = spin_lock_irqsave(&l);
         thread_yield();
         spin_unlock_irqrestore(&l, flags);
+    } else if (cmdline_has(cmd, "crash=mxorder")) {
+        /* mutex 以相反的順序上鎖(內層的先拿):mutex 的層級檢查必須立刻 panic(見 sync.h) */
+        static struct mutex outer = MUTEX_INIT("test-mx-outer", MX_TEST_PI_B);
+        static struct mutex inner = MUTEX_INIT("test-mx-inner", MX_TEST_PI_A);
+        kprintf("locking mutexes in the wrong order...\n");
+        mutex_lock(&inner);
+        mutex_lock(&outer);
+        mutex_unlock(&outer);
+        mutex_unlock(&inner);
+    } else if (cmdline_has(cmd, "crash=lockorder")) {
+        /* 以相反的順序拿兩把鎖(內層的先拿):鎖的層級檢查必須立刻 panic(見 spinlock.h)。
+           不檢查的話,單獨一條路徑這樣做不會出事,要等另一條路徑以正常順序同時進行才會卡死 */
+        static struct spinlock outer = SPINLOCK_INIT("test-outer", LK_TEST_OUTER);
+        static struct spinlock inner = SPINLOCK_INIT("test-inner", LK_TEST_INNER);
+        kprintf("acquiring spinlocks in the wrong order...\n");
+        unsigned long f1 = spin_lock_irqsave(&inner);
+        unsigned long f2 = spin_lock_irqsave(&outer);
+        spin_unlock_irqrestore(&outer, f2);
+        spin_unlock_irqrestore(&inner, f1);
     } else if (cmdline_has(cmd, "crash=spin")) {
         /* 同一顆 CPU 對同一把 spinlock 上鎖兩次:不偵測的話會自己等自己,而且中斷是關的 */
-        static struct spinlock l = SPINLOCK_INIT("test");
+        static struct spinlock l = SPINLOCK_INIT("test", LK_TEST_OUTER);
         kprintf("acquiring a spinlock twice...\n");
         unsigned long flags = spin_lock_irqsave(&l);
         (void)spin_lock_irqsave(&l);
@@ -769,7 +793,7 @@ void sched_crash_test(const char *cmd)
 #define SMP_WORKERS 8
 static volatile unsigned smp_seen[SMP_WORKERS];      /* 每條執行緒跑過的 CPU(位元遮罩) */
 static volatile unsigned long smp_spins[SMP_WORKERS];
-static struct mutex smp_mtx = MUTEX_INIT;
+static struct mutex smp_mtx = MUTEX_INIT("test-smp", MX_TEST);
 static volatile unsigned long smp_counter;
 /* 每條執行緒遞增幾次。爭用時每次上鎖都可能睡下去再被叫醒,不宜太多 */
 #define SMP_ADDS 1000u
@@ -863,7 +887,8 @@ static void rt_task(void *arg)
     unsigned jump = timer_bursts_at_least(&ts1, 6) - timer_bursts_at_least(&ts0, 6);   /* 這段期間跳過 >= 6 的次數 */
     int stalled = jump > 0;
     KASSERT(thread_wait_period(&st) == 0);
-    if (!stalled && (prio_after != PRIO_HIGH || st.overruns != 1 || st.misses != 0 || st.max_used_ms < 5))
+    if (!stalled && (prio_after != PRIO_HIGH || st.overruns != 1 || st.misses != 0 || st.max_used_ms < 5)) {
+        sched_trace_dump(sched_cpu_id(), 40);
         panic("rt test (overrun): prio %d (want %d), overruns %u, misses %u, max used %u ms; "
               "spin %llu..%llu (ended %llu), deadline %llu; my cpu ticks %lu, switches %lu, "
               "starvation boosts %lu, timer jumps 6+: %u",
@@ -871,6 +896,7 @@ static void rt_task(void *arg)
               (unsigned long long)spin_from, (unsigned long long)(spin_from + 12),
               (unsigned long long)spin_end, (unsigned long long)expect, cpu1 - cpu0, sw1 - sw0,
               boosts1 - boosts0, jump);
+    }
     if (stalled) {
         kprintf("rt: measured %u timer jump(s) of 6+ ticks during the overrun test (its slack is 6 ticks); "
                 "its same-period checks were skipped\n", jump);
@@ -935,9 +961,11 @@ static void rt_short_task(void *arg)
     /* 不可以錯過任何期限。例外要量得到:週期 10、預算 3,一次跳過 >= 7 個 tick 才吃得掉餘裕 */
     timer_get_stats(&ts1);
     unsigned jump = timer_bursts_at_least(&ts1, 7) - timer_bursts_at_least(&ts0, 7);
-    if (st.releases + st.misses < 20 || st.misses > jump)
+    if (st.releases + st.misses < 20 || st.misses > jump) {
+        sched_trace_dump(sched_cpu_id(), 40);
         panic("rt test (rate-monotonic): releases %u, misses %u, timer jumps of 7+ ticks in the window: %u",
               st.releases, st.misses, jump);
+    }
     rt_long_stop = 1;
     KASSERT(thread_set_periodic(0, 0) == 0);
 }
