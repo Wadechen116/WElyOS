@@ -24,6 +24,7 @@
 #include "kmalloc.h"
 #include "kprintf.h"
 #include "kstring.h"
+#include "membudget.h"
 #include "mmu.h"
 #include "net.h"
 #include "netif.h"
@@ -125,8 +126,7 @@ struct proc_sig {
 };
 
 struct proc_mem {
-    unsigned long PMEM_F(commit);            /* 已經答應給這個行程的頁數(heap 的範圍加上匿名對映);受 pstate_lk 保護 */
-    unsigned long PMEM_F(limit);             /* commit 的上限(記憶體配額,以頁計) */
+    struct mb_domain *PMEM_F(dom);           /* 記憶體配額的帳戶(持有一份參考;承諾與用量記在位址空間的帳本上) */
     struct { uintptr_t start; unsigned long pages; } PMEM_F(maps)[PROC_MAX_MAPS];   /* 匿名對映;pages 0 = 空位 */
     uintptr_t PMEM_F(mmap_next);             /* 下一塊對映要放的位址(只往上走,不重複使用) */
     uintptr_t PMEM_F(brk);                   /* heap 目前的結尾(0 = 還沒用過,等於 USER_HEAP_BASE);受 pstate_lk 保護 */

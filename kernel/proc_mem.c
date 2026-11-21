@@ -65,15 +65,8 @@ static int proc_fault_locked(struct proc *p, uintptr_t addr, int write)
         spin_unlock_irqrestore(&pstate_lk, fl);
         if (addr >= end)
             return -1;                           /* 超出目前的結尾:真正的錯誤 */
-        void *hp = pmm_alloc();
-        if (!hp)
-            return -1;                           /* 記憶體用完:這個行程會被終止 */
-        memset(hp, 0, PAGE_SIZE);
-        int hrc = vm_space_map_new(p->space, addr & ~(uintptr_t)(PAGE_SIZE - 1), (uintptr_t)hp,
-                                   VM_READ | VM_WRITE);
-        if (hrc != 0)
-            pmm_free(hp);
-        return hrc < 0 ? -1 : 0;
+        /* sbrk 時已經承諾(預留)過:用自己的票配置,一定成功(I-240 C3.2 的 I2) */
+        return vm_space_fault_anon(p->space, addr) < 0 ? -1 : 0;
     }
 
     /* 匿名對映:落在某一塊 mmap 的範圍內而還沒配置的頁,同樣當場配置 */
@@ -86,15 +79,7 @@ static int proc_fault_locked(struct proc *p, uintptr_t addr, int write)
         spin_unlock_irqrestore(&pstate_lk, fl);
         if (!inside)
             return -1;
-        void *mp = pmm_alloc();
-        if (!mp)
-            return -1;
-        memset(mp, 0, PAGE_SIZE);
-        int mrc = vm_space_map_new(p->space, addr & ~(uintptr_t)(PAGE_SIZE - 1), (uintptr_t)mp,
-                                   VM_READ | VM_WRITE);
-        if (mrc != 0)
-            pmm_free(mp);
-        return mrc < 0 ? -1 : 0;
+        return vm_space_fault_anon(p->space, addr) < 0 ? -1 : 0;   /* mmap 時已承諾:一定成功 */
     }
 
     uintptr_t lowest = USER_STACK_TOP - (uintptr_t)PROC_MAX_THREADS * USER_STACK_SLOT;
@@ -179,62 +164,17 @@ int copy_path_from_user(struct proc *p, char *dst, uintptr_t uaddr)
  * 實體記憶體卻不夠時,只剩下一個選擇:終止某個行程(第 30 步的做法,稱為過度承諾)。
  * 被終止的程式沒有做錯任何事,也沒有機會收拾;對要求可靠的系統,這是不能接受的行為。
  *
- * 這裡改成記帳:kernel 記著「已經答應出去的頁數」(commit),包括還沒真的配置的。
- * 每個要求在當下就決定成不成功:
- *   - 行程自己的配額(p->mem.limit):一個行程失控,最多用掉它自己的額度
- *   - 整個系統的上限(commit_cap):答應出去的總量不超過實際有的記憶體,
- *     而且扣掉一塊保留給 kernel 自己(頁表、kernel heap、檔案快取…)
+ * 這裡改成承諾:每個要求在當下就決定成不成功(第 54 步起,I-240 C3.2):
+ *   - 行程自己的配額:行程的 domain(membudget)合計 heap、mmap 與頁表,一個行程失控最多用掉它自己的額度
+ *   - 整個系統:承諾的頁在 pmm 裡預留,一般配置(包括 kernel 自己的)拿不到;
+ *     預留不到(空閒 − 預留 − 底線不夠)就拒絕。不再有第一次使用時才估算的固定上限
+ *   - 承諾記在位址空間的帳本上(vm_space_commit_anon),第一次觸及時用自己的票配置,一定成功
  * 超過就回傳 -E_NOMEM:程式在「要」的時候得到明確的答案,可以改做別的事、
  * 釋放其他東西、或把工作有秩序地結束。之後去使用那些已經答應的頁時,不會再失敗。
  *
- * 配額只能調低(memlimit);調高需要 CAP_ADMIN。子行程沿用父行程的配額。
- * fork 會讓子行程得到同樣多的承諾(寫入時複製:最壞情況下每一頁都要另外一份),
- * 所以 fork 也可能因為配額而失敗。
+ * 配額只能調低(memlimit,可以低於已用量:已承諾的不撤銷,之後的增加被拒絕);調高需要 CAP_ADMIN。
+ * 子行程沿用父行程的配額。fork 依 R1 替父子雙方預留寫入時複製的票,所以 fork 也可能因為配額或預留而失敗。
  */
-static unsigned long commit_total;           /* 所有行程的 commit 總和;受 pstate_lk 保護 */
-static unsigned long commit_cap;             /* 上限;0 = 還沒算(第一次使用時依當時的空閒記憶體決定) */
-
-/* 把 p 的承諾增減 delta 頁。增加時檢查兩個上限,不行就回傳 -E_NOMEM(什麼都不變)。
-   呼叫時必須持有 pstate_lk */
-static int commit_change_locked(struct proc *p, long delta)
-{
-    if (!commit_cap) {
-        /* 保留給 kernel 的部分:至少 2MB,或全部記憶體的 1/16(取大的) */
-        /* 再加上 pmm 的保留底線:承諾出去的頁必須配置得到,而一般配置拿不到底線以下的頁 */
-        unsigned long freep = pmm_free_count(), reserve = pmm_total_pages() / 16;
-        if (reserve < 512)
-            reserve = 512;
-        reserve += pmm_reserve_count();
-        commit_cap = freep > reserve ? freep - reserve : 1;
-    }
-    if (delta > 0) {
-        unsigned long d = (unsigned long)delta;
-        if (d > p->mem.limit || p->mem.commit > p->mem.limit - d ||
-            d > commit_cap || commit_total > commit_cap - d)
-            return -E_NOMEM;
-        p->mem.commit += d;
-        commit_total += d;
-    } else {
-        /* 以無號數取絕對值:delta == LONG_MIN 時 -delta 是未定義行為,0UL - (unsigned long)delta 不是。
-           這一支(歸還)永遠回傳 0 — sys_munmap、sbrk 縮小、commit_release_all 依賴這一點
-           (第 50 步以主機端測試 probe_commit_release.py 窮舉驗證) */
-        unsigned long d = 0UL - (unsigned long)delta;
-        if (d > p->mem.commit)
-            d = p->mem.commit;
-        p->mem.commit -= d;
-        commit_total -= d;
-    }
-    return 0;
-}
-
-/* 行程結束或換成另一個程式:它的承諾全部歸還 */
-void commit_release_all(struct proc *p)
-{
-    unsigned long fl = spin_lock_irqsave(&pstate_lk);
-    commit_change_locked(p, -(long)p->mem.commit);
-    spin_unlock_irqrestore(&pstate_lk, fl);
-}
-
 static unsigned long pages_for(uintptr_t bytes)
 {
     return (unsigned long)((bytes + PAGE_SIZE - 1) / PAGE_SIZE);
@@ -245,19 +185,14 @@ long sys_memlimit(struct proc *p, long kb)
 {
     if (kb < 0)
         return -E_INVAL;
-    unsigned long fl = spin_lock_irqsave(&pstate_lk);
-    long rc = 0;
+    struct mb_domain *d = p->mem.dom;
     if (kb > 0) {
         unsigned long pages = (unsigned long)kb / (PAGE_SIZE / 1024);
-        if (pages > p->mem.limit && !(p->cred.caps & CAP_ADMIN))
-            rc = -E_PERM;
-        else
-            p->mem.limit = pages;
+        if (pages > mb_limit(d) && !(p->cred.caps & CAP_ADMIN))
+            return -E_PERM;
+        mb_set_limit(d, pages);
     }
-    if (rc == 0)
-        rc = (long)(p->mem.limit * (PAGE_SIZE / 1024));
-    spin_unlock_irqrestore(&pstate_lk, fl);
-    return rc;
+    return (long)(mb_limit(d) * (PAGE_SIZE / 1024));
 }
 
 /*
@@ -279,7 +214,7 @@ long sys_mmap(struct proc *p, uintptr_t len)
         if (p->mem.maps[i].pages)
             continue;
         if (start + pages * PAGE_SIZE <= USER_MMAP_BASE + USER_MMAP_MAX &&
-            commit_change_locked(p, (long)pages) == 0) {
+            vm_space_commit_anon(p->space, start, pages * PAGE_SIZE) == 0) {
             p->mem.maps[i].start = start;
             p->mem.maps[i].pages = pages;
             p->mem.mmap_next = start + pages * PAGE_SIZE + PAGE_SIZE;   /* 兩塊之間留一頁不對映:越界會立刻被發現 */
@@ -303,13 +238,12 @@ long sys_munmap(struct proc *p, uintptr_t addr)
         if (p->mem.maps[i].pages && p->mem.maps[i].start == addr) {
             pages = p->mem.maps[i].pages;
             p->mem.maps[i].pages = 0;            /* 先從表格拿掉:之後碰這一塊就是錯誤,不會再被配置 */
-            commit_change_locked(p, -(long)pages);
             break;
         }
     }
     spin_unlock_irqrestore(&pstate_lk, fl);
-    for (unsigned long i = 0; i < pages; i++)
-        vm_space_unmap(p->space, addr + i * PAGE_SIZE);
+    if (pages)                                   /* 頁、票、配額一起歸還(分段放鎖,見 vm.c) */
+        vm_space_release_anon(p->space, addr, pages * PAGE_SIZE);
     mutex_unlock(&p->mem.mx);
     return pages ? 0 : -E_INVAL;
 }
@@ -329,9 +263,10 @@ long sys_sbrk(struct proc *p, long incr)
     uintptr_t now = old + (uintptr_t)incr;
     int ok = incr >= 0 ? (uintptr_t)incr <= USER_HEAP_MAX && now <= USER_HEAP_BASE + USER_HEAP_MAX
                        : (uintptr_t)-incr <= old - USER_HEAP_BASE;
-    /* 記帳:heap 佔用的頁數改變多少,就增減多少承諾。超過配額的話整個要求失敗 */
-    if (ok && commit_change_locked(p, (long)pages_for(now - USER_HEAP_BASE) -
-                                      (long)pages_for(old - USER_HEAP_BASE)) != 0)
+    /* 承諾只依「進位到整頁」的頁數差增減(同一頁內移動結尾不改帳)。超過配額或預留不到就整個失敗 */
+    unsigned long op = ok ? pages_for(old - USER_HEAP_BASE) : 0, np = ok ? pages_for(now - USER_HEAP_BASE) : 0;
+    if (ok && np > op &&
+        vm_space_commit_anon(p->space, USER_HEAP_BASE + op * PAGE_SIZE, (np - op) * PAGE_SIZE) != 0)
         ok = 0;
     if (ok)
         p->mem.brk = now;
@@ -341,10 +276,9 @@ long sys_sbrk(struct proc *p, long incr)
         return -E_NOMEM;
     }
 
-    /* 縮小:釋放不再屬於 heap 的整頁(第一個「完全在新結尾之後」的頁起) */
-    uintptr_t first = (now + PAGE_SIZE - 1) & ~(uintptr_t)(PAGE_SIZE - 1);
-    for (uintptr_t va = first; va < old; va += PAGE_SIZE)
-        vm_space_unmap(p->space, va);
+    /* 縮小:不再屬於 heap 的整頁連同票與配額歸還 */
+    if (np < op)
+        vm_space_release_anon(p->space, USER_HEAP_BASE + np * PAGE_SIZE, (op - np) * PAGE_SIZE);
     mutex_unlock(&p->mem.mx);
     return (long)old;
 }
@@ -354,35 +288,73 @@ long sys_sbrk(struct proc *p, long incr)
 /* 記憶體的記帳(p->mem)只有這個檔案可以存取                            */
 /* ------------------------------------------------------------------ */
 
-/* 新行程:配額沿用建立者的;由 kernel 建立的用預設值 */
-void pmem_init(struct proc *p, const struct proc *parent)
+/* 新行程的配額帳戶:沿用建立者的配額;由 kernel 建立的用預設值。失敗回傳 NULL */
+struct mb_domain *pmem_domain_new(const struct proc *parent)
 {
-    mutex_init(&p->mem.mx, "proc-mem", MX_PROC_MEM);
-    p->mem.limit = parent ? parent->mem.limit : PROC_DEFAULT_LIMIT_PAGES;
+    return mb_domain_new(parent ? mb_limit(parent->mem.dom) : PROC_DEFAULT_LIMIT_PAGES);
 }
 
-/* exec:新的程式從空的 heap 開始(舊的頁隨舊位址空間釋放),匿名對映也都不在了 */
+/* 新行程:接手 dom 的一份參考(由 pmem_domain_new 取得) */
+void pmem_init(struct proc *p, struct mb_domain *dom)
+{
+    mutex_init(&p->mem.mx, "proc-mem", MX_PROC_MEM);
+    p->mem.dom = dom;
+}
+
+struct mb_domain *pmem_domain(const struct proc *p)
+{
+    return p->mem.dom;
+}
+
+/* 行程結構釋放前:放掉 domain 的參考。位址空間此時已經釋放(它記的帳已經退回),
+   domain 不應再有用量 — 有的話是帳務錯誤,記入黑盒子 */
+void pmem_release(struct proc *p)
+{
+    if (p->mem.dom && mb_domain_put(p->mem.dom) != 0)
+        blackbox_log(BB_FAULT, "memory domain of pid %d released with charges left", p->pid);
+    p->mem.dom = NULL;
+}
+
+/* exec:新的程式從空的 heap 開始(舊的頁、票與配額隨舊位址空間一起退回),匿名對映也都不在了 */
 void pmem_exec(struct proc *p)
 {
     p->mem.brk = 0;
-    commit_release_all(p);
     memset(p->mem.maps, 0, sizeof(p->mem.maps));
     p->mem.mmap_next = 0;
 }
 
-/* fork:子行程得到和父行程一樣多的承諾(最壞情況下,共用的每一頁都要各自一份)。
-   先記帳,系統給不出來就回傳非 0(不 fork);heap 與對映的紀錄照抄(內容隨位址空間複製) */
-int pmem_fork(struct proc *child, const struct proc *parent)
+/* fork:子行程的 domain 與位址空間。父行程已承諾的匿名記憶體範圍同步交給 VM,
+   由它依 R1 替父子雙方預留寫入時複製的票(兩筆帳分開,失敗只退子的)。
+   失敗回傳 NULL,子行程的記憶體狀態不留下任何東西 */
+struct vm_space *pmem_fork(struct proc *child, struct proc *parent)
 {
+    struct vm_range r[1 + PROC_MAX_MAPS];
+    unsigned n = 0;
+
     mutex_init(&child->mem.mx, "proc-mem", MX_PROC_MEM);
-    child->mem.limit = parent->mem.limit;
+    child->mem.dom = pmem_domain_new(parent);
+    if (!child->mem.dom)
+        return NULL;
+    mutex_lock(&parent->mem.mx);                 /* 範圍與頁表在複製期間不變 */
     unsigned long fl = spin_lock_irqsave(&pstate_lk);
-    int rc = commit_change_locked(child, (long)parent->mem.commit);
     memcpy(child->mem.maps, parent->mem.maps, sizeof(child->mem.maps));
     child->mem.mmap_next = parent->mem.mmap_next;
     child->mem.brk = parent->mem.brk;
+    if (parent->mem.brk > USER_HEAP_BASE) {
+        r[n].start = USER_HEAP_BASE;
+        r[n++].len = pages_for(parent->mem.brk - USER_HEAP_BASE) * PAGE_SIZE;
+    }
+    for (unsigned i = 0; i < PROC_MAX_MAPS; i++)
+        if (parent->mem.maps[i].pages) {
+            r[n].start = parent->mem.maps[i].start;
+            r[n++].len = parent->mem.maps[i].pages * PAGE_SIZE;
+        }
     spin_unlock_irqrestore(&pstate_lk, fl);
-    return rc;
+    struct vm_space *vs = vm_space_fork(parent->space, child->mem.dom, r, n);
+    mutex_unlock(&parent->mem.mx);
+    if (!vs)
+        pmem_release(child);
+    return vs;
 }
 
 /*

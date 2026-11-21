@@ -77,7 +77,7 @@ if ! command -v gcc >/dev/null; then
   echo "  架構檢查:找不到 gcc,無法確認編譯器的防線"; exit 2
 fi
 probe owner-sig   ok   '#define PROC_OWNER_SIG'   '#include "proc_internal.h"' 'int f(struct proc *p) { return p->sig.stopped; }'
-probe owner-mem   ok   '#define PROC_OWNER_MEM'   '#include "proc_internal.h"' 'unsigned long f(struct proc *p) { return p->mem.commit; }'
+probe owner-mem   ok   '#define PROC_OWNER_MEM'   '#include "proc_internal.h"' 'uintptr_t f(struct proc *p) { return p->mem.brk; }'
 probe owner-files ok   '#define PROC_OWNER_FILES' '#include "proc_internal.h"' 'void *f(struct proc *p) { return p->files.fd[0]; }'
 probe other-sig   fail '#include "proc_internal.h"' 'int f(struct proc *p) { return p->sig.stopped; }'
 probe other-sig2  fail '#define PROC_OWNER_MEM' '#include "proc_internal.h"' 'int f(struct proc *target) { return target -> sig . pending; }'

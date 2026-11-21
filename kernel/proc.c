@@ -14,9 +14,8 @@ struct proc *procs;                  /* 所有行程(含 zombie);上鎖的規則
  *   - 唯一會在裡面再拿的鎖是 VFS 的參考計數鎖 inode_lk(經由 vfs_dup,共 2 處:
  *     查到描述符表裡的指標之後,要在放開 pstate_lk 之前拿到參考)。順序固定為 pstate_lk 在外。
  *     反方向不可能發生:inode_lk 只在 vfs.c 內部使用,而 vfs.c 看不到 pstate_lk。
- *   - 其餘區段在鎖裡只做欄位的讀寫、memcpy / strlen,以及 commit_change_locked
- *     (它查詢頁面配置器的 pmm_free_count / pmm_reserve_count / pmm_total_pages;前兩者會短暫取得 pmm_lk,
- *     層級 LK_PMM 高於 LK_PSTATE,順序合法)。
+ *   - 其餘區段在鎖裡只做欄位的讀寫、memcpy / strlen,以及 sbrk / mmap 的承諾
+ *     (vm_space_commit_anon:依序取得 vm_lk → mb_lk → pmm_lk,層級都高於 LK_PSTATE,順序合法)。
  * 新增持有這把鎖的程式時必須維持這個清單;目前沒有機制在執行時檢查鎖的順序(見 docs/ISSUES.md)。
  */
 struct spinlock pstate_lk = SPINLOCK_INIT("pstate", LK_PSTATE);
@@ -188,7 +187,7 @@ static int image_put_args(struct image *img, uintptr_t top, const struct args *a
 
 /* 從檔案系統載入 path 指到的程式,連同參數準備好。成功回傳 0,*img 可以直接使用;
    失敗回傳負的錯誤碼,*img 不留下任何東西 */
-static int image_build(const char *path, const struct args *a, struct image *img)
+static int image_build(const char *path, const struct args *a, struct image *img, struct mb_domain *dom)
 {
     struct uimg_hdr hdr;
     const struct uimg_hdr *h = &hdr;
@@ -220,7 +219,7 @@ static int image_build(const char *path, const struct args *a, struct image *img
         goto fail;
 
     err = -E_NOMEM;
-    img->space = vm_space_create(NULL);  /* (b1) 第 4 步才接上行程的 domain */
+    img->space = vm_space_create(dom);   /* 頁表記在行程的 domain 上 */
     if (!img->space)
         goto fail;
 
@@ -307,8 +306,7 @@ void proc_thread_exit(void)
 
     if (last) {
         /* 自己是最後一條:已經沒有執行緒屬於這個位址空間,可以在鎖外釋放 */
-        vm_space_destroy(p->space);
-        commit_release_all(p);           /* 答應給它的記憶體全部歸還 */
+        vm_space_destroy(p->space);      /* 頁、承諾(票)與配額全部隨位址空間退回 domain */
         vfs_exec_release(p->exe);        /* 對映已經移除:程式檔不再「執行中」 */
         vfs_close(p->exe);
         fd_close_all(p);                 /* 行程結束時,它開啟的檔案由 kernel 代為關閉 */
@@ -409,8 +407,15 @@ static int proc_create(const char *path, const struct args *a, struct proc *pare
 
     if (!p)
         return -E_NOMEM;
-    err = image_build(path, a, &img);
+    struct mb_domain *dom = pmem_domain_new(parent);   /* 配額沿用建立者的 */
+    if (!dom) {
+        kfree(p);
+        return -E_NOMEM;
+    }
+    pmem_init(p, dom);
+    err = image_build(path, a, &img, dom);
     if (err) {
+        pmem_release(p);
         kfree(p);
         return err;
     }
@@ -418,6 +423,7 @@ static int proc_create(const char *path, const struct args *a, struct proc *pare
         fd_inherit(p, parent, 3);
     } else if (fd_setup_console(p) != 0) {
         image_discard(&img);
+        pmem_release(p);
         kfree(p);
         return -E_IO;
     }
@@ -427,7 +433,6 @@ static int proc_create(const char *path, const struct args *a, struct proc *pare
     p->nstacks = 1;                  /* 第 0 格 stack 已由 image_build 準備好 */
     /* 身分沿用建立者的;kernel 建立的行程是 root,擁有全部的特權 */
     p->cred = parent ? parent->cred : (struct cred){ 0, 0, CAP_ALL };
-    pmem_init(p, parent);            /* 記憶體配額沿用建立者的 */
     files_init_cwd(p, parent);       /* 工作目錄沿用建立者的;kernel 建立的行程從根目錄開始 */
 
     unsigned long flags = sched_lock();
@@ -498,6 +503,8 @@ int proc_wait(int pid)
         }
     }
     sched_unlock(flags);
+    if (p)
+        pmem_release(p);                 /* 配額帳戶的最後一份參考(位址空間早已釋放) */
     kfree(p);                        /* 已從串列移除,別人找不到它了;在鎖外釋放(NULL 無作用) */
     return code;
 }
@@ -572,6 +579,7 @@ static void proc_free_list(struct proc *list)
 {
     while (list) {
         struct proc *next = list->next;
+        pmem_release(list);              /* 配額帳戶的最後一份參考(位址空間早已釋放) */
         kfree(list);
         list = next;
     }
@@ -633,6 +641,8 @@ long proc_wait_child(struct proc *p, long pid, int *code, int nohang, int untrac
         wq_sleep(&p->child_wq);              /* 任何一個子行程結束時會被叫醒,再檢查一次 */
     }
     sched_unlock(flags);
+    if (z)
+        pmem_release(z);                     /* 配額帳戶的最後一份參考 */
     kfree(z);
     return rc;
 }
@@ -727,7 +737,7 @@ long sys_exec(struct proc *p, uintptr_t upath, uintptr_t uargv)
 
     err = vfs_access(path, PERM_X);  /* 要有執行這個檔案的權限 */
     if (err == 0)
-        err = image_build(path, a, &img);
+        err = image_build(path, a, &img, pmem_domain(p));
     kfree(a);
     if (err)
         return err;                  /* 舊程式完全沒被動到 */
@@ -808,14 +818,10 @@ long sys_fork(struct proc *p, void *tf)
     void *frame = kmalloc(arch_frame_size());
     if (!c || !st || !frame)
         goto nomem;
-    /* 子行程得到和父行程一樣多的承諾(最壞情況下,共用的每一頁都要各自一份):先記帳,不夠就不 fork */
-    if (pmem_fork(c, p) != 0)
+    /* 子行程的配額帳戶與位址空間:依 R1 替父子雙方預留寫入時複製的票,不夠就不 fork */
+    c->space = pmem_fork(c, p);
+    if (!c->space)
         goto nomem;
-    c->space = vm_space_fork(p->space);
-    if (!c->space) {
-        commit_release_all(c);
-        goto nomem;
-    }
 
     memcpy(frame, tf, arch_frame_size());
     arch_frame_set_retval(frame, 0);         /* 子行程看到的回傳值 */
@@ -826,7 +832,10 @@ long sys_fork(struct proc *p, void *tf)
     c->cred = p->cred;
     files_init_cwd(c, p);
     c->exe = vfs_dup(p->exe);
-    vfs_exec_hold(c->exe);                   /* 子行程也在執行同一個程式檔 */
+    /* 子行程也在執行同一個程式檔。父行程已經持有同一個一般檔案的執行標記,所以不可能失敗;
+       萬一失敗代表 VFS 的狀態不一致,不能讓子行程在沒有執行標記的情況下繼續 */
+    if (vfs_exec_hold(c->exe) != 0)
+        panic("fork: cannot mark the executable of pid %d as running", p->pid);
     c->nstacks = p->nstacks;
     psig_fork(c, p);                         /* 訊號的處理方式沿用;還沒交付的不帶過去 */
     fd_inherit(c, p, PROC_MAX_FD);
@@ -845,7 +854,6 @@ long sys_fork(struct proc *p, void *tf)
         kfree(st);
         kfree(frame);
         vm_space_destroy(c->space);
-        commit_release_all(c);
         vfs_exec_release(c->exe);
         vfs_close(c->exe);
         fd_close_all(c);

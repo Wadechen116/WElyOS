@@ -678,8 +678,34 @@ static void space_flush_fn(void *arg)
 
 /* 複製一張表格底下的所有對映到 child(僅用於使用者範圍)。呼叫時持有 vm_lk。
    base 為這張表格第 0 項對應的虛擬位址 */
+static unsigned long pt_need(uintptr_t va, uintptr_t len);   /* 定義在檔案後段(匿名記憶體) */
+
+/* fork 時,哪些頁屬於匿名記憶體的已承諾範圍(由行程記憶體模組在 mem.mx 之下同步傳入) */
+struct fork_anon {
+    const struct vm_range *r;
+    unsigned n;
+    unsigned long marked;                    /* 這次由「父的獨佔頁」變成 COW + TICKET 的頁數 */
+};
+
+static int in_anon(const struct fork_anon *fa, uintptr_t va)
+{
+    for (unsigned i = 0; fa && i < fa->n; i++)
+        if (va >= fa->r[i].start && va - fa->r[i].start < fa->r[i].len)
+            return 1;
+    return 0;
+}
+
+/*
+ * fork 分兩趟(設計 BR4:先完成所有可能失敗的步驟,最後才改父行程):
+ *   第一趟 mark_parent = 0:替子空間建表、寫入 PTE(可寫的頁在子這邊直接是唯讀 + COW,
+ *          匿名記憶體另帶 TICKET),增加實體頁的參考。可能因為配置不出頁表而失敗 —
+ *          此時父空間完全沒有被改過。
+ *   第二趟 mark_parent = 1:只把父空間裡可寫的頁改成同樣的唯讀 + COW(+ TICKET),
+ *          不配置任何東西,不會失敗;fa->marked 數出父這邊新增的有票映射。
+ * 兩趟之間一直持有 vm_lk,而且 fork 只允許單一執行緒的行程,父的 PTE 不會被別人改動。
+ */
 static int fork_table(struct vm_space *child, pte_t *t, int level, uintptr_t base,
-                      unsigned first, unsigned last)
+                      unsigned first, unsigned last, struct fork_anon *fa, int mark_parent)
 {
     uintptr_t span = (uintptr_t)PAGE_SIZE << (level * MMU_BITS);
 
@@ -688,7 +714,8 @@ static int fork_table(struct vm_space *child, pte_t *t, int level, uintptr_t bas
             continue;
         uintptr_t va = base + i * span;
         if (level > 0) {
-            if (fork_table(child, (pte_t *)arch_pte_addr(t[i]), level - 1, va, 0, ENTRIES - 1) != 0)
+            if (fork_table(child, (pte_t *)arch_pte_addr(t[i]), level - 1, va, 0, ENTRIES - 1, fa,
+                           mark_parent) != 0)
                 return -1;
             continue;
         }
@@ -696,14 +723,21 @@ static int fork_table(struct vm_space *child, pte_t *t, int level, uintptr_t bas
         uintptr_t pa = arch_pte_addr(t[i]);
         unsigned flags = arch_pte_flags(t[i]);
 
-        if (!(flags & VM_SHARED)) {
-            /* 這一頁從此多一個擁有者。原本可寫的(或已經是 COW 的)頁,
-               在兩邊都變成「唯讀 + COW」:任何一邊寫入都會觸發 page fault */
-            if (flags & (VM_WRITE | VM_COW)) {
-                flags = (flags & ~VM_WRITE) | VM_COW;
+        /* 這一頁從此多一個擁有者。原本可寫的頁在兩邊都變成「唯讀 + COW」:任何一邊寫入都會
+           觸發 page fault。匿名記憶體的頁另外帶 VM_TICKET(R1:每一筆 COW 映射各持一張票);
+           票在呼叫者那裡已經預留好(父:這次變成 COW 的頁數;子:全部承諾數) */
+        if (!(flags & VM_SHARED) && (flags & VM_WRITE)) {
+            flags = (flags & ~VM_WRITE) | VM_COW;
+            if (in_anon(fa, va))
+                flags |= VM_TICKET;
+            if (mark_parent) {
                 arch_pte_set(&t[i], arch_pte_leaf(pa, flags, 0));
+                if (flags & VM_TICKET)
+                    fa->marked++;
             }
         }
+        if (mark_parent)
+            continue;
         pte_t *e = walk(child, child->root, va, 0, 1, 0, WALK_LEGACY, NULL);
         if (!e)
             return -1;                       /* 記憶體不足(配置不出頁表) */
@@ -715,17 +749,66 @@ static int fork_table(struct vm_space *child, pte_t *t, int level, uintptr_t bas
     return 0;
 }
 
-struct vm_space *vm_space_fork(struct vm_space *parent)
+struct vm_space *vm_space_fork(struct vm_space *parent, struct mb_domain *dom,
+                               const struct vm_range *anon, unsigned nanon)
 {
-    struct vm_space *child = vm_space_create(NULL);   /* (b1) 第 5 步才接上 domain */
+    struct vm_space *child = vm_space_create(dom);
     int top = MMU_LEVELS - 1;
+    struct fork_anon fa = { anon, nanon, 0 };
 
     if (!child)
         return NULL;
 
     unsigned long irq = spin_lock_irqsave(&vm_lk);
-    int rc = fork_table(child, parent->root, top, 0,
-                        va_index(USER_BASE, top), va_index(USER_TOP - 1, top));
+    int rc = 0;
+    unsigned long pending = 0;
+    if (dom && parent->dom) {
+        /* 第一筆帳:子空間。每一頁已承諾的匿名記憶體都要一張票(未兌現的,或將成為 COW 的);
+           中間表以子空間的匿名範圍最壞情況預留(上限 M) */
+        unsigned long q = parent->quota[MB_ANON], pt = 0;
+        for (unsigned i = 0; i < nanon; i++)
+            pt += pt_need(anon[i].start, anon[i].len);
+        if (pt > anon_pt_max)
+            pt = anon_pt_max;
+        struct mb_bundle b = { .reserve = q + pt };
+        b.quota[MB_ANON] = q;
+        b.quota[MB_PGTABLE] = pt;
+        if (q + pt < q || mb_commit_bundle(dom, &b) != 0) {
+            rc = -1;
+        } else {
+            child->data_tickets = q;
+            child->pt_tickets = pt;
+            child->quota[MB_ANON] = q;
+            child->quota[MB_PGTABLE] += pt;
+            /* 第二筆帳:父的新增票 — 父的每一頁可寫獨佔匿名頁都會變成 COW + TICKET。
+               只動實體預留(那些頁早已算在父的 ANON 配額裡);先算好數量一次預留 */
+            for (unsigned i = 0; i < nanon; i++)
+                for (uintptr_t off = 0; off < anon[i].len; off += PAGE_SIZE) {
+                    int level = 0;
+                    pte_t *e = walk(parent, parent->root, anon[i].start + off, 0, 0, 0, WALK_LEGACY, &level);
+                    if (e && arch_pte_valid(*e) && level == 0 && (arch_pte_flags(*e) & VM_WRITE))
+                        pending++;
+                }
+            if (pmm_reserve(pending) != 0)
+                rc = -1;                     /* 子的帳由下面的 destroy 退回 */
+        }
+    }
+    if (rc == 0) {
+        struct fork_anon *fap = dom && parent->dom ? &fa : NULL;
+        unsigned lo = va_index(USER_BASE, top), hi = va_index(USER_TOP - 1, top);
+        rc = fork_table(child, parent->root, top, 0, lo, hi, fap, 0);      /* 第一趟:只建子空間 */
+        if (rc == 0)
+            fork_table(child, parent->root, top, 0, lo, hi, fap, 1);       /* 第二趟:標記父,不會失敗 */
+        if (fap) {
+            if (rc == 0) {
+                if (fa.marked != pending)
+                    panic("vm: fork marked %lu parent pages but reserved %lu", fa.marked, pending);
+                parent->data_tickets += fa.marked;      /* 待生效的票轉為正式 */
+            } else {
+                pmm_unreserve(pending);                 /* 失敗:父的待生效票全部退回,父的 PTE 沒有被改過 */
+            }
+        }
+    }
     spin_unlock_irqrestore(&vm_lk, irq);
 
     /* parent 有些頁剛從可寫變成唯讀:它在各顆 CPU 上的舊紀錄(還寫著「可寫」)都要清掉,
@@ -736,7 +819,7 @@ struct vm_space *vm_space_fork(struct vm_space *parent)
     smp_call_mask(parent->used_cpus, space_flush_fn, parent);
 
     if (rc != 0) {
-        vm_space_destroy(child);             /* 已經對映的部分會各自歸還它們的參考 */
+        vm_space_destroy(child);             /* 只退子空間自己的帳;已經對映的部分各自歸還參考 */
         return NULL;
     }
     return child;

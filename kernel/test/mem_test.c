@@ -833,3 +833,81 @@ void anon_ticket_test(void)
     kprintf("anon: ticket test ok (%lu pages committed and first-touched after ordinary allocations "
             "took %zu pages; ticketed COW reuse and copy; M = %lu)\n", n, taken, vm_anon_pt_max());
 }
+
+/*
+ * I-240 C3.2 (b1) 第 4、5 步:fork 的兩筆帳(R1)。父空間承諾 15 頁、觸及其中 10 頁,fork 之後:
+ * 子空間 15 張票(每一頁承諾一張);父空間 5 張未兌現 + 10 張(那 10 頁變成 COW + TICKET)。
+ * 一般配置把記憶體用到預留邊界之後:父寫入 10 頁(共用中,用票複製)、子寫入同樣 10 頁
+ * (只剩自己,退票)、子第一次觸及沒碰過的 5 頁 — 全部成功。每一步核對「兩個空間的票 = pmm 增加的預留」。
+ * 另含失敗注入:子空間第一張表就建不出來時,父空間完全不變(先建子、後標父)。
+ * 負對照:改回「建子時同步標記父」(第 54 步實測)時,失敗注入那段「父的頁仍是可寫獨佔」斷言失敗。
+ */
+void fork_ticket_test(void)
+{
+    uintptr_t heap, hlen;
+    KASSERT(vm_anon_window(0, &heap, &hlen) == 0);
+    size_t r0 = pmm_reserved_count();
+    struct mb_domain *dp = mb_domain_new(100000), *dc = mb_domain_new(100000);
+    struct vm_space *ps = vm_space_create(dp);
+    KASSERT(dp && dc && ps);
+    KASSERT(vm_space_commit_anon(ps, heap, 15 * PAGE_SIZE) == 0);
+    for (int i = 0; i < 10; i++)
+        KASSERT(vm_space_fault_anon(ps, heap + i * PAGE_SIZE) == 0);
+
+    struct vm_range r = { heap, 15 * PAGE_SIZE };
+
+    /* 失敗注入(Codex 183):子 domain 的配額剛好只夠根表 + 15 張資料票 + 2 張頁表票,
+       第一趟替子建第一張表時配額不足 → fork 失敗。父空間的 PTE、票與 pmm 預留必須完全不變 */
+    struct vm_ledger before, after;
+    vm_space_ledger(ps, &before);
+    size_t rb = pmm_reserved_count();
+    struct mb_domain *tight = mb_domain_new(1 + 15 + 2);
+    KASSERT(tight);
+    KASSERT(vm_space_fork(ps, tight, &r, 1) == NULL);
+    vm_space_ledger(ps, &after);
+    KASSERT(after.data_tickets == before.data_tickets && after.pt_tickets == before.pt_tickets);
+    KASSERT(pmm_reserved_count() == rb);
+    for (int i = 0; i < 10; i++) {
+        unsigned f = 0;
+        uintptr_t pa;
+        KASSERT(vm_space_query(ps, heap + i * PAGE_SIZE, &pa, &f) == 0);
+        KASSERT((f & VM_WRITE) && !(f & (VM_COW | VM_TICKET)));    /* 父的頁仍是可寫獨佔 */
+    }
+    KASSERT(mb_domain_put(tight) == 0);
+
+    struct vm_space *cs = vm_space_fork(ps, dc, &r, 1);
+    KASSERT(cs);
+    struct vm_ledger lp, lc;
+    vm_space_ledger(ps, &lp);
+    vm_space_ledger(cs, &lc);
+    KASSERT(lc.data_tickets == 15 && lp.data_tickets == 15);
+    KASSERT(lp.data_tickets + lp.pt_tickets + lc.data_tickets + lc.pt_tickets == pmm_reserved_count() - r0);
+
+    void *chain = NULL;
+    for (void **pg; (pg = pmm_alloc()) != NULL; ) {
+        *pg = chain;
+        chain = pg;
+    }
+    for (int i = 0; i < 10; i++)
+        KASSERT(vm_space_fault(ps, heap + i * PAGE_SIZE, 1) == 0);   /* 共用中:用父的票複製 */
+    for (int i = 0; i < 10; i++)
+        KASSERT(vm_space_fault(cs, heap + i * PAGE_SIZE, 1) == 0);   /* 只剩自己:退子的票 */
+    for (int i = 10; i < 15; i++)
+        KASSERT(vm_space_fault_anon(cs, heap + i * PAGE_SIZE) == 0); /* 未兌現:用子的票 */
+    vm_space_ledger(ps, &lp);
+    vm_space_ledger(cs, &lc);
+    KASSERT(lp.data_tickets == 5 && lc.data_tickets == 0);
+    KASSERT(lp.data_tickets + lp.pt_tickets + lc.data_tickets + lc.pt_tickets == pmm_reserved_count() - r0);
+    while (chain) {
+        void **pg = chain;
+        chain = *pg;
+        pmm_free(pg);
+    }
+
+    vm_space_destroy(cs);
+    vm_space_destroy(ps);
+    KASSERT(pmm_reserved_count() == r0);
+    KASSERT(mb_domain_put(dc) == 0 && mb_domain_put(dp) == 0);
+    kprintf("anon: fork ticket test ok (parent and child each wrote shared pages and touched new ones "
+            "after ordinary allocations reached the reservation)\n");
+}

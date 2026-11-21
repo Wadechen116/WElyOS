@@ -59,14 +59,16 @@ int psig_report_stop(struct proc *p);   /* 〔持有排程器的鎖〕 使用者
 int copy_from_user(struct proc *p, void *dst, uintptr_t uaddr, size_t len);   /* 使用者:proc.c、proc_signal.c、syscall.c */
 int copy_to_user(struct proc *p, uintptr_t uaddr, const void *src, size_t len);   /* 使用者:proc.c、proc_signal.c、proc_fs.c、syscall.c */
 int copy_path_from_user(struct proc *p, char *dst, uintptr_t uaddr);   /* 使用者:proc.c、proc_fs.c */
-void commit_release_all(struct proc *p);   /* 使用者:proc.c */
 long sys_memlimit(struct proc *p, long kb);   /* 使用者:syscall.c */
 long sys_mmap(struct proc *p, uintptr_t len);   /* 使用者:syscall.c */
 long sys_munmap(struct proc *p, uintptr_t addr);   /* 使用者:syscall.c */
 long sys_sbrk(struct proc *p, long incr);   /* 使用者:syscall.c */
-void pmem_init(struct proc *p, const struct proc *parent);   /* 使用者:proc.c */
+struct mb_domain *pmem_domain_new(const struct proc *parent);   /* 使用者:proc.c */
+void pmem_init(struct proc *p, struct mb_domain *dom);   /* 使用者:proc.c */
+struct mb_domain *pmem_domain(const struct proc *p);   /* 使用者:proc.c */
+void pmem_release(struct proc *p);   /* 使用者:proc.c */
 void pmem_exec(struct proc *p);   /* 使用者:proc.c */
-int pmem_fork(struct proc *child, const struct proc *parent);   /* 使用者:proc.c */
+struct vm_space *pmem_fork(struct proc *child, struct proc *parent);   /* 使用者:proc.c */
 long sys_seu(struct proc *p, long pid, uintptr_t addr, long bit);   /* 使用者:syscall.c */
 void pmem_apply_injection(struct proc *p);   /* 使用者:proc_signal.c */
 

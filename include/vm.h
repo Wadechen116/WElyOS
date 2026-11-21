@@ -132,7 +132,11 @@ void vm_space_switch(struct vm_space *vs);
  * vm_space_map_new:同 vm_space_map,但 va 已經有對映時不覆蓋,回傳 1。
  *     用於「用到才配置」的頁:兩條執行緒可能同時為同一頁發生 page fault。
  */
-struct vm_space *vm_space_fork(struct vm_space *parent);
+struct vm_range { uintptr_t start, len; };
+/* dom 不為 NULL(且 parent 也有 domain)時,子空間記在 dom 上;anon 是父行程已承諾的匿名記憶體範圍,
+   依 R1 替父子雙方預留 COW 票(設計 BR4:兩筆帳分開,失敗只退子的帳) */
+struct vm_space *vm_space_fork(struct vm_space *parent, struct mb_domain *dom,
+                               const struct vm_range *anon, unsigned nanon);
 int vm_space_fault(struct vm_space *vs, uintptr_t va, int write);
 int vm_space_map_new(struct vm_space *vs, uintptr_t va, uintptr_t pa, unsigned flags);
 /* 在 VM 的鎖之內查表並複製 n 個位元組(不跨頁);to_user = 1 是寫入使用者頁(必須可寫)。
