@@ -809,6 +809,11 @@ struct thread *thread_prepare(const char *name, void (*fn)(void *), void *arg, i
     return t;
 }
 
+struct mb_domain *thread_domain(void)
+{
+    return cur()->dom;                       /* 只讀自己的欄位;它在執行緒存活期間不變 */
+}
+
 void thread_abandon(struct thread *t)
 {
     thread_uncharge(t);

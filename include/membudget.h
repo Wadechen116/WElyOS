@@ -1,6 +1,7 @@
 #ifndef WELYOS_MEMBUDGET_H
 #define WELYOS_MEMBUDGET_H
 #include <stddef.h>
+#include "pmm.h"   /* PAGE_SIZE */
 
 /*
  * membudget.h - 記憶體配額(I-240 C3.2;設計見 docs/design/C3.2-memory-accounting.md)
@@ -48,5 +49,11 @@ int  mb_release_bundle(struct mb_domain *d, const struct mb_bundle *b);
 unsigned long mb_limit(struct mb_domain *d);
 void mb_set_limit(struct mb_domain *d, unsigned long limit);
 void mb_stats(struct mb_domain *d, struct mb_stats *out);
-unsigned long mb_accounting_errors(void);              /* 超量歸還、帶著用量釋放的次數 */
+unsigned long mb_accounting_errors(void);
+
+/* kernel 物件(檔案、管線…)由建立者的 domain 持有:取得一份參考並記 KOBJ 配額(失敗 -E_NOMEM、什麼都不改);
+   最後一個參考釋放時以 mb_release_object 退回並放掉參考(帳務不符回傳 -1) */
+int  mb_charge_object(struct mb_domain *d, unsigned long pages);
+int  mb_release_object(struct mb_domain *d, unsigned long pages);
+static inline unsigned long mb_pages_for_bytes(unsigned long bytes) { return (bytes + PAGE_SIZE - 1) / PAGE_SIZE; }              /* 超量歸還、帶著用量釋放的次數 */
 #endif

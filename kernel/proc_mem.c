@@ -88,7 +88,8 @@ static int proc_fault_locked(struct proc *p, uintptr_t addr, int write)
     unsigned slot = (unsigned)((USER_STACK_TOP - 1 - addr) / USER_STACK_SLOT);
     uintptr_t slot_base = USER_STACK_TOP - (uintptr_t)(slot + 1) * USER_STACK_SLOT;
     uintptr_t page = addr & ~(uintptr_t)(PAGE_SIZE - 1);
-    if (slot >= p->nstacks || page == slot_base)     /* 沒有這條 stack,或碰到保護頁 */
+    if (slot >= PROC_MAX_THREADS || !(__atomic_load_n(&p->stack_slots, __ATOMIC_ACQUIRE) & (1u << slot)) ||
+        page == slot_base)                       /* 沒有這條 stack,或碰到保護頁 */
         return -1;
 
     void *mem = pmm_alloc();
@@ -337,23 +338,30 @@ void pmem_exec(struct proc *p)
     p->mem.mmap_next = 0;
 }
 
-/* fork:子行程的 domain 與位址空間。父行程已承諾的匿名記憶體範圍同步交給 VM,
-   由它依 R1 替父子雙方預留寫入時複製的票(兩筆帳分開,失敗只退子的)。
-   失敗回傳 NULL,子行程的記憶體狀態不留下任何東西 */
-struct vm_space *pmem_fork(struct proc *child, struct proc *parent)
+/* fork 的第一部分:子行程的 domain(沿用父的配額)與行程結構的 KOBJ。失敗回傳 -E_NOMEM,不留東西 */
+int pmem_fork_domain(struct proc *child, const struct proc *parent)
+{
+    mutex_init(&child->mem.mx, "proc-mem", MX_PROC_MEM);
+    child->mem.dom = pmem_domain_new(parent);
+    if (!child->mem.dom)
+        return -E_NOMEM;
+    if (mb_quota_add(child->mem.dom, MB_KOBJ, proc_kobj_pages(child)) != 0) {
+        pmem_release(child);
+        return -E_NOMEM;
+    }
+    child->mem.kobj = proc_kobj_pages(child);
+    return 0;
+}
+
+/* fork 的最後一個可能失敗的步驟:子行程的位址空間。父行程已承諾的匿名記憶體範圍同步交給 VM,
+   由它依 R1 替父子雙方預留寫入時複製的票(兩趟:先建子、後標父)。呼叫者必須把其他所有可能失敗的
+   配置都放在這一步之前 — 這一步成功之後父的頁已經改成 COW,不能再因別的原因回退(Codex 198)。
+   失敗回傳 NULL;父不變,子的 domain 仍由 child 持有(呼叫者以 pmem_release 放掉) */
+struct vm_space *pmem_fork_space(struct proc *child, struct proc *parent)
 {
     struct vm_range r[1 + PROC_MAX_MAPS];
     unsigned n = 0;
 
-    mutex_init(&child->mem.mx, "proc-mem", MX_PROC_MEM);
-    child->mem.dom = pmem_domain_new(parent);
-    if (!child->mem.dom)
-        return NULL;
-    if (mb_quota_add(child->mem.dom, MB_KOBJ, proc_kobj_pages(child)) != 0) {
-        pmem_release(child);
-        return NULL;
-    }
-    child->mem.kobj = proc_kobj_pages(child);
     mutex_lock(&parent->mem.mx);                 /* 範圍與頁表在複製期間不變 */
     unsigned long fl = spin_lock_irqsave(&pstate_lk);
     memcpy(child->mem.maps, parent->mem.maps, sizeof(child->mem.maps));
@@ -371,8 +379,6 @@ struct vm_space *pmem_fork(struct proc *child, struct proc *parent)
     spin_unlock_irqrestore(&pstate_lk, fl);
     struct vm_space *vs = vm_space_fork(parent->space, child->mem.dom, r, n);
     mutex_unlock(&parent->mem.mx);
-    if (!vs)
-        pmem_release(child);
     return vs;
 }
 
@@ -432,3 +438,8 @@ void proc_mem_boot(void)
     static const uintptr_t len[2] = { USER_HEAP_MAX, USER_MMAP_MAX };
     vm_set_anon_windows(base, len, 2);
 }
+
+/* 讓行程核心在「配置 / 回退使用者 stack 的格子與頁」時持有 mem.mx,與 stack 成長的 fault 序列化
+   (否則 fault 可能在格子已佔、頁還沒對映的空檔裡自己裝上一頁,之後被覆寫而漏掉 — 審查代理人的發現) */
+void pmem_lock(struct proc *p)   { mutex_lock(&p->mem.mx); }
+void pmem_unlock(struct proc *p) { mutex_unlock(&p->mem.mx); }

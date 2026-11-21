@@ -18,6 +18,8 @@
 #include "cred.h"
 #include "fs.h"
 #include "kmalloc.h"
+#include "membudget.h"
+#include "sched.h"
 #include "kprintf.h"
 #include "kstring.h"
 #include "panic.h"
@@ -31,6 +33,8 @@ struct file {
     int flags;
     unsigned refs;               /* 有幾個檔案描述符指向這次開啟(受 inode_lk 保護) */
     struct mutex lock;
+    struct mb_domain *dom;       /* 建立者的 domain(持有一份參考,KOBJ 記在它上面);kernel 建立的為 NULL */
+    unsigned long kobj;
 };
 
 static struct inode *root;
@@ -303,6 +307,17 @@ struct file *vfs_file_new(struct inode *in, int flags)
 
     if (!f)
         return NULL;
+    /* 由建立者的 domain 持有,直到最後一個參考關閉(fork 之後共用、父先結束也一樣) */
+    struct mb_domain *d = thread_domain();
+    if (d) {
+        unsigned long k = mb_pages_for_bytes(kmalloc_size(f));
+        if (mb_charge_object(d, k) != 0) {
+            kfree(f);
+            return NULL;
+        }
+        f->dom = d;
+        f->kobj = k;
+    }
     f->in = iget(in);
     f->flags = flags;
     f->refs = 1;
@@ -332,6 +347,8 @@ void vfs_close(struct file *f)
         if (f->in->ops->closed)
             f->in->ops->closed(f->in, f->flags);
         iput(f->in);
+        if (f->dom && mb_release_object(f->dom, f->kobj) != 0)
+            panic("vfs: file kernel-object accounting mismatch");
         kfree(f);
     }
 }

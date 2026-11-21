@@ -378,6 +378,7 @@ void kmain(const struct boot_info *bi)
         sleep_wall_test();
         pte_tear_test();
         thread_kobj_test();
+        pipe_kobj_test();
         fs_demo();
         disk_demo();
         nic_selftest();                      /* 驅動程式單獨的測試:要在協定堆疊開始收訊框之前 */
@@ -388,6 +389,7 @@ void kmain(const struct boot_info *bi)
     if (selftest) {
         pipe_demo();
         user_demo();
+        user_stack_rollback_test();
     }
     if (cmdline_has(bi->cmdline, "stress"))
         sched_stress();

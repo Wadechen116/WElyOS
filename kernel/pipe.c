@@ -25,6 +25,8 @@
 #include <stddef.h>
 #include "fs.h"
 #include "kmalloc.h"
+#include "membudget.h"
+#include "panic.h"
 #include "kstring.h"
 #include "sched.h"
 
@@ -37,6 +39,8 @@ struct pipe {
     unsigned readers, writers;               /* 還開著的讀端 / 寫端數量 */
     unsigned head, count;                    /* 最舊資料的位置;目前有多少位元組 */
     char buf[PIPE_SIZE];
+    struct mb_domain *dom;           /* 建立者的 domain(持有一份參考,KOBJ 記在它上面);NULL = kernel */
+    unsigned long kobj;
 };
 
 static struct pipe *pp(struct inode *in) { return (struct pipe *)in; }
@@ -130,9 +134,17 @@ static void pipe_closed(struct inode *in, int oflags)
     sched_unlock(flags);
 }
 
+/* 管線本身的釋放:退回建立者 domain 的 KOBJ 與參考,再釋放記憶體 */
+static void pipe_free(struct pipe *p)
+{
+    if (p->dom && mb_release_object(p->dom, p->kobj) != 0)
+        panic("pipe: kernel-object accounting mismatch");
+    kfree(p);
+}
+
 static void pipe_release(struct inode *in)
 {
-    kfree(pp(in));
+    pipe_free(pp(in));
 }
 
 static const struct inode_ops pipe_ops = {
@@ -148,6 +160,16 @@ int vfs_pipe(struct file **rd, struct file **wr)
 
     if (!p)
         return -E_NOMEM;
+    struct mb_domain *d = thread_domain();
+    if (d) {
+        unsigned long k = mb_pages_for_bytes(kmalloc_size(p));
+        if (mb_charge_object(d, k) != 0) {
+            kfree(p);
+            return -E_NOMEM;
+        }
+        p->dom = d;
+        p->kobj = k;
+    }
     inode_init(&p->in, &pipe_ops, I_PIPE);
     p->readers = p->writers = 1;
 
@@ -159,7 +181,7 @@ int vfs_pipe(struct file **rd, struct file **wr)
             p->writers = 0;
             vfs_close(*rd);                  /* 最後一個參考:管線會被釋放 */
         } else {
-            kfree(p);
+            pipe_free(p);                    /* 沒有任何檔案指向它:直接釋放(連同 KOBJ) */
         }
         return -E_NOMEM;
     }

@@ -56,6 +56,7 @@ struct thread *thread_prepare(const char *name, void (*fn)(void *), void *arg, i
                               struct mb_domain *dom);
 int  thread_start(struct thread *t);
 void thread_abandon(struct thread *t);
+struct mb_domain *thread_domain(void);   /* 目前執行緒記帳的 domain;kernel 執行緒為 NULL */
 
 /* 設定 / 取得目前執行緒的優先權。調低後若有更優先的執行緒在等,會立刻讓出 CPU */
 void thread_set_priority(int prio);

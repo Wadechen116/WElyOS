@@ -1,0 +1,12 @@
+diff --git a/kernel/ramfs.c b/kernel/ramfs.c
+--- a/kernel/ramfs.c
++++ b/kernel/ramfs.c
+@@ -256,7 +256,7 @@ static long ramfs_write(struct inode *in, const void *buf, size_t n, uint64_t off)
+         memcpy((uint8_t *)f->blocks[blk] + in_blk, src + done, k);
+         done += k;
+     }
+-    if (off + done > in->size)
++    if (done > 0 && off + done > in->size)
+         in->size = off + done;
+     return done ? (long)done : -E_NOMEM;
+ }

@@ -190,3 +190,22 @@ unsigned long mb_accounting_errors(void)
     spin_unlock_irqrestore(&mb_lk, f);
     return v;
 }
+
+int mb_charge_object(struct mb_domain *d, unsigned long pages)
+{
+    if (mb_domain_get(d) != 0)
+        return -E_NOMEM;
+    if (mb_quota_add(d, MB_KOBJ, pages) != 0) {
+        mb_domain_put(d);                    /* 剛取得的參考,不可能是最後一份 */
+        return -E_NOMEM;
+    }
+    return 0;
+}
+
+int mb_release_object(struct mb_domain *d, unsigned long pages)
+{
+    int rc = mb_quota_sub(d, MB_KOBJ, pages);
+    if (mb_domain_put(d) != 0)
+        rc = -1;
+    return rc;
+}

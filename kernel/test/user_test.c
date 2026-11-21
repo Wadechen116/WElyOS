@@ -265,3 +265,25 @@ void user_demo(void)
     KASSERT(h1.free_bytes + (sched_pool_bytes() - pool0) == h0.free_bytes + heap_grow);
     kprintf("user: all processes exited, memory reclaimed\n");
 }
+
+/*
+ * Codex 191 的回歸:建立使用者執行緒時,stack 已經對映好、之後 kernel 執行緒準備失敗 —
+ * 這次配置的 stack 頁與格子必須退回。連續失敗 20 次(超過 16 格上限)之後,
+ * 格位與位址空間頁數都和開始時一樣。目標是一個在睡覺的 /bin/sleep 行程。
+ * 負對照:失敗時不退回 stack(第 55 步實測),格位被佔滿、頁數增加 60,斷言失敗。
+ */
+void user_stack_rollback_test(void)
+{
+    const char *argv[] = { "sleep", "30", NULL };  /* 睡得比測試久得多:測試期間它一定還在(測完由下面終止) */
+    int pid = proc_spawn("/bin/sleep", argv);
+    KASSERT(pid > 0);
+    thread_sleep(20);                             /* 讓它進到 sleep */
+    uint32_t s0, s1;
+    unsigned long p0, p1;
+    int ok = proc_thread_failure_probe(pid, 20, &s0, &s1, &p0, &p1);
+    kprintf("user: 20 failed thread creations: slots 0x%x -> 0x%x, pages %lu -> %lu\n",
+            (unsigned)s0, (unsigned)s1, p0, p1);
+    KASSERT(ok == 0 && s0 == s1 && p0 == p1);
+    KASSERT(proc_kill(pid, 0) == 0);
+    proc_wait(pid);
+}

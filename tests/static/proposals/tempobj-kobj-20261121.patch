@@ -1,0 +1,71 @@
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -384,12 +384,23 @@
+     proc_thread_exit();
+ }
+ 
++/* ustart 在 prepare 成功後交給 user_thread_main,失敗則由建立者歸還。
++   保存帳務欄位後先釋放物件,最後才放掉它自己的 domain 參考。 */
++static void ustart_release(struct ustart *st)
++{
++    struct mb_domain *dom = st->dom;
++    unsigned long kobj = st->kobj;
++    kfree(st);
++    if (dom && mb_release_object(dom, kobj) != 0)
++        blackbox_log(BB_FAULT, "ustart kernel-object quota mismatch");
++}
++
+ /* 行程中每條執行緒在 kernel 這一側的起點:設定好歸屬與位址空間後降到使用者模式 */
+ static void user_thread_main(void *arg)
+ {
+     struct ustart st = *(struct ustart *)arg;
+ 
+-    kfree(arg);
++    ustart_release(arg);
+     thread_set_data(st.p);
+     thread_set_space(st.p->space);
+ 
+@@ -416,6 +427,14 @@
+     struct ustart *st = kmalloc(sizeof(*st));
+     if (!st)
+         return NULL;
++    st->dom = NULL;
++    st->kobj = mb_pages_for_bytes(kmalloc_size(st));
++    struct mb_domain *dom = pmem_domain(p);
++    if (dom && mb_charge_object(dom, st->kobj) != 0) {
++        kfree(st);                           /* charge 失敗沒有取得參考或配額 */
++        return NULL;
++    }
++    st->dom = dom;
+     st->p = p;
+     st->entry = entry;
+     st->arg = arg;
+@@ -427,7 +446,7 @@
+     }
+     st->usp = usp;
+     if (!st->usp) {
+-        kfree(st);
++        ustart_release(st);
+         return NULL;
+     }
+     struct thread *t = thread_prepare(p->name, user_thread_main, st, PRIO_NORMAL, pmem_domain(p));
+@@ -440,7 +459,7 @@
+             free_user_stack_slot(p, slot);
+             pmem_unlock(p);
+         }
+-        kfree(st);
++        ustart_release(st);
+     }
+     return t;
+ }
+--- a/kernel/proc_internal.h
++++ b/kernel/proc_internal.h
+@@ -181,6 +181,8 @@
+ 
+ /* 新執行緒進入使用者模式所需的資訊,由建立者交給新執行緒 */
+ struct ustart {
++    struct mb_domain *dom;           /* 自有參考,直到暫時物件釋放 */
++    unsigned long kobj;
+     struct proc *p;
+     uintptr_t entry, usp, arg;
+ };

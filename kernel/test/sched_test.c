@@ -869,6 +869,10 @@ static void rt_task(void *arg)
             late = (unsigned)(now - expect);
         rt_spin_until(now + 1);                          /* 做一點點事 */
     }
+    if (!(st.releases == 10 && st.misses == 0 && st.overruns == 0 && st.period_ms == 20))
+        kprintf("rt: periodic stats mismatch: releases %u, misses %u, overruns %u, period %u ms, "
+                "max late %u ticks\n", (unsigned)st.releases, (unsigned)st.misses,
+                (unsigned)st.overruns, (unsigned)st.period_ms, late);   /* 失敗時留下是哪一項 */
     KASSERT(st.releases == 10 && st.misses == 0 && st.overruns == 0 && st.period_ms == 20);
     rt_max_late = late;
 

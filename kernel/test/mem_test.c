@@ -931,12 +931,15 @@ void thread_kobj_test(void)
     KASSERT(t);
     mb_stats(d, &st);
     unsigned long k = st.used[MB_KOBJ];
-    KASSERT(k >= 5 && st.refs == 2);             /* kernel stack 4 頁 + 保護頁,加上結構 */
+    /* 獨立算出應有的量(Codex 190):kernel stack 4 頁(與 sched.c 的 STACK_PAGES 一致)+ 保護頁 1 頁,
+       加上結構以實際配置大小向上取整;精確比對,少算保護頁也會被抓到 */
+    unsigned long expect = 4 + 1 + (kmalloc_size(t) + PAGE_SIZE - 1) / PAGE_SIZE;
+    KASSERT(k == expect && st.refs == 2);
     thread_abandon(t);
     mb_stats(d, &st);
     KASSERT(st.used[MB_KOBJ] == 0 && st.refs == 1);
 
-    mb_set_limit(d, k - 1);                       /* 差一頁:準備失敗,不留任何東西 */
+    mb_set_limit(d, expect - 1);                  /* 差一頁:準備失敗,不留任何東西 */
     KASSERT(thread_prepare("kobj", kobj_fn, NULL, PRIO_NORMAL, d) == NULL);
     mb_stats(d, &st);
     KASSERT(st.used[MB_KOBJ] == 0 && st.refs == 1);
@@ -954,4 +957,40 @@ void thread_kobj_test(void)
     KASSERT(mb_domain_put(d) == 0);
     kprintf("sched: thread kernel-object accounting ok (%lu pages per thread; refused at the limit, "
             "returned on abandon and after reaping)\n", k);
+}
+
+/*
+ * I-240 C3.2 (b2):檔案與管線由建立者的 domain 持有。
+ * 一條帶著 domain 的執行緒建立一條管線(兩個 struct file + 一個 struct pipe),不關閉就結束;
+ * 執行緒被回收之後,domain 仍記著這些物件的 KOBJ、仍被它們持有參考(建立者先結束,物件還在);
+ * 由別人關閉最後一個參考時,KOBJ 歸零、參考只剩 domain 自己的一份。
+ * 負對照:vfs_close 不退配額(第 55 步實測)時,「關閉後 KOBJ 歸零」斷言失敗。
+ */
+static struct file *pobj_r, *pobj_w;
+static void pobj_fn(void *arg)
+{
+    (void)arg;
+    KASSERT(vfs_pipe(&pobj_r, &pobj_w) == 0);
+}
+
+void pipe_kobj_test(void)
+{
+    struct mb_domain *d = mb_domain_new(1000);
+    struct mb_stats st;
+    KASSERT(d);
+    struct thread *t = thread_prepare("pobj", pobj_fn, NULL, PRIO_NORMAL, d);
+    KASSERT(t);
+    int tid = thread_start(t);
+    thread_join(tid);
+    sched_trim();                                 /* 建立者已結束並被回收 */
+    mb_stats(d, &st);
+    KASSERT(st.used[MB_KOBJ] >= 3 && st.refs == 4);   /* 2 個檔案 + 1 條管線,各持一份參考 */
+    unsigned long k = st.used[MB_KOBJ];
+    vfs_close(pobj_w);
+    vfs_close(pobj_r);                            /* 最後一個參考:管線也釋放 */
+    mb_stats(d, &st);
+    KASSERT(st.used[MB_KOBJ] == 0 && st.refs == 1);
+    KASSERT(mb_domain_put(d) == 0);
+    kprintf("vfs: pipe and files stay charged to their creator after it exits (%lu pages), "
+            "returned on the last close\n", k);
 }

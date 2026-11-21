@@ -68,7 +68,10 @@ int pmem_init(struct proc *p, struct mb_domain *dom);   /* 使用者:proc.c */
 struct mb_domain *pmem_domain(const struct proc *p);   /* 使用者:proc.c */
 void pmem_release(struct proc *p);   /* 使用者:proc.c */
 void pmem_exec(struct proc *p);   /* 使用者:proc.c */
-struct vm_space *pmem_fork(struct proc *child, struct proc *parent);   /* 使用者:proc.c */
+void pmem_lock(struct proc *p);   /* 使用者:proc.c(配置 / 回退使用者 stack) */
+void pmem_unlock(struct proc *p);   /* 使用者:proc.c */
+int pmem_fork_domain(struct proc *child, const struct proc *parent);   /* 使用者:proc.c */
+struct vm_space *pmem_fork_space(struct proc *child, struct proc *parent);   /* 使用者:proc.c(必須是最後一個可能失敗的步驟) */
 long sys_seu(struct proc *p, long pid, uintptr_t addr, long bit);   /* 使用者:syscall.c */
 void pmem_apply_injection(struct proc *p);   /* 使用者:proc_signal.c */
 

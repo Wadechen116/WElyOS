@@ -55,26 +55,66 @@ static void *map_page(struct vm_space *vs, uintptr_t va, unsigned flags)
     return page;
 }
 
-/* 對映第 slot 格使用者 stack(最上面的 16KB),回傳 stack 頂端的位址(失敗回傳 0) */
+static void free_user_stack_slot(struct proc *p, unsigned slot);
+
+/* 對映第 slot 格使用者 stack(最上面的 16KB),回傳 stack 頂端的位址。
+   失敗回傳 0,而且這次已經對映的頁全部解除並釋放(交易:不留半套 stack) */
 static uintptr_t map_user_stack(struct vm_space *vs, unsigned slot)
 {
     uintptr_t top = USER_STACK_TOP - (uintptr_t)slot * USER_STACK_SLOT;
 
-    for (unsigned i = 1; i <= USER_STACK_PAGES; i++)
-        if (!map_page(vs, top - i * PAGE_SIZE, VM_READ | VM_WRITE))
+    for (unsigned i = 1; i <= USER_STACK_PAGES; i++) {
+        if (!map_page(vs, top - i * PAGE_SIZE, VM_READ | VM_WRITE)) {
+            while (--i >= 1)
+                if (vm_space_unmap(vs, top - i * PAGE_SIZE) != 0)
+                    panic("proc: cannot roll back stack page");
             return 0;
+        }
+    }
     return top;
 }
 
-/* 替行程的一條新執行緒準備使用者 stack,回傳 stack 頂端的位址(失敗回傳 0) */
-static uintptr_t alloc_user_stack(struct proc *p)
+/* 失敗回退:解除這一格裡所有已對映的頁(一開始對映的,以及別的執行緒碰到而由 fault 長出來的)。
+   呼叫者持有 mem.mx,fault 不會同時進來 */
+static void unmap_user_stack(struct vm_space *vs, unsigned slot)
 {
-    if (p->nstacks >= PROC_MAX_THREADS)
+    uintptr_t top = USER_STACK_TOP - (uintptr_t)slot * USER_STACK_SLOT;
+    for (uintptr_t va = top - USER_STACK_SLOT + PAGE_SIZE; va < top; va += PAGE_SIZE)
+        vm_space_unmap(vs, va);              /* 沒有對映的頁回傳 -1:本來就沒有東西要退 */
+}
+
+/* 替行程的一條新執行緒準備使用者 stack:拿一格空的、對映最上面的幾頁。
+   成功回傳 stack 頂端並以 *slot_out 交回格號;失敗回傳 0,格子與頁都沒有留下 */
+static uintptr_t alloc_user_stack(struct proc *p, unsigned *slot_out)
+{
+    unsigned long fl = spin_lock_irqsave(&pstate_lk);
+    unsigned slot = PROC_MAX_THREADS;
+    for (unsigned i = 0; i < PROC_MAX_THREADS; i++)
+        if (!(p->stack_slots & (1u << i))) {
+            slot = i;
+            break;
+        }
+    if (slot < PROC_MAX_THREADS)
+        __atomic_or_fetch(&p->stack_slots, 1u << slot, __ATOMIC_RELEASE);
+    spin_unlock_irqrestore(&pstate_lk, fl);
+    if (slot == PROC_MAX_THREADS)
         return 0;
-    uintptr_t top = map_user_stack(p->space, p->nstacks);
-    if (top)
-        p->nstacks++;
+
+    uintptr_t top = map_user_stack(p->space, slot);
+    if (!top) {
+        free_user_stack_slot(p, slot);
+        return 0;
+    }
+    *slot_out = slot;
     return top;
+}
+
+/* 放回一格(只放自己拿到的那一格) */
+static void free_user_stack_slot(struct proc *p, unsigned slot)
+{
+    unsigned long fl = spin_lock_irqsave(&pstate_lk);
+    __atomic_and_fetch(&p->stack_slots, ~(1u << slot), __ATOMIC_RELEASE);
+    spin_unlock_irqrestore(&pstate_lk, fl);
 }
 
 /* 把資料寫進「某個位址空間」的使用者位址(不必是目前載入的那一個):
@@ -379,14 +419,29 @@ static struct thread *user_thread_prepare(struct proc *p, uintptr_t entry, uintp
     st->p = p;
     st->entry = entry;
     st->arg = arg;
-    st->usp = usp ? usp : alloc_user_stack(p);
+    unsigned slot = PROC_MAX_THREADS;        /* PROC_MAX_THREADS = 呼叫者自己提供了 stack,不是我們配置的 */
+    if (!usp) {
+        pmem_lock(p);                        /* 佔格 + 對映,與 stack 成長的 fault 序列化 */
+        usp = alloc_user_stack(p, &slot);
+        pmem_unlock(p);
+    }
+    st->usp = usp;
     if (!st->usp) {
         kfree(st);
         return NULL;
     }
     struct thread *t = thread_prepare(p->name, user_thread_main, st, PRIO_NORMAL, pmem_domain(p));
-    if (!t)
+    if (!t) {
+        /* 準備失敗:這次配置的 stack 與格子一起退回(呼叫者提供的 stack 不碰)。
+           解除對映與放回格子在同一段 mem.mx 之內:放格之前 fault 不能補頁進來 */
+        if (slot < PROC_MAX_THREADS) {
+            pmem_lock(p);
+            unmap_user_stack(p->space, slot);
+            free_user_stack_slot(p, slot);
+            pmem_unlock(p);
+        }
         kfree(st);
+    }
     return t;
 }
 
@@ -438,7 +493,7 @@ static int proc_create(const char *path, const struct args *a, struct proc *pare
     proc_set_name(p, path);
     p->space = img.space;
     p->exe = img.exe;
-    p->nstacks = 1;                  /* 第 0 格 stack 已由 image_build 準備好 */
+    p->stack_slots = 1;              /* 第 0 格 stack 已由 image_build 準備好 */
     /* 身分沿用建立者的;kernel 建立的行程是 root,擁有全部的特權 */
     p->cred = parent ? parent->cred : (struct cred){ 0, 0, CAP_ALL };
     files_init_cwd(p, parent);       /* 工作目錄沿用建立者的;kernel 建立的行程從根目錄開始 */
@@ -761,7 +816,7 @@ long sys_exec(struct proc *p, uintptr_t upath, uintptr_t uargv)
     pmem_exec(p);                    /* 新的程式從空的 heap 開始;舊程式的 heap 與匿名對映都不在了 */
     psig_exec(p);                    /* 處理函式是舊程式裡的位址:全部還原成預設(「忽略」則保留) */
     p->exe = img.exe;
-    p->nstacks = 1;
+    p->stack_slots = 1;              /* 新程式只有第 0 格 stack(舊的隨舊位址空間消失) */
     thread_set_space(img.space);     /* 換到新的位址空間;舊的已經沒有人使用 */
     vm_space_destroy(old_space);
     vfs_exec_release(old_exe);
@@ -826,9 +881,9 @@ long sys_fork(struct proc *p, void *tf)
     void *frame = kmalloc(arch_frame_size());
     if (!c || !st || !frame)
         goto nomem;
-    /* 子行程的配額帳戶與位址空間:依 R1 替父子雙方預留寫入時複製的票,不夠就不 fork */
-    c->space = pmem_fork(c, p);
-    if (!c->space)
+    /* 順序(Codex 198):先做所有可能失敗、又不會改動父行程的配置 — 子的 domain、子的執行緒 —
+       最後才複製位址空間(它會把父的頁改成 COW 並預留票)。複製成功之後只剩不會失敗的步驟 */
+    if (pmem_fork_domain(c, p) != 0)
         goto nomem;
 
     memcpy(frame, tf, arch_frame_size());
@@ -841,7 +896,12 @@ long sys_fork(struct proc *p, void *tf)
        公布之後只剩 thread_start(不會失敗)。以前是公布之後才 thread_create,失敗時留下立刻死亡的子行程 */
     struct thread *ct = thread_prepare(c->name, fork_child_main, st, PRIO_NORMAL, pmem_domain(c));
     if (!ct) {
-        vm_space_destroy(c->space);
+        pmem_release(c);
+        goto nomem;
+    }
+    c->space = pmem_fork_space(c, p);        /* 最後一個可能失敗的步驟 */
+    if (!c->space) {
+        thread_abandon(ct);                  /* 還沒啟動:全部退回;父行程沒有被改過 */
         pmem_release(c);
         goto nomem;
     }
@@ -852,7 +912,7 @@ long sys_fork(struct proc *p, void *tf)
        萬一失敗代表 VFS 的狀態不一致,不能讓子行程在沒有執行標記的情況下繼續 */
     if (vfs_exec_hold(c->exe) != 0)
         panic("fork: cannot mark the executable of pid %d as running", p->pid);
-    c->nstacks = p->nstacks;
+    c->stack_slots = __atomic_load_n(&p->stack_slots, __ATOMIC_ACQUIRE);   /* fork 只允許單一執行緒,不會同時變動 */
     psig_fork(c, p);                         /* 訊號的處理方式沿用;還沒交付的不帶過去 */
     fd_inherit(c, p, PROC_MAX_FD);
 
@@ -1078,4 +1138,34 @@ long sys_sysinfo(struct proc *p, uintptr_t uinfo)
     if (copy_to_user(p, uinfo, &si, sizeof(si)) != 0)
         return -E_FAULT;
     return 0;
+}
+
+/*
+ * 自我測試用(I-240 C3.2 (b2),Codex 191):讓 pid 這個行程「建立執行緒」連續失敗 rounds 次 —
+ * 把它的配額暫時調到已用量,kernel 執行緒的 KOBJ 記不上去,thread_prepare 在 stack 已經配置好之後失敗。
+ * 回報前後的 stack 格位與位址空間頁數;結束時配額還原。回傳成功建立的次數(應為 0)
+ */
+int proc_thread_failure_probe(int pid, unsigned rounds, uint32_t *slots0, uint32_t *slots1,
+                              unsigned long *pages0, unsigned long *pages1)
+{
+    unsigned long flags = sched_lock();
+    struct proc *p = proc_find(pid);
+    sched_unlock(flags);
+    if (!p)
+        return -1;
+    struct mb_domain *d = pmem_domain(p);
+    struct mb_stats st;
+    mb_stats(d, &st);
+    unsigned long limit = mb_limit(d);
+    mb_set_limit(d, st.total);                   /* 一頁都不能再增加 */
+    *slots0 = __atomic_load_n(&p->stack_slots, __ATOMIC_ACQUIRE);
+    *pages0 = vm_space_pages(p->space);
+    int ok = 0;
+    for (unsigned i = 0; i < rounds; i++)
+        if (proc_add_thread(p, 0, 0, 0) >= 0)
+            ok++;
+    *slots1 = __atomic_load_n(&p->stack_slots, __ATOMIC_ACQUIRE);
+    *pages1 = vm_space_pages(p->space);
+    mb_set_limit(d, limit);
+    return ok;
 }

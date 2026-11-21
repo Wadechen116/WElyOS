@@ -55,6 +55,7 @@ struct uimg_hdr {
 #define USER_STACK_SLOT  0x100000u
 #define USER_STACK_PAGES 4u
 #define PROC_MAX_THREADS 16u
+_Static_assert(PROC_MAX_THREADS <= 32, "stack_slots is a 32-bit map");
 
 /* 使用者 heap:程式的資料之後、stack 之前的一段固定範圍(程式本身最大 256MB,見 image_build)。
    行程以 sbrk 移動「結尾」(break)來取得或歸還記憶體;範圍內的頁用到才配置 */
@@ -153,7 +154,8 @@ struct proc {
     struct vm_space *space;          /* 位址空間 */
     struct file *exe;                /* 正在執行的程式檔。一直開著:它的頁直接對映在行程裡 */
     unsigned nthreads;               /* 還活著的執行緒數 */
-    unsigned nstacks;                /* 已分配的 stack 格數(不重複使用) */
+    uint32_t stack_slots;            /* bit n = 第 n 格使用者 stack 已分配(受 pstate_lk 保護;fault 以原子讀取)。
+                                        配置失敗時只釋放自己拿到的那一格,多個建立者同時進行也不會誤放別人的 */
     int exiting;                     /* 已開始結束流程 */
     int exit_code;
     int zombie;                      /* 所有執行緒都結束了,等待 proc_wait 來收 */

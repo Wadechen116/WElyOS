@@ -1,5 +1,6 @@
 #ifndef WELYOS_SELFTEST_H
 #define WELYOS_SELFTEST_H
+#include <stdint.h>
 
 /*
  * selftest.h - kernel 自我測試的進入點(實作在 kernel/test/)
@@ -16,6 +17,9 @@ int cmdline_has(const char *cmd, const char *word);      /* 開機參數裡有�
 unsigned resident_threads(void);         /* 常駐的 kernel 執行緒數(網路、巡檢):核對執行緒數時要扣掉 */
 extern struct netdev *boot_nic;          /* 開機時找到的網路卡;沒有則為 NULL */
 struct blkdev *arch_blk_probe_cached(void);              /* 開機時找到的磁碟;沒有則為 NULL */
+/* (kernel/proc.c)讓 pid 建立執行緒連續失敗 rounds 次,回報前後的 stack 格位與頁數;回傳成功次數 */
+int proc_thread_failure_probe(int pid, unsigned rounds, uint32_t *slots0, uint32_t *slots1,
+                              unsigned long *pages0, unsigned long *pages1);
 
 /* ---- kernel/test/mem_test.c ---- */
 void vm_demo(void);                      /* 分頁:權限、別名對映 */
@@ -31,6 +35,8 @@ void vm_ledger_test(void);               /* I-240 C3.2 (b1):位址空間帳本�
 void anon_ticket_test(void);             /* I-240 C3.2 (b1):匿名記憶體承諾後第一次觸及一定成功(I2) */
 void fork_ticket_test(void);             /* I-240 C3.2 (b1):fork 的兩筆帳,飽和後父子寫入與觸及都成功 */
 void thread_kobj_test(void);             /* I-240 C3.2 (b2):執行緒的 KOBJ 記帳、先準備後啟動 */
+void pipe_kobj_test(void);               /* I-240 C3.2 (b2):檔案與管線由建立者的 domain 持有 */
+void user_stack_rollback_test(void);     /* Codex 191:建立執行緒失敗時 stack 與格子退回 */
 void pte_tear_test(void);                /* I-090:頁表項目 64 位元寫入不撕裂(需要 2 顆 CPU) */
 void crash_test(const char *cmd);        /* crash=<種類>:故意觸發錯誤(排程器啟動之前可以做的那些) */
 
