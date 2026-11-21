@@ -45,6 +45,7 @@
 #include "spinlock.h"
 #include "timer.h"
 #include "vm.h"
+#include "membudget.h"
 
 #define STACK_PAGES   4u                     /* 每條執行緒的 stack:16KB */
 #define STACK_SIZE    (STACK_PAGES * PAGE_SIZE)
@@ -63,6 +64,8 @@ enum thread_state {
 
 struct thread {
     void *sp;                  /* 被切換出去時的 stack pointer(arch_switch 存取) */
+    struct mb_domain *dom;     /* 記帳的 domain(持有一份參考,到 thread_free 才放);kernel 執行緒為 NULL */
+    unsigned long kobj;        /* 記在 dom 上的 KOBJ 頁數(kernel stack + 這個結構) */
     int id;
     const char *name;
     enum thread_state state;
@@ -435,8 +438,20 @@ static void thread_struct_free(struct thread *t)
 static volatile unsigned nzombies;
 
 /* 釋放一條已結束的執行緒(它的 stack 與結構本身) */
+/* 退回一條執行緒記在 domain 上的 KOBJ 配額並放掉參考(stack 進快取、結構進 pool 之後就是 kernel 的) */
+static void thread_uncharge(struct thread *t)
+{
+    struct mb_domain *d = t->dom;
+    if (!d)
+        return;
+    t->dom = NULL;
+    if (mb_quota_sub(d, MB_KOBJ, t->kobj) != 0 || mb_domain_put(d) != 0)
+        panic("sched: thread %s kernel-object accounting mismatch", t->name);
+}
+
 static void thread_free(struct thread *t)
 {
+    thread_uncharge(t);
     stack_free(t->stack);
     thread_struct_free(t);
     __atomic_fetch_sub(&nzombies, 1, __ATOMIC_SEQ_CST);
@@ -764,15 +779,45 @@ int thread_create(const char *name, void (*fn)(void *), void *arg)
     return thread_create_prio(name, fn, arg, PRIO_NORMAL);
 }
 
-int thread_create_prio(const char *name, void (*fn)(void *), void *arg, int prio)
+struct thread *thread_prepare(const char *name, void (*fn)(void *), void *arg, int prio,
+                              struct mb_domain *dom)
 {
     if (prio < PRIO_MIN || prio > PRIO_MAX)
-        return -1;
-
+        return NULL;
     struct thread *t = thread_alloc(name, fn, arg, prio);
     if (!t)
-        return -1;
+        return NULL;
+    if (dom) {
+        /* KOBJ:kernel stack(含保護頁)精確計;結構以 kmalloc 實際配置的大小向上取整成頁 —
+           保守的邏輯配額,不拿來推論實體用量(設計 B6) */
+        unsigned long k = STACK_PAGES + 1 + (kmalloc_size(t) + PAGE_SIZE - 1) / PAGE_SIZE;
+        if (mb_domain_get(dom) != 0) {
+            stack_free(t->stack);
+            thread_struct_free(t);
+            return NULL;
+        }
+        if (mb_quota_add(dom, MB_KOBJ, k) != 0) {
+            if (mb_domain_put(dom) != 0)
+                panic("sched: domain reference mismatch");
+            stack_free(t->stack);
+            thread_struct_free(t);
+            return NULL;
+        }
+        t->dom = dom;
+        t->kobj = k;
+    }
+    return t;
+}
 
+void thread_abandon(struct thread *t)
+{
+    thread_uncharge(t);
+    stack_free(t->stack);
+    thread_struct_free(t);
+}
+
+int thread_start(struct thread *t)
+{
     unsigned long flags = sched_lock();
     int id = t->id = next_id++;
     nthreads++;
@@ -783,6 +828,12 @@ int thread_create_prio(const char *name, void (*fn)(void *), void *arg, int prio
     sched_unlock(flags);
     /* 注意:解鎖之後 t 隨時可能已經跑完並被釋放,所以回傳先記下的 id,不再碰 t */
     return id;
+}
+
+int thread_create_prio(const char *name, void (*fn)(void *), void *arg, int prio)
+{
+    struct thread *t = thread_prepare(name, fn, arg, prio, NULL);
+    return t ? thread_start(t) : -1;
 }
 
 void thread_join(int tid)

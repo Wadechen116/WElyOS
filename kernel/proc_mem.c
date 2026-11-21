@@ -294,11 +294,22 @@ struct mb_domain *pmem_domain_new(const struct proc *parent)
     return mb_domain_new(parent ? mb_limit(parent->mem.dom) : PROC_DEFAULT_LIMIT_PAGES);
 }
 
-/* 新行程:接手 dom 的一份參考(由 pmem_domain_new 取得) */
-void pmem_init(struct proc *p, struct mb_domain *dom)
+/* 行程結構本身的 KOBJ 配額:以 kmalloc 實際配置的大小向上取整成頁(保守的邏輯配額,設計 B6) */
+static unsigned long proc_kobj_pages(const struct proc *p)
+{
+    return (kmalloc_size((void *)p) + PAGE_SIZE - 1) / PAGE_SIZE;
+}
+
+/* 新行程:接手 dom 的一份參考(由 pmem_domain_new 取得),記上行程結構的 KOBJ。
+   配額不夠回傳 -E_NOMEM(dom 仍由 p 持有,呼叫者以 pmem_release 放掉) */
+int pmem_init(struct proc *p, struct mb_domain *dom)
 {
     mutex_init(&p->mem.mx, "proc-mem", MX_PROC_MEM);
     p->mem.dom = dom;
+    if (mb_quota_add(dom, MB_KOBJ, proc_kobj_pages(p)) != 0)
+        return -E_NOMEM;
+    p->mem.kobj = proc_kobj_pages(p);
+    return 0;
 }
 
 struct mb_domain *pmem_domain(const struct proc *p)
@@ -310,6 +321,9 @@ struct mb_domain *pmem_domain(const struct proc *p)
    domain 不應再有用量 — 有的話是帳務錯誤,記入黑盒子 */
 void pmem_release(struct proc *p)
 {
+    if (p->mem.dom && p->mem.kobj && mb_quota_sub(p->mem.dom, MB_KOBJ, p->mem.kobj) != 0)
+        blackbox_log(BB_FAULT, "memory domain of pid %d: kernel-object quota mismatch", p->pid);
+    p->mem.kobj = 0;
     if (p->mem.dom && mb_domain_put(p->mem.dom) != 0)
         blackbox_log(BB_FAULT, "memory domain of pid %d released with charges left", p->pid);
     p->mem.dom = NULL;
@@ -335,6 +349,11 @@ struct vm_space *pmem_fork(struct proc *child, struct proc *parent)
     child->mem.dom = pmem_domain_new(parent);
     if (!child->mem.dom)
         return NULL;
+    if (mb_quota_add(child->mem.dom, MB_KOBJ, proc_kobj_pages(child)) != 0) {
+        pmem_release(child);
+        return NULL;
+    }
+    child->mem.kobj = proc_kobj_pages(child);
     mutex_lock(&parent->mem.mx);                 /* 範圍與頁表在複製期間不變 */
     unsigned long fl = spin_lock_irqsave(&pstate_lk);
     memcpy(child->mem.maps, parent->mem.maps, sizeof(child->mem.maps));

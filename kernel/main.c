@@ -377,6 +377,7 @@ void kmain(const struct boot_info *bi)
         rt_demo();
         sleep_wall_test();
         pte_tear_test();
+        thread_kobj_test();
         fs_demo();
         disk_demo();
         nic_selftest();                      /* 驅動程式單獨的測試:要在協定堆疊開始收訊框之前 */

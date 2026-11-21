@@ -370,32 +370,39 @@ static void user_thread_main(void *arg)
 
 /* 在行程 p 中建立一條執行緒。usp 為它的使用者 stack pointer;
    傳 0 表示替它配置一格新的 stack。回傳 tid,失敗回傳 -1 */
-int proc_add_thread(struct proc *p, uintptr_t entry, uintptr_t arg, uintptr_t usp)
+/* 準備一條使用者執行緒(ustart、使用者 stack、kernel stack 與結構、KOBJ),還不啟動。失敗回傳 NULL,不留下東西 */
+static struct thread *user_thread_prepare(struct proc *p, uintptr_t entry, uintptr_t arg, uintptr_t usp)
 {
     struct ustart *st = kmalloc(sizeof(*st));
     if (!st)
-        return -1;
+        return NULL;
     st->p = p;
     st->entry = entry;
     st->arg = arg;
     st->usp = usp ? usp : alloc_user_stack(p);
     if (!st->usp) {
         kfree(st);
-        return -1;
+        return NULL;
     }
-
-    unsigned long flags = sched_lock();
-    p->nthreads++;                   /* 先算進去:新執行緒可能立刻開始跑甚至結束 */
-    sched_unlock(flags);
-
-    int tid = thread_create(p->name, user_thread_main, st);
-    if (tid < 0) {
-        flags = sched_lock();
-        p->nthreads--;
-        sched_unlock(flags);
+    struct thread *t = thread_prepare(p->name, user_thread_main, st, PRIO_NORMAL, pmem_domain(p));
+    if (!t)
         kfree(st);
-    }
-    return tid;
+    return t;
+}
+
+/* 啟動準備好的執行緒:先算進行程的執行緒數(新執行緒可能立刻開始跑甚至結束),再排入佇列。不會失敗 */
+static int user_thread_start(struct proc *p, struct thread *t)
+{
+    unsigned long flags = sched_lock();
+    p->nthreads++;
+    sched_unlock(flags);
+    return thread_start(t);
+}
+
+int proc_add_thread(struct proc *p, uintptr_t entry, uintptr_t arg, uintptr_t usp)
+{
+    struct thread *t = user_thread_prepare(p, entry, arg, usp);
+    return t ? user_thread_start(p, t) : -1;
 }
 
 /* 建立行程。parent 為 NULL 表示由 kernel 建立。回傳 pid 或負的錯誤碼 */
@@ -412,8 +419,9 @@ static int proc_create(const char *path, const struct args *a, struct proc *pare
         kfree(p);
         return -E_NOMEM;
     }
-    pmem_init(p, dom);
-    err = image_build(path, a, &img, dom);
+    err = pmem_init(p, dom);
+    if (err == 0)
+        err = image_build(path, a, &img, dom);
     if (err) {
         pmem_release(p);
         kfree(p);
@@ -435,6 +443,16 @@ static int proc_create(const char *path, const struct args *a, struct proc *pare
     p->cred = parent ? parent->cred : (struct cred){ 0, 0, CAP_ALL };
     files_init_cwd(p, parent);       /* 工作目錄沿用建立者的;kernel 建立的行程從根目錄開始 */
 
+    /* 第一條執行緒在公布 pid 之前準備好(I-240 C3.2 (b2)):失敗時行程從沒出現過,直接拆掉 */
+    struct thread *t = user_thread_prepare(p, img.entry, img.argp, img.usp);
+    if (!t) {
+        image_discard(&img);
+        fd_close_all(p);
+        pmem_release(p);
+        kfree(p);
+        return -E_NOMEM;
+    }
+
     unsigned long flags = sched_lock();
     int pid = p->pid = next_pid++;
     p->ppid = parent ? parent->pid : 0;
@@ -443,17 +461,7 @@ static int proc_create(const char *path, const struct args *a, struct proc *pare
     procs = p;
     sched_unlock(flags);
 
-    if (proc_add_thread(p, img.entry, img.argp, img.usp) < 0) {
-        /* 沒有任何執行緒:直接當作已結束,讓 proc_wait 回收 */
-        image_discard(&img);
-        fd_close_all(p);
-        flags = sched_lock();
-        p->space = NULL;
-        p->exit_code = PROC_KILLED_FAULT;
-        struct proc *dead = proc_became_zombie(p);
-        sched_unlock(flags);
-        proc_free_list(dead);
-    }
+    user_thread_start(p, t);
     return pid;
 }
 
@@ -829,6 +837,14 @@ long sys_fork(struct proc *p, void *tf)
     st->frame = frame;
 
     memcpy(c->name, p->name, sizeof(c->name));
+    /* 所有可能失敗的配置都在公布 pid 之前完成(I-240 C3.2 (b2)):子行程唯一的執行緒先準備好,
+       公布之後只剩 thread_start(不會失敗)。以前是公布之後才 thread_create,失敗時留下立刻死亡的子行程 */
+    struct thread *ct = thread_prepare(c->name, fork_child_main, st, PRIO_NORMAL, pmem_domain(c));
+    if (!ct) {
+        vm_space_destroy(c->space);
+        pmem_release(c);
+        goto nomem;
+    }
     c->cred = p->cred;
     files_init_cwd(c, p);
     c->exe = vfs_dup(p->exe);
@@ -849,22 +865,7 @@ long sys_fork(struct proc *p, void *tf)
     c->nthreads = 1;
     sched_unlock(flags);
 
-    if (thread_create(c->name, fork_child_main, st) < 0) {
-        /* 沒有任何執行緒:直接當作已結束,讓 wait 回收 */
-        kfree(st);
-        kfree(frame);
-        vm_space_destroy(c->space);
-        vfs_exec_release(c->exe);
-        vfs_close(c->exe);
-        fd_close_all(c);
-        flags = sched_lock();
-        c->space = NULL;
-        c->nthreads = 0;
-        c->exit_code = PROC_KILLED_FAULT;
-        struct proc *dead = proc_became_zombie(c);
-        sched_unlock(flags);
-        proc_free_list(dead);
-    }
+    thread_start(ct);
     return pid;
 
 nomem:

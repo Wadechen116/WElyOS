@@ -30,6 +30,7 @@ void pte_encoding_test(void);            /* I-240 C3.2 (b1):PTE 軟體位元(SHA
 void vm_ledger_test(void);               /* I-240 C3.2 (b1):位址空間帳本與 legacy 建表的配額 */
 void anon_ticket_test(void);             /* I-240 C3.2 (b1):匿名記憶體承諾後第一次觸及一定成功(I2) */
 void fork_ticket_test(void);             /* I-240 C3.2 (b1):fork 的兩筆帳,飽和後父子寫入與觸及都成功 */
+void thread_kobj_test(void);             /* I-240 C3.2 (b2):執行緒的 KOBJ 記帳、先準備後啟動 */
 void pte_tear_test(void);                /* I-090:頁表項目 64 位元寫入不撕裂(需要 2 顆 CPU) */
 void crash_test(const char *cmd);        /* crash=<種類>:故意觸發錯誤(排程器啟動之前可以做的那些) */
 

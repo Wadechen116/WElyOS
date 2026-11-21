@@ -64,7 +64,7 @@ long sys_mmap(struct proc *p, uintptr_t len);   /* 使用者:syscall.c */
 long sys_munmap(struct proc *p, uintptr_t addr);   /* 使用者:syscall.c */
 long sys_sbrk(struct proc *p, long incr);   /* 使用者:syscall.c */
 struct mb_domain *pmem_domain_new(const struct proc *parent);   /* 使用者:proc.c */
-void pmem_init(struct proc *p, struct mb_domain *dom);   /* 使用者:proc.c */
+int pmem_init(struct proc *p, struct mb_domain *dom);   /* 使用者:proc.c */
 struct mb_domain *pmem_domain(const struct proc *p);   /* 使用者:proc.c */
 void pmem_release(struct proc *p);   /* 使用者:proc.c */
 void pmem_exec(struct proc *p);   /* 使用者:proc.c */

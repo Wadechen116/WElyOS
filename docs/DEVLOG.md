@@ -7885,3 +7885,18 @@ C3.2 的 R1 規則需要 VM 層從 PTE 本身知道「這筆 COW 映射有沒有
 | **負對照**:第一趟就標記父的頁 | 失敗注入那段「父的頁仍是可寫獨佔」斷言失敗 |
 
 Codex 的交叉驗證:`probe_anon_pt_bound.py`(頁表上限 1000 萬組狀態)、`model_anon_r1.py`(R1 規格模型)、`probe_fork_two_pass.py`(兩趟 fork,6480 種混合頁面在每一張子表的位置注入失敗)都通過;Codex 註明它們沒有執行完整的 `vm_space_fork` 加真 pmm 的回滾,R1 在行程整個生命週期、分段歸還與 COW 交錯的整合驗證仍待做。
+
+## 第 55 步:C3.2 (b2) — 先準備、後啟動,kernel 物件的記帳
+
+- **`thread_prepare` / `thread_start` / `thread_abandon`**(`kernel/sched.c`):準備時配置 kernel stack 與結構,`dom` 不為 NULL 時記 KOBJ 配額(kernel stack 含保護頁 5 頁精確計,結構以 `kmalloc_size` 向上取整 — 保守的邏輯配額)並持有 domain 參考,不排入執行;`thread_start` 只指定編號、排入佇列,不會失敗;`thread_abandon` 全部退回。執行緒結束後,延遲回收(`thread_free`)時退回配額、放掉參考 — stack 進快取、結構進 pool 之後就是 kernel 的。`thread_create` 改成「準備 + 啟動」。
+- **fork 先準備後公布**:子行程唯一的執行緒在公布 pid 之前準備好,公布之後只剩 `thread_start`。以前是公布 pid 之後才 `thread_create`,失敗時留下一個立刻死亡的子行程。**spawn(`proc_create`)同樣修正**:第一條執行緒在公布前準備好,失敗時行程從沒出現過,直接拆掉。
+- **行程結構的 KOBJ**:建立(spawn / fork)時記在行程的 domain 上,`pmem_release` 時退回。
+- 尚未記帳的 kernel 物件:`ustart`、`fork_start`、frame(執行緒開始執行時就釋放的暫時物件)、檔案與管線(要由建立者的 domain 持有,下一小步)。
+
+| 測試(三架構 QEMU,`thread_kobj_test`) | 結果 |
+|---|---|
+| 準備:KOBJ 6 頁、domain 參考 2;放棄後歸零、參考 1 | 通過 |
+| 配額差一頁:準備失敗,KOBJ 與參考都不變 | 通過 |
+| 準備 → 啟動 → 結束 → 回收(`sched_trim`):執行緒確實跑過,KOBJ 歸零、參考 1 | 通過 |
+| 完整自我測試(含使用者程式的 spawn、fork、exec;結束後記憶體全部回收) | 通過 |
+| **負對照**:回收時不退配額 | 「回收後 KOBJ 歸零」斷言失敗 |

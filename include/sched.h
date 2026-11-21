@@ -45,6 +45,17 @@ int thread_create(const char *name, void (*fn)(void *), void *arg);
 
 /* 同 thread_create,但指定優先權(PRIO_MIN ~ PRIO_MAX) */
 int thread_create_prio(const char *name, void (*fn)(void *), void *arg, int prio);
+/*
+ * 先準備、後啟動(I-240 C3.2 (b2)):thread_prepare 配置 kernel stack 與結構,dom 不為 NULL 時
+ * 記 KOBJ 配額並持有 dom 的參考(到 thread_free 才退回);不排入執行、還沒有編號。
+ * 之後只能呼叫一次 thread_start(排入佇列、回傳編號,不會失敗)或 thread_abandon(全部退回)。
+ * 用途:把「可能失敗的配置」放在公布結果(例如 fork 公布子行程編號)之前。
+ */
+struct mb_domain;
+struct thread *thread_prepare(const char *name, void (*fn)(void *), void *arg, int prio,
+                              struct mb_domain *dom);
+int  thread_start(struct thread *t);
+void thread_abandon(struct thread *t);
 
 /* 設定 / 取得目前執行緒的優先權。調低後若有更優先的執行緒在等,會立刻讓出 CPU */
 void thread_set_priority(int prio);

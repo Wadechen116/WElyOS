@@ -127,6 +127,7 @@ struct proc_sig {
 
 struct proc_mem {
     struct mb_domain *PMEM_F(dom);           /* 記憶體配額的帳戶(持有一份參考;承諾與用量記在位址空間的帳本上) */
+    unsigned long PMEM_F(kobj);              /* 行程結構本身記在 dom 上的 KOBJ 頁數 */
     struct { uintptr_t start; unsigned long pages; } PMEM_F(maps)[PROC_MAX_MAPS];   /* 匿名對映;pages 0 = 空位 */
     uintptr_t PMEM_F(mmap_next);             /* 下一塊對映要放的位址(只往上走,不重複使用) */
     uintptr_t PMEM_F(brk);                   /* heap 目前的結尾(0 = 還沒用過,等於 USER_HEAP_BASE);受 pstate_lk 保護 */

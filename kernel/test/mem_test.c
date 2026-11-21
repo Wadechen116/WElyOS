@@ -911,3 +911,47 @@ void fork_ticket_test(void)
     kprintf("anon: fork ticket test ok (parent and child each wrote shared pages and touched new ones "
             "after ordinary allocations reached the reservation)\n");
 }
+
+/*
+ * I-240 C3.2 (b2):執行緒的 KOBJ 記帳與「先準備、後啟動」。
+ * 準備時記 KOBJ(kernel stack 精確 + 結構取整)並持有 domain 參考;配額不夠時準備失敗、什麼都不留;
+ * 放棄時全部退回;啟動、結束、被回收之後也全部退回。
+ * 負對照:thread_free 不退配額(第 54 步實測)時,「回收後 KOBJ 歸零」斷言失敗。
+ */
+static volatile int kobj_ran;
+static void kobj_fn(void *arg) { (void)arg; kobj_ran = 1; }
+
+void thread_kobj_test(void)
+{
+    struct mb_domain *d = mb_domain_new(1000);
+    struct mb_stats st;
+    KASSERT(d);
+
+    struct thread *t = thread_prepare("kobj", kobj_fn, NULL, PRIO_NORMAL, d);
+    KASSERT(t);
+    mb_stats(d, &st);
+    unsigned long k = st.used[MB_KOBJ];
+    KASSERT(k >= 5 && st.refs == 2);             /* kernel stack 4 頁 + 保護頁,加上結構 */
+    thread_abandon(t);
+    mb_stats(d, &st);
+    KASSERT(st.used[MB_KOBJ] == 0 && st.refs == 1);
+
+    mb_set_limit(d, k - 1);                       /* 差一頁:準備失敗,不留任何東西 */
+    KASSERT(thread_prepare("kobj", kobj_fn, NULL, PRIO_NORMAL, d) == NULL);
+    mb_stats(d, &st);
+    KASSERT(st.used[MB_KOBJ] == 0 && st.refs == 1);
+
+    mb_set_limit(d, 1000);
+    kobj_ran = 0;
+    t = thread_prepare("kobj", kobj_fn, NULL, PRIO_NORMAL, d);
+    KASSERT(t);
+    int tid = thread_start(t);
+    KASSERT(tid > 0);
+    thread_join(tid);
+    sched_trim();                                 /* 等延遲回收完成 */
+    mb_stats(d, &st);
+    KASSERT(kobj_ran && st.used[MB_KOBJ] == 0 && st.refs == 1);
+    KASSERT(mb_domain_put(d) == 0);
+    kprintf("sched: thread kernel-object accounting ok (%lu pages per thread; refused at the limit, "
+            "returned on abandon and after reaping)\n", k);
+}
