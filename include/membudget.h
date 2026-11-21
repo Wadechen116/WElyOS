@@ -44,7 +44,12 @@ struct mb_exec_txn {
     struct mb_domain *d;
     unsigned long pending;
     int active;
+    const void *bound;       /* 綁定的新位址空間(只比較身分,不解參考);一張憑證只能綁一個(Codex 223) */
 };
+/* 把憑證綁到新位址空間 owner:憑證必須有效、屬於 d、而且還沒綁過。0,否則 -1(什麼都不改) */
+int  mb_exec_bind(struct mb_exec_txn *t, struct mb_domain *d, const void *owner);
+/* 新空間建立失敗時解除綁定(只有 owner 本人能解);之後憑證可以再綁一次 */
+void mb_exec_unbind(struct mb_exec_txn *t, const void *owner);
 int  mb_exec_begin(struct mb_domain *d, unsigned long pending, struct mb_exec_txn *t);
 int  mb_exec_check_final(struct mb_exec_txn *t, unsigned long old_now);
 void mb_exec_end(struct mb_exec_txn *t);
@@ -57,6 +62,8 @@ int  mb_domain_put(struct mb_domain *d);                /* 0;最後一份時釋�
 int  mb_quota_add(struct mb_domain *d, enum mb_class c, unsigned long n);
 int  mb_quota_add_txn(struct mb_domain *d, enum mb_class c, unsigned long n, const struct mb_exec_txn *txn);
 int  mb_quota_sub(struct mb_domain *d, enum mb_class c, unsigned long n);
+/* 略過 limit 的記帳(只檢查不溢位):給有特權的使用者寫共用的檔案系統;照樣記帳,不改共用的 limit */
+int  mb_quota_force_add(struct mb_domain *d, enum mb_class c, unsigned long n);
 
 /* 多類別配額 + 實體預留,一次完成;失敗回傳 -E_NOMEM 且不改任何狀態 */
 int  mb_commit_bundle(struct mb_domain *d, const struct mb_bundle *b);

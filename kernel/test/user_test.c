@@ -65,6 +65,7 @@ void user_demo(void)
     size_t free0 = pmm_free_count() + vm_table_pages();
     struct kheap_stats h0, h1;
     kheap_stats(&h0);
+    size_t resv0 = pmm_reserved_count();      /* 所有使用者程式結束後,預留也要回到這個值 */
     size_t pool0 = sched_pool_bytes();       /* 執行緒結構留在池子裡不歸還,核對時要扣掉 */
 
     kprintf("user: running a program in user mode\n");
@@ -131,6 +132,7 @@ void user_demo(void)
     /* 記憶體配額(超過的要求當場失敗)與匿名對映 */
     run_user("memory quota and mmap", UMODE_MEMQUOTA, 27);
     run_user("40 threads created and exited, each using 512KB of its stack", UMODE_THREADCHURN, 61);
+    run_user("ramfs quota: unprivileged writer stops at E_NOSPC, admin may exceed", UMODE_FSQUOTA, 71);
     /* 週期性的即時工作:參數檢查、負載上限、需要特權、準時 */
     run_user("periodic real-time tasks", UMODE_RT, 29);
     /* 三重執行加投票:對其中一份注入位元翻轉、讓一份卡住、讓兩份都出錯 */
@@ -261,6 +263,9 @@ void user_demo(void)
     KASSERT(sched_thread_count() == 1 + resident_threads());   /* main,加上網路的接收執行緒(有網路卡時) */
     /* heap 向頁面配置器要來的頁不會歸還(見 kmalloc.c),所以這段期間 heap 若長大了
        (例如管線的緩衝區第一次配置),要把那部分算進去:那些頁現在是 heap 的空閒空間 */
+    /* 預留也要全部回來(I-240 C3.2):承諾與票都隨位址空間退回;預留洩漏會讓之後的 fork 失敗 */
+    if (pmm_reserved_count() != resv0)
+        panic("user: %zu reserved pages leaked after all processes exited", pmm_reserved_count() - resv0);
     size_t heap_grow = h1.heap_bytes - h0.heap_bytes;
     KASSERT(pmm_free_count() + vm_table_pages() == free0 - heap_grow / PAGE_SIZE);
     KASSERT(h1.free_bytes + (sched_pool_bytes() - pool0) == h0.free_bytes + heap_grow);

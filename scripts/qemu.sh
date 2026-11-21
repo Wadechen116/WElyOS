@@ -116,8 +116,12 @@ case "$QEMU" in *.exe)
   fi ;;
 esac
 
+# QEMU_RUN_TAG:回歸測試給這次執行的專屬名稱,結束時只回收帶這個名稱的 QEMU(不影響別人的)
+NAME_ARGS=()
+[ -n "${QEMU_RUN_TAG:-}" ] && NAME_ARGS=(-name "$QEMU_RUN_TAG")
+
 set +e
-"${LAUNCH[@]}" "${MACHINE[@]}" "${DISK_ARGS[@]}" "${NET_ARGS[@]}" -kernel "$ELF" -serial stdio \
+"${LAUNCH[@]}" "${MACHINE[@]}" "${DISK_ARGS[@]}" "${NET_ARGS[@]}" "${NAME_ARGS[@]}" -kernel "$ELF" -serial stdio \
         -display "${QEMU_DISPLAY:-none}" -no-reboot "$@"
 rc=$?
 # i386 的 isa-debug-exit 寫入 0 時,QEMU 回傳 1,視為成功

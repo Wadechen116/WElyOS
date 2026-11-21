@@ -188,6 +188,9 @@ void inode_init(struct inode *in, const struct inode_ops *ops, int type);
 struct inode *ramfs_create_root(void);
 /* ramfs 目前佔用的資料頁數(測試用:檔案刪除後應該回到原本的值) */
 unsigned long ramfs_pages(void);
+/* 設定 ramfs 記帳用的 FS domain(I-240 C3.2 (d));要在建立根目錄之前呼叫,所有物件才會記帳 */
+struct mb_domain;
+void ramfs_set_domain(struct mb_domain *d);
 
 /*
  * wfs.c:磁碟上的檔案系統。

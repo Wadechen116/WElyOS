@@ -6,6 +6,11 @@
 #   -r N          另外重複執行「全部測試」N 次,分別以 1、4、8 顆 CPU(找偶發的錯誤)
 #   -a "架構..."  只測指定的架構,例如 -a "riscv64"
 #   -q            只跑最基本的四個情境(只開機、selftest、全部測試、bench)
+#   -k            預檢(架構檢查、靜態檢查)失敗時仍繼續跑 QEMU(預設:預檢失敗就立刻停,不白跑)
+#
+# 每次執行的輸出放在獨立的目錄 build/regress/run-<日期時間>-<pid>/(不覆蓋以前的),
+# build/regress/latest 指向最新一次;重複測試成功的紀錄也保留,方便事後比對偶發失敗。
+# 這次啟動的 QEMU 都帶上專屬名稱(-name welyos-<run>),結束時只回收自己的,不影響主機上別人的 QEMU。
 # 環境變數 QEMU_SMP 決定 23 個情境使用的 CPU 數(預設 4)。
 # 另外每個架構做一次「磁碟跨開機測試」(15 次開機,使用獨立的映像檔;-q 時略過)。
 # 23 個情境使用預設的磁碟映像 build/<架構>/disk.img(測試結束時會把自己建立的東西刪掉)。
@@ -19,20 +24,53 @@ cd "$(dirname "$0")/.."
 ARCHS="i386 riscv64 aarch64"
 REPEAT=0
 QUICK=0
-while getopts "r:a:q" opt; do
+KEEP=0
+while getopts "r:a:qk" opt; do
   case $opt in
     r) REPEAT=$OPTARG ;;
     a) ARCHS=$OPTARG ;;
     q) QUICK=1 ;;
+    k) KEEP=1 ;;
     *) exit 2 ;;
   esac
 done
 
-OUT=build/regress; mkdir -p "$OUT"
+RUN_ID="run-$(date +%Y%m%d-%H%M%S)-$$"
+OUT="build/regress/$RUN_ID"; mkdir -p "$OUT"
+ln -sfn "$RUN_ID" build/regress/latest
+export QEMU_RUN_TAG="welyos-$RUN_ID"
+{ echo "run: $RUN_ID"; echo "start: $(date -Is)"; echo "source: $(git rev-parse --short HEAD 2>/dev/null)$(git diff --quiet 2>/dev/null || echo ' + uncommitted')";
+  echo "args: $*"; echo "host load: $(cut -d' ' -f1-3 /proc/loadavg)"; } > "$OUT/run-info.txt"
+echo "輸出目錄:$OUT"
+
+# 只回收這次啟動的 QEMU(以 -name 的專屬名稱辨認),不動主機上別人的
+cleanup_qemu() {
+  command -v powershell.exe >/dev/null || return 0
+  powershell.exe -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name like 'qemu-system-%'\" | Where-Object { \$_.CommandLine -like '*$QEMU_RUN_TAG*' } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force }" >/dev/null 2>&1
+}
+trap cleanup_qemu EXIT
 CRASH="panic fault illegal break dfree stack mainstack thread relock null wtext exec uaccess uexec spin spinsleep lockorder mxorder smp wdog"
 fail=0
 . scripts/exit5-class.sh
 hostcrash=0                  # 已證實是模擬器結束時當掉、重試後通過的次數
+
+# 預檢(幾秒鐘):架構規則與靜態檢查不需要 QEMU,先跑。失敗就立刻停(-k 才繼續),
+# 免得跑完 40 分鐘的 QEMU 矩陣才在最後因為一條靜態提示失敗
+pre_fail=0
+if [ -f scripts/arch-check.sh ]; then
+  bash scripts/arch-check.sh || pre_fail=1          # 模組之間的界線,見 scripts/arch-check.sh
+fi
+if [ -f scripts/static-gate.sh ]; then
+  bash scripts/static-gate.sh || pre_fail=1         # 只看相對於「上一次提交」新增的提示
+fi
+if [ "$pre_fail" -ne 0 ]; then
+  fail=1
+  if [ "$KEEP" -eq 0 ]; then
+    echo "預檢失敗:先處理上面的提示(或以 -k 繼續跑 QEMU)"
+    echo "有不符合預期的結果"
+    exit 1
+  fi
+fi
 
 for a in $ARCHS; do
   # A failed configure/build must never fall through to an old ELF.
@@ -173,7 +211,7 @@ for a in $ARCHS; do
         log="$OUT/$a-repeat-smp$n-$i.txt"
         if QEMU_SMP=$n timeout 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
              -append "autoexit selftest stress memtest" > "$log" 2>&1 < /dev/null; then
-          good=$((good + 1)); rm -f "$log"
+          good=$((good + 1))               # 成功的紀錄也保留:偶發失敗時可以和成功的那幾次比對
         else
           fail=1; echo "  $a,$n 顆 CPU,第 $i 次失敗,輸出在 $log"
         fi
@@ -192,19 +230,10 @@ if [ "$QUICK" -eq 0 ] && [ -f scripts/host-test-net.sh ]; then
   fi
 fi
 
-# 架構規則:模組之間的界線(誰可以存取哪一組狀態、誰可以引入哪個內部標頭),見 scripts/arch-check.sh
-if [ -f scripts/arch-check.sh ]; then
-  bash scripts/arch-check.sh || fail=1
-fi
-
-# 靜態檢查(約 2 秒):只看相對於「上一次提交」新增的提示,見 scripts/static-gate.sh
-if [ -f scripts/static-gate.sh ]; then
-  bash scripts/static-gate.sh || fail=1
-fi
-
-# Windows 版 QEMU 逾時被中止時可能殘留行程
-command -v taskkill.exe >/dev/null && taskkill.exe /F /IM qemu-system-i386.exe /IM qemu-system-riscv64.exe /IM qemu-system-aarch64.exe >/dev/null 2>&1
+# Windows 版 QEMU 逾時被中止時可能殘留行程:只回收這次啟動的(結束時 trap 也會再做一次)
+cleanup_qemu
 bash scripts/test-exit5-class.sh || fail=1
 [ "$hostcrash" -gt 0 ] && echo "模擬器結束時當掉(0xC0000005,kernel 給的值正確)後重試通過:$hostcrash 次(證據在 build/exit5-hunt/)"
+echo "end: $(date -Is)" >> "$OUT/run-info.txt"
 [ "$fail" -eq 0 ] && echo "全部符合預期" || echo "有不符合預期的結果"
 exit $fail

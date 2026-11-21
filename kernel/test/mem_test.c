@@ -1166,6 +1166,14 @@ void exec_txn_test(void)
     KASSERT(nw);
     KASSERT(vm_space_commit_anon(nw, heap, 300 * PAGE_SIZE) == 0);          /* 放寬:暫時超過 400 */
     struct mb_stats st;
+    /* 憑證只能綁一個新空間(Codex 223):第二個空間、別的 domain 都拒絕,而且帳完全不變 */
+    struct mb_stats before;
+    mb_stats(d, &before);
+    KASSERT(vm_space_create_txn(d, &t) == NULL);
+    struct mb_domain *other = mb_domain_new(1000);
+    KASSERT(other && vm_space_create_txn(other, &t) == NULL);
+    mb_stats(d, &st);
+    KASSERT(st.total == before.total && st.refs == before.refs);
     mb_stats(d, &st);
     KASSERT(st.total > st.limit);
     KASSERT(vm_space_commit_anon(nw, heap + 300 * PAGE_SIZE, 200 * PAGE_SIZE) == -E_NOMEM);  /* 超過 limit + pending */
@@ -1177,6 +1185,8 @@ void exec_txn_test(void)
     mb_stats(d, &st);
     KASSERT(st.total <= st.limit);
     KASSERT(mb_quota_add_txn(d, MB_KOBJ, 200, &t) == -E_NOMEM);   /* 交易結束後憑證不再放寬 */
+    KASSERT(vm_space_create_txn(d, &t) == NULL);                  /* 已結束的憑證不能再綁 */
+    KASSERT(mb_domain_put(other) == 0);
     vm_space_destroy(nw);
     KASSERT(pmm_reserved_count() == r0 && mb_domain_put(d) == 0);
     kprintf("exec: transaction let the new space exceed the limit by exactly what the old space returns\n");

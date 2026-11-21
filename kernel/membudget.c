@@ -234,6 +234,7 @@ int mb_exec_begin(struct mb_domain *d, unsigned long pending, struct mb_exec_txn
         t->d = d;
         t->pending = pending;
         t->active = 1;
+        t->bound = NULL;
         rc = 0;
     }
     spin_unlock_irqrestore(&mb_lk, f);
@@ -255,9 +256,44 @@ int mb_exec_check_final(struct mb_exec_txn *t, unsigned long old_now)
     return rc;
 }
 
+int mb_exec_bind(struct mb_exec_txn *t, struct mb_domain *d, const void *owner)
+{
+    unsigned long f = spin_lock_irqsave(&mb_lk);
+    int rc = -1;
+    if (t->active && t->d == d && !t->bound && owner) {
+        t->bound = owner;
+        rc = 0;
+    }
+    spin_unlock_irqrestore(&mb_lk, f);
+    return rc;
+}
+
+void mb_exec_unbind(struct mb_exec_txn *t, const void *owner)
+{
+    unsigned long f = spin_lock_irqsave(&mb_lk);
+    if (t->bound == owner)
+        t->bound = NULL;
+    spin_unlock_irqrestore(&mb_lk, f);
+}
+
 void mb_exec_end(struct mb_exec_txn *t)
 {
     unsigned long f = spin_lock_irqsave(&mb_lk);
     t->active = 0;                           /* 之後帶這個憑證的記帳回到一般上限 */
     spin_unlock_irqrestore(&mb_lk, f);
+}
+
+int mb_quota_force_add(struct mb_domain *d, enum mb_class c, unsigned long n)
+{
+    if ((unsigned)c >= MB_NCLASS)
+        return -E_INVAL;
+    unsigned long f = spin_lock_irqsave(&mb_lk);
+    int rc = -E_NOMEM;
+    if (n <= (unsigned long)-1 - d->total) {  /* 不檢查 limit,只防溢位 */
+        d->used[c] += n;
+        d->total += n;
+        rc = 0;
+    }
+    spin_unlock_irqrestore(&mb_lk, f);
+    return rc;
 }

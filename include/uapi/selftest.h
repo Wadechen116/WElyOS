@@ -42,5 +42,6 @@ enum {
     UMODE_TMR,           /* 三重執行加投票:注入位元翻轉、卡住的那一份、兩份都錯 */
     UMODE_MEMRACE,       /* 同一個行程的多條執行緒同時改變對映(mmap/munmap、sbrk)並和 kernel 交換資料 */
     UMODE_THREADCHURN,   /* 反覆建立、結束執行緒(超過 16 格):結束時歸還 stack 格,每條都深用自己的 stack */
+    UMODE_FSQUOTA,       /* ramfs 的 FS 配額:一般使用者寫到上限得到 E_NOSPC,管理者可越過,刪檔後歸還 */
 };
 #endif

@@ -107,6 +107,91 @@ static int mode_threadchurn(void)
     return churn_bad ? 2 : 61;
 }
 
+/* ---- UMODE_FSQUOTA ---- */
+
+/* I-240 C3.2 (d):ramfs 的 FS 配額。放棄 CAP_ADMIN 的子行程一直寫檔,必須停在 FS 上限、
+   得到 -E_NOSPC(不是 -E_NOMEM,也沒被終止),此時 statfs 報告的空閒量是 0;
+   管理者接著再寫 1MB 可以越過上限;全部刪掉之後 statfs 的空閒量回到原值 */
+static char fsq_buf[65536];
+
+static long fsq_fill(const char *prefix, int max_files, long max_chunks, long *err)
+{
+    char name[16];
+    long chunks = 0;
+    *err = 0;
+    for (int f = 0; f < max_files && chunks < max_chunks && !*err; f++) {
+        unsigned k = 0;
+        for (const char *c = prefix; *c; c++)
+            name[k++] = *c;
+        name[k++] = (char)('0' + f / 10);
+        name[k++] = (char)('0' + f % 10);
+        name[k] = 0;
+        long fd = sys_open(name, O_CREAT | O_WRONLY | O_TRUNC);
+        if (fd < 0) {
+            *err = fd;
+            break;
+        }
+        for (int i = 0; i < 240 && chunks < max_chunks; i++) {     /* 每個檔案最多 15MB */
+            long n = sys_write(fd, fsq_buf, sizeof(fsq_buf));
+            if (n >= 0 && n < (long)sizeof(fsq_buf))
+                n = sys_write(fd, fsq_buf, sizeof(fsq_buf));   /* 只寫進一部分:再寫一次,拿到真正的錯誤碼 */
+            if (n != (long)sizeof(fsq_buf)) {
+                *err = n < 0 ? n : -E_IO;
+                break;
+            }
+            chunks++;
+        }
+        if (sys_close(fd) != 0 && !*err)
+            *err = -E_IO;
+    }
+    return chunks;
+}
+
+static void fsq_clean(const char *prefix, int max_files)
+{
+    char name[16];
+    for (int f = 0; f < max_files; f++) {
+        unsigned k = 0;
+        for (const char *c = prefix; *c; c++)
+            name[k++] = *c;
+        name[k++] = (char)('0' + f / 10);
+        name[k++] = (char)('0' + f % 10);
+        name[k] = 0;
+        if (sys_unlink(name) != 0)
+            break;
+    }
+}
+
+static int mode_fsquota(void)
+{
+    struct fsinfo fi0, fi;
+    if (sys_statfs("/", &fi0) != 0)
+        return 1;
+    long pid = sys_fork();
+    if (pid == 0) {
+        long err;
+        if (sys_capdrop(CAP_ADMIN) < 0)
+            sys_exit(2);
+        fsq_fill("/fsu", 64, 1L << 30, &err);
+        if (err != -E_NOSPC)
+            sys_exit(err == -E_NOMEM ? 3 : 4);       /* 必須是 FS 上限,不是實體記憶體 */
+        if (sys_statfs("/", &fi) != 0 || fi.free_blocks > 16)
+            sys_exit(5);                             /* 到上限時,一般使用者看得到的空閒量是 0(容許取整) */
+        sys_exit(0);
+    }
+    int st = -1;
+    if (pid < 0 || sys_waitpid(pid, &st, 0) != pid || st != 0)
+        return 10 + st;
+    long err;
+    if (fsq_fill("/fsa", 1, 16, &err) != 16 || err != 0)
+        return 20;                                   /* 管理者:越過 FS 上限再寫 1MB */
+    fsq_clean("/fsa", 1);
+    fsq_clean("/fsu", 64);
+    if (sys_statfs("/", &fi) != 0 || fi.free_blocks + 16 < fi0.free_blocks)
+        return 30;                                   /* 刪掉之後空閒量回來(容許 16 頁的 heap / 表的差異) */
+    return 71;
+}
+
 /* ---- UMODE_FUTEX ---- */
 
 #define FUTEX_THREADS 3
@@ -1504,7 +1589,8 @@ static int mode_sighandler(void)
     pid = sys_fork();
     if (pid == 0) {
         for (int i = 0; i < 20; i++) {                   /* 子行程不斷送訊號給我們 */
-            sys_kill(me, SIGUSR1);
+            if (sys_kill(me, SIGUSR1) != 0)
+                sys_exit(2);
             sys_sleep(1);
         }
         sys_exit(0);
@@ -1526,9 +1612,12 @@ static int mode_sighandler(void)
     pid = sys_fork();
     if (pid == 0) {
         sys_sleep(6);
-        sys_kill(me, SIGUSR1);
+        if (sys_kill(me, SIGUSR1) != 0)
+            sys_exit(2);
         sys_exit(0);
     }
+    if (pid < 0)
+        return 1223 + (pid == -E_NOMEM ? 0 : 1);         /* fork 失敗:1223 = 記憶體 / 預留不足,1224 = 其他 */
     struct sysinfo t0, t1;
     if (sys_sysinfo(&t0) != 0)
         return 1221;
@@ -1546,10 +1635,10 @@ static int mode_sighandler(void)
     pid = sys_fork();
     if (pid == 0) {
         sys_sleep(6);
-        sys_kill(me, SIGUSR1);
+        if (sys_kill(me, SIGUSR1) != 0)
+            sys_exit(2);
         sys_sleep(6);
-        sys_write(fds[1], "ok", 2);
-        sys_exit(0);
+        sys_exit(sys_write(fds[1], "ok", 2) == 2 ? 0 : 3);
     }
     if (sys_read(fds[0], buf, sizeof(buf)) != -E_INTR)
         return 1231;
@@ -1557,14 +1646,14 @@ static int mode_sighandler(void)
         return 1232;
     while (sys_waitpid(pid, &st, 0) == -E_INTR)
         ;
-    sys_close(fds[0]);
-    sys_close(fds[1]);
+    if (sys_close(fds[0]) != 0 || sys_close(fds[1]) != 0)
+        return 1233;
 
     /* 5. 忽略:SIGTERM 不再終止行程;改回預設之後又會 */
     pid = sys_fork();
     if (pid == 0) {
-        sys_signal(SIGTERM, SIG_IGN);
-        sys_write(fds[1], "", 0);
+        if (sys_signal(SIGTERM, SIG_IGN) < 0 || sys_write(1, "", 0) < 0)
+            sys_exit(6);
         for (;;)
             sys_sleep(1000);
     }
@@ -1580,7 +1669,8 @@ static int mode_sighandler(void)
         return 1241;
 
     /* 6. 處理函式可以不返回(直接結束);fork 的子行程沿用父行程的設定 */
-    sys_signal(SIGINT, on_signal_exit);
+    if (sys_signal(SIGINT, on_signal_exit) < 0)
+        return 1255;
     pid = sys_fork();
     if (pid == 0) {
         for (;;)
@@ -1591,14 +1681,15 @@ static int mode_sighandler(void)
         return 1251;
     if (sys_waitpid(pid, &st, 0) != pid || st != 70 + SIGINT)
         return 1250;
-    sys_signal(SIGINT, SIG_DFL);
+    if (sys_signal(SIGINT, SIG_DFL) < 0)
+        return 1256;
 
     /* 7. exec 之後,處理函式還原成預設(那些位址是舊程式的):被 SIGUSR1 終止 */
     pid = sys_fork();
     if (pid == 0) {
         char *argv[] = { "sleep", "5", 0 };
-        sys_exec("/bin/sleep", argv);
-        sys_exit(1);
+        long e = sys_exec("/bin/sleep", argv);          /* 成功就不會回來 */
+        sys_exit(e < 0 ? 1 : 2);
     }
     sys_sleep(6);
     if (pid <= 0 || sys_kill(pid, SIGUSR1) != 0)
@@ -1629,8 +1720,8 @@ static int mode_sighandler(void)
     /* 9. stack 壞掉的時候收到訊號:沒有地方放暫存器,行程被終止,kernel 不受影響 */
     pid = sys_fork();
     if (pid == 0) {
-        sys_signal(SIGUSR2, on_signal);
-        sys_write(1, "", 0);
+        if (sys_signal(SIGUSR2, on_signal) < 0 || sys_write(1, "", 0) < 0)
+            sys_exit(7);
 #if defined(__i386__)
         __asm__ volatile("mov $16, %esp\n mov $4, %eax\n 1: int $0x80\n jmp 1b");       /* yield 不斷 */
 #elif defined(__riscv)
@@ -2664,6 +2755,9 @@ static int umain(long mode)
 
     case UMODE_THREADCHURN:
         return mode_threadchurn();
+
+    case UMODE_FSQUOTA:
+        return mode_fsquota();
 
     case UMODE_PERM: {
         /* 同一組測試在記憶體檔案系統與磁碟上各做一次 */

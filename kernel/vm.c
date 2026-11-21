@@ -430,15 +430,27 @@ struct vm_space *vm_space_create_txn(struct mb_domain *dom, struct mb_exec_txn *
     struct vm_space *vs = kzalloc(sizeof(*vs));     /* 帳本從 0 開始 */
     if (!vs)
         return NULL;
-    vs->txn = dom ? txn : NULL;              /* 根表的 1 頁也用交易的放寬上限(否則接近上限的 exec 會提早被拒) */
+    /* 交易憑證只能綁一個新空間、只屬於這個 domain、必須還有效(Codex 223);綁不上就整個失敗,
+       什麼都沒改。根表的 1 頁也用放寬上限(否則接近上限的 exec 會提早被拒) */
+    if (txn) {
+        if (!dom || mb_exec_bind(txn, dom, vs) != 0) {
+            kfree(vs);
+            return NULL;
+        }
+        vs->txn = txn;
+    }
     /* 根表是一般配置實際取得,記 PGTABLE 配額 1 頁、不用票(R5) */
     if (dom) {
         if (mb_domain_get(dom) != 0) {
+            if (txn)
+                mb_exec_unbind(txn, vs);
             kfree(vs);
             return NULL;
         }
         if (mb_quota_add_txn(dom, MB_PGTABLE, 1, vs->txn) != 0) {
             mb_domain_put(dom);
+            if (txn)
+                mb_exec_unbind(txn, vs);
             kfree(vs);
             return NULL;
         }
@@ -460,6 +472,8 @@ struct vm_space *vm_space_create_txn(struct mb_domain *dom, struct mb_exec_txn *
     if (!vs->root) {
         if (dom && (mb_quota_sub(dom, MB_PGTABLE, 1) != 0 || mb_domain_put(dom) != 0))
             panic("vm: root table quota rollback mismatch");
+        if (txn)
+            mb_exec_unbind(txn, vs);
         kfree(vs);
         return NULL;
     }

@@ -16,6 +16,10 @@
 #include "kmalloc.h"
 #include "kstring.h"
 #include "pmm.h"
+#include "cred.h"
+#include "panic.h"
+#include "membudget.h"
+#include "uapi/errno.h"
 
 #define RAMFS_MAX_BLOCKS 4096u               /* 單一檔案的上限:4096 頁 = 16MB */
 
@@ -38,6 +42,38 @@ struct rnode {
 static const struct inode_ops ramfs_ops;
 static unsigned long data_pages;             /* 所有檔案的資料頁總數 */
 
+/*
+ * ramfs 的記帳(I-240 C3.2 (d)):全系統共用一個 FS domain,在建立根目錄之前設定,所以每一個
+ * 物件(包括開機時解開的檔案)都記帳。資料頁每頁 1;節點、目錄項、區塊表以 kmalloc 實際大小取整
+ * (釋放時用同一個大小算,所以不必另外記)。一般使用者受 FS domain 的上限限制;有 CAP_ADMIN 的
+ * (以及沒有身分的 kernel 執行緒)略過這個上限但照樣記帳 — 實體上仍受 pmm 的底線與預留保護。
+ */
+static struct mb_domain *fs_dom;
+
+void ramfs_set_domain(struct mb_domain *d)
+{
+    fs_dom = d;
+}
+
+/* 記 n 頁;FS 上限不夠回傳 -E_NOSPC,什麼都不改 */
+static int fs_charge(unsigned long n)
+{
+    if (!fs_dom || n == 0)
+        return 0;
+    const struct cred *c = cred_current();
+    int rc = (!c || (c->caps & CAP_ADMIN)) ? mb_quota_force_add(fs_dom, MB_RAMFS, n)
+                                           : mb_quota_add(fs_dom, MB_RAMFS, n);
+    return rc == 0 ? 0 : -E_NOSPC;
+}
+
+static void fs_uncharge(unsigned long n)
+{
+    if (fs_dom && n && mb_quota_sub(fs_dom, MB_RAMFS, n) != 0)
+        panic("ramfs: quota release mismatch");
+}
+
+static unsigned long obj_pages(void *p) { return p ? mb_pages_for_bytes(kmalloc_size(p)) : 0; }
+
 static struct rnode *rn(struct inode *in) { return (struct rnode *)in; }
 
 unsigned long ramfs_pages(void)
@@ -50,6 +86,10 @@ static struct rnode *node_new(int type, struct rnode *parent)
     struct rnode *n = kzalloc(sizeof(*n));
     if (!n)
         return NULL;
+    if (fs_charge(obj_pages(n)) != 0) {
+        kfree(n);
+        return NULL;
+    }
     inode_init(&n->in, &ramfs_ops, type);
     n->parent = parent ? parent : n;
     return n;
@@ -88,12 +128,17 @@ static int ramfs_create(struct inode *dir, const char *name, int type, struct in
 {
     struct rnode *d = rn(dir);
     struct rdirent *e = kzalloc(sizeof(*e));
-    struct rnode *n = node_new(type, d);
-
-    if (!e || !n) {
-        kfree(e);
-        kfree(n);
+    if (!e)
         return -E_NOMEM;
+    if (fs_charge(obj_pages(e)) != 0) {
+        kfree(e);
+        return -E_NOSPC;
+    }
+    struct rnode *n = node_new(type, d);
+    if (!n) {
+        fs_uncharge(obj_pages(e));
+        kfree(e);
+        return -E_NOSPC;                     /* 配置或 FS 上限不夠:對使用者而言都是空間不足 */
     }
     for (size_t i = 0; i <= strlen(name); i++)
         e->name[i] = name[i];
@@ -116,6 +161,10 @@ static int ramfs_link(struct inode *dir, const char *name, struct inode *in)
 
     if (!e)
         return -E_NOMEM;
+    if (fs_charge(obj_pages(e)) != 0) {
+        kfree(e);
+        return -E_NOSPC;
+    }
     for (size_t i = 0; i <= strlen(name); i++)
         e->name[i] = name[i];
     e->node = rn(in);
@@ -139,6 +188,7 @@ static int ramfs_unlink(struct inode *dir, const char *name, struct inode **vict
             continue;
         *pp = e->next;
         *victim = &e->node->in;
+        fs_uncharge(obj_pages(e));
         kfree(e);
         d->in.size--;
         return 0;
@@ -176,6 +226,13 @@ static int ramfs_statfs(struct inode *in, struct fsinfo *out)
     out->block_size = PAGE_SIZE;
     out->blocks = pmm_total_pages();
     out->free_blocks = pmm_free_count();
+    if (fs_dom) {                            /* 一般使用者能寫的量還受 FS domain 的上限限制 */
+        struct mb_stats st;
+        mb_stats(fs_dom, &st);
+        unsigned long room = st.total < st.limit ? st.limit - st.total : 0;
+        if (room < out->free_blocks)
+            out->free_blocks = room;
+    }
     memcpy(out->type, "ramfs", 6);
     return 0;
 }
@@ -218,8 +275,13 @@ static int grow_table(struct rnode *f, size_t want)
     void **t = kzalloc(cap * sizeof(void *));
     if (!t)
         return -E_NOMEM;
+    if (fs_charge(obj_pages(t)) != 0) {      /* 新表先記帳;不夠就保留舊表、什麼都不改 */
+        kfree(t);
+        return -E_NOSPC;
+    }
     if (f->blocks)
         memcpy(t, f->blocks, f->nblocks * sizeof(void *));
+    fs_uncharge(obj_pages(f->blocks));
     kfree(f->blocks);
     f->blocks = t;
     f->nblocks = cap;
@@ -236,8 +298,10 @@ static long ramfs_write(struct inode *in, const void *buf, size_t n, uint64_t of
         return -E_FBIG;
     if (n == 0)
         return 0;
-    if (grow_table(f, (size_t)((off + n + PAGE_SIZE - 1) / PAGE_SIZE)) != 0)
-        return -E_NOMEM;
+    int gerr = grow_table(f, (size_t)((off + n + PAGE_SIZE - 1) / PAGE_SIZE));
+    if (gerr)
+        return gerr;
+    long err = -E_NOMEM;                     /* 一個位元組都沒寫進去時回傳的錯誤 */
 
     while (done < n) {
         size_t blk = (size_t)((off + done) / PAGE_SIZE);
@@ -246,9 +310,15 @@ static long ramfs_write(struct inode *in, const void *buf, size_t n, uint64_t of
         if (k > n - done)
             k = n - done;
         if (!f->blocks[blk]) {
+            if (fs_charge(1) != 0) {
+                err = -E_NOSPC;              /* FS 上限:回報已經寫入的部分 */
+                break;
+            }
             void *page = pmm_alloc();
-            if (!page)
+            if (!page) {
+                fs_uncharge(1);
                 break;                       /* 記憶體用完:回報已經寫入的部分 */
+            }
             memset(page, 0, PAGE_SIZE);      /* 新的頁一定清 0:不可以讓人讀到別人用過的內容 */
             f->blocks[blk] = page;
             __atomic_fetch_add(&data_pages, 1, __ATOMIC_RELAXED);
@@ -258,7 +328,7 @@ static long ramfs_write(struct inode *in, const void *buf, size_t n, uint64_t of
     }
     if (done > 0 && off + done > in->size)
         in->size = off + done;
-    return done ? (long)done : -E_NOMEM;
+    return done ? (long)done : err;
 }
 
 /* 檔案第 off / 4096 頁的內容所在的實體頁。只有「整頁都在檔案範圍內」才提供:
@@ -283,6 +353,7 @@ static int ramfs_truncate(struct inode *in, uint64_t size)
             pmm_free(f->blocks[i]);
             f->blocks[i] = NULL;
             __atomic_fetch_sub(&data_pages, 1, __ATOMIC_RELAXED);
+            fs_uncharge(1);
         }
     }
     /* 留下的最後一頁中,超出新大小的部分清 0:之後檔案再變大時,那裡應該讀到 0 */
@@ -299,6 +370,7 @@ static void ramfs_release(struct inode *in)
 
     if (in->type == I_FILE)
         ramfs_truncate(in, 0);
+    fs_uncharge(obj_pages(n->blocks) + obj_pages(n));
     kfree(n->blocks);
     kfree(n);                                /* 目錄此時一定是空的(非空的目錄不允許刪除) */
 }

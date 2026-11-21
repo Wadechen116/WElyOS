@@ -17,6 +17,7 @@
 #include "kstring.h"
 #include "panic.h"
 #include "pmm.h"
+#include "membudget.h"
 #include "proc.h"
 #include "sched.h"
 #include "smp.h"
@@ -292,6 +293,12 @@ void kmain(const struct boot_info *bi)
             panic("pmm: too little memory to keep a kernel reserve (%zu pages usable)", usable);
         kprintf("pmm: kernel reserve %zu pages (%zu KB) of %zu usable\n",
                 floor, floor * (PAGE_SIZE / 1024), usable);
+        /* ramfs 的 FS domain(I-240 C3.2 (d)):使用者可用量的一半。檔案比行程活得久,不記在寫入者的帳上 */
+        struct mb_domain *fsd = mb_domain_new((usable - floor) / 2);
+        if (!fsd)
+            panic("ramfs: cannot create its memory domain");
+        ramfs_set_domain(fsd);
+        kprintf("ramfs: quota %zu pages for unprivileged writers\n", (usable - floor) / 2);
     }
     if (selftest) {
         pmm_floor_test();
