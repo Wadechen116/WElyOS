@@ -114,6 +114,7 @@ add_executable(welyos.elf
     kernel/console.c
     kernel/pipe.c
     kernel/ramfs.c
+    kernel/failinj.c
     kernel/wfs.c
     kernel/bcache.c
     kernel/blkfault.c

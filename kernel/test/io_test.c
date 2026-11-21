@@ -14,6 +14,7 @@
 #include "fs.h"
 #include "membudget.h"
 #include "kmalloc.h"
+#include "failinj.h"
 #include "kprintf.h"
 #include "kstring.h"
 #include "panic.h"
@@ -690,6 +691,120 @@ static void fs_worker(void *arg)
    「差額」與「新表」之間時檔案長不大,得到假的 E_NOSPC)。換上自己的 FS domain,
    把剩餘額度精確設成「差額 + 1 頁資料」:寫第 513 頁(表 512 → 1024 格)必須成功,
    之後額度剛好用完、下一頁 E_NOSPC;刪檔後帳回到原值 */
+/* I-335:配置失敗注入掃過 ramfs 的每一個配置點。對每個操作、每個地點(kmalloc / pmm),
+   令第 N 次配置失敗(N = 1, 2, ...),直到操作不再碰到注入為止。每次失敗都要:
+   回傳 -E_NOMEM(或寫入時回報已寫的部分),而且 ramfs 頁數、FS 帳、heap 使用量完全回到原值 */
+struct fi_snap { unsigned long pages, fs; size_t heap_used; };
+
+static struct mb_domain *fi_fsdom(void)
+{
+    struct mb_domain *d = ramfs_set_domain(NULL);
+    ramfs_set_domain(d);
+    return d;
+}
+
+static void fi_take(struct fi_snap *x)
+{
+    struct mb_stats st;
+    struct kheap_stats h;
+    mb_stats(fi_fsdom(), &st);
+    kheap_stats(&h);
+    x->pages = ramfs_pages();
+    x->fs = st.total;
+    x->heap_used = h.heap_bytes - h.free_bytes;
+}
+
+static void fi_same(const struct fi_snap *a, const char *what, int site, unsigned n)
+{
+    struct fi_snap b;
+    fi_take(&b);
+    if (a->pages != b.pages || a->fs != b.fs || a->heap_used != b.heap_used)
+        panic("fs: failinj %s site %d #%u leaked: pages %lu->%lu fs %lu->%lu heap %zu->%zu", what, site, n,
+              a->pages, b.pages, a->fs, b.fs, a->heap_used, b.heap_used);
+}
+
+static void fs_failinj_test(void)
+{
+    static char data[3 * PAGE_SIZE];
+    unsigned points[2][3] = { { 0 } };
+    for (int site = 0; site < FI_NSITES; site++) {
+        /* 1. 建立檔案 */
+        for (unsigned n = 1;; n++) {
+            KASSERT(n < 100);
+            struct fi_snap a;
+            struct file *f = NULL;
+            fi_take(&a);
+            failinj_arm((enum fi_site)site, n);
+            int r = vfs_open("/fiA", O_CREAT | O_WRONLY, &f);
+            int fired = failinj_fired();
+            failinj_disarm();
+            if (!fired) {
+                KASSERT(r == 0);
+                vfs_close(f);
+                KASSERT(vfs_unlink("/fiA") == 0);
+                fi_same(&a, "create(cleanup)", site, n);
+                points[site][0] = n - 1;
+                break;
+            }
+            if (r != -E_NOMEM)
+                panic("fs: failinj create site %d #%u returned %d, want -E_NOMEM", site, n, r);
+            fi_same(&a, "create", site, n);
+        }
+        /* 2. 寫 3 頁到空檔案 */
+        for (unsigned n = 1;; n++) {
+            KASSERT(n < 100);
+            struct file *f;
+            KASSERT(vfs_open("/fiB", O_CREAT | O_RDWR | O_TRUNC, &f) == 0);
+            struct fi_snap a;
+            fi_take(&a);
+            failinj_arm((enum fi_site)site, n);
+            long w = vfs_write(f, data, sizeof(data));
+            int fired = failinj_fired();
+            failinj_disarm();
+            if (!fired)
+                KASSERT(w == (long)sizeof(data));
+            else if (w != -E_NOMEM && !(w > 0 && w < (long)sizeof(data) && w % PAGE_SIZE == 0))
+                panic("fs: failinj write site %d #%u returned %ld", site, n, w);
+            KASSERT(vfs_size(f) == (uint64_t)(w > 0 ? w : 0));
+            vfs_close(f);
+            KASSERT(vfs_unlink("/fiB") == 0);
+            KASSERT(vfs_open("/fiB", O_CREAT | O_RDWR | O_TRUNC, &f) == 0);   /* 重新量:刪檔應歸還一切 */
+            vfs_close(f);
+            KASSERT(vfs_unlink("/fiB") == 0);
+            if (!fired) {
+                points[site][1] = n - 1;
+                break;
+            }
+        }
+        /* 3. 建立第二個名稱(link) */
+        struct file *f;
+        KASSERT(vfs_open("/fiC", O_CREAT | O_WRONLY, &f) == 0);
+        vfs_close(f);
+        for (unsigned n = 1;; n++) {
+            KASSERT(n < 100);
+            struct fi_snap a;
+            fi_take(&a);
+            failinj_arm((enum fi_site)site, n);
+            int r = vfs_link("/fiC", "/fiD");
+            int fired = failinj_fired();
+            failinj_disarm();
+            if (!fired) {
+                KASSERT(r == 0 && vfs_unlink("/fiD") == 0);
+                fi_same(&a, "link(cleanup)", site, n);
+                points[site][2] = n - 1;
+                break;
+            }
+            if (r != -E_NOMEM)
+                panic("fs: failinj link site %d #%u returned %d, want -E_NOMEM", site, n, r);
+            fi_same(&a, "link", site, n);
+        }
+        KASSERT(vfs_unlink("/fiC") == 0);
+    }
+    kprintf("fs: allocation-failure injection: create %u+%u, write %u+%u, link %u+%u failure points "
+            "(kmalloc+pmm), each -E_NOMEM or a partial write, nothing leaked\n",
+            points[0][0], points[1][0], points[0][1], points[1][1], points[0][2], points[1][2]);
+}
+
 static void fs_quota_table_test(void)
 {
     static char page[PAGE_SIZE];
@@ -845,6 +960,7 @@ void fs_demo(void)
     KASSERT(ramfs_pages() == pages0);
     KASSERT(h1.free_bytes + (sched_pool_bytes() - pool0) == h0.free_bytes + (h1.heap_bytes - h0.heap_bytes));
     fs_quota_table_test();
+    fs_failinj_test();
     kprintf("fs: selftest ok (all files removed, memory returned)\n");
 }
 

@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include "pmm.h"
 #include "spinlock.h"
+#include "failinj.h"
 #include "arch.h"
 #include "kprintf.h"
 #include "kstring.h"
@@ -163,6 +164,8 @@ static void *alloc_pages_ref(size_t n, int mode)
 
 void *pmm_alloc_pages(size_t n)
 {
+    if (failinj_check(FI_PMM))               /* 測試:假裝配置失敗(include/failinj.h);應急與預留的配置不注入 */
+        return NULL;
     return alloc_pages_ref(n, ALLOC_NORMAL);
 }
 

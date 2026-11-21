@@ -258,16 +258,26 @@ static int create_at(const char *path, int type, int excl, struct inode **out)
     return err;
 }
 
+static struct file *file_alloc(void);
+static void file_discard(struct file *f);
+static void file_bind(struct file *f, struct inode *in, int flags);
+
 int vfs_open(const char *path, int flags, struct file **out)
 {
     struct inode *in;
+    struct file *f = file_alloc();           /* 先配置:之後的步驟失敗時才能完全退回 */
+    if (!f)
+        return -E_NOMEM;
     int err = (flags & O_CREAT) ? create_at(path, I_FILE, 0, &in) : walk(path, 0, NULL, &in);
 
-    if (err)
+    if (err) {
+        file_discard(f);
         return err;
+    }
     /* 目錄只能以唯讀開啟(用來列出內容),也不能清空 */
     if (in->type == I_DIR && ((flags & O_ACCMODE) != O_RDONLY || (flags & O_TRUNC))) {
         iput(in);
+        file_discard(f);
         return -E_ISDIR;
     }
     /* 權限:依開啟的方式需要讀、寫或兩者;清空內容算寫入。之後的讀寫不再檢查 —
@@ -279,6 +289,7 @@ int vfs_open(const char *path, int flags, struct file **out)
     mutex_unlock(&in->lock);
     if (err) {
         iput(in);
+        file_discard(f);
         return err;
     }
     if ((flags & O_TRUNC) && in->type == I_FILE) {
@@ -289,19 +300,21 @@ int vfs_open(const char *path, int flags, struct file **out)
         mutex_unlock(&in->lock);
         if (err) {
             iput(in);
+            file_discard(f);
             return err;
         }
     }
 
-    struct file *f = vfs_file_new(in, flags);
-    iput(in);                                /* vfs_file_new 自己拿了一個參考 */
-    if (!f)
-        return -E_NOMEM;
+    file_bind(f, in, flags);
+    iput(in);                                /* file_bind 自己拿了一個參考 */
     *out = f;
     return 0;
 }
 
-struct file *vfs_file_new(struct inode *in, int flags)
+/* 開啟檔案的結構分兩步:先配置(含記帳,可能失敗),再綁上 inode(不會失敗)。
+   vfs_open 先做第一步,之後才建立或查找檔案 — 失敗時什麼都沒發生(I-335 注入測試發現:
+   原本最後才配置,失敗時 O_CREAT 建立的檔案留了下來,open 卻回報失敗) */
+static struct file *file_alloc(void)
 {
     struct file *f = kzalloc(sizeof(*f));
 
@@ -318,10 +331,30 @@ struct file *vfs_file_new(struct inode *in, int flags)
         f->dom = d;
         f->kobj = k;
     }
+    return f;
+}
+
+/* 還沒綁上 inode 的結構:退帳並釋放 */
+static void file_discard(struct file *f)
+{
+    if (f->dom && mb_release_object(f->dom, f->kobj) != 0)
+        panic("vfs: file kernel-object accounting mismatch");
+    kfree(f);
+}
+
+static void file_bind(struct file *f, struct inode *in, int flags)
+{
     f->in = iget(in);
     f->flags = flags;
     f->refs = 1;
     mutex_init(&f->lock, "file", MX_FILE);
+}
+
+struct file *vfs_file_new(struct inode *in, int flags)
+{
+    struct file *f = file_alloc();
+    if (f)
+        file_bind(f, in, flags);
     return f;
 }
 

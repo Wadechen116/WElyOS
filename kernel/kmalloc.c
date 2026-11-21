@@ -26,6 +26,7 @@
 #include "kstring.h"
 #include "panic.h"
 #include "pmm.h"
+#include "failinj.h"
 
 /* 保護空閒串列。持有期間可能再取得 pmm 的鎖(heap 擴充時),順序固定為 heap -> pmm */
 static struct spinlock heap_lk = SPINLOCK_INIT("heap", LK_HEAP);
@@ -138,6 +139,8 @@ static void *kmalloc_locked(size_t size)
 
 void *kmalloc(size_t size)
 {
+    if (failinj_check(FI_KMALLOC))           /* 測試:假裝配置失敗(include/failinj.h) */
+        return NULL;
     unsigned long flags = spin_lock_irqsave(&heap_lk);
     void *p = kmalloc_locked(size);
     spin_unlock_irqrestore(&heap_lk, flags);
