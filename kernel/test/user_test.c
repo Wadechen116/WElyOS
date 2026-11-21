@@ -133,6 +133,7 @@ void user_demo(void)
     run_user("memory quota and mmap", UMODE_MEMQUOTA, 27);
     run_user("40 threads created and exited, each using 512KB of its stack", UMODE_THREADCHURN, 61);
     run_user("ramfs quota: unprivileged writer stops at E_NOSPC, admin may exceed", UMODE_FSQUOTA, 71);
+    run_user("concurrent thread create/exit; fork after the main thread exited", UMODE_THREADMIX, 72);
     /* 週期性的即時工作:參數檢查、負載上限、需要特權、準時 */
     run_user("periodic real-time tasks", UMODE_RT, 29);
     /* 三重執行加投票:對其中一份注入位元翻轉、讓一份卡住、讓兩份都出錯 */

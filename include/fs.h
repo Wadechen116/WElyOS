@@ -190,7 +190,8 @@ struct inode *ramfs_create_root(void);
 unsigned long ramfs_pages(void);
 /* 設定 ramfs 記帳用的 FS domain(I-240 C3.2 (d));要在建立根目錄之前呼叫,所有物件才會記帳 */
 struct mb_domain;
-void ramfs_set_domain(struct mb_domain *d);
+struct mb_domain *ramfs_set_domain(struct mb_domain *d);   /* 回傳原本的 */
+void ramfs_test_strict(int on);                  /* 測試用:kernel 執行緒也受 FS 上限限制 */
 
 /*
  * wfs.c:磁碟上的檔案系統。

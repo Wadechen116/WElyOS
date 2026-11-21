@@ -433,11 +433,13 @@ static void user_thread_main(void *arg)
 }
 
 /* 在行程 p 中建立一條執行緒。usp 為它的使用者 stack pointer;
-   傳 0 表示替它配置一格新的 stack。回傳 tid,失敗回傳 -1 */
+   傳 0 表示替它配置一格新的 stack。回傳 tid;失敗時 -E_BUSY = 16 格 stack 都在用(暫時,等其他執行緒結束),
+   -E_NOMEM = 記憶體或配額不足 */
 /* 準備一條使用者執行緒(ustart、使用者 stack、kernel stack 與結構、KOBJ),還不啟動。失敗回傳 NULL,不留下東西 */
 static struct thread *user_thread_prepare(struct proc *p, uintptr_t entry, uintptr_t arg, uintptr_t usp,
-                                         unsigned owned_slot)
+                                         unsigned owned_slot, int *err)
 {
+    *err = -E_NOMEM;
     struct ustart *st = kmalloc(sizeof(*st));
     if (!st)
         return NULL;
@@ -462,6 +464,8 @@ static struct thread *user_thread_prepare(struct proc *p, uintptr_t entry, uintp
     st->usp = usp;
     st->slot = slot;
     if (!st->usp) {
+        if (slot == PROC_MAX_THREADS)
+            *err = -E_BUSY;                  /* 格子都在用,不是記憶體不足 */
         ustart_release(st);
         return NULL;
     }
@@ -488,8 +492,9 @@ static int user_thread_start(struct proc *p, struct thread *t)
 
 int proc_add_thread(struct proc *p, uintptr_t entry, uintptr_t arg, uintptr_t usp)
 {
-    struct thread *t = user_thread_prepare(p, entry, arg, usp, PROC_MAX_THREADS);
-    return t ? user_thread_start(p, t) : -1;
+    int err;
+    struct thread *t = user_thread_prepare(p, entry, arg, usp, PROC_MAX_THREADS, &err);
+    return t ? user_thread_start(p, t) : err;
 }
 
 /* 建立行程。parent 為 NULL 表示由 kernel 建立。回傳 pid 或負的錯誤碼 */
@@ -532,13 +537,14 @@ static int proc_create(const char *path, const struct args *a, struct proc *pare
     files_init_cwd(p, parent);       /* 工作目錄沿用建立者的;kernel 建立的行程從根目錄開始 */
 
     /* 第一條執行緒在公布 pid 之前準備好(I-240 C3.2 (b2)):失敗時行程從沒出現過,直接拆掉 */
-    struct thread *t = user_thread_prepare(p, img.entry, img.argp, img.usp, 0);   /* 第 0 格由 image_build 準備好 */
+    int perr;
+    struct thread *t = user_thread_prepare(p, img.entry, img.argp, img.usp, 0, &perr);   /* 第 0 格由 image_build 準備好 */
     if (!t) {
         image_discard(&img);
         fd_close_all(p);
         pmem_release(p);
         kfree(p);
-        return -E_NOMEM;
+        return perr;
     }
 
     unsigned long flags = sched_lock();

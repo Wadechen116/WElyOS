@@ -43,6 +43,13 @@ export QEMU_RUN_TAG="welyos-$RUN_ID"
   echo "args: $*"; echo "host load: $(cut -d' ' -f1-3 /proc/loadavg)"; } > "$OUT/run-info.txt"
 echo "輸出目錄:$OUT"
 
+# 客體標記(Codex 231):只看結束碼會把「模擬器沒跑 kernel 卻回傳 0」當成通過。
+# kernel 每次結束(含故意當機)最後都印「exit: code N to the emulator」,必須看到預期的 N
+guest_exit_ok() {   # $1 = 輸出檔, $2 = kernel 應該給的值
+  grep -aq "exit: code $2 to the emulator" "$1"
+}
+# timeout -k:時間到先送 TERM,10 秒後仍在就 KILL,不讓忽略 TERM 的模擬器殘留到後面的情境
+
 # 只回收這次啟動的 QEMU(以 -name 的專屬名稱辨認),不動主機上別人的
 cleanup_qemu() {
   command -v powershell.exe >/dev/null || return 0
@@ -110,7 +117,7 @@ for a in $ARCHS; do
     # 「模擬器以結束碼 5 結束」至今只出現在這類情境,而且約七百次才一次,專門去重現(500 次)沒有遇到。
     # 讓它下次出現時自己留下證據(見下方與 docs/ISSUES.md 的 N-002)
     wx=0; case "$c" in crash=*) wx=1 ;; esac
-    QEMU_WINEXIT=$wx timeout 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" -append "autoexit $c" > "$log" 2>&1 < /dev/null
+    QEMU_WINEXIT=$wx timeout -k 10 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" -append "autoexit $c" > "$log" 2>&1 < /dev/null
     rc=$?
     t=$(echo "$(date +%s.%N) - $t0" | bc)
     # 結束碼 5(docs/ISSUES.md N-002(a))。第 51 步的追查(1400 次當機情境)抓到兩次,都在 aarch64:
@@ -125,13 +132,18 @@ for a in $ARCHS; do
       mkdir -p build/exit5-hunt && cp "$log" "build/exit5-hunt/regress-$(date +%Y%m%d-%H%M%S)-$a-${c// /+}.txt"
       if exit5_is_host_crash "$log"; then
         echo "  注意:$a ${c:-(只開機)}:kernel 給了正確的值,模擬器結束時當掉($win),重試一次(輸出保留在 $log.exit5)"
-        QEMU_WINEXIT=1 timeout 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" -append "autoexit $c" > "$log" 2>&1 < /dev/null
+        QEMU_WINEXIT=1 timeout -k 10 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" -append "autoexit $c" > "$log" 2>&1 < /dev/null
         rc=$?
         [ "$rc" -eq "$want" ] && hostcrash=$((hostcrash + 1))
       else
         echo "  $a ${c:-(只開機)}:結束碼 5 但不符合「模擬器當掉」的條件($win),算失敗;輸出保留在 $log.exit5"
         fail=1
       fi
+    fi
+    kcode=0; [ "$want" -ne 0 ] && kcode=1     # i386 的 3 = kernel 給 1((1 << 1) | 1)
+    if [ "$rc" -eq "$want" ] && ! guest_exit_ok "$log" "$kcode"; then
+      echo "  $a ${c:-(只開機)}:結束碼符合,但輸出裡沒有 kernel 的「exit: code $kcode」,算失敗"
+      rc=-1
     fi
     if [ "$rc" -eq "$want" ]; then
       ok=$((ok + 1))
@@ -152,7 +164,7 @@ for a in $ARCHS; do
       log="$OUT/$a-disktest$s.txt"
       # 第 6 階段故意 panic(測試黑盒子):預期的結束碼和其他當機情境相同
       dwant=0; [ "$s" -eq 6 ] && { [ "$a" = i386 ] && dwant=3 || dwant=1; }
-      QEMU_DISK="$img" timeout 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
+      QEMU_DISK="$img" timeout -k 10 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
            -append "autoexit disktest=$s" > "$log" 2>&1 < /dev/null
       if [ "$?" -eq "$dwant" ]; then
         dok=$((dok + 1))
@@ -167,7 +179,7 @@ for a in $ARCHS; do
     # 在安全模式裡正常結束之後,第五次回到一般的開機
     rm -f "$img"; sok=0; pwant=1; [ "$a" = i386 ] && pwant=3
     for step in "crash=boot:$pwant" "crash=boot:$pwant" "crash=boot:$pwant" "expect=safe:0" "expect=normal:0"; do
-      QEMU_DISK="$img" timeout 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
+      QEMU_DISK="$img" timeout -k 10 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
            -append "autoexit ${step%%:*}" > "$OUT/$a-safemode.txt" 2>&1 < /dev/null
       if [ "$?" -eq "${step##*:}" ]; then
         sok=$((sok + 1))
@@ -182,7 +194,7 @@ for a in $ARCHS; do
     # 不掛載、不格式化,黑盒子也不可以把紀錄寫在它最後的 8KB(Codex 找到的問題:第 113 號留言)
     python3 -c "import sys; open(sys.argv[1],'wb').write(b'\\xa5' * (16 << 20))" "$img"
     before=$(md5sum < "$img")
-    QEMU_DISK="$img" timeout 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
+    QEMU_DISK="$img" timeout -k 10 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
          -append "autoexit" > "$OUT/$a-foreign.txt" 2>&1 < /dev/null
     frc=$?
     if [ "$frc" -eq 0 ] && [ "$(md5sum < "$img")" = "$before" ] && grep -q "blackbox: disabled" "$OUT/$a-foreign.txt"; then
@@ -194,7 +206,7 @@ for a in $ARCHS; do
 
     # 沒有磁碟、也沒有網路卡:每個驅動程式都必須正確回報「沒有」,自我測試照樣通過。
     # (第 48 步以前只在 RISC-V 上跑過這個組合,i386 的 NE2000 偵測因此把空的匯流排當成一張卡)
-    QEMU_DISK=none QEMU_NET=none timeout 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
+    QEMU_DISK=none QEMU_NET=none timeout -k 10 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
          -append "autoexit selftest" > "$OUT/$a-bare.txt" 2>&1 < /dev/null
     brc=$?
     if [ "$brc" -eq 0 ] && grep -q "^net: none" "$OUT/$a-bare.txt" && grep -q "^disk: none" "$OUT/$a-bare.txt"; then
@@ -209,8 +221,8 @@ for a in $ARCHS; do
       good=0
       for i in $(seq "$REPEAT"); do
         log="$OUT/$a-repeat-smp$n-$i.txt"
-        if QEMU_SMP=$n timeout 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
-             -append "autoexit selftest stress memtest" > "$log" 2>&1 < /dev/null; then
+        if QEMU_SMP=$n timeout -k 10 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
+             -append "autoexit selftest stress memtest" > "$log" 2>&1 < /dev/null && guest_exit_ok "$log" 0; then
           good=$((good + 1))               # 成功的紀錄也保留:偶發失敗時可以和成功的那幾次比對
         else
           fail=1; echo "  $a,$n 顆 CPU,第 $i 次失敗,輸出在 $log"

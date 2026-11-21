@@ -12,6 +12,7 @@
 #include "console.h"
 #include "cpu.h"
 #include "fs.h"
+#include "membudget.h"
 #include "kmalloc.h"
 #include "kprintf.h"
 #include "kstring.h"
@@ -685,6 +686,50 @@ static void fs_worker(void *arg)
     vfs_close(log);
 }
 
+/* ramfs 區塊表換大時只記新舊兩表的差額(審查發現:原本先記整張新表,剩餘額度介於
+   「差額」與「新表」之間時檔案長不大,得到假的 E_NOSPC)。換上自己的 FS domain,
+   把剩餘額度精確設成「差額 + 1 頁資料」:寫第 513 頁(表 512 → 1024 格)必須成功,
+   之後額度剛好用完、下一頁 E_NOSPC;刪檔後帳回到原值 */
+static void fs_quota_table_test(void)
+{
+    static char page[PAGE_SIZE];
+    struct mb_domain *d = mb_domain_new(1u << 20);
+    KASSERT(d);
+    struct mb_domain *old = ramfs_set_domain(d);
+    ramfs_test_strict(1);
+    struct mb_stats s0, s;
+    mb_stats(d, &s0);
+
+    struct file *f;
+    KASSERT(vfs_open("/qtbl", O_CREAT | O_WRONLY | O_TRUNC, &f) == 0);
+    for (int i = 0; i < 512; i++)
+        KASSERT(vfs_write(f, page, sizeof(page)) == (long)sizeof(page));
+    void *a = kmalloc(512 * sizeof(void *)), *b = kmalloc(1024 * sizeof(void *));
+    KASSERT(a && b);
+    unsigned long op = mb_pages_for_bytes(kmalloc_size(a)), np = mb_pages_for_bytes(kmalloc_size(b));
+    kfree(a);
+    kfree(b);
+    KASSERT(np > op);
+    mb_stats(d, &s);
+    mb_set_limit(d, s.total + (np - op) + 1);       /* 容得下差額 + 1 頁,容不下整張新表 + 1 頁 */
+    KASSERT(np + 1 > np - op + 1 && s.total + np + 1 > s.total + (np - op) + 1);
+    long w = vfs_write(f, page, sizeof(page));
+    if (w != (long)sizeof(page))
+        panic("fs: table growth near the FS limit failed (%ld): charged the whole new table", w);
+    mb_stats(d, &s);
+    KASSERT(s.total == s.limit);                     /* 剛好用完 */
+    KASSERT(vfs_write(f, page, sizeof(page)) == -E_NOSPC);
+    vfs_close(f);
+    KASSERT(vfs_unlink("/qtbl") == 0);
+    mb_stats(d, &s);
+    KASSERT(s.total == s0.total);
+
+    ramfs_test_strict(0);
+    KASSERT(ramfs_set_domain(old) == d);
+    KASSERT(mb_domain_put(d) == 0);
+    kprintf("fs: table growth near the FS limit charges only the difference (%lu -> %lu pages)\n", op, np);
+}
+
 void fs_demo(void)
 {
     struct file *f;
@@ -799,6 +844,7 @@ void fs_demo(void)
     kheap_stats(&h1);
     KASSERT(ramfs_pages() == pages0);
     KASSERT(h1.free_bytes + (sched_pool_bytes() - pool0) == h0.free_bytes + (h1.heap_bytes - h0.heap_bytes));
+    fs_quota_table_test();
     kprintf("fs: selftest ok (all files removed, memory returned)\n");
 }
 

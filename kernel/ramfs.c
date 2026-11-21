@@ -49,10 +49,19 @@ static unsigned long data_pages;             /* 所有檔案的資料頁總數 *
  * (以及沒有身分的 kernel 執行緒)略過這個上限但照樣記帳 — 實體上仍受 pmm 的底線與預留保護。
  */
 static struct mb_domain *fs_dom;
+static int fs_strict;                        /* 測試用:kernel 執行緒也照一般使用者受上限限制 */
 
-void ramfs_set_domain(struct mb_domain *d)
+/* 回傳原本的 domain(測試換上自己的 domain 之後要換回去) */
+struct mb_domain *ramfs_set_domain(struct mb_domain *d)
 {
+    struct mb_domain *old = fs_dom;
     fs_dom = d;
+    return old;
+}
+
+void ramfs_test_strict(int on)
+{
+    fs_strict = on;
 }
 
 /* 記 n 頁;FS 上限不夠回傳 -E_NOSPC,什麼都不改 */
@@ -61,7 +70,7 @@ static int fs_charge(unsigned long n)
     if (!fs_dom || n == 0)
         return 0;
     const struct cred *c = cred_current();
-    int rc = (!c || (c->caps & CAP_ADMIN)) ? mb_quota_force_add(fs_dom, MB_RAMFS, n)
+    int rc = (!fs_strict && (!c || (c->caps & CAP_ADMIN))) ? mb_quota_force_add(fs_dom, MB_RAMFS, n)
                                            : mb_quota_add(fs_dom, MB_RAMFS, n);
     return rc == 0 ? 0 : -E_NOSPC;
 }
@@ -81,13 +90,17 @@ unsigned long ramfs_pages(void)
     return __atomic_load_n(&data_pages, __ATOMIC_RELAXED);
 }
 
-static struct rnode *node_new(int type, struct rnode *parent)
+/* 失敗時 *err:-E_NOMEM = 實體記憶體不夠,-E_NOSPC = FS 上限(呼叫者照實回報,不混為一談) */
+static struct rnode *node_new(int type, struct rnode *parent, int *err)
 {
     struct rnode *n = kzalloc(sizeof(*n));
-    if (!n)
+    if (!n) {
+        *err = -E_NOMEM;
         return NULL;
+    }
     if (fs_charge(obj_pages(n)) != 0) {
         kfree(n);
+        *err = -E_NOSPC;
         return NULL;
     }
     inode_init(&n->in, &ramfs_ops, type);
@@ -97,7 +110,8 @@ static struct rnode *node_new(int type, struct rnode *parent)
 
 struct inode *ramfs_create_root(void)
 {
-    struct rnode *n = node_new(I_DIR, NULL);
+    int err;
+    struct rnode *n = node_new(I_DIR, NULL, &err);
     return n ? &n->in : NULL;
 }
 
@@ -134,11 +148,12 @@ static int ramfs_create(struct inode *dir, const char *name, int type, struct in
         kfree(e);
         return -E_NOSPC;
     }
-    struct rnode *n = node_new(type, d);
+    int err;
+    struct rnode *n = node_new(type, d, &err);
     if (!n) {
         fs_uncharge(obj_pages(e));
         kfree(e);
-        return -E_NOSPC;                     /* 配置或 FS 上限不夠:對使用者而言都是空間不足 */
+        return err;                          /* 和目錄項一致:記憶體不夠 E_NOMEM,FS 上限 E_NOSPC */
     }
     for (size_t i = 0; i <= strlen(name); i++)
         e->name[i] = name[i];
@@ -275,13 +290,17 @@ static int grow_table(struct rnode *f, size_t want)
     void **t = kzalloc(cap * sizeof(void *));
     if (!t)
         return -E_NOMEM;
-    if (fs_charge(obj_pages(t)) != 0) {      /* 新表先記帳;不夠就保留舊表、什麼都不改 */
+    /* 只記新舊兩表的差額:換表之後留下來的只有新表。若先記整張新表,剩餘額度介於
+       「差額」和「新表」之間時檔案會長不大(審查發現的假性 E_NOSPC)。不夠就保留舊表、什麼都不改 */
+    unsigned long np = obj_pages(t), op = obj_pages(f->blocks);
+    if (np > op && fs_charge(np - op) != 0) {
         kfree(t);
         return -E_NOSPC;
     }
     if (f->blocks)
         memcpy(t, f->blocks, f->nblocks * sizeof(void *));
-    fs_uncharge(obj_pages(f->blocks));
+    if (op > np)
+        fs_uncharge(op - np);
     kfree(f->blocks);
     f->blocks = t;
     f->nblocks = cap;

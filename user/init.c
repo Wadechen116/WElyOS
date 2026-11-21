@@ -107,6 +107,113 @@ static int mode_threadchurn(void)
     return churn_bad ? 2 : 61;
 }
 
+/* ---- UMODE_THREADMIX ---- */
+
+/* I-240 C3.2 補測:
+   A. 4 條「產生者」執行緒同時各自反覆建立、等待 30 條工作執行緒(共 120 條),
+      建立與結束在多顆 CPU 上交錯,搶同一組 stack 格;每條工作執行緒深用 128KB stack。
+   B. fork 出的子行程:主執行緒建立 T 之後自己先結束;T(用第 2 格以後的 stack)再 fork,
+      孫行程在繼承來的那格 stack 上深用 256KB,結束碼要正確傳回 */
+static volatile int mix_done, mix_bad, mix_spawners;
+static volatile int mix_mine[4];                 /* 每個產生者自己的工作執行緒完成數(只看全域數會被別人的完成誤觸發) */
+
+static void mix_worker(long idx)
+{
+    volatile char deep[128 * 1024];
+    for (unsigned long i = 0; i < sizeof(deep); i += 4096)
+        deep[i] = (char)(idx + i / 4096);
+    for (unsigned long i = 0; i < sizeof(deep); i += 4096)
+        if (deep[i] != (char)(idx + i / 4096))
+            mix_bad = 1;
+    __atomic_fetch_add(&mix_mine[idx / 100], 1, __ATOMIC_SEQ_CST);
+    __atomic_fetch_add(&mix_done, 1, __ATOMIC_SEQ_CST);
+    sys_thread_exit();
+}
+
+static void mix_spawner(long id)
+{
+    for (int i = 0; i < 30; i++) {
+        long r;
+        int tries = 0;
+        while ((r = sys_thread_create(mix_worker, id * 100 + i)) < 0) {
+            if (r != -E_BUSY || ++tries > 2000) {      /* 格子暫時都在用:等別人歸還 */
+                mix_bad = 2;
+                goto out;
+            }
+            sys_sleep(1);
+        }
+        for (int w = 0; __atomic_load_n(&mix_mine[id], __ATOMIC_SEQ_CST) <= i; w++) {
+            if (w > 5000) {
+                mix_bad = 3;
+                goto out;
+            }
+            sys_sleep(1);
+        }
+    }
+out:
+    __atomic_fetch_sub(&mix_spawners, 1, __ATOMIC_SEQ_CST);
+    sys_thread_exit();
+}
+
+/* fork 只允許單一執行緒的行程;其他執行緒還在結束途中時回傳 -E_BUSY(暫時),有上限地重試 */
+static long mix_fork(void)
+{
+    long pid;
+    for (int tries = 0; (pid = sys_fork()) == -E_BUSY && tries < 5000; tries++)
+        sys_sleep(1);
+    return pid;
+}
+
+static void mix_forker(long unused)
+{
+    (void)unused;
+    long pid = mix_fork();                       /* 主執行緒結束之前是 -E_BUSY */
+    if (pid == 0) {
+        volatile char deep[256 * 1024];
+        for (unsigned long i = 0; i < sizeof(deep); i += 4096)
+            deep[i] = (char)(i / 4096);
+        for (unsigned long i = 0; i < sizeof(deep); i += 4096)
+            if (deep[i] != (char)(i / 4096))
+                sys_exit(5);
+        sys_exit(33);
+    }
+    if (pid < 0)
+        sys_exit(pid == -E_NOMEM ? 6 : 7);
+    int st = 0;
+    if (sys_waitpid(pid, &st, 0) != pid)
+        sys_exit(8);
+    sys_exit(st == 33 ? 34 : 9);
+}
+
+static int mode_threadmix(void)
+{
+    mix_spawners = 4;
+    for (long i = 0; i < 4; i++)
+        if (sys_thread_create(mix_spawner, i) < 0)
+            return 1;
+    for (int w = 0; __atomic_load_n(&mix_spawners, __ATOMIC_SEQ_CST) > 0; w++) {
+        if (w > 60000)
+            return 2;
+        sys_sleep(1);
+    }
+    if (mix_bad)
+        return 10 + mix_bad;
+    if (mix_done != 120)
+        return 3;
+    long pid = mix_fork();                       /* 產生者真正結束之前是 -E_BUSY */
+    if (pid == 0) {
+        if (sys_thread_create(mix_forker, 0) < 0)
+            sys_exit(4);
+        sys_thread_exit();                       /* 主執行緒先結束;行程由 T 繼續 */
+    }
+    if (pid < 0)
+        return pid == -E_BUSY ? 22 : 20;
+    int st = 0;
+    if (sys_waitpid(pid, &st, 0) != pid)
+        return 21;
+    return st == 34 ? 72 : 30 + st;
+}
+
 /* ---- UMODE_FSQUOTA ---- */
 
 /* I-240 C3.2 (d):ramfs 的 FS 配額。放棄 CAP_ADMIN 的子行程一直寫檔,必須停在 FS 上限、
@@ -2756,6 +2863,8 @@ static int umain(long mode)
     case UMODE_THREADCHURN:
         return mode_threadchurn();
 
+    case UMODE_THREADMIX:
+        return mode_threadmix();
     case UMODE_FSQUOTA:
         return mode_fsquota();
 
