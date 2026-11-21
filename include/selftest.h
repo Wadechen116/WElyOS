@@ -19,7 +19,7 @@ extern struct netdev *boot_nic;          /* 開機時找到的網路卡;沒有�
 struct blkdev *arch_blk_probe_cached(void);              /* 開機時找到的磁碟;沒有則為 NULL */
 /* (kernel/proc.c)讓 pid 建立執行緒連續失敗 rounds 次,回報前後的 stack 格位與頁數;回傳成功次數 */
 int proc_thread_failure_probe(int pid, unsigned rounds, uint32_t *slots0, uint32_t *slots1,
-                              unsigned long *pages0, unsigned long *pages1);
+                              unsigned long *pages0, unsigned long *pages1, unsigned long *reached);
 
 /* ---- kernel/test/mem_test.c ---- */
 void vm_demo(void);                      /* 分頁:權限、別名對映 */
@@ -37,6 +37,8 @@ void fork_ticket_test(void);             /* I-240 C3.2 (b1):fork 的兩筆帳,�
 void thread_kobj_test(void);             /* I-240 C3.2 (b2):執行緒的 KOBJ 記帳、先準備後啟動 */
 void pipe_kobj_test(void);               /* I-240 C3.2 (b2):檔案與管線由建立者的 domain 持有 */
 void user_stack_rollback_test(void);     /* Codex 191:建立執行緒失敗時 stack 與格子退回 */
+void ramfs_eof_test(void);               /* Codex 209:寫入失敗時 ramfs 檔案長度不變 */
+void stack_ticket_test(void);            /* I-240 C3.2 (c1):承諾的 stack 在飽和後整格可觸及 */
 void pte_tear_test(void);                /* I-090:頁表項目 64 位元寫入不撕裂(需要 2 顆 CPU) */
 void crash_test(const char *cmd);        /* crash=<種類>:故意觸發錯誤(排程器啟動之前可以做的那些) */
 

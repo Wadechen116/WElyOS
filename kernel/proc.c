@@ -55,36 +55,43 @@ static void *map_page(struct vm_space *vs, uintptr_t va, unsigned flags)
     return page;
 }
 
-static void free_user_stack_slot(struct proc *p, unsigned slot);
+/*
+ * 使用者 stack(I-240 C3.2 (c1)):每一格 1MB,最低一頁是保護頁(從不承諾、從不對映),
+ * 其餘 255 頁在建立執行緒時一次承諾(連同頁表票),之後 stack 往下長時用票兌現 — 一定成功。
+ * 兩張位元圖:stack_slots = 已佔格,stack_ready = 已承諾(fault 只認這張)。
+ */
+#define USER_STACK_COMMIT_PAGES (USER_STACK_SLOT / PAGE_SIZE - 1)
 
-/* 對映第 slot 格使用者 stack(最上面的 16KB),回傳 stack 頂端的位址。
-   失敗回傳 0,而且這次已經對映的頁全部解除並釋放(交易:不留半套 stack) */
-static uintptr_t map_user_stack(struct vm_space *vs, unsigned slot)
+static uintptr_t slot_top(unsigned slot)
 {
-    uintptr_t top = USER_STACK_TOP - (uintptr_t)slot * USER_STACK_SLOT;
+    return USER_STACK_TOP - (uintptr_t)slot * USER_STACK_SLOT;
+}
 
-    for (unsigned i = 1; i <= USER_STACK_PAGES; i++) {
-        if (!map_page(vs, top - i * PAGE_SIZE, VM_READ | VM_WRITE)) {
-            while (--i >= 1)
-                if (vm_space_unmap(vs, top - i * PAGE_SIZE) != 0)
-                    panic("proc: cannot roll back stack page");
-            return 0;
-        }
-    }
+/* 承諾第 slot 格並以票兌現最上面 USER_STACK_PAGES 頁(參數要寫進去)。
+   成功回傳 stack 頂端;失敗回傳 0,什麼都沒留下(承諾失敗不改任何狀態;兌現不會失敗) */
+static uintptr_t commit_user_stack(struct vm_space *vs, unsigned slot)
+{
+    uintptr_t top = slot_top(slot), base = top - USER_STACK_SLOT + PAGE_SIZE;
+    if (vm_space_commit(vs, MB_STACK, base, (uintptr_t)USER_STACK_COMMIT_PAGES * PAGE_SIZE) != 0)
+        return 0;
+    for (unsigned i = 1; i <= USER_STACK_PAGES; i++)
+        if (vm_space_fault_anon(vs, top - i * PAGE_SIZE) < 0)
+            panic("proc: committed stack page could not be backed");
     return top;
 }
 
-/* 失敗回退:解除這一格裡所有已對映的頁(一開始對映的,以及別的執行緒碰到而由 fault 長出來的)。
-   呼叫者持有 mem.mx,fault 不會同時進來 */
-static void unmap_user_stack(struct vm_space *vs, unsigned slot)
+static void set_stack_bit(uint32_t *map, unsigned slot, int on)
 {
-    uintptr_t top = USER_STACK_TOP - (uintptr_t)slot * USER_STACK_SLOT;
-    for (uintptr_t va = top - USER_STACK_SLOT + PAGE_SIZE; va < top; va += PAGE_SIZE)
-        vm_space_unmap(vs, va);              /* 沒有對映的頁回傳 -1:本來就沒有東西要退 */
+    unsigned long fl = spin_lock_irqsave(&pstate_lk);
+    if (on)
+        __atomic_or_fetch(map, 1u << slot, __ATOMIC_RELEASE);
+    else
+        __atomic_and_fetch(map, ~(1u << slot), __ATOMIC_RELEASE);
+    spin_unlock_irqrestore(&pstate_lk, fl);
 }
 
-/* 替行程的一條新執行緒準備使用者 stack:拿一格空的、對映最上面的幾頁。
-   成功回傳 stack 頂端並以 *slot_out 交回格號;失敗回傳 0,格子與頁都沒有留下 */
+/* 替行程的一條新執行緒準備使用者 stack:佔一格空的 → 承諾 → 兌現最上面幾頁 → 設 ready。
+   成功回傳 stack 頂端並以 *slot_out 交回格號;失敗回傳 0,格子與帳都沒有留下 */
 static uintptr_t alloc_user_stack(struct proc *p, unsigned *slot_out)
 {
     unsigned long fl = spin_lock_irqsave(&pstate_lk);
@@ -100,21 +107,26 @@ static uintptr_t alloc_user_stack(struct proc *p, unsigned *slot_out)
     if (slot == PROC_MAX_THREADS)
         return 0;
 
-    uintptr_t top = map_user_stack(p->space, slot);
+    uintptr_t top = commit_user_stack(p->space, slot);
     if (!top) {
-        free_user_stack_slot(p, slot);
+        set_stack_bit(&p->stack_slots, slot, 0);
         return 0;
     }
+    set_stack_bit(&p->stack_ready, slot, 1);     /* 從現在起 fault 才會在這一格兌現 */
     *slot_out = slot;
     return top;
 }
 
-/* 放回一格(只放自己拿到的那一格) */
-static void free_user_stack_slot(struct proc *p, unsigned slot)
+/* 歸還一格(執行緒結束,或建立失敗):先清 ready、再逐頁退頁與票(R1)、最後放格。
+   清 ready 與退頁在同一段 mem.mx 之內:stack 成長的 fault 也拿這把鎖,不會在中間插入 */
+static void release_user_stack(struct proc *p, unsigned slot)
 {
-    unsigned long fl = spin_lock_irqsave(&pstate_lk);
-    __atomic_and_fetch(&p->stack_slots, ~(1u << slot), __ATOMIC_RELEASE);
-    spin_unlock_irqrestore(&pstate_lk, fl);
+    uintptr_t top = slot_top(slot), base = top - USER_STACK_SLOT + PAGE_SIZE;
+    pmem_lock(p);
+    set_stack_bit(&p->stack_ready, slot, 0);
+    vm_space_release(p->space, MB_STACK, base, (uintptr_t)USER_STACK_COMMIT_PAGES * PAGE_SIZE);
+    pmem_unlock(p);
+    set_stack_bit(&p->stack_slots, slot, 0);     /* 此後別的建立者才能拿這一格 */
 }
 
 /* 把資料寫進「某個位址空間」的使用者位址(不必是目前載入的那一個):
@@ -298,7 +310,7 @@ static int image_build(const char *path, const struct args *a, struct image *img
         }
     }
 
-    uintptr_t top = map_user_stack(img->space, 0);
+    uintptr_t top = commit_user_stack(img->space, 0);   /* 第 0 格:承諾 255 頁並兌現最上面幾頁 */
     if (!top)
         goto fail;
     err = image_put_args(img, top, a);
@@ -332,6 +344,14 @@ static void proc_set_name(struct proc *p, const char *path)
 void proc_thread_exit(void)
 {
     struct proc *p = thread_data();
+
+    /* 歸還自己的 stack 格(I-330):這條執行緒不會再回到使用者模式,不會再在那塊 stack 上執行。
+       在扣掉執行緒數之前做:位址空間此時一定還在(最後一條執行緒才會釋放它) */
+    unsigned long tag = thread_tag();
+    if (tag) {
+        thread_set_tag(0);
+        release_user_stack(p, (unsigned)(tag - 1));
+    }
 
     /* 先放掉位址空間(換回 kernel 頁表),再把自己從行程的執行緒數中扣掉。
        順序很重要:扣到 0 的那條執行緒會釋放位址空間,而此時其他執行緒可能還在
@@ -384,14 +404,26 @@ void proc_exit(int code)
     proc_thread_exit();
 }
 
+/* ustart 在 prepare 成功後交給 user_thread_main,失敗則由建立者歸還。
+   保存帳務欄位後先釋放物件,最後才放掉它自己的 domain 參考。 */
+static void ustart_release(struct ustart *st)
+{
+    struct mb_domain *dom = st->dom;
+    unsigned long kobj = st->kobj;
+    kfree(st);
+    if (dom && mb_release_object(dom, kobj) != 0)
+        blackbox_log(BB_FAULT, "ustart kernel-object quota mismatch");
+}
+
 /* 行程中每條執行緒在 kernel 這一側的起點:設定好歸屬與位址空間後降到使用者模式 */
 static void user_thread_main(void *arg)
 {
     struct ustart st = *(struct ustart *)arg;
 
-    kfree(arg);
+    ustart_release(arg);
     thread_set_data(st.p);
     thread_set_space(st.p->space);
+    thread_set_tag(st.slot < PROC_MAX_THREADS ? st.slot + 1 : 0);   /* 結束時歸還這一格(I-330) */
 
     /*
      * 還沒開始跑,行程就已經開始結束了?兩種情況都要檢查:
@@ -411,36 +443,44 @@ static void user_thread_main(void *arg)
 /* 在行程 p 中建立一條執行緒。usp 為它的使用者 stack pointer;
    傳 0 表示替它配置一格新的 stack。回傳 tid,失敗回傳 -1 */
 /* 準備一條使用者執行緒(ustart、使用者 stack、kernel stack 與結構、KOBJ),還不啟動。失敗回傳 NULL,不留下東西 */
-static struct thread *user_thread_prepare(struct proc *p, uintptr_t entry, uintptr_t arg, uintptr_t usp)
+static struct thread *user_thread_prepare(struct proc *p, uintptr_t entry, uintptr_t arg, uintptr_t usp,
+                                         unsigned owned_slot)
 {
     struct ustart *st = kmalloc(sizeof(*st));
     if (!st)
         return NULL;
+    st->dom = NULL;
+    st->kobj = mb_pages_for_bytes(kmalloc_size(st));
+    struct mb_domain *dom = pmem_domain(p);
+    if (dom && mb_charge_object(dom, st->kobj) != 0) {
+        kfree(st);                           /* charge 失敗沒有取得參考或配額 */
+        return NULL;
+    }
+    st->dom = dom;
     st->p = p;
     st->entry = entry;
     st->arg = arg;
-    unsigned slot = PROC_MAX_THREADS;        /* PROC_MAX_THREADS = 呼叫者自己提供了 stack,不是我們配置的 */
+    /* owned_slot:呼叫者已經準備好的格(proc_create 的第 0 格);PROC_MAX_THREADS = 呼叫者自己提供的 stack。
+       usp 為 0 時由這裡配置一格,失敗時也只退這一格 */
+    unsigned slot = owned_slot, mine = 0;
     if (!usp) {
-        pmem_lock(p);                        /* 佔格 + 對映,與 stack 成長的 fault 序列化 */
         usp = alloc_user_stack(p, &slot);
-        pmem_unlock(p);
+        mine = usp != 0;
     }
     st->usp = usp;
+    st->slot = slot;
     if (!st->usp) {
-        kfree(st);
+        ustart_release(st);
         return NULL;
     }
     struct thread *t = thread_prepare(p->name, user_thread_main, st, PRIO_NORMAL, pmem_domain(p));
     if (!t) {
-        /* 準備失敗:這次配置的 stack 與格子一起退回(呼叫者提供的 stack 不碰)。
-           解除對映與放回格子在同一段 mem.mx 之內:放格之前 fault 不能補頁進來 */
-        if (slot < PROC_MAX_THREADS) {
-            pmem_lock(p);
-            unmap_user_stack(p->space, slot);
-            free_user_stack_slot(p, slot);
-            pmem_unlock(p);
+        /* 準備失敗:這次配置的 stack 連同承諾與格子一起退回(呼叫者提供或已擁有的格不碰) */
+        if (mine) {
+            release_user_stack(p, slot);
+            __atomic_fetch_add(&p->stack_rollbacks, 1, __ATOMIC_RELAXED);   /* 每個行程各自計數(Codex 213) */
         }
-        kfree(st);
+        ustart_release(st);
     }
     return t;
 }
@@ -456,7 +496,7 @@ static int user_thread_start(struct proc *p, struct thread *t)
 
 int proc_add_thread(struct proc *p, uintptr_t entry, uintptr_t arg, uintptr_t usp)
 {
-    struct thread *t = user_thread_prepare(p, entry, arg, usp);
+    struct thread *t = user_thread_prepare(p, entry, arg, usp, PROC_MAX_THREADS);
     return t ? user_thread_start(p, t) : -1;
 }
 
@@ -493,13 +533,13 @@ static int proc_create(const char *path, const struct args *a, struct proc *pare
     proc_set_name(p, path);
     p->space = img.space;
     p->exe = img.exe;
-    p->stack_slots = 1;              /* 第 0 格 stack 已由 image_build 準備好 */
+    p->stack_slots = p->stack_ready = 1;   /* 第 0 格 stack 已由 image_build 承諾好 */
     /* 身分沿用建立者的;kernel 建立的行程是 root,擁有全部的特權 */
     p->cred = parent ? parent->cred : (struct cred){ 0, 0, CAP_ALL };
     files_init_cwd(p, parent);       /* 工作目錄沿用建立者的;kernel 建立的行程從根目錄開始 */
 
     /* 第一條執行緒在公布 pid 之前準備好(I-240 C3.2 (b2)):失敗時行程從沒出現過,直接拆掉 */
-    struct thread *t = user_thread_prepare(p, img.entry, img.argp, img.usp);
+    struct thread *t = user_thread_prepare(p, img.entry, img.argp, img.usp, 0);   /* 第 0 格由 image_build 準備好 */
     if (!t) {
         image_discard(&img);
         fd_close_all(p);
@@ -816,7 +856,8 @@ long sys_exec(struct proc *p, uintptr_t upath, uintptr_t uargv)
     pmem_exec(p);                    /* 新的程式從空的 heap 開始;舊程式的 heap 與匿名對映都不在了 */
     psig_exec(p);                    /* 處理函式是舊程式裡的位址:全部還原成預設(「忽略」則保留) */
     p->exe = img.exe;
-    p->stack_slots = 1;              /* 新程式只有第 0 格 stack(舊的隨舊位址空間消失) */
+    p->stack_slots = p->stack_ready = 1;   /* 新程式只有第 0 格 stack(舊的隨舊位址空間消失) */
+    thread_set_tag(1);                       /* 這條執行緒現在擁有第 0 格(fork 前可能是別格) */
     thread_set_space(img.space);     /* 換到新的位址空間;舊的已經沒有人使用 */
     vm_space_destroy(old_space);
     vfs_exec_release(old_exe);
@@ -827,9 +868,24 @@ long sys_exec(struct proc *p, uintptr_t upath, uintptr_t uargv)
 
 /* fork 出來的子行程的第一條(也是唯一一條)執行緒在 kernel 這一側的起點 */
 struct fork_start {
+    unsigned long tag;               /* 父的呼叫執行緒擁有的 stack 格(+1),子行程唯一的執行緒沿用 */
+    struct mb_domain *dom;           /* 暫時容器與 frame 共持一份參考 */
+    unsigned long kobj;              /* 兩個 kmalloc 物件各取整後的和 */
     struct proc *p;
     void *frame;                     /* 父行程呼叫 fork 時的暫存器(回傳值已改成 0) */
 };
+
+/* fork_start 擁有 frame,兩者一起交接給子執行緒或由建立者回退。
+   dom 為 NULL 表示尚未記帳,但兩個物件仍須釋放。 */
+static void fork_start_release(struct fork_start *st)
+{
+    struct mb_domain *dom = st->dom;
+    unsigned long kobj = st->kobj;
+    kfree(st->frame);
+    kfree(st);
+    if (dom && mb_release_object(dom, kobj) != 0)
+        blackbox_log(BB_FAULT, "fork temporary-object quota mismatch");
+}
 
 static void fork_child_main(void *arg)
 {
@@ -838,11 +894,11 @@ static void fork_child_main(void *arg)
        大小依架構而定,這裡取一個夠大的上限 */
     _Alignas(16) char frame[512];
 
-    kfree(arg);
     thread_set_data(st.p);
     thread_set_space(st.p->space);
+    thread_set_tag(st.tag);                  /* 沿用父的呼叫執行緒那一格(子空間裡同一格已承諾) */
     memcpy(frame, st.frame, arch_frame_size());
-    kfree(st.frame);
+    fork_start_release(arg);
 
     unsigned long flags = sched_lock();      /* 和 user_thread_main 相同的檢查 */
     int dying = st.p->exiting;
@@ -877,18 +933,28 @@ long sys_fork(struct proc *p, void *tf)
         return -E_BUSY;
 
     struct proc *c = kzalloc(sizeof(*c));
-    struct fork_start *st = kmalloc(sizeof(*st));
+    struct fork_start *st = kzalloc(sizeof(*st));
     void *frame = kmalloc(arch_frame_size());
+    if (st)
+        st->frame = frame;
     if (!c || !st || !frame)
         goto nomem;
     /* 順序(Codex 198):先做所有可能失敗、又不會改動父行程的配置 — 子的 domain、子的執行緒 —
        最後才複製位址空間(它會把父的頁改成 COW 並預留票)。複製成功之後只剩不會失敗的步驟 */
     if (pmem_fork_domain(c, p) != 0)
         goto nomem;
+    st->kobj = mb_pages_for_bytes(kmalloc_size(st)) + mb_pages_for_bytes(kmalloc_size(frame));
+    struct mb_domain *dom = pmem_domain(c);
+    if (mb_charge_object(dom, st->kobj) != 0) {
+        pmem_release(c);
+        goto nomem;
+    }
+    st->dom = dom;
 
     memcpy(frame, tf, arch_frame_size());
     arch_frame_set_retval(frame, 0);         /* 子行程看到的回傳值 */
     st->p = c;
+    st->tag = thread_tag();
     st->frame = frame;
 
     memcpy(c->name, p->name, sizeof(c->name));
@@ -930,8 +996,10 @@ long sys_fork(struct proc *p, void *tf)
 
 nomem:
     kfree(c);
-    kfree(st);
-    kfree(frame);
+    if (st)
+        fork_start_release(st);
+    else
+        kfree(frame);
     return -E_NOMEM;
 }
 
@@ -1142,11 +1210,11 @@ long sys_sysinfo(struct proc *p, uintptr_t uinfo)
 
 /*
  * 自我測試用(I-240 C3.2 (b2),Codex 191):讓 pid 這個行程「建立執行緒」連續失敗 rounds 次 —
- * 把它的配額暫時調到已用量,kernel 執行緒的 KOBJ 記不上去,thread_prepare 在 stack 已經配置好之後失敗。
- * 回報前後的 stack 格位與位址空間頁數;結束時配額還原。回傳成功建立的次數(應為 0)
+ * 每一輪把它的配額調到「剛好夠 ustart 與 stack 的頁表、不夠 kernel 執行緒」,thread_prepare 在 stack 已經配置好之後失敗。
+ * 回報前後的 stack 格位、位址空間頁數,以及確實走到「stack 之後才失敗」的次數;結束時配額還原。回傳成功建立的次數(應為 0)
  */
 int proc_thread_failure_probe(int pid, unsigned rounds, uint32_t *slots0, uint32_t *slots1,
-                              unsigned long *pages0, unsigned long *pages1)
+                              unsigned long *pages0, unsigned long *pages1, unsigned long *reached)
 {
     unsigned long flags = sched_lock();
     struct proc *p = proc_find(pid);
@@ -1157,13 +1225,19 @@ int proc_thread_failure_probe(int pid, unsigned rounds, uint32_t *slots0, uint32
     struct mb_stats st;
     mb_stats(d, &st);
     unsigned long limit = mb_limit(d);
-    mb_set_limit(d, st.total);                   /* 一頁都不能再增加 */
     *slots0 = __atomic_load_n(&p->stack_slots, __ATOMIC_ACQUIRE);
     *pages0 = vm_space_pages(p->space);
+    unsigned long rb0 = __atomic_load_n(&p->stack_rollbacks, __ATOMIC_RELAXED);
     int ok = 0;
-    for (unsigned i = 0; i < rounds; i++)
+    for (unsigned i = 0; i < rounds; i++) {
+        /* 每一輪重新設上限:ustart 1 頁 + stack 承諾 255 頁 + 最多 3 張頁表票,
+           kernel 執行緒的 KOBJ(6 頁)記不上去 → 一定是在 stack 建好之後、thread_prepare 失敗(Codex 211) */
+        mb_stats(d, &st);
+        mb_set_limit(d, st.total + 1 + USER_STACK_COMMIT_PAGES + 3);
         if (proc_add_thread(p, 0, 0, 0) >= 0)
             ok++;
+    }
+    *reached = __atomic_load_n(&p->stack_rollbacks, __ATOMIC_RELAXED) - rb0;
     *slots1 = __atomic_load_n(&p->stack_slots, __ATOMIC_ACQUIRE);
     *pages1 = vm_space_pages(p->space);
     mb_set_limit(d, limit);

@@ -130,6 +130,7 @@ void user_demo(void)
     run_user("users and permissions", UMODE_PERM, 26);
     /* 記憶體配額(超過的要求當場失敗)與匿名對映 */
     run_user("memory quota and mmap", UMODE_MEMQUOTA, 27);
+    run_user("40 threads created and exited, each using 512KB of its stack", UMODE_THREADCHURN, 61);
     /* 週期性的即時工作:參數檢查、負載上限、需要特權、準時 */
     run_user("periodic real-time tasks", UMODE_RT, 29);
     /* 三重執行加投票:對其中一份注入位元翻轉、讓一份卡住、讓兩份都出錯 */
@@ -279,11 +280,11 @@ void user_stack_rollback_test(void)
     KASSERT(pid > 0);
     thread_sleep(20);                             /* 讓它進到 sleep */
     uint32_t s0, s1;
-    unsigned long p0, p1;
-    int ok = proc_thread_failure_probe(pid, 20, &s0, &s1, &p0, &p1);
-    kprintf("user: 20 failed thread creations: slots 0x%x -> 0x%x, pages %lu -> %lu\n",
-            (unsigned)s0, (unsigned)s1, p0, p1);
-    KASSERT(ok == 0 && s0 == s1 && p0 == p1);
+    unsigned long p0, p1, reached;
+    int ok = proc_thread_failure_probe(pid, 20, &s0, &s1, &p0, &p1, &reached);
+    kprintf("user: 20 failed thread creations (%lu failed after the stack was mapped): slots 0x%x -> 0x%x, "
+            "pages %lu -> %lu\n", reached, (unsigned)s0, (unsigned)s1, p0, p1);
+    KASSERT(ok == 0 && reached == 20 && s0 == s1 && p0 == p1);   /* 每一輪都走到要測的那一步 */
     KASSERT(proc_kill(pid, 0) == 0);
     proc_wait(pid);
 }

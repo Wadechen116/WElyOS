@@ -984,7 +984,11 @@ void pipe_kobj_test(void)
     thread_join(tid);
     sched_trim();                                 /* 建立者已結束並被回收 */
     mb_stats(d, &st);
-    KASSERT(st.used[MB_KOBJ] >= 3 && st.refs == 4);   /* 2 個檔案 + 1 條管線,各持一份參考 */
+    /* 獨立算出應有的量(Codex 196):兩個 struct file 與 struct pipe(它的第一個成員就是 inode)
+       各以實際配置大小向上取整成頁,精確比對 */
+    unsigned long expect = mb_pages_for_bytes(kmalloc_size(pobj_r)) + mb_pages_for_bytes(kmalloc_size(pobj_w)) +
+                           mb_pages_for_bytes(kmalloc_size(vfs_file_inode(pobj_r)));
+    KASSERT(st.used[MB_KOBJ] == expect && st.refs == 4);   /* 2 個檔案 + 1 條管線,各持一份參考 */
     unsigned long k = st.used[MB_KOBJ];
     vfs_close(pobj_w);
     vfs_close(pobj_r);                            /* 最後一個參考:管線也釋放 */
@@ -993,4 +997,78 @@ void pipe_kobj_test(void)
     KASSERT(mb_domain_put(d) == 0);
     kprintf("vfs: pipe and files stay charged to their creator after it exits (%lu pages), "
             "returned on the last close\n", k);
+}
+
+/*
+ * Codex 209 的 ramfs 缺陷:在檔案結尾之後寫入,第一個資料頁就配置不到時,系統呼叫回報錯誤,
+ * 但檔案長度卻被加大(什麼都沒寫進去,檔案變長了)。這裡把一般配置吃到預留邊界,
+ * 在空檔案的 8192 位置寫入:必須回傳 -E_NOMEM,而且長度維持 0。
+ * 負對照:拿掉 ramfs_write 的「done > 0」條件(第 55 步實測)時,長度變成 8193,斷言失敗。
+ */
+void ramfs_eof_test(void)
+{
+    struct file *f;
+    struct stat st;
+    KASSERT(vfs_open("/eoftest", O_CREAT | O_RDWR | O_TRUNC, &f) == 0);
+    void *chain = NULL;
+    for (void **pg; (pg = pmm_alloc()) != NULL; ) {
+        *pg = chain;
+        chain = pg;
+    }
+    char c = 'x';
+    KASSERT(vfs_seek(f, 8192, SEEK_SET) == 8192);
+    long rc = vfs_write(f, &c, 1);
+    while (chain) {
+        void **pg = chain;
+        chain = *pg;
+        pmm_free(pg);
+    }
+    KASSERT(vfs_stat("/eoftest", &st) == 0);
+    kprintf("ramfs: write past EOF with no memory -> %ld, size stays %llu\n", rc, (unsigned long long)st.size);
+    KASSERT(rc == -E_NOMEM && st.size == 0);
+    vfs_close(f);
+    KASSERT(vfs_unlink("/eoftest") == 0);
+}
+
+/*
+ * I-240 C3.2 (c1):stack 的 I2。承諾一整格 stack(255 頁,保護頁不承諾)之後,
+ * 一般配置把記憶體用到預留邊界,整格 255 頁第一次觸及仍然全部成功(含需要新中間表的);
+ * 歸還後票與配額全部退回。負對照見 DEVLOG(stack fault 改回一般配置 → 飽和時失敗)。
+ */
+void stack_ticket_test(void)
+{
+    uintptr_t sbase, slen;
+    KASSERT(vm_anon_window(2, &sbase, &slen) == 0);      /* 第三個承諾窗 = stack 區 */
+    size_t r0 = pmm_reserved_count();
+    struct mb_domain *d = mb_domain_new(100000);
+    struct vm_space *vs = vm_space_create(d);
+    KASSERT(d && vs);
+    uintptr_t base = sbase + PAGE_SIZE, len = 255 * PAGE_SIZE;   /* 第一格,略過保護頁 */
+    KASSERT(vm_space_commit(vs, MB_STACK, base, len) == 0);
+    struct mb_stats st;
+    mb_stats(d, &st);
+    KASSERT(st.used[MB_STACK] == 255);
+
+    void *chain = NULL;
+    for (void **pg; (pg = pmm_alloc()) != NULL; ) {
+        *pg = chain;
+        chain = pg;
+    }
+    for (uintptr_t va = base + len; va > base; va -= PAGE_SIZE)  /* 由上往下,像 stack 一樣長 */
+        KASSERT(vm_space_fault_anon(vs, va - PAGE_SIZE) == 0);
+    struct vm_ledger l;
+    vm_space_ledger(vs, &l);
+    KASSERT(l.data_tickets == 0);
+    while (chain) {
+        void **pg = chain;
+        chain = *pg;
+        pmm_free(pg);
+    }
+    vm_space_release(vs, MB_STACK, base, len);
+    mb_stats(d, &st);
+    KASSERT(st.used[MB_STACK] == 0);
+    vm_space_destroy(vs);
+    KASSERT(pmm_reserved_count() == r0 && mb_domain_put(d) == 0);
+    kprintf("stack: a committed 255-page stack slot was fully touched after ordinary allocations "
+            "reached the reservation\n");
 }

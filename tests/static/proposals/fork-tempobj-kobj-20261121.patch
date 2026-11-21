@@ -1,0 +1,77 @@
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -827,9 +827,23 @@
+ 
+ /* fork 出來的子行程的第一條(也是唯一一條)執行緒在 kernel 這一側的起點 */
+ struct fork_start {
++    struct mb_domain *dom;           /* 暫時容器與 frame 共持一份參考 */
++    unsigned long kobj;              /* 兩個 kmalloc 物件各取整後的和 */
+     struct proc *p;
+     void *frame;                     /* 父行程呼叫 fork 時的暫存器(回傳值已改成 0) */
+ };
++
++/* fork_start 擁有 frame,兩者一起交接給子執行緒或由建立者回退。
++   dom 為 NULL 表示尚未記帳,但兩個物件仍須釋放。 */
++static void fork_start_release(struct fork_start *st)
++{
++    struct mb_domain *dom = st->dom;
++    unsigned long kobj = st->kobj;
++    kfree(st->frame);
++    kfree(st);
++    if (dom && mb_release_object(dom, kobj) != 0)
++        blackbox_log(BB_FAULT, "fork temporary-object quota mismatch");
++}
+ 
+ static void fork_child_main(void *arg)
+ {
+@@ -838,11 +852,10 @@
+        大小依架構而定,這裡取一個夠大的上限 */
+     _Alignas(16) char frame[512];
+ 
+-    kfree(arg);
+     thread_set_data(st.p);
+     thread_set_space(st.p->space);
+     memcpy(frame, st.frame, arch_frame_size());
+-    kfree(st.frame);
++    fork_start_release(arg);
+ 
+     unsigned long flags = sched_lock();      /* 和 user_thread_main 相同的檢查 */
+     int dying = st.p->exiting;
+@@ -877,14 +890,23 @@
+         return -E_BUSY;
+ 
+     struct proc *c = kzalloc(sizeof(*c));
+-    struct fork_start *st = kmalloc(sizeof(*st));
++    struct fork_start *st = kzalloc(sizeof(*st));
+     void *frame = kmalloc(arch_frame_size());
++    if (st)
++        st->frame = frame;
+     if (!c || !st || !frame)
+         goto nomem;
+     /* 順序(Codex 198):先做所有可能失敗、又不會改動父行程的配置 — 子的 domain、子的執行緒 —
+        最後才複製位址空間(它會把父的頁改成 COW 並預留票)。複製成功之後只剩不會失敗的步驟 */
+     if (pmem_fork_domain(c, p) != 0)
+         goto nomem;
++    st->kobj = mb_pages_for_bytes(kmalloc_size(st)) + mb_pages_for_bytes(kmalloc_size(frame));
++    struct mb_domain *dom = pmem_domain(c);
++    if (mb_charge_object(dom, st->kobj) != 0) {
++        pmem_release(c);
++        goto nomem;
++    }
++    st->dom = dom;
+ 
+     memcpy(frame, tf, arch_frame_size());
+     arch_frame_set_retval(frame, 0);         /* 子行程看到的回傳值 */
+@@ -930,8 +952,10 @@
+ 
+ nomem:
+     kfree(c);
+-    kfree(st);
+-    kfree(frame);
++    if (st)
++        fork_start_release(st);
++    else
++        kfree(frame);
+     return -E_NOMEM;
+ }
+ 

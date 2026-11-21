@@ -72,6 +72,41 @@ static int mode_hello(void)
     return worker_result[0] + worker_result[1] == 25150 ? 42 : 2;
 }
 
+/* ---- UMODE_THREADCHURN ---- */
+
+/* I-330 / I-240 C3.2 (c1):反覆建立、結束執行緒 40 次(每個行程只有 16 格 stack)。
+   每條執行緒都往下用自己的 stack 到 512KB 深(stack 成長的 fault 用預先承諾的票),
+   寫入、讀回、結束;下一條要能拿到剛歸還的格。以前格子只增不減,第 16 條起就建立失敗 */
+static volatile int churn_done, churn_bad;
+
+static void churn_fn(long idx)
+{
+    volatile char deep[512 * 1024];
+    for (unsigned long i = 0; i < sizeof(deep); i += 4096)
+        deep[i] = (char)(idx + i / 4096);
+    for (unsigned long i = 0; i < sizeof(deep); i += 4096)
+        if (deep[i] != (char)(idx + i / 4096))
+            churn_bad = 1;
+    churn_done = 1;
+    sys_thread_exit();
+}
+
+static int mode_threadchurn(void)
+{
+    for (int round = 0; round < 40; round++) {
+        churn_done = 0;
+        if (sys_thread_create(churn_fn, round) < 0)
+            return 100 + round;                  /* 第幾輪建立失敗 */
+        for (int w = 0; !churn_done; w++) {
+            if (w > 5000)
+                return 200 + round;              /* 等太久:那條執行緒沒做完 */
+            sys_sleep(1);
+        }
+        sys_sleep(2);                            /* 讓它真正結束、歸還格子 */
+    }
+    return churn_bad ? 2 : 61;
+}
+
 /* ---- UMODE_FUTEX ---- */
 
 #define FUTEX_THREADS 3
@@ -930,15 +965,17 @@ static int in_child(int (*fn)(void))
     return st;
 }
 
-/* 配額 2MB:超過的要求當場失敗,行程照常繼續;答應過的每一頁都真的能用 */
+/* 配額 4MB:超過的要求當場失敗,行程照常繼續;答應過的每一頁都真的能用。
+   第 56 步起配額也涵蓋每條執行緒預先承諾的整格 stack(255 頁)、頁表與 kernel 物件,
+   一個剛 fork 出來的行程本身就佔約 1.1MB,所以配額從 2MB 改成 4MB(I-240 C3.2 (c1)) */
 static int memq_limit_checks(void)
 {
     static char *blk[64];
     int n = 0;
 
-    if (sys_memlimit(2048) != 2048 || sys_memlimit(0) != 2048)
+    if (sys_memlimit(4096) != 4096 || sys_memlimit(0) != 4096)
         return 1;
-    if (sys_memlimit(4096) != -E_PERM)                   /* 調高需要特權(這個子行程已經放棄了) */
+    if (sys_memlimit(8192) != -E_PERM)                   /* 調高需要特權(這個子行程已經放棄了) */
         return 2;
     long base = sys_sbrk(0);
     if (sys_sbrk(1 << 20) != base)                       /* 1MB:在配額內 */
@@ -955,7 +992,7 @@ static int memq_limit_checks(void)
         memset(blk[n], n, 100 * 1024);
         n++;
     }
-    if (n < 10 || n >= 21)                               /* 2MB 的配額大約放得下 19 塊 100KB */
+    if (n < 15 || n >= 40)                               /* 4MB 扣掉行程本身的約 1.1MB,大約放得下 29 塊 100KB */
         return 6;
     for (int i = 0; i < n; i++) {
         if (blk[i][0] != (char)i || blk[i][100 * 1024 - 1] != (char)i)
@@ -970,7 +1007,7 @@ static int memq_limit_checks(void)
     /* fork 需要和自己一樣多的承諾:配額沿用,子行程同樣受限 */
     long pid = sys_fork();
     if (pid == 0)
-        sys_exit(sys_memlimit(0) == 2048 && sys_sbrk(4 << 20) == -E_NOMEM ? 0 : 1);
+        sys_exit(sys_memlimit(0) == 4096 && sys_sbrk(4 << 20) == -E_NOMEM ? 0 : 1);
     int st = 1;
     if (pid < 0 || sys_waitpid(pid, &st, 0) != pid || st != 0)
         return 9;
@@ -2610,6 +2647,9 @@ static int umain(long mode)
 
     case UMODE_MEMRACE:
         return mode_memrace();
+
+    case UMODE_THREADCHURN:
+        return mode_threadchurn();
 
     case UMODE_PERM: {
         /* 同一組測試在記憶體檔案系統與磁碟上各做一次 */

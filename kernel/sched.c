@@ -66,6 +66,7 @@ struct thread {
     void *sp;                  /* 被切換出去時的 stack pointer(arch_switch 存取) */
     struct mb_domain *dom;     /* 記帳的 domain(持有一份參考,到 thread_free 才放);kernel 執行緒為 NULL */
     unsigned long kobj;        /* 記在 dom 上的 KOBJ 頁數(kernel stack + 這個結構) */
+    unsigned long tag;         /* 擁有者自訂的標記(行程模組記這條執行緒用哪一格使用者 stack);0 = 沒有 */
     int id;
     const char *name;
     enum thread_state state;
@@ -808,6 +809,9 @@ struct thread *thread_prepare(const char *name, void (*fn)(void *), void *arg, i
     }
     return t;
 }
+
+void thread_set_tag(unsigned long tag) { cur()->tag = tag; }   /* 只動自己的欄位 */
+unsigned long thread_tag(void) { return cur()->tag; }
 
 struct mb_domain *thread_domain(void)
 {

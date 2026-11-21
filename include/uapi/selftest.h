@@ -41,5 +41,6 @@ enum {
     UMODE_RT,            /* 週期性的即時工作:準時、負載檢查、需要特權 */
     UMODE_TMR,           /* 三重執行加投票:注入位元翻轉、卡住的那一份、兩份都錯 */
     UMODE_MEMRACE,       /* 同一個行程的多條執行緒同時改變對映(mmap/munmap、sbrk)並和 kernel 交換資料 */
+    UMODE_THREADCHURN,   /* 反覆建立、結束執行緒(超過 16 格):結束時歸還 stack 格,每條都深用自己的 stack */
 };
 #endif

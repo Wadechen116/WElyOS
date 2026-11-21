@@ -92,14 +92,10 @@ static int proc_fault_locked(struct proc *p, uintptr_t addr, int write)
         page == slot_base)                       /* 沒有這條 stack,或碰到保護頁 */
         return -1;
 
-    void *mem = pmm_alloc();
-    if (!mem)
+    /* 已承諾的格(stack_ready)才兌現,用自己的票 — 一定成功(I-240 C3.2 (c1)) */
+    if (!(__atomic_load_n(&p->stack_ready, __ATOMIC_ACQUIRE) & (1u << slot)))
         return -1;
-    memset(mem, 0, PAGE_SIZE);
-    int rc = vm_space_map_new(p->space, page, (uintptr_t)mem, VM_READ | VM_WRITE);
-    if (rc != 0)
-        pmm_free(mem);       /* 1 = 同一行程的另一條執行緒搶先配置了同一頁:用它的 */
-    return rc < 0 ? -1 : 0;
+    return vm_space_fault_anon(p->space, page) < 0 ? -1 : 0;
 }
 
 int proc_page_fault(uintptr_t addr, int write)
@@ -359,7 +355,7 @@ int pmem_fork_domain(struct proc *child, const struct proc *parent)
    失敗回傳 NULL;父不變,子的 domain 仍由 child 持有(呼叫者以 pmem_release 放掉) */
 struct vm_space *pmem_fork_space(struct proc *child, struct proc *parent)
 {
-    struct vm_range r[1 + PROC_MAX_MAPS];
+    struct vm_range r[1 + PROC_MAX_MAPS + PROC_MAX_THREADS];
     unsigned n = 0;
 
     mutex_lock(&parent->mem.mx);                 /* 範圍與頁表在複製期間不變 */
@@ -376,6 +372,14 @@ struct vm_space *pmem_fork_space(struct proc *child, struct proc *parent)
             r[n].start = parent->mem.maps[i].start;
             r[n++].len = parent->mem.maps[i].pages * PAGE_SIZE;
         }
+    /* 已承諾的 stack 格也帶走(I-240 C3.2 (c1)):保護頁不在範圍內 */
+    uint32_t ready = __atomic_load_n(&parent->stack_ready, __ATOMIC_ACQUIRE);
+    for (unsigned i = 0; i < PROC_MAX_THREADS; i++)
+        if (ready & (1u << i)) {
+            r[n].start = USER_STACK_TOP - (uintptr_t)(i + 1) * USER_STACK_SLOT + PAGE_SIZE;
+            r[n++].len = USER_STACK_SLOT - PAGE_SIZE;
+        }
+    child->stack_ready = ready;
     spin_unlock_irqrestore(&pstate_lk, fl);
     struct vm_space *vs = vm_space_fork(parent->space, child->mem.dom, r, n);
     mutex_unlock(&parent->mem.mx);
@@ -434,9 +438,11 @@ void pmem_apply_injection(struct proc *p)
 /* 開機時把匿名記憶體(heap 與 mmap)的位址區域登記給 VM:VM 依此算出頁表票的上限(I-240 C3.2 BR5) */
 void proc_mem_boot(void)
 {
-    static const uintptr_t base[2] = { USER_HEAP_BASE, USER_MMAP_BASE };
-    static const uintptr_t len[2] = { USER_HEAP_MAX, USER_MMAP_MAX };
-    vm_set_anon_windows(base, len, 2);
+    /* 三個承諾窗由低到高:heap、mmap、stack 區(mmap 窗的結尾就是 stack 區的起點,相鄰共用的表 VM 會扣掉) */
+    static const uintptr_t base[3] = { USER_HEAP_BASE, USER_MMAP_BASE,
+                                       USER_STACK_TOP - (uintptr_t)PROC_MAX_THREADS * USER_STACK_SLOT };
+    static const uintptr_t len[3] = { USER_HEAP_MAX, USER_MMAP_MAX, (uintptr_t)PROC_MAX_THREADS * USER_STACK_SLOT };
+    vm_set_anon_windows(base, len, 3);
 }
 
 /* 讓行程核心在「配置 / 回退使用者 stack 的格子與頁」時持有 mem.mx,與 stack 成長的 fault 序列化

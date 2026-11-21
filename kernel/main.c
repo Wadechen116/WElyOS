@@ -301,6 +301,7 @@ void kmain(const struct boot_info *bi)
         vm_ledger_test();
         anon_ticket_test();
         fork_ticket_test();
+        stack_ticket_test();
     }
 
     /* 啟動計時器(1000Hz,一個 tick 1ms)與排程器,再開中斷。
@@ -379,6 +380,7 @@ void kmain(const struct boot_info *bi)
         pte_tear_test();
         thread_kobj_test();
         pipe_kobj_test();
+        ramfs_eof_test();
         fs_demo();
         disk_demo();
         nic_selftest();                      /* 驅動程式單獨的測試:要在協定堆疊開始收訊框之前 */

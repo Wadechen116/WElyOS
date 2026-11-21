@@ -168,6 +168,10 @@ unsigned long vm_anon_pt_max(void);
 int  vm_space_commit_anon(struct vm_space *vs, uintptr_t va, uintptr_t len);
 int  vm_space_fault_anon(struct vm_space *vs, uintptr_t va);
 void vm_space_release_anon(struct vm_space *vs, uintptr_t va, uintptr_t len);
+/* 同上,但指定配額類別(MB_ANON 或 MB_STACK;第 (c1) 批起 stack 也走承諾 / 兌現 / 歸還) */
+enum mb_class;
+int  vm_space_commit(struct vm_space *vs, enum mb_class cls, uintptr_t va, uintptr_t len);
+void vm_space_release(struct vm_space *vs, enum mb_class cls, uintptr_t va, uintptr_t len);
 struct vm_ledger { unsigned long data_tickets, pt_tickets, anon_tables, anon_quota, pt_quota; };
 void vm_space_ledger(struct vm_space *vs, struct vm_ledger *out);   /* 同一把鎖內讀出(測試用) */
 #endif

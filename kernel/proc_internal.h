@@ -154,6 +154,9 @@ struct proc {
     struct vm_space *space;          /* 位址空間 */
     struct file *exe;                /* 正在執行的程式檔。一直開著:它的頁直接對映在行程裡 */
     unsigned nthreads;               /* 還活著的執行緒數 */
+    unsigned long stack_rollbacks;   /* 這個行程「stack 已配置之後才失敗而回退」的次數(自我測試核對用) */
+    uint32_t stack_ready;            /* bit n = 第 n 格的 255 頁已承諾,fault 可以用票兌現(受 pstate_lk 保護;fault 原子讀取)。
+                                        只在承諾成功後設、在歸還之前清;stack_slots 是「已佔格」,兩者分開(I-240 C3.2 (c1)) */
     uint32_t stack_slots;            /* bit n = 第 n 格使用者 stack 已分配(受 pstate_lk 保護;fault 以原子讀取)。
                                         配置失敗時只釋放自己拿到的那一格,多個建立者同時進行也不會誤放別人的 */
     int exiting;                     /* 已開始結束流程 */
@@ -181,6 +184,9 @@ extern int next_pid;
 
 /* 新執行緒進入使用者模式所需的資訊,由建立者交給新執行緒 */
 struct ustart {
+    unsigned slot;                   /* 這條執行緒擁有的 stack 格;PROC_MAX_THREADS = 呼叫者自己提供的 stack */
+    struct mb_domain *dom;           /* 自有參考,直到暫時物件釋放 */
+    unsigned long kobj;
     struct proc *p;
     uintptr_t entry, usp, arg;
 };

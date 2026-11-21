@@ -74,7 +74,7 @@ struct vm_space {
  * 每個空間維持 E + T <= M:承諾時只預留 min(pt_need, M - E - T) 張頁表票。到達上限時,
  * 區域裡每一張可能的表不是已經存在、就是已經有票,所以少預留也安全;反覆 grow / shrink 也不會無限多領。
  */
-#define ANON_WIN_MAX 2
+#define ANON_WIN_MAX 3
 static struct { uintptr_t base, len; } anon_win[ANON_WIN_MAX];
 static unsigned n_anon_win;
 static unsigned long anon_pt_max;
@@ -763,32 +763,36 @@ struct vm_space *vm_space_fork(struct vm_space *parent, struct mb_domain *dom,
     int rc = 0;
     unsigned long pending = 0;
     if (dom && parent->dom) {
-        /* 第一筆帳:子空間。每一頁已承諾的匿名記憶體都要一張票(未兌現的,或將成為 COW 的);
-           中間表以子空間的匿名範圍最壞情況預留(上限 M) */
-        unsigned long q = parent->quota[MB_ANON], pt = 0;
+        /* 先數出父的新增票:父的每一頁可寫獨佔、位於承諾範圍內的頁都會變成 COW + TICKET */
+        for (unsigned i = 0; i < nanon; i++)
+            for (uintptr_t off = 0; off < anon[i].len; off += PAGE_SIZE) {
+                int level = 0;
+                pte_t *e = walk(parent, parent->root, anon[i].start + off, 0, 0, 0, WALK_LEGACY, &level);
+                if (e && arch_pte_valid(*e) && level == 0 && (arch_pte_flags(*e) & VM_WRITE))
+                    pending++;
+            }
+        /* 第一筆帳:子空間。R1:父的承諾範圍內每一頁不是未兌現(A)、就是 COW + TICKET(B)、
+           就是可寫獨佔(X);父持有 |A| + |B| 張票(COW 只剩自己時會退票,所以沒有多餘的票),
+           子要 |A| + |B| + |X| = 父的票 + pending。配額照抄父的 ANON 與 STACK(保守的邏輯配額);
+           中間表以子空間的承諾範圍最壞情況預留(上限 M) */
+        unsigned long q = parent->data_tickets + pending, pt = 0;
         for (unsigned i = 0; i < nanon; i++)
             pt += pt_need(anon[i].start, anon[i].len);
         if (pt > anon_pt_max)
             pt = anon_pt_max;
         struct mb_bundle b = { .reserve = q + pt };
-        b.quota[MB_ANON] = q;
+        b.quota[MB_ANON] = parent->quota[MB_ANON];
+        b.quota[MB_STACK] = parent->quota[MB_STACK];
         b.quota[MB_PGTABLE] = pt;
-        if (q + pt < q || mb_commit_bundle(dom, &b) != 0) {
+        if (q < pending || q + pt < q || mb_commit_bundle(dom, &b) != 0) {
             rc = -1;
         } else {
             child->data_tickets = q;
             child->pt_tickets = pt;
-            child->quota[MB_ANON] = q;
+            child->quota[MB_ANON] = parent->quota[MB_ANON];
+            child->quota[MB_STACK] = parent->quota[MB_STACK];
             child->quota[MB_PGTABLE] += pt;
-            /* 第二筆帳:父的新增票 — 父的每一頁可寫獨佔匿名頁都會變成 COW + TICKET。
-               只動實體預留(那些頁早已算在父的 ANON 配額裡);先算好數量一次預留 */
-            for (unsigned i = 0; i < nanon; i++)
-                for (uintptr_t off = 0; off < anon[i].len; off += PAGE_SIZE) {
-                    int level = 0;
-                    pte_t *e = walk(parent, parent->root, anon[i].start + off, 0, 0, 0, WALK_LEGACY, &level);
-                    if (e && arch_pte_valid(*e) && level == 0 && (arch_pte_flags(*e) & VM_WRITE))
-                        pending++;
-                }
+            /* 第二筆帳:父的新增票。只動實體預留(那些頁早已算在父的配額裡) */
             if (pmm_reserve(pending) != 0)
                 rc = -1;                     /* 子的帳由下面的 destroy 退回 */
         }
@@ -1056,6 +1060,13 @@ int vm_anon_window(unsigned i, uintptr_t *base, uintptr_t *len)
 
 int vm_space_commit_anon(struct vm_space *vs, uintptr_t va, uintptr_t len)
 {
+    return vm_space_commit(vs, MB_ANON, va, len);
+}
+
+int vm_space_commit(struct vm_space *vs, enum mb_class cls, uintptr_t va, uintptr_t len)
+{
+    if (cls != MB_ANON && cls != MB_STACK)
+        return -E_INVAL;
     if (!vs->dom || len == 0 || ((va | len) & (PAGE_SIZE - 1)) || !user_range(va) ||
         va + len < va || !user_range(va + len - 1))
         return -E_INVAL;
@@ -1069,13 +1080,13 @@ int vm_space_commit_anon(struct vm_space *vs, uintptr_t va, uintptr_t len)
     if (pt > room)
         pt = room;
     struct mb_bundle b = { .reserve = n + pt };
-    b.quota[MB_ANON] = n;
+    b.quota[cls] = n;
     b.quota[MB_PGTABLE] = pt;
     int rc = -E_NOMEM;
     if (n + pt >= n && mb_commit_bundle(vs->dom, &b) == 0) {      /* 完成點:配額與預留一起 */
         vs->data_tickets += n;
         vs->pt_tickets += pt;
-        vs->quota[MB_ANON] += n;
+        vs->quota[cls] += n;
         vs->quota[MB_PGTABLE] += pt;
         rc = 0;
     }
@@ -1112,7 +1123,12 @@ int vm_space_fault_anon(struct vm_space *vs, uintptr_t va)
 
 void vm_space_release_anon(struct vm_space *vs, uintptr_t va, uintptr_t len)
 {
-    KASSERT(vs->dom && ((va | len) & (PAGE_SIZE - 1)) == 0);
+    vm_space_release(vs, MB_ANON, va, len);
+}
+
+void vm_space_release(struct vm_space *vs, enum mb_class cls, uintptr_t va, uintptr_t len)
+{
+    KASSERT(vs->dom && ((va | len) & (PAGE_SIZE - 1)) == 0 && (cls == MB_ANON || cls == MB_STACK));
     unsigned long total = (unsigned long)(len / PAGE_SIZE);
 
     for (unsigned long done = 0; done < total; ) {
@@ -1143,11 +1159,11 @@ void vm_space_release_anon(struct vm_space *vs, uintptr_t va, uintptr_t len)
         if (tickets > vs->data_tickets)
             panic("vm: releasing more tickets than the address space holds");
         struct mb_bundle b = { .reserve = tickets };
-        b.quota[MB_ANON] = seg;
+        b.quota[cls] = seg;
         if (mb_release_bundle(vs->dom, &b) != 0)
-            panic("vm: anonymous release does not match the domain");
+            panic("vm: committed-memory release does not match the domain");
         vs->data_tickets -= tickets;
-        vs->quota[MB_ANON] -= seg;
+        vs->quota[cls] -= seg;
         spin_unlock_irqrestore(&vm_lk, irq);
         done += seg;
     }
