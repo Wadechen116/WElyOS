@@ -283,6 +283,7 @@ static inline long sys_kill(long pid, long sig)   { return syscall3(SYS_kill, pi
 static inline long sys_setpgid(long pid, long pgid) { return syscall3(SYS_setpgid, pid, pgid, 0); }
 static inline long sys_tcsetfg(long pgid)         { return syscall3(SYS_tcsetfg, pgid, 0, 0); }
 /* 建立管線:fds[0] 是讀端,fds[1] 是寫端 */
+static inline long sys_failinj(long op, long site, long n) { return syscall3(SYS_failinj, op, site, n); }
 static inline long sys_pipe(int fds[2])           { return syscall3(SYS_pipe, (long)fds, 0, 0); }
 /* 複製目前的行程。回傳值:在原本的行程裡是新行程的 pid,在新行程裡是 0 */
 static inline long sys_fork(void)                 { return syscall3(SYS_fork, 0, 0, 0); }

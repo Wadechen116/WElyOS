@@ -22,6 +22,7 @@
 #include "sched.h"
 #include "timer.h"
 #include "proc_calls.h"
+#include "failinj.h"
 
 /* rename / link:兩個路徑 */
 static long sys_two_paths(struct proc *p, long num, uintptr_t uold, uintptr_t unew)
@@ -379,6 +380,10 @@ long syscall_dispatch(long num, long a0, long a1, long a2, void *tf)
         return proc_cred_call(p, num, a0, a1);   /* 身分與特權:見 proc.c */
     case SYS_sync:
         return vfs_sync();
+    case SYS_failinj:
+        if (!cred_current() || !(cred_current()->caps & CAP_ADMIN))
+            return -E_PERM;
+        return failinj_syscall((long)a0, (long)a1, (long)a2);
     case SYS_lseek:
         return sys_lseek(p, a0, a1, a2);
     case SYS_sbrk:

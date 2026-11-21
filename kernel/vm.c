@@ -1054,6 +1054,25 @@ static unsigned long pt_need(uintptr_t va, uintptr_t len)
     return n;
 }
 
+/* 範圍內「目前還不存在」的中間表數(持有 vm_lk)。表一旦建立就保留到位址空間銷毀(有界保留契約),
+   所以這裡看到已存在的表,之後也一直存在、不需要票。承諾只替缺的表預付票:
+   以前一律以 pt_need(假設一張都沒有)預付,同一段範圍反覆承諾(每建立一條執行緒就重新承諾
+   一格 stack)時每次多留 2 張票,一路累積到上限 M(I-335 注入掃描發現) */
+static unsigned long pt_missing(struct vm_space *vs, uintptr_t va, uintptr_t len)
+{
+    unsigned long n = 0;
+    for (int l = 0; l < MMU_LEVELS - 1; l++) {
+        unsigned sh = PAGE_SHIFT + (unsigned)(l + 1) * MMU_BITS;
+        for (uintptr_t i = va >> sh; i <= (va + len - 1) >> sh; i++) {
+            int lvl = 0;
+            pte_t *e = walk(vs, vs->root, i << sh, l + 1, 0, 0, WALK_LEGACY, &lvl);
+            if (!e || lvl != l + 1 || !arch_pte_valid(*e))
+                n++;                         /* 這一層的表(由上一層的這一格指向)還不存在 */
+        }
+    }
+    return n;
+}
+
 void vm_set_anon_windows(const uintptr_t base[], const uintptr_t len[], unsigned n)
 {
     KASSERT(n <= ANON_WIN_MAX && n_anon_win == 0);
@@ -1107,7 +1126,7 @@ int vm_space_commit(struct vm_space *vs, enum mb_class cls, uintptr_t va, uintpt
     if (vs->anon_tables + vs->pt_tickets > anon_pt_max)
         panic("vm: page-table tickets exceed the anonymous-region bound");
     unsigned long room = anon_pt_max - vs->anon_tables - vs->pt_tickets;
-    unsigned long pt = pt_need(va, len);
+    unsigned long pt = pt_missing(vs, va, len);   /* 只替還不存在的表預付 */
     if (pt > room)
         pt = room;
     struct mb_bundle b = { .reserve = n + pt };

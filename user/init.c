@@ -214,6 +214,206 @@ static int mode_threadmix(void)
     return st == 34 ? 72 : 30 + st;
 }
 
+/* ---- UMODE_FAILSWEEP ---- */
+
+/* I-335:配置失敗注入(SYS_failinj,只在 selftest 開機 + CAP_ADMIN 時有效)掃過行程相關的系統呼叫。
+   對每個操作、每個地點(kmalloc / pmm),令第 N 次配置失敗(N = 1, 2, …),直到操作不再碰到注入。
+   每次失敗:回傳 -E_NOMEM;收拾之後「可用記憶體」(pmm 空閒 + heap 空閒 + 執行緒池)、
+   pmm 預留、自己 domain 的帳都和之前完全相同 */
+static volatile int fsw_thread_ran;
+static int fsw_warm;                             /* 暖身:不比較(有界保留的結構可能在這次建立) */
+
+static void fsw_thread(long a)
+{
+    (void)a;
+    fsw_thread_ran = 1;
+    sys_thread_exit();
+}
+
+struct fsw_snap { long avail, resv, dom; };
+
+/* 先前成功的 fork 讓自己的可寫頁變成 COW + 票;之後寫到其中一頁時退回一張票(預留數因此變動,
+   不是洩漏)。拍快照前把測試會寫到的頁都寫一遍:全域資料與 bss,以及 stack 上一段**固定的**
+   絕對範圍(mode_failsweep 進入時的 stack 位置往下 128KB)。範圍若跟著呼叫深度走,
+   比較時呼叫得較深就會碰到新的 stack 頁(與它的頁表),看起來像洩漏 */
+extern char __text_end[], __bss_end[];
+static uintptr_t fsw_stack_hi;
+
+static void fsw_settle(void)
+{
+    for (uintptr_t a = fsw_stack_hi - 128 * 1024; a < fsw_stack_hi; a += 4096) {
+        volatile char *c = (volatile char *)a;
+        *c = *c;
+    }
+    uintptr_t lo = ((uintptr_t)__text_end + 4095) & ~(uintptr_t)4095;
+    for (uintptr_t a = lo; a < (uintptr_t)__bss_end; a += 4096) {
+        volatile char *c = (volatile char *)a;
+        *c = *c;
+    }
+}
+
+static void fsw_take(struct fsw_snap *x)
+{
+    fsw_settle();
+    x->avail = sys_failinj(FI_OP_AVAIL_KB, 0, 0);
+    x->resv = sys_failinj(FI_OP_RESERVED, 0, 0);
+    x->dom = sys_failinj(FI_OP_DOMAIN, 0, 0);
+}
+
+static int fsw_report(const char *what, int site, int n, const char *why, long v)
+{
+    struct line l = { .len = 0 };
+    line_str(&l, "  [user] failsweep ");
+    line_str(&l, what);
+    line_str(&l, site ? " pmm #" : " kmalloc #");
+    line_num(&l, n);
+    line_str(&l, ": ");
+    line_str(&l, why);
+    line_str(&l, " ");
+    line_num(&l, v);
+    line_str(&l, "\n");
+    line_out(&l);
+    return 0;
+}
+
+/* 等收拾完成:執行緒、子行程的資源由 kernel 非同步回收,最多等 2 秒讓數字穩定。
+   check_resv = 0:fork 成功過(父的可寫頁變成 COW + 票,父多持有預留票,直到它寫到那些頁或結束才退;
+   這是設計,不是洩漏 — 所有程式結束後預留回到原值由 user_test 另外核對) */
+static int fsw_same(const struct fsw_snap *a, const char *what, int site, int n, int check_resv)
+{
+    if (fsw_warm)
+        return 1;
+    struct fsw_snap b;
+    for (int w = 0; w < 2000; w++) {
+        fsw_take(&b);
+        if (b.avail == a->avail && (!check_resv || b.resv == a->resv) && b.dom == a->dom)
+            return 1;
+        sys_sleep(1);
+    }
+    fsw_report(what, site, n, "leaked avail_kb", b.avail - a->avail);
+    fsw_report(what, site, n, "reserved", b.resv - a->resv);
+    fsw_report(what, site, n, "domain pages", b.dom - a->dom);
+    return 0;
+}
+
+enum { FSW_FORK, FSW_THREAD, FSW_EXEC, FSW_SPAWN, FSW_PIPE, FSW_NOPS };
+static const char *const fsw_names[FSW_NOPS] = { "fork", "thread_create", "exec", "spawn", "pipe" };
+
+/* 做一次操作(第 n 次配置失敗)。回傳 -1 = 錯誤(已印出),0 = 碰到注入且正確失敗,1 = 沒碰到注入 */
+static int fsw_once(int op, int site, int n)
+{
+    static char *sleep_argv[] = { "sleep", "0", 0 };
+    int st = 0, fds[2];
+    long r;
+    struct fsw_snap a;
+    fsw_take(&a);
+    if (op == FSW_EXEC) {
+        /* exec 成功就不會回來:在子行程裡做,子行程自己核對「失敗時舊程式完好、帳不變」 */
+        long pid = sys_fork();
+        if (pid < 0)
+            return fsw_report("exec(fork)", site, n, "fork failed", pid), -1;
+        if (pid == 0) {
+            long d0 = sys_failinj(FI_OP_DOMAIN, 0, 0);
+            sys_failinj(FI_OP_ARM, site, n);
+            r = sys_exec("/bin/sleep", sleep_argv);
+            int fired = (int)sys_failinj(FI_OP_DISARM, 0, 0);
+            if (!fired)
+                sys_exit(90);                    /* exec 失敗卻沒有碰到注入 */
+            if (r != -E_NOMEM)
+                sys_exit(91);
+            sys_exit(sys_failinj(FI_OP_DOMAIN, 0, 0) == d0 ? 92 : 93);
+        }
+        if (sys_waitpid(pid, &st, 0) != pid)
+            return fsw_report("exec", site, n, "waitpid", 0), -1;
+        if (st != 0 && st != 92)
+            return fsw_report("exec", site, n, "child status", st), -1;
+        if (!fsw_same(&a, "exec", site, n, 0))       /* 父這邊 fork 過 */
+            return -1;
+        return st == 0 ? 1 : 0;
+    }
+    if (sys_failinj(FI_OP_ARM, site, n) != 0)
+        return fsw_report(fsw_names[op], site, n, "arm failed", 0), -1;
+    switch (op) {
+    case FSW_FORK:
+        r = sys_fork();
+        if (r == 0)
+            sys_exit(0);
+        break;
+    case FSW_THREAD:
+        fsw_thread_ran = 0;
+        r = sys_thread_create(fsw_thread, 0);
+        break;
+    case FSW_SPAWN:
+        r = sys_spawn("/bin/sleep", sleep_argv);
+        break;
+    default:
+        r = sys_pipe(fds);
+        break;
+    }
+    int fired = (int)sys_failinj(FI_OP_DISARM, 0, 0);
+    if (fired && r != -E_NOMEM)
+        return fsw_report(fsw_names[op], site, n, "returned", r), -1;
+    if (!fired) {                                /* 成功:收拾乾淨,核對收拾之後也回到原值 */
+        if (r < 0)
+            return fsw_report(fsw_names[op], site, n, "failed without injection", r), -1;
+        if (op == FSW_FORK || op == FSW_SPAWN) {
+            if (sys_waitpid(r, &st, 0) != r || st != 0)
+                return fsw_report(fsw_names[op], site, n, "child status", st), -1;
+        } else if (op == FSW_THREAD) {
+            for (int w = 0; !fsw_thread_ran; w++) {
+                if (w > 5000)
+                    return fsw_report("thread_create", site, n, "thread never ran", 0), -1;
+                sys_sleep(1);
+            }
+        } else if (sys_close(fds[0]) != 0 || sys_close(fds[1]) != 0) {
+            return fsw_report("pipe", site, n, "close", 0), -1;
+        }
+    }
+    /* 失敗:父完全沒被動過,三項都必須回到原值。fork 成功時預留可以合理增加(見 fsw_same) */
+    if (!fsw_same(&a, fsw_names[op], site, n, fired || op != FSW_FORK))
+        return -1;
+    return fired ? 0 : 1;
+}
+
+static int mode_failsweep(void)
+{
+    if (sys_failinj(FI_OP_AVAIL_KB, 0, 0) < 0)
+        return 2;                                /* 沒有以 selftest 開機,或沒有 CAP_ADMIN */
+    volatile char here;
+    fsw_stack_hi = (uintptr_t)&here & ~(uintptr_t)4095;   /* 這一頁以下 128KB 涵蓋整個掃描的 stack 用量 */
+    int points[FSW_NOPS][2];
+    for (int op = 0; op < FSW_NOPS; op++)
+        for (int site = 0; site < 2; site++) {
+            /* 暖身:先成功做一次,讓有界保留的結構(stack 格的中間頁表與它的票,保留到位址空間銷毀,
+               上限 M)先建好。之後每個失敗點都必須讓帳完全回到原值 */
+            fsw_warm = 1;
+            int wr = fsw_once(op, site, 100000);
+            fsw_warm = 0;
+            if (wr != 1)
+                return 40 + op * 2 + site;
+            int n = 1, r;
+            while ((r = fsw_once(op, site, n)) == 0)
+                if (++n > 200)
+                    return 3;
+            if (r < 0)
+                return 10 + op * 2 + site;      /* 哪個操作、哪個地點出錯(細節已印出) */
+            points[op][site] = n - 1;
+        }
+    struct line l = { .len = 0 };
+    line_str(&l, "  [user] failsweep: failure points kmalloc+pmm:");
+    for (int op = 0; op < FSW_NOPS; op++) {
+        line_str(&l, " ");
+        line_str(&l, fsw_names[op]);
+        line_str(&l, " ");
+        line_num(&l, points[op][0]);
+        line_str(&l, "+");
+        line_num(&l, points[op][1]);
+    }
+    line_str(&l, "\n");
+    line_out(&l);
+    return 73;
+}
+
 /* ---- UMODE_FSQUOTA ---- */
 
 /* I-240 C3.2 (d):ramfs 的 FS 配額。放棄 CAP_ADMIN 的子行程一直寫檔,必須停在 FS 上限、
@@ -2863,6 +3063,8 @@ static int umain(long mode)
     case UMODE_THREADCHURN:
         return mode_threadchurn();
 
+    case UMODE_FAILSWEEP:
+        return mode_failsweep();
     case UMODE_THREADMIX:
         return mode_threadmix();
     case UMODE_FSQUOTA:

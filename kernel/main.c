@@ -18,6 +18,7 @@
 #include "panic.h"
 #include "pmm.h"
 #include "membudget.h"
+#include "failinj.h"
 #include "proc.h"
 #include "sched.h"
 #include "smp.h"
@@ -268,6 +269,7 @@ void kmain(const struct boot_info *bi)
        開機才不會被測試拖慢;回歸測試與 `run` target 會帶上這個參數 */
     int selftest = cmdline_has(bi->cmdline, "selftest");
     if (selftest) {
+        failinj_enable();                    /* 配置失敗注入的系統呼叫只在自我測試時有效 */
         vm_demo();
         mem_selftest();
     }

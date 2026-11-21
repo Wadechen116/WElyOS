@@ -93,8 +93,20 @@ enum {
     /* ---- 效能量測 ---- */
     SYS_clock,              /* (info)          讀取高精度時鐘(struct clockinfo,見 uapi/proc.h);
                                                沒有可用的時鐘時回傳 -E_NOSYS */
+    SYS_failinj,            /* (op, site, n)   配置失敗注入與計量(只給自我測試):只有以 selftest 開機、
+                                               而且呼叫者有 CAP_ADMIN 時有效,否則 -E_PERM。
+                                               op:FI_OP_ARM / DISARM(回傳是否注入過)/ DOMAIN / RESERVED / AVAIL_KB */
 };
 
+
+/* SYS_failinj 的 op 與地點(地點和 kernel 的 enum fi_site 相同) */
+#define FI_OP_DISARM    0
+#define FI_OP_ARM       1
+#define FI_OP_DOMAIN    2     /* 呼叫者 domain 目前記帳的頁數 */
+#define FI_OP_RESERVED  3     /* pmm 的預留頁數 */
+#define FI_OP_AVAIL_KB  4     /* pmm 空閒 + heap 空閒 + 執行緒池(KB):不受 heap 成長、執行緒池影響 */
+#define FI_SITE_KMALLOC 0
+#define FI_SITE_PMM     1
 
 /* SYS_sigreturn 的數值:使用者端 crt0.c 裡的組合語言要用(寫不了 enum) */
 #define SYS_SIGRETURN_NUM 40
