@@ -730,7 +730,7 @@ void sched_crash_test(const char *cmd)
          *   讀取:i386 SMAP、AArch64 PAN、RISC-V 的 sstatus.SUM = 0
          *   執行:i386 SMEP、AArch64 PXN、RISC-V 的 S-mode 不可執行 U 頁
          */
-        struct vm_space *vs = vm_space_create();
+        struct vm_space *vs = vm_space_create(NULL);
         void *page = pmm_alloc();
         KASSERT(vs && page);
         memset(page, 0, PAGE_SIZE);

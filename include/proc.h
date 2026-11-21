@@ -15,6 +15,7 @@
 /* 建立行程,執行檔案系統中 path 指到的程式(例如 "/bin/init")。
    argv 是傳給程式 main 的參數:以 NULL 結尾的字串陣列;傳 NULL 表示只有程式名稱。
    回傳行程編號(pid);失敗(檔案不存在、不是合法的程式、記憶體不足)回傳 -1 */
+void proc_mem_boot(void);                /* 開機時登記匿名記憶體的位址區域(vm_init 之後) */
 int proc_spawn(const char *path, const char *const argv[]);
 
 /* 等待行程結束並取得它的結束碼,同時釋放行程的紀錄。pid 不存在回傳 -1。

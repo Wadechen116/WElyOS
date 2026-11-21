@@ -26,6 +26,9 @@ void pmm_floor_test(void);
 void pmm_reservation_test(void);
 void membudget_test(void);               /* I-240 C3.2 (b1):配額計數(不下溢、bundle 全有或全無) */         /* I-240 C3.2 (a):預留不被一般 / 應急配置吃掉,兌現永遠成功 */               /* I-240 C3.1:一般配置不能跌破 kernel 保留底線 */
 void memhog_test(const char *mode);      /* I-240 C3.1:使用者把記憶體用到被拒絕,底線守住、全部歸還 */
+void pte_encoding_test(void);            /* I-240 C3.2 (b1):PTE 軟體位元(SHARED / COW / COW+TICKET)編碼往返 */
+void vm_ledger_test(void);               /* I-240 C3.2 (b1):位址空間帳本與 legacy 建表的配額 */
+void anon_ticket_test(void);             /* I-240 C3.2 (b1):匿名記憶體承諾後第一次觸及一定成功(I2) */
 void pte_tear_test(void);                /* I-090:頁表項目 64 位元寫入不撕裂(需要 2 顆 CPU) */
 void crash_test(const char *cmd);        /* crash=<種類>:故意觸發錯誤(排程器啟動之前可以做的那些) */
 

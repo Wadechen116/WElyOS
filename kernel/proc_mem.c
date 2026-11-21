@@ -433,3 +433,11 @@ void pmem_apply_injection(struct proc *p)
             return;
     }
 }
+
+/* 開機時把匿名記憶體(heap 與 mmap)的位址區域登記給 VM:VM 依此算出頁表票的上限(I-240 C3.2 BR5) */
+void proc_mem_boot(void)
+{
+    static const uintptr_t base[2] = { USER_HEAP_BASE, USER_MMAP_BASE };
+    static const uintptr_t len[2] = { USER_HEAP_MAX, USER_MMAP_MAX };
+    vm_set_anon_windows(base, len, 2);
+}

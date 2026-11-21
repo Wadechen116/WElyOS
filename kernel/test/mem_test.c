@@ -658,3 +658,178 @@ void membudget_test(void)
     kprintf("membudget: selftest ok (limit below used refuses, bundles all-or-nothing, "
             "%lu deliberate accounting errors counted)\n", mb_accounting_errors() - err_start);
 }
+
+/*
+ * I-240 C3.2 (b1):PTE 軟體位元的編碼往返(VM_SHARED / VM_COW / VM_COW|VM_TICKET)。
+ * 每一種合法的權限組合 × 四種軟體狀態 × 幾個實體位址:arch_pte_leaf 產生的項目,
+ * 位址、R/W/X/U 與軟體狀態都要原樣解回來;非法組合(TICKET 沒有 COW、SHARED 與 COW 並存)
+ * 在 vm_sw_flags_ok 與 vm_map 的入口就被拒絕,不會進到架構層。
+ * 負對照:把 vm_sw_decode 的 3 解成 VM_SHARED | VM_COW(第 53 步實測)時,「11 不含 SHARED」的斷言失敗 —
+ * 那種解法會讓 free_table 把有票的 COW 頁當成檔案的頁而不釋放。
+ */
+void pte_encoding_test(void)
+{
+    static const unsigned perms[] = {
+        VM_READ, VM_READ | VM_WRITE, VM_READ | VM_EXEC,
+        VM_READ | VM_USER, VM_READ | VM_WRITE | VM_USER, VM_READ | VM_EXEC | VM_USER,
+    };
+    static const unsigned sws[] = { 0, VM_SHARED, VM_COW, VM_COW | VM_TICKET };
+    uintptr_t pas[] = { pmm_mem_start(), pmm_mem_start() + 0x1000, pmm_mem_start() + 0x3ff000 };
+    unsigned checked = 0;
+
+    for (unsigned i = 0; i < sizeof(perms) / sizeof(perms[0]); i++)
+        for (unsigned j = 0; j < 4; j++)
+            for (unsigned k = 0; k < 3; k++) {
+                unsigned in = perms[i] | sws[j];
+                KASSERT(vm_sw_flags_ok(in));
+                pte_t e = arch_pte_leaf(pas[k], in, 0);
+                unsigned out = arch_pte_flags(e);
+                unsigned want = in;
+                if (!MMU_HAS_NX)
+                    want |= VM_EXEC;                 /* 沒有 NX 的 CPU:有對映就可執行 */
+                KASSERT(arch_pte_valid(e) && arch_pte_addr(e) == pas[k]);
+                KASSERT((out & (VM_READ | VM_WRITE | VM_EXEC | VM_USER)) ==
+                        (want & (VM_READ | VM_WRITE | VM_EXEC | VM_USER)));
+                KASSERT((out & (VM_SHARED | VM_COW | VM_TICKET)) == sws[j]);
+                checked++;
+            }
+    /* 兩個位元都設的狀態:只能是 COW + TICKET,絕不帶 SHARED */
+    KASSERT(vm_sw_decode(3) == (VM_COW | VM_TICKET) && !(vm_sw_decode(3) & VM_SHARED));
+
+    static const unsigned bad[] = { VM_TICKET, VM_SHARED | VM_COW, VM_SHARED | VM_TICKET,
+                                    VM_SHARED | VM_COW | VM_TICKET };
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        KASSERT(!vm_sw_flags_ok(VM_READ | bad[i]));
+        KASSERT(vm_map(0x40000000u, pmm_mem_start(), VM_READ | bad[i]) == -1);   /* 入口拒絕,不改頁表 */
+    }
+    kprintf("pte: software-bit encoding round-trip ok (%u leaf entries, 4 invalid combinations rejected)\n",
+            checked);
+}
+
+/*
+ * I-240 C3.2 (b1) 第 2 步:位址空間的帳本與「legacy」建表的配額。
+ * 根表記 1 頁 PGTABLE;第一次對映到空的區域要建 MMU_LEVELS - 1 張中間表,各記 1 頁;
+ * 同一張表底下的下一頁不再記;配額不夠時對映失敗、帳本與 domain 都不變;destroy 之後 domain 歸零。
+ * 負對照:new_table 的 WALK_LEGACY 不記配額(第 54 步實測)時,「第一次對映後 PGTABLE = MMU_LEVELS」失敗。
+ */
+void vm_ledger_test(void)
+{
+    struct mb_domain *d = mb_domain_new(100);
+    struct mb_stats st;
+    KASSERT(d);
+    struct vm_space *vs = vm_space_create(d);
+    KASSERT(vs);
+    mb_stats(d, &st);
+    KASSERT(st.used[MB_PGTABLE] == 1 && st.total == 1 && st.refs == 2);   /* 根表;空間持有一份參考 */
+
+    void *p1 = pmm_alloc(), *p2 = pmm_alloc(), *p3 = pmm_alloc();
+    KASSERT(p1 && p2 && p3);
+    KASSERT(vm_space_map(vs, USER_BASE, (uintptr_t)p1, VM_READ | VM_WRITE) == 0);
+    mb_stats(d, &st);
+    KASSERT(st.used[MB_PGTABLE] == MMU_LEVELS);                           /* 根 + 中間表 */
+    KASSERT(vm_space_map(vs, USER_BASE + PAGE_SIZE, (uintptr_t)p2, VM_READ | VM_WRITE) == 0);
+    mb_stats(d, &st);
+    KASSERT(st.used[MB_PGTABLE] == MMU_LEVELS);                           /* 同一張表:不再記 */
+
+    /* 配額只夠現有的:下一個 2MB 區域需要新的最底層表 → 對映失敗,什麼都不變 */
+    mb_set_limit(d, st.total);
+    uintptr_t far = USER_BASE + ((uintptr_t)PAGE_SIZE << MMU_BITS);
+    KASSERT(vm_space_map(vs, far, (uintptr_t)p3, VM_READ | VM_WRITE) != 0);
+    mb_stats(d, &st);
+    KASSERT(st.used[MB_PGTABLE] == MMU_LEVELS && st.total == MMU_LEVELS);
+    pmm_free(p3);
+
+    vm_space_destroy(vs);                                                  /* p1、p2 隨空間釋放 */
+    mb_stats(d, &st);
+    KASSERT(st.total == 0 && st.refs == 1);
+    KASSERT(mb_domain_put(d) == 0);
+    kprintf("vm: address-space ledger test ok (root + %d intermediate tables charged, "
+            "quota exhaustion refuses a new table without side effects)\n", MMU_LEVELS - 1);
+}
+
+/*
+ * I-240 C3.2 (b1) 第 3 步:匿名記憶體的承諾、兌現、歸還與有票的 COW。
+ * 核心是 I2:承諾成功之後,即使一般配置已經把記憶體用到預留邊界,第一次觸及
+ * (包括需要新中間表的位址)仍然一定成功。每一步核對「這個空間的票 = pmm 增加的預留」。
+ * 負對照:fault_anon 改用一般配置(第 54 步實測)時,飽和狀態下第一次觸及失敗。
+ */
+static void anon_check(struct vm_space *vs, size_t r0, const char *where)
+{
+    struct vm_ledger l;
+    vm_space_ledger(vs, &l);
+    if (l.data_tickets + l.pt_tickets != pmm_reserved_count() - r0)
+        panic("anon: tickets %lu + %lu != reserved %zu at %s", l.data_tickets, l.pt_tickets,
+              pmm_reserved_count() - r0, where);
+}
+
+void anon_ticket_test(void)
+{
+    uintptr_t heap, hlen, mm, mlen;
+    KASSERT(vm_anon_window(0, &heap, &hlen) == 0 && vm_anon_window(1, &mm, &mlen) == 0);
+    KASSERT(vm_anon_pt_max() > 0);
+    size_t r0 = pmm_reserved_count();
+    struct mb_domain *d = mb_domain_new(100000);
+    struct vm_space *vs = vm_space_create(d);
+    struct vm_ledger l;
+    KASSERT(d && vs);
+
+    /* 承諾 600 頁:跨兩張最底層表(512 頁一張)+ 上一層 1 張 */
+    const unsigned long n = 600;
+    KASSERT(vm_space_commit_anon(vs, heap, n * PAGE_SIZE) == 0);
+    vm_space_ledger(vs, &l);
+    KASSERT(l.data_tickets == n && l.pt_tickets == 3 && l.anon_quota == n);
+    anon_check(vs, r0, "commit");
+
+    /* 一般配置用到預留邊界(拿不到任何一頁為止) */
+    void *chain = NULL;
+    size_t taken = 0;
+    for (void **pg; (pg = pmm_alloc()) != NULL; taken++) {
+        *pg = chain;
+        chain = pg;
+    }
+    /* I2:每一頁第一次觸及都成功,含需要新中間表的 */
+    for (unsigned long i = 0; i < n; i++)
+        KASSERT(vm_space_fault_anon(vs, heap + i * PAGE_SIZE) == 0);
+    KASSERT(vm_space_fault_anon(vs, heap) == 1);                 /* 已經有對映:不用票 */
+    vm_space_ledger(vs, &l);
+    KASSERT(l.data_tickets == 0 && l.pt_tickets == 0 && l.anon_tables == 3);
+    anon_check(vs, r0, "faults");
+    while (chain) {
+        void **pg = chain;
+        chain = *pg;
+        pmm_free(pg);
+    }
+
+    /* 有票的 COW:兩頁,一頁只剩自己(退票),一頁共用中(用票複製) */
+    KASSERT(vm_space_commit_anon(vs, mm, 2 * PAGE_SIZE) == 0);
+    anon_check(vs, r0, "commit2");
+    void *solo = pmm_alloc(), *shared = pmm_alloc();
+    KASSERT(solo && shared);
+    pmm_ref(shared);                                              /* 模擬另一個擁有者 */
+    KASSERT(vm_space_map(vs, mm, (uintptr_t)solo, VM_READ | VM_COW | VM_TICKET) == 0);
+    KASSERT(vm_space_map(vs, mm + PAGE_SIZE, (uintptr_t)shared, VM_READ | VM_COW | VM_TICKET) == 0);
+    vm_space_ledger(vs, &l);
+    unsigned long dt = l.data_tickets;                            /* 2 張:對應兩筆 COW 映射 */
+    KASSERT(dt == 2);
+    KASSERT(vm_space_fault(vs, mm, 1) == 0);                      /* refcount 1:退票 */
+    KASSERT(vm_space_fault(vs, mm + PAGE_SIZE, 1) == 0);          /* refcount 2:用票複製 */
+    vm_space_ledger(vs, &l);
+    KASSERT(l.data_tickets == 0 && pmm_refcount(shared) == 1);
+    anon_check(vs, r0, "cow");
+    pmm_free(shared);                                             /* 模擬的另一個擁有者放手 */
+
+    /* 歸還:600 頁全部已配置 → 釋放頁、不退票;另一段承諾但沒碰的 → 退票 */
+    KASSERT(vm_space_commit_anon(vs, heap + n * PAGE_SIZE, 100 * PAGE_SIZE) == 0);
+    vm_space_release_anon(vs, heap, (n + 100) * PAGE_SIZE);
+    vm_space_ledger(vs, &l);
+    KASSERT(l.data_tickets == 0 && l.anon_quota == 2);
+    anon_check(vs, r0, "release");
+
+    vm_space_destroy(vs);
+    struct mb_stats st;
+    mb_stats(d, &st);
+    KASSERT(st.total == 0 && pmm_reserved_count() == r0);
+    KASSERT(mb_domain_put(d) == 0);
+    kprintf("anon: ticket test ok (%lu pages committed and first-touched after ordinary allocations "
+            "took %zu pages; ticketed COW reuse and copy; M = %lu)\n", n, taken, vm_anon_pt_max());
+}

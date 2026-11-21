@@ -106,9 +106,12 @@ pte_t arch_pte_leaf(uintptr_t pa, unsigned flags, int level)
         e |= PTE_NX;
     if (level > 0)
         e |= PTE_PS;
-    if (flags & VM_SHARED)
+    if (!vm_sw_flags_ok(flags))
+        panic("mmu: invalid software flags 0x%x", flags);
+    unsigned sw = vm_sw_encode(flags);       /* 0~3,規則見 vm.h */
+    if (sw & 1)
         e |= PTE_SW_SHARED;
-    if (flags & VM_COW)
+    if (sw & 2)
         e |= PTE_SW_COW;
     return e;
 }
@@ -147,10 +150,7 @@ unsigned arch_pte_flags(pte_t e)
         f |= VM_USER;
     if (!has_nx || !(e & PTE_NX))
         f |= VM_EXEC;                        /* 沒有 NX 的 CPU:有對映就可執行 */
-    if (e & PTE_SW_SHARED)
-        f |= VM_SHARED;
-    if (e & PTE_SW_COW)
-        f |= VM_COW;
+    f |= vm_sw_decode(((e & PTE_SW_SHARED) ? 1u : 0u) | ((e & PTE_SW_COW) ? 2u : 0u));
     return f;
 }
 

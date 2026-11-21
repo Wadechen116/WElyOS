@@ -220,7 +220,7 @@ static int image_build(const char *path, const struct args *a, struct image *img
         goto fail;
 
     err = -E_NOMEM;
-    img->space = vm_space_create();
+    img->space = vm_space_create(NULL);  /* (b1) 第 4 步才接上行程的 domain */
     if (!img->space)
         goto fail;
 

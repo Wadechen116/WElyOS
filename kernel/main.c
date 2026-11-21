@@ -262,6 +262,7 @@ void kmain(const struct boot_info *bi)
     /* 記憶體管理:先建立頁面配置器,之後才能用 kmalloc */
     pmm_init(bi);
     vm_init(bi);                             /* 開啟分頁;之後的存取都經過頁表 */
+    proc_mem_boot();                         /* 匿名記憶體的位址區域交給 VM(頁表票的上限) */
     /* 開機參數 selftest:執行各子系統的自我測試與示範。預設不執行,
        開機才不會被測試拖慢;回歸測試與 `run` target 會帶上這個參數 */
     int selftest = cmdline_has(bi->cmdline, "selftest");
@@ -296,6 +297,9 @@ void kmain(const struct boot_info *bi)
         pmm_floor_test();
         pmm_reservation_test();
         membudget_test();
+        pte_encoding_test();
+        vm_ledger_test();
+        anon_ticket_test();
     }
 
     /* 啟動計時器(1000Hz,一個 tick 1ms)與排程器,再開中斷。

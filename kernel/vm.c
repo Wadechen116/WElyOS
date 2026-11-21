@@ -31,6 +31,8 @@
 #include "sched.h"
 #include "smp.h"
 #include "spinlock.h"
+#include "membudget.h"
+#include "uapi/errno.h"
 
 /* 保護 kernel 頁表、所有位址空間的頁表與 ASID 的分配。
    持有期間可能再取得 pmm 的鎖(配置表格時),順序固定為 vm -> pmm */
@@ -55,7 +57,36 @@ struct vm_space {
      */
     volatile unsigned used_cpus;
     unsigned long pages;                     /* 目前對映了幾個使用者的頁(top 顯示行程的記憶體用量) */
+    /*
+     * 記憶體帳本(I-240 C3.2;設計見 docs/design/C3.2-memory-accounting.md 的 B2 / BR2)。受 vm_lk 保護。
+     * dom 為 NULL:不記帳(kernel 或還沒接上配額的建立者)。
+     */
+    struct mb_domain *dom;                   /* 持有一份參考 */
+    unsigned long quota[MB_NCLASS];          /* 這個空間記在 dom 上的配額 */
+    unsigned long data_tickets;              /* R1:未兌現 + 標 VM_TICKET 的已承諾映射數 */
+    unsigned long pt_tickets;                /* 替還不存在的中間表預留的票 */
+    unsigned long anon_tables;               /* E:已存在、且會被匿名記憶體區域用到的中間表數(BR5) */
 };
+
+/*
+ * 匿名記憶體(heap、mmap)的位址區域,由行程記憶體模組在開機時登記(VM 不知道它們的意義)。
+ * anon_pt_max(BR5 的 M):整個區域集合用得到的「不同」中間表總數,由區域與分頁格式算出。
+ * 每個空間維持 E + T <= M:承諾時只預留 min(pt_need, M - E - T) 張頁表票。到達上限時,
+ * 區域裡每一張可能的表不是已經存在、就是已經有票,所以少預留也安全;反覆 grow / shrink 也不會無限多領。
+ */
+#define ANON_WIN_MAX 2
+static struct { uintptr_t base, len; } anon_win[ANON_WIN_MAX];
+static unsigned n_anon_win;
+static unsigned long anon_pt_max;
+
+/*
+ * 建頁表的用途(BR2)。不同區域之間不能借用承諾:
+ *   WALK_KERNEL  kernel 的位址空間:一般配置,不記配額
+ *   WALK_LEGACY  還沒接上預留的使用者區域(stack、映像…):一般配置並記 PGTABLE 配額,不碰 pt_tickets
+ *   WALK_ANON    已承諾的匿名記憶體:只能兌現 pt_tickets;沒有票是帳務錯誤
+ * 已經存在的表,任何用途都可以直接使用,不耗票。
+ */
+enum walk_use { WALK_KERNEL, WALK_LEGACY, WALK_ANON };
 
 #if MMU_ASID_MAX > 0
 static uint32_t asid_used[(MMU_ASID_MAX + 31) / 32];     /* bit n = 1:編號 n 使用中 */
@@ -145,8 +176,69 @@ static int split_large(pte_t *e, int level, uintptr_t base)
  *   split :途中遇到大分頁時是否拆開繼續往下。為 0 則直接回傳該大分頁項目
  * 失敗(缺表格又不配置、位址超出範圍、記憶體不足)回傳 NULL。
  */
-static pte_t *walk(pte_t *t, uintptr_t va, int target, int create, int split,
-                   int user, int *out_level)
+/* 第 level 層的項目所指的那張表(涵蓋 va 附近 PAGE_SIZE << (level * MMU_BITS) 位元組)
+   是否會被匿名記憶體區域用到 */
+static int table_in_anon(uintptr_t va, int level)
+{
+    uintptr_t span = (uintptr_t)PAGE_SIZE << (level * MMU_BITS);
+    uintptr_t tb = va & ~(span - 1);
+    for (unsigned i = 0; i < n_anon_win; i++)
+        if (tb < anon_win[i].base + anon_win[i].len && anon_win[i].base < tb + span)
+            return 1;
+    return 0;
+}
+
+/* 新建了一張表之後的 E / T 記帳(持有 vm_lk)。用票建的:T 減一、E 加一,總和不變。
+   legacy 建的而且落在匿名區域:E 加一;若因此 E + T 超過 M,代表那張表本來就算在某張票裡,
+   退掉一張票(連同它的 PGTABLE 配額 — legacy 建表時已經另外記過一頁),維持 E + T <= M */
+static void anon_table_built(struct vm_space *vs, uintptr_t va, int level, enum walk_use use)
+{
+    if (!vs || !vs->dom || !table_in_anon(va, level))
+        return;
+    vs->anon_tables++;
+    if (use != WALK_ANON && vs->pt_tickets > 0 && vs->anon_tables + vs->pt_tickets > anon_pt_max) {
+        vs->pt_tickets--;
+        vs->quota[MB_PGTABLE]--;
+        pmm_unreserve(1);
+        if (mb_quota_sub(vs->dom, MB_PGTABLE, 1) != 0)
+            panic("vm: page-table ticket quota mismatch");
+    }
+}
+
+/* 依用途配置一張新的中間表(持有 vm_lk)。失敗回傳 NULL,狀態不變 */
+static pte_t *new_table(struct vm_space *vs, enum walk_use use)
+{
+    pte_t *t;
+
+    switch (use) {
+    case WALK_ANON:
+        if (!vs || vs->pt_tickets == 0)
+            panic("vm: anonymous-memory table without a reserved ticket");
+        t = pmm_alloc_reserved();            /* 一定成功(pmm 的 N1) */
+        memset(t, 0, PAGE_SIZE);
+        table_pages++;
+        vs->pt_tickets--;                    /* 配額在承諾時已經記過 */
+        return t;
+    case WALK_LEGACY:
+        if (vs && vs->dom && mb_quota_add(vs->dom, MB_PGTABLE, 1) != 0)
+            return NULL;
+        t = table_alloc();
+        if (vs && vs->dom) {
+            if (!t) {
+                if (mb_quota_sub(vs->dom, MB_PGTABLE, 1) != 0)   /* 撤回剛記的 1 頁,不可能超量 */
+                    panic("vm: table quota rollback mismatch");
+            } else
+                vs->quota[MB_PGTABLE]++;
+        }
+        return t;
+    case WALK_KERNEL:
+    default:
+        return table_alloc();
+    }
+}
+
+static pte_t *walk(struct vm_space *vs, pte_t *t, uintptr_t va, int target, int create, int split,
+                   enum walk_use use, int *out_level)
 {
     int level;
 
@@ -158,10 +250,11 @@ static pte_t *walk(pte_t *t, uintptr_t va, int target, int create, int split,
         if (!arch_pte_valid(*e)) {
             if (!create)
                 return NULL;
-            pte_t *next = table_alloc();
+            pte_t *next = new_table(vs, use);
             if (!next)
                 return NULL;
-            arch_pte_set(e, arch_pte_table((uintptr_t)next, user, level));
+            arch_pte_set(e, arch_pte_table((uintptr_t)next, use != WALK_KERNEL, level));
+            anon_table_built(vs, va, level, use);
             if (enabled && level == MMU_LEVELS - 1)
                 arch_mmu_root_changed(t);    /* i386 PAE:最上層的修改要重新載入才生效 */
         } else if (!arch_pte_is_table(*e, level)) {
@@ -234,7 +327,7 @@ static void tlb_shootdown_space(struct vm_space *vs, uintptr_t va)
 
 static int flags_ok(unsigned flags)
 {
-    return !((flags & VM_WRITE) && (flags & VM_EXEC));
+    return !((flags & VM_WRITE) && (flags & VM_EXEC)) && vm_sw_flags_ok(flags);
 }
 
 int vm_map(uintptr_t va, uintptr_t pa, unsigned flags)
@@ -243,7 +336,7 @@ int vm_map(uintptr_t va, uintptr_t pa, unsigned flags)
         return -1;
 
     unsigned long irq = spin_lock_irqsave(&vm_lk);
-    pte_t *e = walk(root, va, 0, 1, 1, 0, NULL);
+    pte_t *e = walk(NULL, root, va, 0, 1, 1, WALK_KERNEL, NULL);
     int rc = -1;
     if (e) {
         int was_valid = arch_pte_valid(*e);
@@ -265,7 +358,7 @@ int vm_map(uintptr_t va, uintptr_t pa, unsigned flags)
 /* 以一個大分頁對映 [va, va + LARGE_SIZE)。只在 vm_init 建立初始對映時使用 */
 static int map_large(uintptr_t va, uintptr_t pa, unsigned flags)
 {
-    pte_t *e = walk(root, va, MMU_LARGE_LEVEL, 1, 0, 0, NULL);
+    pte_t *e = walk(NULL, root, va, MMU_LARGE_LEVEL, 1, 0, WALK_KERNEL, NULL);
     if (!e)
         return -1;
     arch_pte_set(e, arch_pte_leaf(pa, flags, MMU_LARGE_LEVEL));
@@ -286,7 +379,7 @@ int vm_unmap(uintptr_t va)
     va &= ~(uintptr_t)(PAGE_SIZE - 1);
 
     unsigned long irq = spin_lock_irqsave(&vm_lk);
-    pte_t *e = walk(root, va, 0, 0, 1, 0, NULL);   /* 落在大分頁裡就先拆開,只移除這一頁 */
+    pte_t *e = walk(NULL, root, va, 0, 0, 1, WALK_KERNEL, NULL);   /* 落在大分頁裡就先拆開,只移除這一頁 */
     int rc = -1;
     if (e && arch_pte_valid(*e)) {
         arch_pte_set(e, 0);
@@ -302,7 +395,7 @@ int vm_query(uintptr_t va, uintptr_t *pa, unsigned *flags)
 {
     unsigned long irq = spin_lock_irqsave(&vm_lk);
     int level = 0;
-    pte_t *e = walk(root, va, 0, 0, 0, 0, &level);
+    pte_t *e = walk(NULL, root, va, 0, 0, 0, WALK_KERNEL, &level);
     int rc = -1;
     if (e && arch_pte_valid(*e)) {
         /* 大分頁的頁內偏移比較寬:第 level 層的一項涵蓋 4KB << (level * 位元數) */
@@ -326,12 +419,25 @@ static int user_range(uintptr_t va)
     return va >= USER_BASE && va < USER_TOP;
 }
 
-struct vm_space *vm_space_create(void)
+struct vm_space *vm_space_create(struct mb_domain *dom)
 {
-    struct vm_space *vs = kmalloc(sizeof(*vs));
+    struct vm_space *vs = kzalloc(sizeof(*vs));     /* 帳本從 0 開始 */
     if (!vs)
         return NULL;
-    vs->pages = 0;
+    /* 根表是一般配置實際取得,記 PGTABLE 配額 1 頁、不用票(R5) */
+    if (dom) {
+        if (mb_domain_get(dom) != 0) {
+            kfree(vs);
+            return NULL;
+        }
+        if (mb_quota_add(dom, MB_PGTABLE, 1) != 0) {
+            mb_domain_put(dom);
+            kfree(vs);
+            return NULL;
+        }
+        vs->dom = dom;
+        vs->quota[MB_PGTABLE] = 1;
+    }
 
     unsigned long irq = spin_lock_irqsave(&vm_lk);
     vs->root = table_alloc();
@@ -345,6 +451,8 @@ struct vm_space *vm_space_create(void)
     spin_unlock_irqrestore(&vm_lk, irq);
 
     if (!vs->root) {
+        if (dom && (mb_quota_sub(dom, MB_PGTABLE, 1) != 0 || mb_domain_put(dom) != 0))
+            panic("vm: root table quota rollback mismatch");
         kfree(vs);
         return NULL;
     }
@@ -400,7 +508,17 @@ void vm_space_destroy(struct vm_space *vs)
     pmm_free(vs->root);
     table_pages--;
     asid_free(vs->asid);
+    /* 帳本:所有表與頁都已釋放;剩下沒兌現的票退回 pmm,配額全部退回 domain(vm_lk → mb_lk → pmm_lk) */
+    if (vs->dom) {
+        struct mb_bundle b = { .reserve = vs->data_tickets + vs->pt_tickets };
+        for (unsigned i = 0; i < MB_NCLASS; i++)
+            b.quota[i] = vs->quota[i];
+        if (mb_release_bundle(vs->dom, &b) != 0)
+            panic("vm: address space ledger does not match its domain");
+    }
     spin_unlock_irqrestore(&vm_lk, irq);
+    if (vs->dom && mb_domain_put(vs->dom) != 0)
+        panic("vm: domain released with memory still charged");
     kfree(vs);
 }
 
@@ -411,7 +529,7 @@ int vm_space_map(struct vm_space *vs, uintptr_t va, uintptr_t pa, unsigned flags
         return -1;
 
     unsigned long irq = spin_lock_irqsave(&vm_lk);
-    pte_t *e = walk(vs->root, va, 0, 1, 0, 1, NULL);
+    pte_t *e = walk(vs, vs->root, va, 0, 1, 0, WALK_LEGACY, NULL);
     int rc = -1;
     if (e) {
         int was_valid = arch_pte_valid(*e);
@@ -436,7 +554,7 @@ int vm_space_query(struct vm_space *vs, uintptr_t va, uintptr_t *pa, unsigned *f
 
     unsigned long irq = spin_lock_irqsave(&vm_lk);
     int level = 0;
-    pte_t *e = walk(vs->root, va, 0, 0, 0, 0, &level);
+    pte_t *e = walk(vs, vs->root, va, 0, 0, 0, WALK_LEGACY, &level);
     int rc = -1;
     if (e && arch_pte_valid(*e) && level == 0 && (arch_pte_flags(*e) & VM_USER)) {
         if (pa)
@@ -469,7 +587,7 @@ int vm_space_copy(struct vm_space *vs, uintptr_t va, void *kbuf, size_t n, int t
     unsigned long irq = spin_lock_irqsave(&vm_lk);
     int level = 0;
     int rc = -1;
-    pte_t *e = walk(vs->root, va, 0, 0, 0, 0, &level);
+    pte_t *e = walk(vs, vs->root, va, 0, 0, 0, WALK_LEGACY, &level);
     if (e && arch_pte_valid(*e) && level == 0) {
         unsigned f = arch_pte_flags(*e);
         if ((f & VM_USER) && (!to_user || (f & VM_WRITE))) {
@@ -492,7 +610,7 @@ int vm_space_map_new(struct vm_space *vs, uintptr_t va, uintptr_t pa, unsigned f
         return -1;
 
     unsigned long irq = spin_lock_irqsave(&vm_lk);
-    pte_t *e = walk(vs->root, va, 0, 1, 0, 1, NULL);
+    pte_t *e = walk(vs, vs->root, va, 0, 1, 0, WALK_LEGACY, NULL);
     int rc = -1;
     if (e && arch_pte_valid(*e)) {
         rc = 1;                              /* 別人已經先對映了 */
@@ -516,7 +634,7 @@ int vm_space_unmap(struct vm_space *vs, uintptr_t va)
 
     unsigned long irq = spin_lock_irqsave(&vm_lk);
     int level = 0;
-    pte_t *e = walk(vs->root, va, 0, 0, 0, 0, &level);
+    pte_t *e = walk(vs, vs->root, va, 0, 0, 0, WALK_LEGACY, &level);
     int rc = -1;
     if (e && arch_pte_valid(*e) && level == 0) {
         uintptr_t pa = arch_pte_addr(*e);
@@ -586,7 +704,7 @@ static int fork_table(struct vm_space *child, pte_t *t, int level, uintptr_t bas
                 arch_pte_set(&t[i], arch_pte_leaf(pa, flags, 0));
             }
         }
-        pte_t *e = walk(child->root, va, 0, 1, 0, 1, NULL);
+        pte_t *e = walk(child, child->root, va, 0, 1, 0, WALK_LEGACY, NULL);
         if (!e)
             return -1;                       /* 記憶體不足(配置不出頁表) */
         if (!(flags & VM_SHARED))
@@ -599,7 +717,7 @@ static int fork_table(struct vm_space *child, pte_t *t, int level, uintptr_t bas
 
 struct vm_space *vm_space_fork(struct vm_space *parent)
 {
-    struct vm_space *child = vm_space_create();
+    struct vm_space *child = vm_space_create(NULL);   /* (b1) 第 5 步才接上 domain */
     int top = MMU_LEVELS - 1;
 
     if (!child)
@@ -632,7 +750,7 @@ int vm_space_fault(struct vm_space *vs, uintptr_t va, int write)
 
     unsigned long irq = spin_lock_irqsave(&vm_lk);
     int level = 0, rc = -1;
-    pte_t *e = walk(vs->root, va, 0, 0, 0, 0, &level);
+    pte_t *e = walk(vs, vs->root, va, 0, 0, 0, WALK_LEGACY, &level);
 
     if (e && arch_pte_valid(*e) && level == 0) {
         unsigned flags = arch_pte_flags(*e);
@@ -646,15 +764,31 @@ int vm_space_fault(struct vm_space *vs, uintptr_t va, int write)
             arch_tlb_flush(va);
             rc = 0;
         } else if (flags & VM_COW) {
-            unsigned nflags = (flags & ~VM_COW) | VM_WRITE;
+            unsigned nflags = (flags & ~(VM_COW | VM_TICKET)) | VM_WRITE;   /* 兩條分支都清掉 COW 與 TICKET */
 
             if (pmm_refcount((void *)pa) == 1) {
-                /* 只剩自己在用(其他人都已經複製走或結束了):不必複製,改回可寫即可 */
+                /* 只剩自己在用(其他人都已經複製走或結束了):不必複製,改回可寫即可。
+                   有票的映射(R1)從此是獨佔的,不再需要那張票:退回 */
                 arch_pte_set(e, arch_pte_leaf(pa, nflags, 0));
+                if (flags & VM_TICKET) {
+                    if (vs->data_tickets == 0)
+                        panic("vm: ticketed copy-on-write page without a ticket");
+                    vs->data_tickets--;
+                    pmm_unreserve(1);
+                }
                 cow_reuses++;
                 rc = 0;
             } else {
-                void *copy = pmm_alloc();
+                /* 有票的映射用自己的票複製:一定成功(I2);沒有票的照舊一般配置,可能失敗 */
+                void *copy;
+                if (flags & VM_TICKET) {
+                    if (vs->data_tickets == 0)
+                        panic("vm: ticketed copy-on-write page without a ticket");
+                    vs->data_tickets--;
+                    copy = pmm_alloc_reserved();
+                } else {
+                    copy = pmm_alloc();
+                }
                 if (copy) {
                     memcpy(copy, (const void *)pa, PAGE_SIZE);
                     arch_pte_set(e, arch_pte_leaf((uintptr_t)copy, nflags, 0));
@@ -782,4 +916,167 @@ void vm_init(const struct boot_info *bi)
             (unsigned long)(LARGE_SIZE >> 20), table_pages);
     kprintf("vm: text %p-%p r-x, rodata -%p r--, rest rw-\n",
             (void *)__kernel_start, (void *)__text_end, (void *)__rodata_end);
+}
+
+/* ---- 匿名記憶體的承諾、兌現、歸還(I-240 C3.2 (b1) 第 3 步;設計 B3 / BR5) ---- */
+
+/* [start, end) 在第 l 層(l = 0 是最底層的表)需要幾張表 */
+static unsigned long tables_at(uintptr_t start, uintptr_t end, int l)
+{
+    unsigned sh = PAGE_SHIFT + (unsigned)(l + 1) * MMU_BITS;
+    return (unsigned long)(((end - 1) >> sh) - (start >> sh) + 1);
+}
+
+/* 範圍需要的中間表數,假設一張都還不存在(根表不算) */
+static unsigned long pt_need(uintptr_t va, uintptr_t len)
+{
+    unsigned long n = 0;
+    for (int l = 0; l < MMU_LEVELS - 1; l++)
+        n += tables_at(va, va + len, l);
+    return n;
+}
+
+void vm_set_anon_windows(const uintptr_t base[], const uintptr_t len[], unsigned n)
+{
+    KASSERT(n <= ANON_WIN_MAX && n_anon_win == 0);
+    for (unsigned i = 0; i < n; i++) {
+        KASSERT(len[i] > 0 && (base[i] & (PAGE_SIZE - 1)) == 0 && user_range(base[i]) &&
+                user_range(base[i] + len[i] - 1));
+        KASSERT(i == 0 || base[i] >= base[i - 1] + len[i - 1]);   /* 由低到高、不重疊 */
+        anon_win[i].base = base[i];
+        anon_win[i].len = len[i];
+    }
+    n_anon_win = n;
+    /* M:每一層把各區域的表數加起來,再扣掉相鄰兩區共用的同一張表 */
+    unsigned long m = 0;
+    for (int l = 0; l < MMU_LEVELS - 1; l++) {
+        unsigned sh = PAGE_SHIFT + (unsigned)(l + 1) * MMU_BITS;
+        for (unsigned i = 0; i < n; i++) {
+            m += tables_at(base[i], base[i] + len[i], l);
+            if (i > 0 && ((base[i - 1] + len[i - 1] - 1) >> sh) == (base[i] >> sh))
+                m--;
+        }
+    }
+    anon_pt_max = m;
+}
+
+unsigned long vm_anon_pt_max(void) { return anon_pt_max; }
+
+int vm_anon_window(unsigned i, uintptr_t *base, uintptr_t *len)
+{
+    if (i >= n_anon_win)
+        return -1;
+    *base = anon_win[i].base;
+    *len = anon_win[i].len;
+    return 0;
+}
+
+int vm_space_commit_anon(struct vm_space *vs, uintptr_t va, uintptr_t len)
+{
+    if (!vs->dom || len == 0 || ((va | len) & (PAGE_SIZE - 1)) || !user_range(va) ||
+        va + len < va || !user_range(va + len - 1))
+        return -E_INVAL;
+    unsigned long n = (unsigned long)(len / PAGE_SIZE);
+
+    unsigned long irq = spin_lock_irqsave(&vm_lk);
+    if (vs->anon_tables + vs->pt_tickets > anon_pt_max)
+        panic("vm: page-table tickets exceed the anonymous-region bound");
+    unsigned long room = anon_pt_max - vs->anon_tables - vs->pt_tickets;
+    unsigned long pt = pt_need(va, len);
+    if (pt > room)
+        pt = room;
+    struct mb_bundle b = { .reserve = n + pt };
+    b.quota[MB_ANON] = n;
+    b.quota[MB_PGTABLE] = pt;
+    int rc = -E_NOMEM;
+    if (n + pt >= n && mb_commit_bundle(vs->dom, &b) == 0) {      /* 完成點:配額與預留一起 */
+        vs->data_tickets += n;
+        vs->pt_tickets += pt;
+        vs->quota[MB_ANON] += n;
+        vs->quota[MB_PGTABLE] += pt;
+        rc = 0;
+    }
+    spin_unlock_irqrestore(&vm_lk, irq);
+    return rc;
+}
+
+int vm_space_fault_anon(struct vm_space *vs, uintptr_t va)
+{
+    va &= ~(uintptr_t)(PAGE_SIZE - 1);
+    if (!vs->dom || !user_range(va))
+        return -1;
+
+    unsigned long irq = spin_lock_irqsave(&vm_lk);
+    int rc = 1;
+    pte_t *e = walk(vs, vs->root, va, 0, 1, 0, WALK_ANON, NULL);   /* 缺的表用預付的票:不會失敗 */
+    if (!arch_pte_valid(*e)) {
+        if (vs->data_tickets == 0)
+            panic("vm: anonymous fault at %p without a ticket", (void *)va);
+        vs->data_tickets--;
+        void *page = pmm_alloc_reserved();
+        memset(page, 0, PAGE_SIZE);          /* 不把別人用過的資料交給行程 */
+        arch_pte_set(e, arch_pte_leaf((uintptr_t)page, VM_READ | VM_WRITE | VM_USER, 0));
+        vs->pages++;
+        if (enabled)
+            arch_tlb_flush(va);
+        rc = 0;
+    }
+    spin_unlock_irqrestore(&vm_lk, irq);
+    return rc;
+}
+
+#define RELEASE_SEGMENT 64u                  /* 每段最多處理幾頁就放一次鎖 */
+
+void vm_space_release_anon(struct vm_space *vs, uintptr_t va, uintptr_t len)
+{
+    KASSERT(vs->dom && ((va | len) & (PAGE_SIZE - 1)) == 0);
+    unsigned long total = (unsigned long)(len / PAGE_SIZE);
+
+    for (unsigned long done = 0; done < total; ) {
+        unsigned long seg = total - done < RELEASE_SEGMENT ? total - done : RELEASE_SEGMENT;
+        unsigned long tickets = 0;
+        unsigned long irq = spin_lock_irqsave(&vm_lk);
+        for (unsigned long i = 0; i < seg; i++) {
+            uintptr_t a = va + (done + i) * PAGE_SIZE;
+            int level = 0;
+            pte_t *e = walk(vs, vs->root, a, 0, 0, 0, WALK_LEGACY, &level);
+            /* 每一頁都在鎖內重新讀 PTE:段與段之間 COW 快路徑仍可能改過它 */
+            if (!e || !arch_pte_valid(*e)) {
+                tickets++;                   /* 未兌現:退一張票 */
+                continue;
+            }
+            KASSERT(level == 0);
+            unsigned flags = arch_pte_flags(*e);
+            uintptr_t pa = arch_pte_addr(*e);
+            arch_pte_set(e, 0);
+            vs->pages--;
+            if (enabled)
+                tlb_shootdown_space(vs, a);
+            if (flags & VM_TICKET)
+                tickets++;                   /* 共用中的 COW:不再需要複製,退票 */
+            if (!(flags & VM_SHARED))
+                pmm_free((void *)pa);        /* 獨佔的頁釋放;共用的只減參考 */
+        }
+        if (tickets > vs->data_tickets)
+            panic("vm: releasing more tickets than the address space holds");
+        struct mb_bundle b = { .reserve = tickets };
+        b.quota[MB_ANON] = seg;
+        if (mb_release_bundle(vs->dom, &b) != 0)
+            panic("vm: anonymous release does not match the domain");
+        vs->data_tickets -= tickets;
+        vs->quota[MB_ANON] -= seg;
+        spin_unlock_irqrestore(&vm_lk, irq);
+        done += seg;
+    }
+}
+
+void vm_space_ledger(struct vm_space *vs, struct vm_ledger *out)
+{
+    unsigned long irq = spin_lock_irqsave(&vm_lk);
+    out->data_tickets = vs->data_tickets;
+    out->pt_tickets = vs->pt_tickets;
+    out->anon_tables = vs->anon_tables;
+    out->anon_quota = vs->quota[MB_ANON];
+    out->pt_quota = vs->quota[MB_PGTABLE];
+    spin_unlock_irqrestore(&vm_lk, irq);
 }

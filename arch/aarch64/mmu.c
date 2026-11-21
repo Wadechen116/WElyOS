@@ -34,6 +34,7 @@
 #include "cpu.h"
 #include "mmu.h"
 #include "kprintf.h"
+#include "panic.h"
 #include "vm.h"
 
 #define PTE_VALID     0x3UL                  /* 表格 / 頁 */
@@ -77,9 +78,12 @@ pte_t arch_pte_leaf(uintptr_t pa, unsigned flags, int level)
         e |= PTE_ATTR(ATTR_NORMAL) | PTE_SH_INNER;
     if (!(flags & VM_WRITE))
         e |= PTE_AP_RO;
-    if (flags & VM_SHARED)
+    if (!vm_sw_flags_ok(flags))
+        panic("mmu: invalid software flags 0x%x", flags);
+    unsigned sw = vm_sw_encode(flags);       /* 0~3,規則見 vm.h */
+    if (sw & 1)
         e |= PTE_SW_SHARED;
-    if (flags & VM_COW)
+    if (sw & 2)
         e |= PTE_SW_COW;
     return e;
 }
@@ -121,10 +125,7 @@ unsigned arch_pte_flags(pte_t e)
     }
     if (((e >> 2) & 7) == ATTR_DEVICE)
         f |= VM_DEVICE;
-    if (e & PTE_SW_SHARED)
-        f |= VM_SHARED;
-    if (e & PTE_SW_COW)
-        f |= VM_COW;
+    f |= vm_sw_decode(((e & PTE_SW_SHARED) ? 1u : 0u) | ((e & PTE_SW_COW) ? 2u : 0u));
     return f;
 }
 

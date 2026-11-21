@@ -21,6 +21,7 @@
  *              bit 43~0 根表格的頁號。
  */
 #include "mmu.h"
+#include "panic.h"
 #include "vm.h"
 
 #define PTE_V  0x01UL
@@ -51,9 +52,12 @@ pte_t arch_pte_leaf(uintptr_t pa, unsigned flags, int level)
         e |= PTE_U;
     else
         e |= PTE_G;                          /* kernel 的頁:所有位址空間共用 TLB 紀錄 */
-    if (flags & VM_SHARED)
+    if (!vm_sw_flags_ok(flags))
+        panic("mmu: invalid software flags 0x%x", flags);
+    unsigned sw = vm_sw_encode(flags);       /* 0~3,規則見 vm.h */
+    if (sw & 1)
         e |= PTE_SW_SHARED;
-    if (flags & VM_COW)
+    if (sw & 2)
         e |= PTE_SW_COW;
     return e;
 }
@@ -84,8 +88,8 @@ uintptr_t arch_pte_addr(pte_t e)
 unsigned arch_pte_flags(pte_t e)
 {
     return VM_READ | ((e & PTE_W) ? VM_WRITE : 0) | ((e & PTE_X) ? VM_EXEC : 0) |
-           ((e & PTE_U) ? VM_USER : 0) | ((e & PTE_SW_SHARED) ? VM_SHARED : 0) |
-           ((e & PTE_SW_COW) ? VM_COW : 0);
+           ((e & PTE_U) ? VM_USER : 0) |
+           vm_sw_decode(((e & PTE_SW_SHARED) ? 1u : 0u) | ((e & PTE_SW_COW) ? 2u : 0u));
 }
 
 void arch_mmu_enable(pte_t *root)

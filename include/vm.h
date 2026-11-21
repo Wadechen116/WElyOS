@@ -29,6 +29,34 @@
 #define VM_COW     0x40u       /* 寫入時複製(copy-on-write):這一頁目前和別的位址空間共用,
                                   對映成唯讀;有人寫入時才複製出自己的一份(見 vm_space_fault)。
                                   同樣記在軟體使用的位元裡 */
+#define VM_TICKET  0x80u       /* 只和 VM_COW 一起出現:這筆 COW 映射持有一張實體預留的票
+                                  (I-240 C3.2;寫入時用自己的票複製,或在只剩自己時退票)。
+                                  設計見 docs/design/C3.2-memory-accounting.md 的 BR3 */
+
+/*
+ * 軟體位元的編碼。三個架構都只保證兩個軟體位元(RISC-V 的 RSW 只有 bit 8、9),
+ * 而 VM_SHARED(屬於檔案的頁)與 VM_COW 不會同時成立,所以兩個位元表示四種狀態:
+ *   0 一般   1 SHARED   2 COW(沒有票)   3 COW + TICKET
+ * 架構層只負責把這個 0~3 的值放進自己的兩個位元、再取出來;規則集中在這裡。
+ */
+static inline int vm_sw_flags_ok(unsigned flags)
+{
+    unsigned sw = flags & (VM_SHARED | VM_COW | VM_TICKET);
+    return sw == 0 || sw == VM_SHARED || sw == VM_COW || sw == (VM_COW | VM_TICKET);
+}
+static inline unsigned vm_sw_encode(unsigned flags)      /* 呼叫前必須 vm_sw_flags_ok */
+{
+    if (flags & VM_SHARED)
+        return 1;
+    if (flags & VM_COW)
+        return (flags & VM_TICKET) ? 3 : 2;
+    return 0;
+}
+static inline unsigned vm_sw_decode(unsigned code)
+{
+    static const unsigned map[4] = { 0, VM_SHARED, VM_COW, VM_COW | VM_TICKET };
+    return map[code & 3];
+}
 
 /* 建立 kernel 頁表並開啟分頁。需先完成 pmm_init() */
 void vm_init(const struct boot_info *bi);
@@ -67,7 +95,10 @@ unsigned long vm_space_pages(struct vm_space *vs);   /* 這個位址空間目前
  */
 struct vm_space;
 
-struct vm_space *vm_space_create(void);          /* 失敗回傳 NULL */
+struct mb_domain;
+/* dom 不為 NULL 時,這個空間的配額與預留記在 dom 上(持有一份參考,根表記 PGTABLE 1 頁);
+   NULL = 不記帳。失敗回傳 NULL */
+struct vm_space *vm_space_create(struct mb_domain *dom);
 
 /* 釋放位址空間:使用者部分的所有實體頁與頁表都還給 pmm。
    呼叫時這個位址空間不可以是 CPU 正在使用的那一份 */
@@ -119,4 +150,20 @@ void vm_enable_secondary(void);
 
 /* kernel 頁表根表格的實體位址(i386 的啟動程式要在開啟分頁前把它載入 CR3) */
 uintptr_t vm_kernel_root(void);
+/*
+ * 匿名記憶體(heap、mmap)的承諾、兌現、歸還(I-240 C3.2 (b1);設計見 docs/design/C3.2-memory-accounting.md)。
+ * 只用於以 domain 建立的位址空間。
+ *   vm_set_anon_windows  開機時由行程記憶體模組登記匿名記憶體的位址區域(由低到高、不重疊)
+ *   vm_space_commit_anon 承諾 [va, va+len):配額(ANON + PGTABLE)與實體預留一次完成;0 或 -E_NOMEM / -E_INVAL
+ *   vm_space_fault_anon  在已承諾的 va 配置一頁(清 0):用自己的票,一定成功;1 = 已經有對映
+ *   vm_space_release_anon 歸還 [va, va+len):逐頁依 R1 釋放頁、退票,配額退回(頁表票留到 destroy)
+ */
+void vm_set_anon_windows(const uintptr_t base[], const uintptr_t len[], unsigned n);
+int  vm_anon_window(unsigned i, uintptr_t *base, uintptr_t *len);
+unsigned long vm_anon_pt_max(void);
+int  vm_space_commit_anon(struct vm_space *vs, uintptr_t va, uintptr_t len);
+int  vm_space_fault_anon(struct vm_space *vs, uintptr_t va);
+void vm_space_release_anon(struct vm_space *vs, uintptr_t va, uintptr_t len);
+struct vm_ledger { unsigned long data_tickets, pt_tickets, anon_tables, anon_quota, pt_quota; };
+void vm_space_ledger(struct vm_space *vs, struct vm_ledger *out);   /* 同一把鎖內讀出(測試用) */
 #endif
