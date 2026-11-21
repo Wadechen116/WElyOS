@@ -326,6 +326,15 @@ void pmem_release(struct proc *p)
     p->mem.dom = NULL;
 }
 
+/* 記下映像的可寫範圍(spawn 與 exec 成功之後);fork 時把它加進交給 VM 的承諾範圍 */
+void pmem_set_image_rw(struct proc *p, uintptr_t start, uintptr_t len)
+{
+    unsigned long fl = spin_lock_irqsave(&pstate_lk);
+    p->mem.image_rw_start = start;
+    p->mem.image_rw_len = len;
+    spin_unlock_irqrestore(&pstate_lk, fl);
+}
+
 /* exec:新的程式從空的 heap 開始(舊的頁、票與配額隨舊位址空間一起退回),匿名對映也都不在了 */
 void pmem_exec(struct proc *p)
 {
@@ -355,7 +364,7 @@ int pmem_fork_domain(struct proc *child, const struct proc *parent)
    失敗回傳 NULL;父不變,子的 domain 仍由 child 持有(呼叫者以 pmem_release 放掉) */
 struct vm_space *pmem_fork_space(struct proc *child, struct proc *parent)
 {
-    struct vm_range r[1 + PROC_MAX_MAPS + PROC_MAX_THREADS];
+    struct vm_range r[2 + PROC_MAX_MAPS + PROC_MAX_THREADS];
     unsigned n = 0;
 
     mutex_lock(&parent->mem.mx);                 /* 範圍與頁表在複製期間不變 */
@@ -363,6 +372,12 @@ struct vm_space *pmem_fork_space(struct proc *child, struct proc *parent)
     memcpy(child->mem.maps, parent->mem.maps, sizeof(child->mem.maps));
     child->mem.mmap_next = parent->mem.mmap_next;
     child->mem.brk = parent->mem.brk;
+    child->mem.image_rw_start = parent->mem.image_rw_start;
+    child->mem.image_rw_len = parent->mem.image_rw_len;
+    if (parent->mem.image_rw_len) {               /* 映像的可寫範圍:fork 後兩邊的 COW 頁各持一張票 */
+        r[n].start = parent->mem.image_rw_start;
+        r[n++].len = parent->mem.image_rw_len;
+    }
     if (parent->mem.brk > USER_HEAP_BASE) {
         r[n].start = USER_HEAP_BASE;
         r[n++].len = pages_for(parent->mem.brk - USER_HEAP_BASE) * PAGE_SIZE;

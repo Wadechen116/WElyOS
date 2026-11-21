@@ -59,19 +59,28 @@ int mb_domain_put(struct mb_domain *d)
     return rc;
 }
 
-/* 正增量 n 是否放得下(持有 mb_lk) */
-static int fits_locked(const struct mb_domain *d, unsigned long n)
+/* 正增量 n 是否放得下(持有 mb_lk)。txn 有效且屬於這個 domain 時,上限暫時放寬為 limit + pending
+   (exec 交易:舊位址空間確定會歸還的量;設計 R4)。limit + pending 溢位時不放寬 */
+static int fits_locked(const struct mb_domain *d, unsigned long n, const struct mb_exec_txn *txn)
 {
-    return n == 0 || (d->total <= d->limit && n <= d->limit - d->total);
+    unsigned long lim = d->limit;
+    if (txn && txn->active && txn->d == d && txn->pending <= (unsigned long)-1 - lim)
+        lim += txn->pending;
+    return n == 0 || (d->total <= lim && n <= lim - d->total);
 }
 
 int mb_quota_add(struct mb_domain *d, enum mb_class c, unsigned long n)
+{
+    return mb_quota_add_txn(d, c, n, NULL);
+}
+
+int mb_quota_add_txn(struct mb_domain *d, enum mb_class c, unsigned long n, const struct mb_exec_txn *txn)
 {
     if ((unsigned)c >= MB_NCLASS)
         return -E_INVAL;
     unsigned long f = spin_lock_irqsave(&mb_lk);
     int rc = -E_NOMEM;
-    if (fits_locked(d, n)) {                 /* total + n <= limit:各類別與總和都不會溢位 */
+    if (fits_locked(d, n, txn)) {            /* total + n <= 上限:各類別與總和都不會溢位 */
         d->used[c] += n;
         d->total += n;
         rc = 0;
@@ -119,13 +128,18 @@ static int bundle_sum(const struct mb_bundle *b, unsigned long *sum)
 
 int mb_commit_bundle(struct mb_domain *d, const struct mb_bundle *b)
 {
+    return mb_commit_bundle_txn(d, b, NULL);
+}
+
+int mb_commit_bundle_txn(struct mb_domain *d, const struct mb_bundle *b, const struct mb_exec_txn *txn)
+{
     unsigned long n;
     if (bundle_sum(b, &n) != 0)
         return -E_NOMEM;
     unsigned long f = spin_lock_irqsave(&mb_lk);
     int rc = -E_NOMEM;
     /* 完成點:配額放得下 → pmm 預留成功 → 套用配額。預留失敗時配額還沒動 */
-    if (fits_locked(d, n) && pmm_reserve(b->reserve) == 0) {
+    if (fits_locked(d, n, txn) && pmm_reserve(b->reserve) == 0) {
         for (unsigned i = 0; i < MB_NCLASS; i++)
             d->used[i] += b->quota[i];
         d->total += n;
@@ -208,4 +222,42 @@ int mb_release_object(struct mb_domain *d, unsigned long pages)
     if (mb_domain_put(d) != 0)
         rc = -1;
     return rc;
+}
+
+/* ---- exec 交易(設計 R4 / 第 (c3) 批) ---- */
+
+int mb_exec_begin(struct mb_domain *d, unsigned long pending, struct mb_exec_txn *t)
+{
+    unsigned long f = spin_lock_irqsave(&mb_lk);
+    int rc = -E_NOMEM;
+    if (pending <= (unsigned long)-1 - d->limit) {     /* limit + pending 不溢位才能開始 */
+        t->d = d;
+        t->pending = pending;
+        t->active = 1;
+        rc = 0;
+    }
+    spin_unlock_irqrestore(&mb_lk, f);
+    return rc;
+}
+
+int mb_exec_check_final(struct mb_exec_txn *t, unsigned long old_now)
+{
+    unsigned long f = spin_lock_irqsave(&mb_lk);
+    struct mb_domain *d = t->d;
+    int rc;
+    if (!t->active || d->total < old_now) {
+        errors++;                            /* 交易沒開始,或舊空間的帳比總量還大:帳務錯誤 */
+        rc = -1;
+    } else {
+        rc = d->total - old_now <= d->limit ? 0 : -E_NOMEM;   /* 舊空間退完之後仍在上限內 */
+    }
+    spin_unlock_irqrestore(&mb_lk, f);
+    return rc;
+}
+
+void mb_exec_end(struct mb_exec_txn *t)
+{
+    unsigned long f = spin_lock_irqsave(&mb_lk);
+    t->active = 0;                           /* 之後帶這個憑證的記帳回到一般上限 */
+    spin_unlock_irqrestore(&mb_lk, f);
 }

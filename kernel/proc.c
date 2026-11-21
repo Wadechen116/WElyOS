@@ -41,19 +41,6 @@ struct proc *proc_find(int pid)
     return NULL;
 }
 
-/* 配置一個清為 0 的實體頁並對映到位址空間的 va。回傳該頁在 kernel 中可用的位址 */
-static void *map_page(struct vm_space *vs, uintptr_t va, unsigned flags)
-{
-    void *page = pmm_alloc();
-    if (!page)
-        return NULL;
-    memset(page, 0, PAGE_SIZE);      /* 清 0 也是安全措施:不把別人用過的資料交給行程 */
-    if (vm_space_map(vs, va, (uintptr_t)page, flags) != 0) {
-        pmm_free(page);
-        return NULL;
-    }
-    return page;
-}
 
 /*
  * 使用者 stack(I-240 C3.2 (c1)):每一格 1MB,最低一頁是保護頁(從不承諾、從不對映),
@@ -189,6 +176,7 @@ struct image {
     uintptr_t entry;                 /* 進入點 */
     uintptr_t usp;                   /* 主執行緒一開始的 stack pointer */
     uintptr_t argp;                  /* 參數區塊的位址,傳給進入點 */
+    uintptr_t rw_start, rw_len;      /* 映像的可寫範圍(data + bss);fork 時要帶走它的 COW 票 */
 };
 
 static void image_discard(struct image *img)
@@ -239,7 +227,8 @@ static int image_put_args(struct image *img, uintptr_t top, const struct args *a
 
 /* 從檔案系統載入 path 指到的程式,連同參數準備好。成功回傳 0,*img 可以直接使用;
    失敗回傳負的錯誤碼,*img 不留下任何東西 */
-static int image_build(const char *path, const struct args *a, struct image *img, struct mb_domain *dom)
+static int image_build(const char *path, const struct args *a, struct image *img, struct mb_domain *dom,
+                       struct mb_exec_txn *txn)
 {
     struct uimg_hdr hdr;
     const struct uimg_hdr *h = &hdr;
@@ -271,7 +260,7 @@ static int image_build(const char *path, const struct args *a, struct image *img
         goto fail;
 
     err = -E_NOMEM;
-    img->space = vm_space_create(dom);   /* 頁表記在行程的 domain 上 */
+    img->space = vm_space_create_txn(dom, txn);   /* 頁表記在行程的 domain 上;exec 時帶交易憑證 */
     if (!img->space)
         goto fail;
 
@@ -296,7 +285,8 @@ static int image_build(const char *path, const struct args *a, struct image *img
         }
         /* 資料:可讀寫、不可執行(使用者程式同樣遵守 W^X)。每個行程要有自己的一份 */
         unsigned flags = off < h->text_end ? (VM_READ | VM_EXEC) : (VM_READ | VM_WRITE);
-        uint8_t *page = map_page(img->space, va, flags);
+        /* 私有頁:先記 IMAGE 配額再配置(I-240 C3.2 (c2));失敗時整個新空間由 image_discard 退回 */
+        uint8_t *page = vm_space_map_charged(img->space, MB_IMAGE, va, flags);
         if (!page)
             goto fail;
         if (off < h->data_end) {
@@ -317,6 +307,8 @@ static int image_build(const char *path, const struct args *a, struct image *img
     if (err)
         goto fail;
     img->entry = USER_BASE + h->entry;
+    img->rw_start = USER_BASE + h->text_end;                     /* text_end 已檢查過是頁對齊 */
+    img->rw_len = ((uintptr_t)h->bss_end + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE - h->text_end;
     return 0;
 
 fail:
@@ -516,7 +508,7 @@ static int proc_create(const char *path, const struct args *a, struct proc *pare
     }
     err = pmem_init(p, dom);
     if (err == 0)
-        err = image_build(path, a, &img, dom);
+        err = image_build(path, a, &img, dom, NULL);   /* 新行程沒有舊空間:不用交易 */
     if (err) {
         pmem_release(p);
         kfree(p);
@@ -534,6 +526,7 @@ static int proc_create(const char *path, const struct args *a, struct proc *pare
     p->space = img.space;
     p->exe = img.exe;
     p->stack_slots = p->stack_ready = 1;   /* 第 0 格 stack 已由 image_build 承諾好 */
+    pmem_set_image_rw(p, img.rw_start, img.rw_len);   /* fork 時要帶走映像可寫頁的 COW 票 */
     /* 身分沿用建立者的;kernel 建立的行程是 root,擁有全部的特權 */
     p->cred = parent ? parent->cred : (struct cred){ 0, 0, CAP_ALL };
     files_init_cwd(p, parent);       /* 工作目錄沿用建立者的;kernel 建立的行程從根目錄開始 */
@@ -838,12 +831,30 @@ long sys_exec(struct proc *p, uintptr_t upath, uintptr_t uargv)
         return -E_BUSY;
     }
 
+    /*
+     * exec 交易(I-240 C3.2 (c3)):新舊兩個位址空間會同時存在一段時間,兩者都完整記帳
+     * (實體預留不放寬)。新空間的記帳上限暫時放寬為 limit + pending,pending 是舊空間帳本的
+     * 配額總和 — exec 成功後它會整個退回。公布前再確認「舊空間退完之後仍不超過上限」。
+     * 同一時間建立的其他東西(例如 image_build 打開的程式檔)不帶憑證,不能借用放寬
+     */
+    struct mb_domain *dom = pmem_domain(p);
+    struct mb_exec_txn txn;
     err = vfs_access(path, PERM_X);  /* 要有執行這個檔案的權限 */
     if (err == 0)
-        err = image_build(path, a, &img, pmem_domain(p));
+        err = mb_exec_begin(dom, vm_space_quota_total(p->space), &txn);
+    if (err == 0) {
+        err = image_build(path, a, &img, dom, &txn);
+        if (err == 0 && mb_exec_check_final(&txn, vm_space_quota_total(p->space)) != 0) {
+            image_discard(&img);     /* 舊空間退完之後仍會超過上限(交易中有人調低了配額) */
+            err = -E_NOMEM;
+        }
+        if (err)
+            mb_exec_end(&txn);
+    }
     kfree(a);
     if (err)
         return err;                  /* 舊程式完全沒被動到 */
+    vm_space_clear_txn(img.space);   /* 從現在起新空間回到一般上限 */
 
     /* ---- 從這裡起不會失敗,也不會回到舊程式 ---- */
     struct vm_space *old_space = p->space;
@@ -854,12 +865,14 @@ long sys_exec(struct proc *p, uintptr_t upath, uintptr_t uargv)
     p->space = img.space;
     sched_unlock(flags);
     pmem_exec(p);                    /* 新的程式從空的 heap 開始;舊程式的 heap 與匿名對映都不在了 */
+    pmem_set_image_rw(p, img.rw_start, img.rw_len);
     psig_exec(p);                    /* 處理函式是舊程式裡的位址:全部還原成預設(「忽略」則保留) */
     p->exe = img.exe;
     p->stack_slots = p->stack_ready = 1;   /* 新程式只有第 0 格 stack(舊的隨舊位址空間消失) */
     thread_set_tag(1);                       /* 這條執行緒現在擁有第 0 格(fork 前可能是別格) */
     thread_set_space(img.space);     /* 換到新的位址空間;舊的已經沒有人使用 */
-    vm_space_destroy(old_space);
+    vm_space_destroy(old_space);     /* 舊空間的頁實際釋放、帳退完 */
+    mb_exec_end(&txn);               /* 之後才結束交易(放寬到此為止) */
     vfs_exec_release(old_exe);
     vfs_close(old_exe);
 

@@ -131,6 +131,8 @@ struct proc_mem {
     unsigned long PMEM_F(kobj);              /* 行程結構本身記在 dom 上的 KOBJ 頁數 */
     struct { uintptr_t start; unsigned long pages; } PMEM_F(maps)[PROC_MAX_MAPS];   /* 匿名對映;pages 0 = 空位 */
     uintptr_t PMEM_F(mmap_next);             /* 下一塊對映要放的位址(只往上走,不重複使用) */
+    uintptr_t PMEM_F(image_rw_start);        /* 映像的可寫範圍(data + bss):fork 時加進承諾範圍(I-240 C3.2 (c2)) */
+    uintptr_t PMEM_F(image_rw_len);
     uintptr_t PMEM_F(brk);                   /* heap 目前的結尾(0 = 還沒用過,等於 USER_HEAP_BASE);受 pstate_lk 保護 */
     volatile int PMEM_F(seu_pending);        /* 故障注入(SYS_seu):等著翻轉的一個位元(見 proc_mem.c) */
     struct mutex PMEM_F(mx);         /* 序列化「改變使用者範圍的對映」:fault 的配置、munmap、sbrk(見 proc_mem.c) */

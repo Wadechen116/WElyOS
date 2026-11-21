@@ -875,6 +875,14 @@ void fork_ticket_test(void)
     }
     KASSERT(mb_domain_put(tight) == 0);
 
+    /* U1:範圍外的可寫私有頁 → fork 失敗,父不變(第 (c2) 批) */
+    void *stray = pmm_alloc();
+    KASSERT(stray);
+    KASSERT(vm_space_map(ps, heap + 100 * PAGE_SIZE, (uintptr_t)stray, VM_READ | VM_WRITE) == 0);
+    rb = pmm_reserved_count();
+    KASSERT(vm_space_fork(ps, dc, &r, 1) == NULL && pmm_reserved_count() == rb);
+    KASSERT(vm_space_unmap(ps, heap + 100 * PAGE_SIZE) == 0);   /* 拿掉,之後的 fork 才合法 */
+
     struct vm_space *cs = vm_space_fork(ps, dc, &r, 1);
     KASSERT(cs);
     struct vm_ledger lp, lc;
@@ -1071,4 +1079,105 @@ void stack_ticket_test(void)
     KASSERT(pmm_reserved_count() == r0 && mb_domain_put(d) == 0);
     kprintf("stack: a committed 255-page stack slot was fully touched after ordinary allocations "
             "reached the reservation\n");
+}
+
+/*
+ * I-240 C3.2 (c2):映像私有頁的記帳與 fork。
+ * vm_space_map_charged 每一頁記 IMAGE 配額;配額不夠時失敗、什麼都不變。
+ * 把 8 頁當成映像的可寫範圍,fork 時交給 VM:父子各自的 COW 頁持有一張票,
+ * 一般配置吃到預留邊界之後,父寫入(共用中,用票複製)與子寫入(只剩自己,退票)都成功。
+ * 負對照:fork 不把映像可寫範圍放進範圍(第 56 步實測)→ U1 讓 fork 失敗。
+ */
+void image_ticket_test(void)
+{
+    uintptr_t base = 0x40000000u + 0x00100000u;           /* USER_BASE + 1MB:映像區 */
+    size_t r0 = pmm_reserved_count();
+    struct mb_domain *dp = mb_domain_new(100000), *dc = mb_domain_new(100000);
+    struct vm_space *ps = vm_space_create(dp);
+    KASSERT(dp && dc && ps);
+#if UINTPTR_MAX > 0xffffffffu
+    base = 0x100000000ul + 0x00100000u;
+#endif
+    for (int i = 0; i < 8; i++) {
+        uint8_t *pg = vm_space_map_charged(ps, MB_IMAGE, base + i * PAGE_SIZE, VM_READ | VM_WRITE);
+        KASSERT(pg);
+        pg[0] = (uint8_t)(i + 1);
+    }
+    struct mb_stats st;
+    mb_stats(dp, &st);
+    KASSERT(st.used[MB_IMAGE] == 8);
+    mb_set_limit(dp, st.total);                           /* 一頁都不能再加:配置失敗、帳不變 */
+    KASSERT(vm_space_map_charged(ps, MB_IMAGE, base + 8 * PAGE_SIZE, VM_READ | VM_WRITE) == NULL);
+    mb_stats(dp, &st);
+    KASSERT(st.used[MB_IMAGE] == 8);
+    mb_set_limit(dp, 100000);
+
+    struct vm_range r = { base, 8 * PAGE_SIZE };
+    struct vm_space *cs = vm_space_fork(ps, dc, &r, 1);
+    KASSERT(cs);
+    struct vm_ledger lp, lc;
+    vm_space_ledger(ps, &lp);
+    vm_space_ledger(cs, &lc);
+    KASSERT(lp.data_tickets == 8 && lc.data_tickets == 8);
+    void *chain = NULL;
+    for (void **pg; (pg = pmm_alloc()) != NULL; ) {
+        *pg = chain;
+        chain = pg;
+    }
+    for (int i = 0; i < 8; i++)
+        KASSERT(vm_space_fault(ps, base + i * PAGE_SIZE, 1) == 0);
+    for (int i = 0; i < 8; i++)
+        KASSERT(vm_space_fault(cs, base + i * PAGE_SIZE, 1) == 0);
+    vm_space_ledger(ps, &lp);
+    vm_space_ledger(cs, &lc);
+    KASSERT(lp.data_tickets == 0 && lc.data_tickets == 0);
+    while (chain) {
+        void **pg = chain;
+        chain = *pg;
+        pmm_free(pg);
+    }
+    vm_space_destroy(cs);
+    vm_space_destroy(ps);
+    KASSERT(pmm_reserved_count() == r0 && mb_domain_put(dc) == 0 && mb_domain_put(dp) == 0);
+    kprintf("image: 8 charged private pages; after fork both sides wrote them with ordinary "
+            "allocations at the reservation\n");
+}
+
+/*
+ * I-240 C3.2 (c3):exec 交易的上限。domain 上限 400 頁,舊空間承諾 300 頁;
+ * 開始交易(pending = 舊空間帳本總和)後,新空間承諾 300 頁可以(暫時超過上限,但不超過 limit + pending);
+ * 再多到超過 limit + pending 就拒絕;交易中不帶憑證的記帳照一般上限 → 拒絕;
+ * 最終檢查(舊空間退完之後 ≤ limit)通過 → 解除綁定、銷毀舊空間、結束交易,用量回到上限內。
+ * 負對照:新空間不綁憑證(第 56 步實測)→ 新空間的 300 頁承諾被拒絕。
+ */
+void exec_txn_test(void)
+{
+    uintptr_t heap, hlen;
+    KASSERT(vm_anon_window(0, &heap, &hlen) == 0);
+    size_t r0 = pmm_reserved_count();
+    struct mb_domain *d = mb_domain_new(400);
+    KASSERT(d);
+    struct vm_space *old = vm_space_create(d);
+    KASSERT(old && vm_space_commit_anon(old, heap, 300 * PAGE_SIZE) == 0);
+
+    struct mb_exec_txn t;
+    KASSERT(mb_exec_begin(d, vm_space_quota_total(old), &t) == 0);
+    struct vm_space *nw = vm_space_create_txn(d, &t);
+    KASSERT(nw);
+    KASSERT(vm_space_commit_anon(nw, heap, 300 * PAGE_SIZE) == 0);          /* 放寬:暫時超過 400 */
+    struct mb_stats st;
+    mb_stats(d, &st);
+    KASSERT(st.total > st.limit);
+    KASSERT(vm_space_commit_anon(nw, heap + 300 * PAGE_SIZE, 200 * PAGE_SIZE) == -E_NOMEM);  /* 超過 limit + pending */
+    KASSERT(mb_quota_add(d, MB_KOBJ, 1) == -E_NOMEM);   /* 不帶憑證的記帳:一般上限,不能借用放寬 */
+    KASSERT(mb_exec_check_final(&t, vm_space_quota_total(old)) == 0);
+    vm_space_clear_txn(nw);
+    vm_space_destroy(old);
+    mb_exec_end(&t);
+    mb_stats(d, &st);
+    KASSERT(st.total <= st.limit);
+    KASSERT(mb_quota_add_txn(d, MB_KOBJ, 200, &t) == -E_NOMEM);   /* 交易結束後憑證不再放寬 */
+    vm_space_destroy(nw);
+    KASSERT(pmm_reserved_count() == r0 && mb_domain_put(d) == 0);
+    kprintf("exec: transaction let the new space exceed the limit by exactly what the old space returns\n");
 }

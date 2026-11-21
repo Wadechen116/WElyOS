@@ -68,6 +68,7 @@ int pmem_init(struct proc *p, struct mb_domain *dom);   /* 使用者:proc.c */
 struct mb_domain *pmem_domain(const struct proc *p);   /* 使用者:proc.c */
 void pmem_release(struct proc *p);   /* 使用者:proc.c */
 void pmem_exec(struct proc *p);   /* 使用者:proc.c */
+void pmem_set_image_rw(struct proc *p, uintptr_t start, uintptr_t len);   /* 使用者:proc.c */
 void pmem_lock(struct proc *p);   /* 使用者:proc.c(配置 / 回退使用者 stack) */
 void pmem_unlock(struct proc *p);   /* 使用者:proc.c */
 int pmem_fork_domain(struct proc *child, const struct proc *parent);   /* 使用者:proc.c */

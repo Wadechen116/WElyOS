@@ -1034,6 +1034,18 @@ static int memq_touch_gap(void)
     return 0;
 }
 
+/* exec 交易(I-240 C3.2 (c3)):配額只有 2MB,而一個程式本身就佔約 1.1MB(stack 255 頁等);
+   exec 時新舊兩份同時存在約 2.2MB,超過配額 — 沒有交易時一定被拒絕。有交易時,新空間可以
+   暫時超過上限、但不超過「舊空間會歸還的量」,換完之後回到上限內:exec 成功,args 以參數個數 3 結束 */
+static int memq_exec_tight(void)
+{
+    char *argv[] = { "args", "x", "y", 0 };
+    if (sys_memlimit(2048) != 2048)
+        return 98;
+    long rc = sys_exec("/bin/args", argv);               /* 成功就不會回來 */
+    return rc == -E_NOMEM ? 99 : 97;                     /* 被配額拒絕 99,其他失敗 97 */
+}
+
 static int mode_memquota(void)
 {
     long def = sys_memlimit(0);
@@ -1053,6 +1065,8 @@ static int mode_memquota(void)
         return 1510 + st;
     if (sys_memlimit(0) != def)                          /* 子行程調低的是它自己的 */
         return 1509;
+    if ((rc = in_child(memq_exec_tight)) != 3)           /* 接近配額上限的 exec(交易) */
+        return 1540 + (rc == 99 ? 9 : rc == 98 ? 8 : 0);
 
     /* 2. 整個系統的上限:有特權的行程把配額調到 1GB,要 200MB — 這台機器沒有那麼多,
           當場拒絕(以前會先答應,等用到時才終止行程) */

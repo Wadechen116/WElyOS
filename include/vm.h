@@ -99,6 +99,12 @@ struct mb_domain;
 /* dom 不為 NULL 時,這個空間的配額與預留記在 dom 上(持有一份參考,根表記 PGTABLE 1 頁);
    NULL = 不記帳。失敗回傳 NULL */
 struct vm_space *vm_space_create(struct mb_domain *dom);
+/* exec 交易用:新空間綁定憑證 txn,它的每一筆記帳(根表、頁表、承諾、映像頁)都帶著憑證;
+   公布前以 vm_space_clear_txn 解除綁定 */
+struct mb_exec_txn;
+struct vm_space *vm_space_create_txn(struct mb_domain *dom, struct mb_exec_txn *txn);
+void vm_space_clear_txn(struct vm_space *vs);
+unsigned long vm_space_quota_total(struct vm_space *vs);   /* 這個空間帳本上的配額總和(exec 的 pending) */
 
 /* 釋放位址空間:使用者部分的所有實體頁與頁表都還給 pmm。
    呼叫時這個位址空間不可以是 CPU 正在使用的那一份 */
@@ -172,6 +178,8 @@ void vm_space_release_anon(struct vm_space *vs, uintptr_t va, uintptr_t len);
 enum mb_class;
 int  vm_space_commit(struct vm_space *vs, enum mb_class cls, uintptr_t va, uintptr_t len);
 void vm_space_release(struct vm_space *vs, enum mb_class cls, uintptr_t va, uintptr_t len);
+/* 帶配額的立即配置(映像的私有頁):記 quota[cls] 1 頁、一般配置、對映;全有或全無,失敗回傳 NULL */
+void *vm_space_map_charged(struct vm_space *vs, enum mb_class cls, uintptr_t va, unsigned flags);
 struct vm_ledger { unsigned long data_tickets, pt_tickets, anon_tables, anon_quota, pt_quota; };
 void vm_space_ledger(struct vm_space *vs, struct vm_ledger *out);   /* 同一把鎖內讀出(測試用) */
 #endif

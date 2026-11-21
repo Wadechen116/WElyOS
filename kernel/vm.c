@@ -66,6 +66,7 @@ struct vm_space {
     unsigned long data_tickets;              /* R1:未兌現 + 標 VM_TICKET 的已承諾映射數 */
     unsigned long pt_tickets;                /* 替還不存在的中間表預留的票 */
     unsigned long anon_tables;               /* E:已存在、且會被匿名記憶體區域用到的中間表數(BR5) */
+    struct mb_exec_txn *txn;                 /* exec 交易中的新空間:記帳帶這個憑證(只有這個空間);NULL = 一般上限 */
 };
 
 /*
@@ -220,7 +221,7 @@ static pte_t *new_table(struct vm_space *vs, enum walk_use use)
         vs->pt_tickets--;                    /* 配額在承諾時已經記過 */
         return t;
     case WALK_LEGACY:
-        if (vs && vs->dom && mb_quota_add(vs->dom, MB_PGTABLE, 1) != 0)
+        if (vs && vs->dom && mb_quota_add_txn(vs->dom, MB_PGTABLE, 1, vs->txn) != 0)
             return NULL;
         t = table_alloc();
         if (vs && vs->dom) {
@@ -421,16 +422,22 @@ static int user_range(uintptr_t va)
 
 struct vm_space *vm_space_create(struct mb_domain *dom)
 {
+    return vm_space_create_txn(dom, NULL);
+}
+
+struct vm_space *vm_space_create_txn(struct mb_domain *dom, struct mb_exec_txn *txn)
+{
     struct vm_space *vs = kzalloc(sizeof(*vs));     /* 帳本從 0 開始 */
     if (!vs)
         return NULL;
+    vs->txn = dom ? txn : NULL;              /* 根表的 1 頁也用交易的放寬上限(否則接近上限的 exec 會提早被拒) */
     /* 根表是一般配置實際取得,記 PGTABLE 配額 1 頁、不用票(R5) */
     if (dom) {
         if (mb_domain_get(dom) != 0) {
             kfree(vs);
             return NULL;
         }
-        if (mb_quota_add(dom, MB_PGTABLE, 1) != 0) {
+        if (mb_quota_add_txn(dom, MB_PGTABLE, 1, vs->txn) != 0) {
             mb_domain_put(dom);
             kfree(vs);
             return NULL;
@@ -727,6 +734,14 @@ static int fork_table(struct vm_space *child, pte_t *t, int level, uintptr_t bas
            觸發 page fault。匿名記憶體的頁另外帶 VM_TICKET(R1:每一筆 COW 映射各持一張票);
            票在呼叫者那裡已經預留好(父:這次變成 COW 的頁數;子:全部承諾數) */
         if (!(flags & VM_SHARED) && (flags & VM_WRITE)) {
+            /* 不變量 U1(第 (c2) 批):有 domain 的空間裡,每一頁可寫的私有頁都屬於某個承諾範圍
+               (heap、mmap、stack 格、映像可寫範圍)。不在範圍內就是帳務漏洞 — 讓 fork 失敗(第一趟,
+               父還沒被改過),而不是產生一筆沒有票、之後可能在 page fault 失敗的 COW */
+            if (fa && !in_anon(fa, va)) {
+                kprintf("vm: fork found a writable private page at %p outside every committed range\n",
+                        (void *)va);
+                return -1;
+            }
             flags = (flags & ~VM_WRITE) | VM_COW;
             if (in_anon(fa, va))
                 flags |= VM_TICKET;
@@ -783,6 +798,7 @@ struct vm_space *vm_space_fork(struct vm_space *parent, struct mb_domain *dom,
         struct mb_bundle b = { .reserve = q + pt };
         b.quota[MB_ANON] = parent->quota[MB_ANON];
         b.quota[MB_STACK] = parent->quota[MB_STACK];
+        b.quota[MB_IMAGE] = parent->quota[MB_IMAGE];
         b.quota[MB_PGTABLE] = pt;
         if (q < pending || q + pt < q || mb_commit_bundle(dom, &b) != 0) {
             rc = -1;
@@ -791,6 +807,7 @@ struct vm_space *vm_space_fork(struct vm_space *parent, struct mb_domain *dom,
             child->pt_tickets = pt;
             child->quota[MB_ANON] = parent->quota[MB_ANON];
             child->quota[MB_STACK] = parent->quota[MB_STACK];
+            child->quota[MB_IMAGE] = parent->quota[MB_IMAGE];
             child->quota[MB_PGTABLE] += pt;
             /* 第二筆帳:父的新增票。只動實體預留(那些頁早已算在父的配額裡) */
             if (pmm_reserve(pending) != 0)
@@ -1083,7 +1100,7 @@ int vm_space_commit(struct vm_space *vs, enum mb_class cls, uintptr_t va, uintpt
     b.quota[cls] = n;
     b.quota[MB_PGTABLE] = pt;
     int rc = -E_NOMEM;
-    if (n + pt >= n && mb_commit_bundle(vs->dom, &b) == 0) {      /* 完成點:配額與預留一起 */
+    if (n + pt >= n && mb_commit_bundle_txn(vs->dom, &b, vs->txn) == 0) {   /* 完成點:配額與預留一起 */
         vs->data_tickets += n;
         vs->pt_tickets += pt;
         vs->quota[cls] += n;
@@ -1178,4 +1195,58 @@ void vm_space_ledger(struct vm_space *vs, struct vm_ledger *out)
     out->anon_quota = vs->quota[MB_ANON];
     out->pt_quota = vs->quota[MB_PGTABLE];
     spin_unlock_irqrestore(&vm_lk, irq);
+}
+
+/*
+ * 帶配額的立即配置(I-240 C3.2 (c2),設計 1.3):在 va 配置一頁清 0 的私有頁並對映,記 quota[cls] += 1。
+ * 用於程式映像的私有頁:建立時就配置好,不留未兌現的票。全有或全無:
+ *   配額(mb_lk)→ 一般配置(pmm 的 N2 檢查)→ walk(WALK_LEGACY,缺表就建、記 PGTABLE)→ 寫 PTE。
+ * 任一步失敗:撤回這一頁的配額、釋放這一頁,回傳 NULL;途中新建的中間表留在空間上(已記 PGTABLE,
+ * destroy 時一起退,與 legacy 建表相同)。va 已經有對映也算失敗(不覆寫)
+ */
+void *vm_space_map_charged(struct vm_space *vs, enum mb_class cls, uintptr_t va, unsigned flags)
+{
+    flags |= VM_USER;
+    if (!vs->dom || (va & (PAGE_SIZE - 1)) || !flags_ok(flags) || !user_range(va) ||
+        (flags & (VM_SHARED | VM_COW | VM_TICKET)))
+        return NULL;
+
+    unsigned long irq = spin_lock_irqsave(&vm_lk);
+    void *page = NULL;
+    if (mb_quota_add_txn(vs->dom, cls, 1, vs->txn) == 0) {
+        page = pmm_alloc();
+        pte_t *e = page ? walk(vs, vs->root, va, 0, 1, 0, WALK_LEGACY, NULL) : NULL;
+        if (e && !arch_pte_valid(*e)) {
+            memset(page, 0, PAGE_SIZE);
+            arch_pte_set(e, arch_pte_leaf((uintptr_t)page, flags, 0));
+            vs->pages++;
+            vs->quota[cls]++;
+            if (enabled)
+                arch_tlb_flush(va);
+        } else {
+            if (page)
+                pmm_free(page);
+            page = NULL;
+            if (mb_quota_sub(vs->dom, cls, 1) != 0)
+                panic("vm: charged-map quota rollback mismatch");
+        }
+    }
+    spin_unlock_irqrestore(&vm_lk, irq);
+    return page;
+}
+
+void vm_space_clear_txn(struct vm_space *vs)
+{
+    unsigned long irq = spin_lock_irqsave(&vm_lk);
+    vs->txn = NULL;                          /* 之後對這個空間的記帳回到一般上限 */
+    spin_unlock_irqrestore(&vm_lk, irq);
+}
+
+unsigned long vm_space_quota_total(struct vm_space *vs)
+{
+    unsigned long irq = spin_lock_irqsave(&vm_lk), t = 0;
+    for (unsigned i = 0; i < MB_NCLASS; i++)
+        t += vs->quota[i];
+    spin_unlock_irqrestore(&vm_lk, irq);
+    return t;
 }

@@ -31,16 +31,36 @@ struct mb_stats {
     unsigned refs;
 };
 
+/*
+ * exec 交易憑證(設計 R4、第 (c) 批定案 3):由呼叫者在 stack 上提供,mb_exec_begin 不配置記憶體。
+ * 交易進行中,帶著這個憑證的記帳(只有記到新位址空間帳本的那些)上限暫時放寬為 limit + pending,
+ * pending = 舊位址空間帳本的配額總和(它在 exec 成功後會整個退回)。其他記帳 — 包括同一時間
+ * 建立的檔案、管線、kernel 物件 — 不帶憑證,照一般上限檢查,不能借用放寬。
+ *   mb_exec_begin       開始(limit + pending 溢位則 -E_NOMEM,什麼都不改)
+ *   mb_exec_check_final 公布前的最終檢查:舊空間退完之後 used 仍不超過 limit(old_now = 舊空間帳本的即時總和)
+ *   mb_exec_end         成功、失敗都呼叫一次;之後再帶這個憑證記帳就是一般上限
+ */
+struct mb_exec_txn {
+    struct mb_domain *d;
+    unsigned long pending;
+    int active;
+};
+int  mb_exec_begin(struct mb_domain *d, unsigned long pending, struct mb_exec_txn *t);
+int  mb_exec_check_final(struct mb_exec_txn *t, unsigned long old_now);
+void mb_exec_end(struct mb_exec_txn *t);
+
 struct mb_domain *mb_domain_new(unsigned long limit);  /* refcount 1;配置失敗回傳 NULL */
 int  mb_domain_get(struct mb_domain *d);                /* 0;refcount 已到上限 -E_NOMEM */
 int  mb_domain_put(struct mb_domain *d);                /* 0;最後一份時釋放。那時 used 不為 0 → -1(已計數) */
 
 /* 單一類別的配額(不預留實體) */
 int  mb_quota_add(struct mb_domain *d, enum mb_class c, unsigned long n);
+int  mb_quota_add_txn(struct mb_domain *d, enum mb_class c, unsigned long n, const struct mb_exec_txn *txn);
 int  mb_quota_sub(struct mb_domain *d, enum mb_class c, unsigned long n);
 
 /* 多類別配額 + 實體預留,一次完成;失敗回傳 -E_NOMEM 且不改任何狀態 */
 int  mb_commit_bundle(struct mb_domain *d, const struct mb_bundle *b);
+int  mb_commit_bundle_txn(struct mb_domain *d, const struct mb_bundle *b, const struct mb_exec_txn *txn);
 /* 整批歸還:任一類超量則整批拒絕(-1、計數),配額與預留都不變。
    呼叫者必須持有並驗證自己這筆 bundle 的未兌現票;PMM 只檢查全系統總數。
    全系統退票超量會先停止,配額尚未修改。正常歸還回傳 0。 */

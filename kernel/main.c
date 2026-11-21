@@ -302,6 +302,8 @@ void kmain(const struct boot_info *bi)
         anon_ticket_test();
         fork_ticket_test();
         stack_ticket_test();
+        image_ticket_test();
+        exec_txn_test();
     }
 
     /* 啟動計時器(1000Hz,一個 tick 1ms)與排程器,再開中斷。

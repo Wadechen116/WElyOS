@@ -39,6 +39,8 @@ void pipe_kobj_test(void);               /* I-240 C3.2 (b2):檔案與管線由�
 void user_stack_rollback_test(void);     /* Codex 191:建立執行緒失敗時 stack 與格子退回 */
 void ramfs_eof_test(void);               /* Codex 209:寫入失敗時 ramfs 檔案長度不變 */
 void stack_ticket_test(void);            /* I-240 C3.2 (c1):承諾的 stack 在飽和後整格可觸及 */
+void image_ticket_test(void);            /* I-240 C3.2 (c2):映像私有頁記 IMAGE 配額,fork 後寫入一定成功 */
+void exec_txn_test(void);                /* I-240 C3.2 (c3):exec 交易的放寬上限 */
 void pte_tear_test(void);                /* I-090:頁表項目 64 位元寫入不撕裂(需要 2 顆 CPU) */
 void crash_test(const char *cmd);        /* crash=<種類>:故意觸發錯誤(排程器啟動之前可以做的那些) */
 
