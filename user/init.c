@@ -268,13 +268,20 @@ static int fsw_quiesce(void)
     return 0;
 }
 
+/* 快照不可信(等不到靜止,或計量的系統呼叫失敗)時設起,掃描以結束碼 5 失敗 —
+   不能拿一個還在變動的基準繼續比(Codex 196) */
+static int fsw_untrusted;
+
 static void fsw_take(struct fsw_snap *x)
 {
-    fsw_quiesce();
+    if (!fsw_quiesce())
+        fsw_untrusted = 1;
     fsw_settle();
     x->avail = sys_failinj(FI_OP_AVAIL_KB, 0, 0);
     x->resv = sys_failinj(FI_OP_RESERVED, 0, 0);
     x->dom = sys_failinj(FI_OP_DOMAIN, 0, 0);
+    if (x->avail < 0 || x->resv < 0 || x->dom < 0)
+        fsw_untrusted = 1;
 }
 
 static int fsw_report(const char *what, int site, int n, const char *why, long v)
@@ -505,14 +512,25 @@ static int mode_failsweep(void)
 {
     if (sys_failinj(FI_OP_AVAIL_KB, 0, 0) < 0)
         return 2;                                /* 沒有以 selftest 開機,或沒有 CAP_ADMIN */
-    /* 基準:前面的測試結束的執行緒也可能還沒回收完 — 等計數連續 50ms 不再下降才定下來 */
+    /* 基準:前面的測試結束的執行緒也可能還沒回收完 — 連續 50 次(每次隔 1ms)讀到完全相同的值
+       才定下來;任何變動(不論變多或變少)都重新計算。5 秒內定不下來就失敗,不拿變動中的值當基準 */
     fsw_threads0 = sys_failinj(FI_OP_UNFREED, 0, 0);
-    for (int still = 0, w = 0; still < 50 && w < 5000; w++) {
+    if (fsw_threads0 < 0)
+        return 4;
+    int still = 0;
+    for (int w = 0; still < 50; w++) {
+        if (w >= 5000)
+            return 4;
         sys_sleep(1);
         long t = sys_failinj(FI_OP_UNFREED, 0, 0);
-        still = t < fsw_threads0 ? 0 : still + 1;
-        if (t < fsw_threads0)
+        if (t < 0)
+            return 4;
+        if (t == fsw_threads0) {
+            still++;
+        } else {
             fsw_threads0 = t;
+            still = 0;
+        }
     }
     volatile char here;
     fsw_stack_hi = (uintptr_t)&here & ~(uintptr_t)4095;   /* 這一頁以下 128KB 涵蓋整個掃描的 stack 用量 */
@@ -532,6 +550,8 @@ static int mode_failsweep(void)
                     return 3;
             if (r < 0)
                 return 10 + op * 2 + site;      /* 哪個操作、哪個地點出錯(細節已印出) */
+            if (fsw_untrusted)
+                return 5;                        /* 等不到靜止或計量失敗:結果不可信 */
             points[op][site] = n - 1;
         }
     /* 第二輪(I-335):沒有網路時 udp_open 在配置之前就回 -E_NETDOWN,UDP 兩項略過 */
@@ -554,6 +574,8 @@ static int mode_failsweep(void)
                     return 3;
             if (r < 0)
                 return 50 + op * 2 + site;
+            if (fsw_untrusted)
+                return 5;
             fpoints[op][site] = n - 1;
             /* 依設計不配置的兩項:失敗點必須是 0(fsi_once 在觸發時已經回報錯誤,這裡是第二道) */
             if ((op == FSI_MEM || op == FSI_PIPEIO) && n != 1)

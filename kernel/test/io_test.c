@@ -264,6 +264,171 @@ static void disk_failinj_test(void)
 
 /* 磁碟上的檔案系統的自我測試。所有東西都放在 /disk/selftest 底下,結束時刪除,
    所以不影響磁碟上原有的內容,空閒的空間也要回到測試之前的數量 */
+/*
+ * wfs 掛載 / 格式化路徑的配置失敗掃描(I-335)。掛載只在開機時跑一次,所以在 disk_init 之前、
+ * 對一顆記憶體磁碟(pmm 頁,不碰真的磁碟)反覆「注入第 N 次配置失敗 → 掛載 → 核對 → 卸載」。
+ * 三種磁碟狀態各掃一輪,涵蓋全部配置點:
+ *   blank  全空白:bcache pool、nodes、scratch、wfs_format 的檢查碼表
+ *   clean  正常卸載過:前三者 + 載入檢查碼表
+ *   dirty  沒有正常卸載(模擬斷電):前三者 + 檢查碼表 + wfs_check(1) 的 bitmap / refs / queue
+ * 每個 N 核對:回 -E_NOMEM(不是 -E_NOSPC / -E_IO);pmm 空閒頁數與 heap 用量不變;
+ * wfs_stats 仍是「沒有掛載」;磁碟映像一個位元組都沒變(失敗的掛載不可以寫磁碟)。
+ * 注入沒有觸發(N 超過配置次數)的那一次必須成功,之後再卸載、重新掛載確認檔案系統一致。
+ * kmalloc 那一輪預期一次都不觸發(掛載路徑依設計不用 heap)。
+ */
+#define MD_BLOCKS 256u                           /* 1MB:超過 WFS_MIN_DEV_BLOCKS,有檢查碼表與間接區塊空間 */
+static uint8_t *md_mem;
+static int md_fail_writes;                       /* 1 = 所有寫入都回 -E_IO(讓檔案系統轉為唯讀) */
+
+static int md_rw(struct blkdev *d, uint64_t lba, unsigned count, void *buf, int write)
+{
+    if (lba + count > d->sectors)
+        return -E_IO;
+    if (write && md_fail_writes)
+        return -E_IO;
+    uint8_t *p = md_mem + lba * BLK_SECTOR;
+    if (write)
+        memcpy(p, buf, (size_t)count * BLK_SECTOR);
+    else
+        memcpy(buf, p, (size_t)count * BLK_SECTOR);
+    return 0;
+}
+static int md_flush(struct blkdev *d) { (void)d; return 0; }
+static struct blkdev md_dev = { "memdisk", (uint64_t)MD_BLOCKS * (PAGE_SIZE / BLK_SECTOR), md_rw, md_flush, NULL };
+
+static uint32_t md_hash(void)                    /* FNV-1a:比較「失敗的掛載前後映像是否相同」 */
+{
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < (size_t)MD_BLOCKS * PAGE_SIZE; i++)
+        h = (h ^ md_mem[i]) * 16777619u;
+    return h;
+}
+
+struct mfi_snap { size_t heap_used, pmm_free; };
+static void mfi_take(struct mfi_snap *x)
+{
+    struct kheap_stats h;
+    kheap_stats(&h);
+    x->heap_used = h.heap_bytes - h.free_bytes;
+    x->pmm_free = pmm_free_count();
+}
+
+/* 掃一種磁碟狀態;回傳成功掛載前觸發了幾個失敗點。成功之後依 leave 卸載(1 = 正常,0 = 斷電) */
+static unsigned mfi_sweep(const char *what, int site, int expect_rc, int leave)
+{
+    struct inode *root;
+    struct wfs_stats st;
+    unsigned n;
+    for (n = 1;; n++) {
+        struct mfi_snap a, b;
+        uint32_t h0 = md_hash();
+        mfi_take(&a);
+        failinj_arm((enum fi_site)site, n);
+        int rc = wfs_mount(&md_dev, &root);
+        failinj_disarm();
+        int fired = failinj_fired();
+        if (!fired) {
+            if (rc != expect_rc)
+                panic("wfs mount failinj %s site %d: unarmed mount returned %d (want %d)", what, site, rc, expect_rc);
+            break;
+        }
+        mfi_take(&b);
+        wfs_stats(&st);
+        if (rc != -E_NOMEM)
+            panic("wfs mount failinj %s site %d #%u: returned %d, want -E_NOMEM", what, site, n, rc);
+        if (st.mounted)
+            panic("wfs mount failinj %s site %d #%u: still marked mounted after failure", what, site, n);
+        if (a.pmm_free != b.pmm_free || a.heap_used != b.heap_used)
+            panic("wfs mount failinj %s site %d #%u leaked: pmm %zu->%zu heap %zu->%zu",
+                  what, site, n, a.pmm_free, b.pmm_free, a.heap_used, b.heap_used);
+        if (md_hash() != h0)
+            panic("wfs mount failinj %s site %d #%u: the failed mount wrote to the disk", what, site, n);
+        if (n > 64)
+            panic("wfs mount failinj %s site %d: more than 64 allocation points?", what, site);
+    }
+    /* 成功的掛載:檔案系統一致,而且看得到上一輪留下的檔案 */
+    wfs_stats(&st);
+    KASSERT(st.mounted && st.checksums);
+    KASSERT(wfs_check_now() == 0);               /* 0 = 不需要修復任何東西 */
+    struct inode *f;
+    if (expect_rc == 1) {                        /* 剛格式化:建立一個檔案,讓之後的狀態看得到它 */
+        KASSERT(root->ops->create(root, "mfi", I_FILE, &f) == 0);
+        KASSERT(root->ops->write(f, "mount-failinj", 13, 0) == 13);
+    } else {
+        char buf[16] = { 0 };
+        KASSERT(root->ops->lookup(root, "mfi", &f) == 0);
+        KASSERT(root->ops->read(f, buf, sizeof(buf), 0) == 13 && memcmp(buf, "mount-failinj", 13) == 0);
+    }
+    KASSERT(f->refs == 0);                       /* 沒有經過 VFS:沒有人持有它,才可以卸載 */
+    KASSERT(wfs_test_unmount(leave) == 0);
+    return n - 1;
+}
+
+void wfs_mount_failinj_test(void)
+{
+    struct mfi_snap before, after;
+    unsigned pts[3][FI_NSITES];
+
+    mfi_take(&before);
+    md_mem = pmm_alloc_pages(MD_BLOCKS);
+    KASSERT(md_mem);
+    memset(md_mem, 0, (size_t)MD_BLOCKS * PAGE_SIZE);
+    struct wfs_stats st;
+    wfs_stats(&st);
+    KASSERT(!st.mounted);                        /* 必須在 disk_init 之前 */
+
+    for (int site = 0; site < FI_NSITES; site++) {
+        memset(md_mem, 0, (size_t)MD_BLOCKS * PAGE_SIZE);
+        pts[0][site] = mfi_sweep("blank", site, 1, 1);   /* 格式化,建立 mfi,正常卸載 */
+        pts[1][site] = mfi_sweep("clean", site, 0, 0);   /* 掛載正常卸載過的;離開時模擬斷電 */
+        pts[2][site] = mfi_sweep("dirty", site, 0, 1);   /* 斷電後的掛載(含 wfs_check(1)) */
+    }
+    /* pmm:blank 4(pool、nodes、scratch、csum)、clean 4、dirty 7;kmalloc 0 — 數目變了就要重新審查 */
+    if (pts[0][FI_PMM] != 4 || pts[1][FI_PMM] != 4 || pts[2][FI_PMM] != 7 ||
+        pts[0][FI_KMALLOC] || pts[1][FI_KMALLOC] || pts[2][FI_KMALLOC])
+        panic("wfs mount failinj: unexpected allocation points pmm %u/%u/%u kmalloc %u/%u/%u",
+              pts[0][FI_PMM], pts[1][FI_PMM], pts[2][FI_PMM],
+              pts[0][FI_KMALLOC], pts[1][FI_KMALLOC], pts[2][FI_KMALLOC]);
+    /* 唯讀狀態不延續到下一次掛載:寫入磁碟失敗使檔案系統轉為唯讀,卸載之後磁碟恢復正常,
+       重新掛載必須可以寫入(以前掛載與卸載都不重設 fs_failed,新的掛載一開始就拒絕所有寫入) */
+    {
+        struct inode *root, *f;
+        struct wfs_stats st;
+        KASSERT(wfs_mount(&md_dev, &root) == 0);
+        wfs_stats(&st);
+        KASSERT(!st.failed);
+        KASSERT(root->ops->create(root, "ro", I_FILE, &f) == 0);
+        KASSERT(root->ops->write(f, "read-only-test", 14, 0) == 14);
+        KASSERT(f->refs == 0);
+        md_fail_writes = 1;                      /* 卸載時的寫回失敗 → 檔案系統轉為唯讀 */
+        KASSERT(wfs_test_unmount(1) == -E_IO);
+        md_fail_writes = 0;
+        KASSERT(wfs_mount(&md_dev, &root) == 0);
+        wfs_stats(&st);
+        if (st.failed)
+            panic("wfs: the read-only state of the previous mount carried over to a new mount");
+        KASSERT(root->ops->create(root, "ro2", I_FILE, &f) == 0);
+        KASSERT(root->ops->write(f, "writable-again", 14, 0) == 14);
+        KASSERT(f->refs == 0);
+        KASSERT(wfs_test_unmount(1) == 0);
+        KASSERT(wfs_mount(&md_dev, &root) == 0);
+        char buf[16] = { 0 };
+        KASSERT(root->ops->lookup(root, "ro2", &f) == 0);
+        KASSERT(root->ops->read(f, buf, sizeof(buf), 0) == 14 && memcmp(buf, "writable-again", 14) == 0);
+        KASSERT(f->refs == 0);
+        KASSERT(wfs_test_unmount(1) == 0);
+    }
+    pmm_free_pages(md_mem, MD_BLOCKS);
+    md_mem = NULL;
+    mfi_take(&after);
+    if (before.pmm_free != after.pmm_free || before.heap_used != after.heap_used)
+        panic("wfs mount failinj: whole test leaked pmm %zu->%zu heap %zu->%zu",
+              before.pmm_free, after.pmm_free, before.heap_used, after.heap_used);
+    kprintf("wfs: mount/format allocation-failure sweep passed (pmm points %u/%u/%u, blank/clean/dirty); "
+            "read-only state does not carry over to a new mount\n",
+            pts[0][FI_PMM], pts[1][FI_PMM], pts[2][FI_PMM]);
+}
+
 void disk_demo(void)
 {
     struct wfs_stats s0, s1, s2;

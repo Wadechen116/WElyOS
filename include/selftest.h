@@ -60,6 +60,7 @@ void spin_forever(void *arg);            /* crash=smp 用:永遠忙碌的執行�
 /* ---- kernel/test/io_test.c ---- */
 void nic_selftest(void);                 /* 網路卡驅動程式(不經過協定堆疊) */
 void disk_demo(void);                    /* 磁碟上的檔案系統 */
+void wfs_mount_failinj_test(void);       /* 掛載 / 格式化路徑的配置失敗掃描(記憶體磁碟,disk_init 之前) */
 void disk_stage_test(const char *cmd);   /* disktest=N:跨開機的磁碟測試 */
 void disk_user_stage_test(const char *cmd);  /* disktest=12~15:使用者程式在寫回失敗時(網路啟動之後) */
 void fs_demo(void);                      /* VFS 與記憶體檔案系統 */

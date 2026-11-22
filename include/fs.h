@@ -225,6 +225,7 @@ void wfs_stats(struct wfs_stats *st);
 int  wfs_check_now(void);
 int  wfs_test_damage(const char *victim_name);
 int  wfs_test_drop_cache(void);
+int  wfs_test_unmount(int clean);            /* 測試用:卸載、釋放全部記憶體(沒有掛到 VFS 的掛載才可以) */
 uint32_t wfs_test_file_block(struct inode *in, uint32_t fb);
 /* 巡檢:從 *pos 起直接讀磁碟核對 count 個區塊的檢查碼;回傳不符的數目,*pos 往後移(會繞回) */
 unsigned wfs_scrub(uint32_t *pos, unsigned count);

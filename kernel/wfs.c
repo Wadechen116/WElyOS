@@ -1361,8 +1361,10 @@ static int wfs_format(uint32_t nblocks)
     layout(&sb, nblocks, ninodes, 1);
     if (sb.data_start + 8 > nblocks)
         return -E_NOSPC;                         /* 磁碟太小 */
-    if (csum_alloc() != 0)
-        return -E_NOMEM;                         /* 記憶體不足:和磁碟大小分開回報 */
+    int rc = csum_alloc();
+    if (rc != 0)
+        return rc;                               /* -E_NOMEM = 記憶體不足(和磁碟大小分開回報);
+                                                    -E_INVAL = layout 算錯,不可以偽裝成記憶體不足 */
     memset(csum, 0, (size_t)sb.csum_blocks * BSIZE);
     memset(csum_dirty, 1, sb.csum_blocks);       /* 整張表都要寫到磁碟上 */
     csum_on = 1;
@@ -1433,14 +1435,18 @@ uint32_t wfs_probe(struct blkdev *dev)
     return result;
 }
 
+static void mount_release(void);
+
 int wfs_mount(struct blkdev *dev, struct inode **root_out)
 {
     int err = -E_IO, formatted = 0;
     uint64_t dev_blocks = dev->sectors / BSECT;
 
-    mutex_init(&wfs_lk, "wfs", MX_WFS);
     if (mounted)
-        return -E_BUSY;
+        return -E_BUSY;                          /* 先判斷:已掛載時重新 mutex_init 會毀掉可能被持有的鎖 */
+    mutex_init(&wfs_lk, "wfs", MX_WFS);
+    fs_failed = 0;                               /* 上一次(失敗或已卸載的)掛載留下的唯讀狀態不延續 */
+    last_repairs = 0;
     if (dev_blocks < WFS_MIN_DEV_BLOCKS)
         return -E_NOSPC;                         /* 磁碟太小 */
     if (dev_blocks > 0x100000)
@@ -1576,20 +1582,59 @@ int wfs_mount(struct blkdev *dev, struct inode **root_out)
 fail_locked:
     mutex_unlock(&wfs_lk);
 fail:
+    mount_release();                             /* 和 wfs_test_unmount 同一份釋放:兩邊不會漏得不一樣 */
+    return err < 0 ? err : -E_IO;
+}
+
+/* 釋放掛載時配置的全部記憶體,回到「從未掛載」(wfs_mount 的失敗路徑與 wfs_test_unmount 共用)。
+   呼叫時不持有 wfs_lk,而且 mounted == 0 */
+static void mount_release(void)
+{
+    size_t node_pages = (MAX_INODES * sizeof(struct wnode) + PAGE_SIZE - 1) / PAGE_SIZE;
     if (scratch)
         pmm_free(scratch);
     if (csum)
         pmm_free_pages(csum, sb.csum_blocks);
-    scratch = NULL;
-    csum = NULL;
-    csum_on = 0;
-    if (cache)
-        bcache_free();
     if (nodes)
         pmm_free_pages(nodes, node_pages);
+    bcache_free();                               /* pool 為 NULL 時只清 bufs,可重複呼叫 */
+    scratch = NULL;
+    csum = NULL;
     nodes = NULL;
+    csum_on = csum_verify = 0;
     disk = NULL;
-    return err < 0 ? err : -E_IO;
+}
+
+/*
+ * 測試用(I-335 掛載路徑的配置失敗掃描):卸載並釋放全部記憶體,之後可以再 wfs_mount。
+ * 只給「沒有掛到 VFS」的掛載用(selftest 在 disk_init 之前、對記憶體磁碟):任何 inode 還被
+ * 引用就拒絕(-E_BUSY)。clean = 1:和 wfs_shutdown 一樣寫回並記下正常卸載;
+ * clean = 0:模擬斷電,快取裡的髒區塊全部丟掉、磁碟維持「使用中」,下次掛載會跑 wfs_check(1)。
+ */
+int wfs_test_unmount(int clean)
+{
+    int rc = 0;
+    if (!mounted)
+        return -E_INVAL;
+    mutex_lock(&wfs_lk);
+    for (uint32_t i = 1; i < sb.ninodes; i++)
+        if (nodes[i].loaded && nodes[i].in.refs != 0) {
+            mutex_unlock(&wfs_lk);
+            return -E_BUSY;
+        }
+    if (clean) {
+        rc = bsync();
+        if (rc == 0 && !fs_failed) {
+            sb.clean = 1;
+            if (sb_write() != 0 || bsync_opt(1) != 0)
+                rc = -E_IO;
+        }
+    }
+    mounted = 0;
+    mutex_unlock(&wfs_lk);
+    mount_release();
+    fs_failed = 0;
+    return rc;
 }
 
 /* 關機前呼叫:寫回所有資料,並記下「正常卸載」。之後不可以再使用這個檔案系統 */

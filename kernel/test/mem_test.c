@@ -850,6 +850,34 @@ void anon_recommit_test(void)
     struct vm_ledger l;
     struct mb_stats st;
     KASSERT(d && vs);
+    /* 這個測試的數字(600 頁跨兩張最底層表、p = 層數)假設每張表 512 項、heap 對齊一張最底層表
+       涵蓋的範圍(2MB)。三個目標架構都成立;換了分頁格式就在這裡明確失敗,而不是誤判 */
+    KASSERT(MMU_BITS == 9 && (heap & (((uintptr_t)PAGE_SIZE << MMU_BITS) - 1)) == 0);
+
+    /* 配額不足使承諾失敗之後,調高配額再重試(Codex 197):失敗不可以留下已預付的位元 —
+       若留下了,重試時那些表不會再收票,pt_tickets 會比該有的少 */
+    {
+        struct mb_domain *d2 = mb_domain_new(10);   /* 遠小於 600 頁 */
+        struct vm_space *v2 = vm_space_create(d2);
+        KASSERT(d2 && v2);
+        struct mb_stats s0, s1;
+        mb_stats(d2, &s0);
+        KASSERT(vm_space_commit_anon(v2, heap, 600 * PAGE_SIZE) == -E_NOMEM);
+        vm_space_ledger(v2, &l);
+        mb_stats(d2, &s1);
+        KASSERT(l.data_tickets == 0 && l.pt_tickets == 0 && s1.total == s0.total && pmm_reserved_count() == r0);
+        mb_set_limit(d2, 100000);
+        KASSERT(vm_space_commit_anon(v2, heap, 600 * PAGE_SIZE) == 0);
+        vm_space_ledger(v2, &l);
+        mb_stats(d2, &s1);
+        if (l.pt_tickets != (unsigned long)MMU_LEVELS || s1.used[MB_PGTABLE] - s0.used[MB_PGTABLE] != (unsigned long)MMU_LEVELS)
+            panic("recommit: retry after a quota failure prepaid %lu tables (PGTABLE +%lu), want %d",
+                  l.pt_tickets, s1.used[MB_PGTABLE] - s0.used[MB_PGTABLE], MMU_LEVELS);
+        vm_space_destroy(v2);
+        mb_stats(d2, &s1);
+        KASSERT(s1.total == 0 && pmm_reserved_count() == r0);
+        KASSERT(mb_domain_put(d2) == 0);
+    }
 
     const unsigned long n = 600;                     /* 跨兩張最底層表 */
     const unsigned rounds = 16;
@@ -895,6 +923,8 @@ void anon_recommit_test(void)
     vm_space_ledger(vs, &l);
     KASSERT(l.pt_tickets == 0 && l.anon_tables == p + q);
     anon_check(vs, r0, "legacy-refund");
+    /* nx 那一頁是 legacy 對映(沒有 VM_TICKET):release 不退它的資料票,那張票留到 destroy 才退
+       (帳是平的;這裡不斷言 data_tickets == 0) */
     vm_space_release_anon(vs, nx, PAGE_SIZE);
 
     vm_space_destroy(vs);

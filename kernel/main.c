@@ -336,6 +336,8 @@ void kmain(const struct boot_info *bi)
             panic("fs: cannot unpack the boot archive (error %d)", nfiles);
         kprintf("fs: root file system ready: %d files unpacked from a %zu KB boot archive\n",
                 nfiles, (size_t)(rootfs_end - rootfs_start) / 1024);
+        if (selftest)
+            wfs_mount_failinj_test();        /* 在真的磁碟掛載之前:wfs 一次只能掛一個(I-335) */
         disk_init(bi->cmdline);              /* 有磁碟的話,掛載到 /disk(或決定進入安全模式) */
         if (cmdline_has(bi->cmdline, "crash=boot"))
             panic("test: this boot fails before it completes");      /* 測試安全模式用 */
