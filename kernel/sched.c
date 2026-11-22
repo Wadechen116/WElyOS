@@ -104,6 +104,11 @@ struct thread {
     unsigned rt_util;          /* 佔 CPU 的千分比(預算 / 週期) */
     int rt_level;              /* 在即時工作之間的層級(0 = 週期最長的);有效優先權 = PRIO_RT + rt_level */
     unsigned rt_releases, rt_misses, rt_overruns, rt_max_used;
+    /* ---- CPU 親和性(affinity,I-343);全部以 0 為預設,所以從 pool 取出時 memset 即是「不限制」 ---- */
+    unsigned allow;            /* 允許的 CPU 遮罩(bit i = 第 i 顆);0 = 全部(不固定,走 runq) */
+    int pin_cpu;               /* 排在第 (pin_cpu - 1) 顆 CPU 的固定佇列上;0 = 不在固定佇列 */
+    int pin_prio;              /* 串在固定佇列的哪一個優先權(取下時用;prio 可能已經改了) */
+    struct thread *pin_next, *pin_prev;
 };
 
 /* 開機時 boot.S 設定的 stack,main 執行緒繼續使用它;stack_guard 是它下方的保護頁 */
@@ -143,6 +148,49 @@ static unsigned long nstarve_boosts;         /* 累計的防飢餓提升次數 *
 #define RT_UTIL_MAX  700u                    /* 即時工作合計最多佔 CPU 的千分比(見 thread_set_periodic) */
 static struct thread *rt_tasks[RT_MAX];
 static unsigned rt_util_total;
+
+/*
+ * ---- CPU 親和性(affinity,I-343)----
+ *
+ * 有限制的執行緒(allow != 0)不進 runq:runq 的環可以被任何 CPU 竊取,而它的介面刻意不認得
+ * struct thread(見 runq.h),在那裡面加「誰能拿」會把排程策略漏進存放層。所以它們排在
+ * 每顆 CPU 一組的「固定佇列」(pinqs)上,由 sched_lk 保護(所有呼叫 runq 的路徑本來就持有它)。
+ *
+ * 不變式(KASSERT 檢查):
+ *   P1  t 在 pinqs[i] 上 ⇒ t 允許第 i 顆(改親和性時,不再允許的會立刻被搬走)
+ *   P2  第 c 顆只會從 runq、自己的固定佇列、別顆固定佇列「各優先權的頭且允許 c 的」取出
+ *       — 每次最多看 PRIO_LEVELS × MAX_CPUS 個頭,時間有界
+ *   P3  從 runq 取到「排隊期間才被限制」而不允許 c 的,不執行,改排到允許的 CPU(最多 PICK_DIVERT_MAX 次)
+ * 已知取捨:同優先權的 runq 與固定佇列之間以輪替決定先後(pin_tie),不是嚴格的先進先出。
+ */
+#define PICK_DIVERT_MAX 8
+struct pinq {
+    struct thread *head[PRIO_LEVELS], *tail[PRIO_LEVELS];
+    unsigned mask;                           /* bit p = 1:優先權 p 非空 */
+};
+static struct pinq pinqs[MAX_CPUS];
+static unsigned char pin_tie[MAX_CPUS];
+
+/* 負對照:定義後,取出時忽略親和性(固定測試必須因此失敗);正式建置絕不定義 */
+#ifdef SCHED_AFFINITY_NEGCTL
+#define AFF_IGNORE 1
+#else
+#define AFF_IGNORE 0
+#endif
+
+static inline int allowed_on(const struct thread *t, int cpu)
+{
+    return t->allow == 0 || ((t->allow >> cpu) & 1u);
+}
+
+static unsigned online_mask_locked(void)
+{
+    unsigned m = 0;
+    for (int i = 0; i < cpu_count && i < MAX_CPUS; i++)
+        if (cpus[i].online)
+            m |= 1u << i;
+    return m;
+}
 
 static void schedule(void);
 static void thread_free(struct thread *t);
@@ -254,12 +302,6 @@ static void rq_push_front(struct thread *t)
     runq_push(&t->rq, t->prio, 1);
 }
 
-/* 目前可執行的最高優先權;沒有任何可執行的執行緒回傳 -1 */
-static int rq_highest(void)
-{
-    return runq_highest();
-}
-
 /* 取出優先權最高的;同級則大致是排最久的 */
 static struct thread *rq_pop(void)
 {
@@ -269,10 +311,159 @@ static struct thread *rq_pop(void)
 
 /* 一條執行緒剛變成可執行:排進佇列;若它比某顆 CPU 正在跑的更優先(或有 CPU 閒著),
    要求那顆 CPU 重新排程 */
+/* ---- 固定佇列(呼叫時持有 sched_lk) ---- */
+
+static void pin_link(struct thread *t, int cpu, int front)
+{
+    struct pinq *q = &pinqs[cpu];
+    int p = t->prio;
+
+    KASSERT(t->pin_cpu == 0 && allowed_on(t, cpu));          /* P1 */
+    t->pin_cpu = cpu + 1;
+    t->pin_prio = p;
+    if (front) {
+        t->pin_prev = NULL;
+        t->pin_next = q->head[p];
+        if (q->head[p])
+            q->head[p]->pin_prev = t;
+        else
+            q->tail[p] = t;
+        q->head[p] = t;
+    } else {
+        t->pin_next = NULL;
+        t->pin_prev = q->tail[p];
+        if (q->tail[p])
+            q->tail[p]->pin_next = t;
+        else
+            q->head[p] = t;
+        q->tail[p] = t;
+    }
+    q->mask |= 1u << p;
+}
+
+static void pin_unlink(struct thread *t)
+{
+    KASSERT(t->pin_cpu > 0);
+    struct pinq *q = &pinqs[t->pin_cpu - 1];
+    int p = t->pin_prio;
+
+    if (t->pin_prev)
+        t->pin_prev->pin_next = t->pin_next;
+    else
+        q->head[p] = t->pin_next;
+    if (t->pin_next)
+        t->pin_next->pin_prev = t->pin_prev;
+    else
+        q->tail[p] = t->pin_prev;
+    if (!q->head[p])
+        q->mask &= ~(1u << p);
+    t->pin_next = t->pin_prev = NULL;
+    t->pin_cpu = 0;
+}
+
+static void pin_push(struct thread *t, int cpu, int front)
+{
+    t->ready_since = timer_ticks();
+    t->state = T_READY;
+    pin_link(t, cpu, front);
+}
+
+/* 第 cpu 顆可以從固定佇列取出的最高優先權者:自己的最高層,以及別顆各層的頭(允許 cpu 的)。
+   相同優先權時自己的優先。成本有界:最多 MAX_CPUS × PRIO_LEVELS 個頭(P2) */
+static struct thread *pin_best(int cpu)
+{
+    struct thread *best = NULL;
+
+    for (int i = 0; i < cpu_count && i < MAX_CPUS; i++) {
+        int c = (cpu + i) % cpu_count;       /* 從自己開始:同優先權時自己的先 */
+        unsigned m = pinqs[c].mask;
+        for (int p = PRIO_LEVELS - 1; p >= 0 && m; p--) {
+            if (!(m & (1u << p)))
+                continue;
+            if (best && p <= best->prio)
+                break;                       /* 這顆剩下的都不會更好 */
+            struct thread *h = pinqs[c].head[p];
+            if (AFF_IGNORE || allowed_on(h, cpu)) {
+                best = h;
+                break;
+            }
+        }
+    }
+    return best;
+}
+
+/* 第 cpu 顆「可以執行」的最高優先權(runq + 固定佇列);-1 = 沒有 */
+static int highest_for(int cpu)
+{
+    int r = runq_highest();
+    struct thread *pt = pin_best(cpu);
+    return pt && pt->prio > r ? pt->prio : r;
+}
+
+/* 有限制的執行緒要排到哪一顆:允許的 CPU 中,正在執行的優先權最低且低於它的(閒置最優先);
+   都不低於它就排在第一顆允許的(從自己開始找)。mask 已在設定時驗證過非空、都在線上 */
+static int choose_home(struct thread *t)
+{
+    int me = this_cpu()->id, best = -1, fallback = -1, best_prio = t->prio;
+
+    for (int i = 0; i < cpu_count; i++) {
+        int id = (me + i) % cpu_count;
+        struct cpu *c = &cpus[id];
+        if (!allowed_on(t, id) || !c->online)
+            continue;
+        if (fallback < 0)
+            fallback = id;
+        if (!c->current || c->need_resched)
+            continue;
+        int p = cpu_running_prio(c);
+        if (p < best_prio) {
+            best_prio = p;
+            best = id;
+        }
+    }
+    KASSERT(fallback >= 0);
+    return best >= 0 ? best : fallback;
+}
+
+/* 一條執行緒剛變成可執行:排進佇列;若它比某顆 CPU 正在跑的更優先(或有 CPU 閒著),
+   要求那顆 CPU 重新排程。有親和性限制的排到允許的 CPU 的固定佇列,只通知那一顆 */
 static void make_ready(struct thread *t)
 {
-    rq_push(t);
-    kick(t->prio);
+    if (!t->allow) {
+        rq_push(t);
+        kick(t->prio);
+        return;
+    }
+    int h = choose_home(t);
+    struct cpu *c = &cpus[h];
+    pin_push(t, h, 0);
+    if (c->current && !c->need_resched && cpu_running_prio(c) < t->prio)
+        cpu_resched(c);
+}
+
+/* schedule() 用:這顆 CPU 下一個要執行的。不會傳回不允許這顆的執行緒(P2、P3) */
+static struct thread *pick_next(struct cpu *c)
+{
+    for (int tries = 0; tries < PICK_DIVERT_MAX; tries++) {
+        struct thread *pt = pin_best(c->id);
+        int pp = pt ? pt->prio : -1, rp = runq_highest();
+
+        if (pt && (pp > rp || (pp == rp && (pin_tie[c->id] ^= 1)))) {
+            pin_unlink(pt);
+            return pt;
+        }
+        struct thread *n = rq_pop();
+        if (!n) {
+            if (pt)
+                pin_unlink(pt);
+            return pt;
+        }
+        if (AFF_IGNORE || allowed_on(n, c->id))
+            return n;
+        make_ready(n);                       /* P3:排隊期間被限制了,改排到允許的 CPU */
+    }
+    c->need_resched = 1;                     /* 次數用完(極少):先跑 idle,下次中斷返回再找 */
+    return NULL;
 }
 
 /* ---- 等待佇列 ---- */
@@ -708,13 +899,18 @@ static void schedule(void)
     }
 
     if (prev->state == T_RUNNING && prev != c->idle) {
-        if (prev->slice > 0)
+        if (prev->allow && allowed_on(prev, c->id))
+            pin_push(prev, c->id, prev->slice > 0);  /* 有限制、仍允許這顆:排回這顆的固定佇列 */
+        else if (prev->allow)
+            make_ready(prev);                /* 親和性已不含這顆:排到允許的 CPU 並通知它(I-343 搬移)。
+                                                鎖持有到切換完成,那顆 CPU 在那之前拿不到它 */
+        else if (prev->slice > 0)
             rq_push_front(prev);             /* 被更優先的搶佔:保留位置與剩餘時間片 */
         else
             rq_push(prev);                   /* 時間片用完或主動讓出:排到同級最後 */
     }
 
-    struct thread *next = rq_pop();          /* 優先權最高的;同級則是排最久的 */
+    struct thread *next = pick_next(c);      /* 優先權最高、允許這顆的;同級則大致是排最久的 */
     if (!next)
         next = c->idle;                      /* 所有人都在睡:跑 idle 等中斷 */
 
@@ -1139,14 +1335,22 @@ static void update_prio(struct thread *t)
     if (t->prio == prio)
         return;
 
-    if (t->state == T_READY) {
+    if (t->state == T_READY && t->pin_cpu) {
+        int h = t->pin_cpu - 1;              /* 固定佇列:同一顆 CPU 換到新優先權的尾端 */
+        struct cpu *c = &cpus[h];
+        pin_unlink(t);
+        t->prio = prio;
+        pin_link(t, h, 0);
+        if (c->current && !c->need_resched && cpu_running_prio(c) < prio)
+            cpu_resched(c);
+    } else if (t->state == T_READY) {
         t->prio = prio;
         runq_reprio(&t->rq, prio);           /* 改到新優先權的佇列;等待時間照舊計算 */
         kick(prio);
     } else {
         t->prio = prio;                      /* RUNNING / SLEEPING / BLOCKED:改欄位即可 */
-        /* 正在執行的執行緒被調低後,若有人比它優先,它所在的 CPU 要讓出 */
-        if (t->state == T_RUNNING && rq_highest() > prio)
+        /* 正在執行的執行緒被調低後,若有人(能在那顆 CPU 上跑的)比它優先,它所在的 CPU 要讓出 */
+        if (t->state == T_RUNNING && highest_for(t->cpu) > prio)
             cpu_resched(&cpus[t->cpu]);
     }
 }
@@ -1222,6 +1426,72 @@ static void starve_scan(uint64_t now)
             update_prio(t);                  /* 移到最高優先權的佇列;必要時要求重新排程 */
         }
     }
+    /* 固定佇列(I-343):同樣只看每層的頭。提升後移到 PRIO_MAX 那層,這個迴圈不再看到它 */
+    for (int i = 0; i < cpu_count && i < MAX_CPUS; i++) {
+        for (int p = PRIO_MAX - 1; p >= PRIO_MIN; p--) {
+            struct thread *t = pinqs[i].head[p];
+            if (!t || t->starve_boost || now < t->ready_since || now - t->ready_since < starve_ticks)
+                continue;
+            KASSERT(t->state == T_READY && t->prio == p);
+            t->starve_boost = 1;
+            nstarve_boosts++;
+            update_prio(t);
+        }
+    }
+}
+
+/*
+ * 設定執行緒的 CPU 親和性(I-343)。tid = 0 表示自己(main 也只能以 0 設定自己)。
+ * mask 必須非空、而且每一位都是在線上的 CPU,否則 -E_INVAL;找不到 tid 回傳 -E_SRCH。
+ * mask 等於全部在線上的 CPU 時存成「不限制」(走 runq,可被竊取)。
+ * 目前所在的 CPU 不在新的 mask 裡:要求那顆 CPU 重新排程;它在 schedule() 裡被排到允許的 CPU。
+ * 設定自己時,返回前就已經在允許的 CPU 上(搶佔點在這裡;在中斷處理中呼叫則延到中斷返回)。
+ */
+int thread_set_affinity(int tid, unsigned mask)
+{
+    unsigned long flags = sched_lock();
+    unsigned online = online_mask_locked();
+    struct thread *t = NULL;
+    int rc = 0;
+
+    if (mask == 0 || (mask & ~online))
+        rc = -E_INVAL;
+    else if (tid == 0)
+        t = cur();
+    else {
+        for (struct thread *x = all_threads; x; x = x->all_next)
+            if (x->id == tid) {
+                t = x;
+                break;
+            }
+        if (!t)
+            rc = -E_SRCH;                    /* all_threads 只含存活的:結束的(zombie)找不到 */
+    }
+    if (rc == 0) {
+        t->allow = mask == online ? 0 : mask;
+        if (t->state == T_READY && t->pin_cpu) {
+            if (!t->allow || !allowed_on(t, t->pin_cpu - 1)) {
+                pin_unlink(t);
+                make_ready(t);               /* P1:不再允許原本那顆,或改成不限制 */
+            }
+        } else if (t->state == T_RUNNING && !allowed_on(t, t->cpu)) {
+            cpu_resched(&cpus[t->cpu]);      /* 別顆:送 IPI;自己:下面的搶佔點 */
+        }
+        /* T_READY 且在 runq 中:無法從無鎖的環中間移除,由 pick_next 取到時改排(P3)。
+           T_SLEEPING / T_BLOCKED:醒來時 make_ready 依新的 mask 排 */
+    }
+    if (t == cur())
+        sched_preempt_point();
+    sched_unlock(flags);
+    return rc;
+}
+
+unsigned sched_online_mask(void)
+{
+    unsigned long flags = sched_lock();
+    unsigned m = online_mask_locked();
+    sched_unlock(flags);
+    return m;
 }
 
 void thread_yield(void)
@@ -1490,6 +1760,7 @@ void thread_exit(void)
     wq_wake_all(&self->joiners);             /* 叫醒所有在等我結束的執行緒 */
     rt_remove(self);                         /* 即時工作:把佔用的 CPU 配額還回去 */
 
+    KASSERT(self->pin_cpu == 0);             /* 正在執行的不會在固定佇列上 */
     self->state = T_ZOMBIE;
     c->zombie = self;                        /* 由這顆 CPU 上的下一條執行緒回收 */
     __atomic_fetch_add(&nzombies, 1, __ATOMIC_SEQ_CST);
@@ -1568,18 +1839,18 @@ void sched_tick(int charge)
         t->rt_throttled = 1;
         t->rt_overruns++;
         update_prio(t);
-        if (rq_highest() >= t->prio)
+        if (highest_for(c->id) >= t->prio)
             c->need_resched = 1;
     }
     /* 閒置中的 CPU:佇列裡(包括別顆 CPU 的)有工作就去拿。平常有工作時會被直接通知,
        這裡是保險,確保不會有「有人在排隊、卻有 CPU 閒著」的情況持續超過一個 tick */
-    if (t == c->idle && rq_highest() >= 0)
+    if (t == c->idle && highest_for(c->id) >= 0)
         c->need_resched = 1;
     if (t != c->idle && t->slice > 0 && --t->slice == 0) {
         /* 靠防飢餓提升上來的執行緒只給一個時間片:用完就讓出,不論別人的優先權高低
            (它此刻是最高優先權,不這樣做的話會反過來霸佔 CPU) */
         int floor = t->starve_boost ? 0 : t->prio;
-        if (rq_highest() >= floor)
+        if (highest_for(c->id) >= floor)
             c->need_resched = 1;
         else
             t->slice = time_slice;

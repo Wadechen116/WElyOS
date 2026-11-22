@@ -401,6 +401,7 @@ void kmain(const struct boot_info *bi)
     if (selftest) {
         smp_sched_demo();
         rt_demo();
+        affinity_test();                     /* I-343 */
         sleep_wall_test();
         cpu0_stall_wake_test();
         clksync_test();

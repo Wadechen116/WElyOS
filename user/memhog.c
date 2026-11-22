@@ -164,9 +164,9 @@ static void thr_fn(long idx)
         sys_sleep(1000);                         /* 停著保持承諾,行程結束時一起收回 */
 }
 
-/* 工作行程:建執行緒到失敗,回報 {原因, 條數};等 go 管線關閉後(stack 模式)觸 stack,
-   回報 'D';等 rel 管線關閉後結束。結束碼 0 = 一切如預期 */
-static int hog_worker(int rep, int go, int rel)
+/* 工作行程:建執行緒到失敗,從自己專屬的 rdy 管線回報 {原因, 條數} 後關閉它;等 go 管線關閉後
+   (stack 模式)觸 stack,從共用的 rep 管線回報 'D';等 rel 管線關閉後結束。結束碼 0 = 一切如預期 */
+static int hog_worker(int rdy, int rep, int go, int rel)
 {
     int n = 0;
     long err = 0;
@@ -181,8 +181,10 @@ static int hog_worker(int rep, int go, int rel)
     char msg[2];
     msg[0] = err == -E_BUSY ? 'B' : err == -E_NOMEM ? 'N' : err == 0 ? 'F' : 'X';
     msg[1] = (char)n;
-    if (sys_write(rep, msg, 2) != 2)
+    if (sys_write(rdy, msg, 2) != 2)
         return 4;
+    if (sys_close(rdy) != 0)
+        return 11;
     char c;
     if (sys_read(go, &c, 1) != 0)
         return 5;
@@ -221,21 +223,39 @@ static int hog_threads(int touch)
     int n = 0, threads = 0, busy = 0, nomem_thr = 0, bad = 0;
     long ferr = 0;
     while (n < MAX_KIDS && !nomem_thr) {
+        /* 每個工作行程一條專屬的 rdy 管線回報初始狀態(Codex msg 213):父行程 fork 後立刻關掉
+           自己的寫入端,之前的工作行程也拿不到這一條(它們的 fork 早於這次 sys_pipe)。
+           所以子行程在回報前死掉時,唯一的寫入端隨行程結束關閉,父行程的讀取立刻得到 EOF。
+           以前共用 rep:父行程與先前的工作行程都握著寫入端,只能等回歸腳本 60 秒逾時 */
+        int rdy[2];
+        long pr = sys_pipe(rdy);
+        if (pr != 0) {
+            ferr = pr;                           /* -E_NOMEM 視同 fork 被拒絕 */
+            break;
+        }
         long pid = sys_fork();
         if (pid == 0) {
             /* 子行程只留自己用得到的那一端;關不掉代表 fd 狀態不對,以專屬結束碼回報 */
-            if (sys_close(rep[0]) != 0 || sys_close(go[1]) != 0 || sys_close(rel[1]) != 0)
+            if (sys_close(rdy[0]) != 0 || sys_close(rep[0]) != 0 || sys_close(go[1]) != 0 ||
+                sys_close(rel[1]) != 0)
                 sys_exit(9);
-            sys_exit(hog_worker(rep[1], go[0], rel[0]));
+            sys_exit(hog_worker(rdy[1], rep[1], go[0], rel[0]));
         }
+        if (sys_close(rdy[1]) != 0)
+            bad = 1;
         if (pid < 0) {
             ferr = pid;
+            if (sys_close(rdy[0]) != 0)
+                bad = 1;
             break;
         }
         kids[n++] = pid;
         char msg[2];
-        if (sys_read(rep[0], msg, 2) != 2) {
+        long rr = bad ? -1 : sys_read(rdy[0], msg, 2);
+        if (sys_close(rdy[0]) != 0)
             bad = 1;
+        if (rr != 2) {
+            bad = 1;                             /* rr == 0:工作行程回報前就死了 */
             break;
         }
         threads += msg[1];

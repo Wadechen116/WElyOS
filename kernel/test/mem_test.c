@@ -2091,9 +2091,28 @@ static void kpool_round(unsigned n, const struct kpool_snap *b, const char *when
     sched_trim();
 }
 
+/* pmm_alloc_pages_aligned 的參數與分類(Codex msg 211):不是 2 的冪、比記憶體還大的對齊被拒絕,
+   空閒頁不夠也不算底線拒絕;合法的對齊真的對齊,而且頁數平衡 */
+static void pmm_aligned_api_test(void)
+{
+    unsigned long ref0 = pmm_reserve_refusals();
+    size_t free0 = pmm_free_count();
+    KASSERT(pmm_alloc_pages_aligned(1, 3) == NULL);
+    KASSERT(pmm_alloc_pages_aligned(1, 6) == NULL);
+    KASSERT(pmm_alloc_pages_aligned(1, (size_t)1 << (sizeof(size_t) * 8 - 1)) == NULL);
+    KASSERT(pmm_alloc_pages_aligned(free0 + 1, 1) == NULL);
+    KASSERT(pmm_reserve_refusals() == ref0 && pmm_free_count() == free0);
+    void *p = pmm_alloc_pages_aligned(4, 16);
+    KASSERT(p && ((uintptr_t)p & (16u * PAGE_SIZE - 1)) == 0);
+    pmm_free_pages(p, 4);
+    KASSERT(pmm_free_count() == free0);
+    kprintf("pmm: aligned alloc rejects non-power-of-two / oversized alignment, short memory is not a floor refusal\n");
+}
+
 void kstack_pool_test(void)
 {
     struct kpool_snap s0, base;
+    pmm_aligned_api_test();
     sched_trim();
     kpool_take(&s0);
     unsigned per = s0.ks.slots_per_chunk;

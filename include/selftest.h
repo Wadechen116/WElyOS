@@ -62,6 +62,7 @@ void sync_demo(void);                    /* mutex、號誌、條件變數 */
 void prio_demo(void);                    /* 優先權、搶佔延遲、優先權繼承、防飢餓 */
 void smp_sched_demo(void);               /* 多顆 CPU 同時排程 */
 void rt_demo(void);                      /* 週期性的即時工作 */
+void affinity_test(void);                /* I-343:CPU 親和性(固定、搬移、拒絕、固定的即時工作) */
 void sleep_wall_test(void);
 void clksync_test(void);                 /* I-337:跨 CPU 計數器同步驗證(含注入偏移的負對照) */
 void cpu0_stall_wake_test(void);         /* 第 0 顆 CPU 關中斷 300 ms 時休眠者照樣醒(I-337) */              /* 睡眠以真實時間計不可提早醒(高精度時鐘量) */

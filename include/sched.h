@@ -203,6 +203,11 @@ int   wq_max_prio(struct wait_queue *wq);
 void sched_init_ap(void);                /* AP 加入排程時在自己身上呼叫(見 sched.c) */
 void sched_set_cpu_count(int n);         /* 設定參與排程的 CPU 數(所有 AP 都登記之後) */
 int  sched_cpu_id(void);                 /* 目前執行在哪一顆 CPU 上(只是當下的值) */
+/* CPU 親和性(I-343):tid = 0 為自己;mask 的 bit i = 第 i 顆。回傳 0、-E_INVAL(空的或含不在線上的 CPU)、
+   -E_SRCH(找不到)。目前的 CPU 不在 mask 中時立刻搬走(設定自己時,返回前已在允許的 CPU 上)。
+   mask 等於全部在線上的 CPU = 不限制 */
+int  thread_set_affinity(int tid, unsigned mask);
+unsigned sched_online_mask(void);        /* 目前在線上的 CPU 遮罩 */
 void sched_space_dropped(struct vm_space *vs);   /* 位址空間即將釋放:這顆 CPU 若還載入著就換掉 */
 void sched_space_flush(struct vm_space *vs);     /* 位址空間的對映大量更改:這顆 CPU 若載入著就清空 TLB */
 

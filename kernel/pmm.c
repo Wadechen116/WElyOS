@@ -177,11 +177,17 @@ void *pmm_alloc_pages_aligned(size_t n, size_t align_pages)
 {
     if (failinj_check(FI_PMM))
         return NULL;
-    if (n == 0 || align_pages == 0)
+    /* 對齊用位元遮罩計算,只對 2 的冪成立;不是 2 的冪、或比整個記憶體還大(位移可能溢位)一律拒絕,
+       不算進底線拒絕次數(那是呼叫錯誤,不是記憶體不足)。Codex msg 211 */
+    if (n == 0 || align_pages == 0 || (align_pages & (align_pages - 1)) != 0 || align_pages > npages)
         return NULL;
     unsigned long flags = spin_lock_irqsave(&pmm_lk);
     void *p = NULL;
-    if (n > nfree || !fits_normal_locked(n)) {
+    /* 和 alloc_pages_locked 同一套分類:空閒頁根本不夠(n > nfree)不算底線拒絕;
+       以前兩種都記成底線拒絕,診斷會誤判 */
+    if (n > nfree)
+        goto out;
+    if (!fits_normal_locked(n)) {
         floor_refusals++;
         goto out;
     }

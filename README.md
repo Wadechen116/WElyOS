@@ -27,6 +27,7 @@
 - [x] 優先權排程:8 級固定優先權、搶佔式、同級輪流;mutex 的優先權繼承(防止優先權反轉)
 - [x] 使用者模式與行程:每個行程獨立的位址空間、系統呼叫(i386 `int 0x80`、RISC-V `ecall`、AArch64 `svc`)、行程內多執行緒、`proc_spawn` / `proc_wait` / `proc_kill`;使用者程式以 C 撰寫、獨立連結後嵌入 kernel;出錯只終止該行程
 - [x] 排程補強:防飢餓(老化)、完整的優先權繼承(多把鎖、連鎖等待)
+- [x] CPU 親和性(affinity):`thread_set_affinity` 把執行緒固定在指定的 CPU 集合;固定佇列不經過工作竊取,即時工作可綁定 CPU
 - [x] 記憶體保護補強:i386 改用 PAE(Physical Address Extension) 分頁取得 NX(No-eXecute);SMEP(Supervisor Mode Execution Prevention) / SMAP(Supervisor Mode Access Prevention,i386)與 PAN(Privileged Access Never,AArch64)禁止 kernel 存取或執行使用者的頁;ASID(Address Space Identifier) 與全域頁避免切換行程時清空 TLB(Translation Lookaside Buffer)
 - [x] futex 與使用者模式的 mutex
 - [x] 以 `-O2` 編譯(`-DWELYOS_OPT=-O0` 可改回,方便 GDB 逐行追蹤)

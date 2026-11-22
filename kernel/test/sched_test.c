@@ -374,52 +374,22 @@ static void latency_spinner(void *arg)
         ;
 }
 
-/* 其他 CPU 上的高優先權忙碌執行緒:「同優先權必須等對方的時間片」的前提是,剛醒的睡眠者只能和
-   spinner 搶同一顆 CPU。有閒著的 CPU 時,工作竊取會立刻把它拿去跑(延遲 1 tick,是更好的行為);
-   任一 CPU 都能叫醒睡眠者(I-337)之後這種情形變多,i386 6 次有 1 次量到 1 而誤判。
-   第一版用「同優先權」的忙碌執行緒佔住其他 CPU 仍不對:睡眠者可能落在某顆忙碌執行緒時間片快用完的
-   CPU 上,延遲 1 是合理的(riscv64 出現一次)。改成高優先權:它們不讓出、也不竊取比自己低的工作,
-   睡眠者只能等 spinner — spinner 在睡眠者入睡時剛拿到全新的時間片 */
-static volatile int lat_hog_stop, lat_hog_running;
-
-static void lat_hog(void *arg)
-{
-    (void)arg;
-    __atomic_fetch_add(&lat_hog_running, 1, __ATOMIC_SEQ_CST);
-    while (!lat_hog_stop)
-        ;
-}
-
+/* 更正(第 69 步):prio_demo 在 smp_sched_start 之前執行(kernel/main.c),這時只有開機的 CPU 在排程,
+   cpu_count == 1。第 67、68 步為了「別顆 CPU 會把睡眠者拿走」加的忙碌執行緒迴圈一條都沒有建立過,
+   「保留它們」的理由也是錯的(Codex msg 211 指出忙碌執行緒無法證明同時佔住,追查時發現根本沒有別顆)。
+   偶發「同優先權量到 1」的真正原因是第 68 步從排程紀錄找到、已修正的 starve_scan 無號下溢。已移除 */
 /* 回傳排程延遲(tick);*jitter 得到這段期間計時器一次補記最多的 tick 數(依分組的下限,保守) */
 static unsigned latency_run(int sleeper_prio, unsigned *jitter)
 {
-    int t[2], hogs[MAX_CPUS];
-    unsigned nh = 0;
+    int t[2];
     struct timer_stats a, b;
 
     lat_sleeping = lat_done = 0;
-    lat_hog_stop = 0;
-    lat_hog_running = 0;
-    if (sleeper_prio == PRIO_NORMAL)             /* 同優先權那一輪:其他 CPU 都佔住 */
-        for (int i = 1; i < cpu_count && nh < MAX_CPUS; i++) {
-            int h = thread_create_prio("lat-hog", lat_hog, NULL, PRIO_HIGH);
-            KASSERT(h > 0);
-            hogs[nh++] = h;
-        }
-    /* 等它們都真的在跑(各佔一顆 CPU)才開始:剛建立時可能還沒排上,短時間內仍有閒著的 CPU
-       會把睡眠者拿走(高優先權版本 12 次仍有 1 次量到 1) */
-    for (int w = 0; __atomic_load_n(&lat_hog_running, __ATOMIC_SEQ_CST) < (int)nh; w++) {
-        KASSERT(w < 5000);
-        thread_sleep(1);
-    }
     timer_get_stats(&a);
     t[0] = thread_create_prio("spinner", latency_spinner, NULL, PRIO_NORMAL);
     t[1] = thread_create_prio("sleeper", latency_sleeper, NULL, sleeper_prio);
     join_all(t, 2);
     timer_get_stats(&b);
-    lat_hog_stop = 1;
-    for (unsigned i = 0; i < nh; i++)
-        thread_join(hogs[i]);
     static const unsigned lo[TIMER_BURST_BUCKETS] = { 2, 3, 4, 6, 7, 10 };
     *jitter = 1;
     for (unsigned k = 0; k < TIMER_BURST_BUCKETS; k++)
@@ -1211,14 +1181,12 @@ static void cs_sleeper(void *arg)
 {
     (void)arg;
     cs_sleeper_self = thread_current();
-    /* 忙等:卡住期間不能靠 sleep 開始(那正是待測項目)。落在第 0 顆時睡 1 毫秒讓出,醒來時有機會換到
-       別顆 CPU — 沒有「固定在某顆 CPU」的機制,高優先權又一直忙等的它不會自己離開第 0 顆 */
-    while (cs_phase == 0) {
-        int c = sched_cpu_id();
-        cs_sleeper_cpu = c;
-        if (c == 0)
-            thread_sleep(1);
-    }
+    /* 固定在第 1 ~ n-1 顆(I-343):返回時已經不在第 0 顆,之後也不會再被排到第 0 顆 */
+    KASSERT(thread_set_affinity(0, sched_online_mask() & ~1u) == 0);
+    KASSERT(sched_cpu_id() != 0);
+    /* 忙等:卡住期間不能靠 sleep 開始(那正是待測項目) */
+    while (cs_phase == 0)
+        cs_sleeper_cpu = sched_cpu_id();
     while (cs_phase == 1) {
         uint64_t t0 = timer_clock_count();
         thread_sleep(CS_SLEEP_MS);
@@ -1248,7 +1216,7 @@ static void cs_stall_fn(void *arg)
     /* 被打斷的正是睡眠者(它在卡住開始前忙等,可能剛好在第 0 顆上):它會跟著卡住、無法被搬走,
        這一輪不算 — 放棄,讓測試稍後重試(18 次曾有 1 次因此一次都沒醒) */
     if (this_cpu()->current == cs_sleeper_self) {
-        x->aborted = 1;
+        x->aborted = 1;                      /* 固定之後不可能發生(I-343):呼叫端視為失敗 */
         return;
     }
     x->hb0 = this_cpu()->heartbeat;
@@ -1270,10 +1238,11 @@ static void cs_stall_fn(void *arg)
 void cpu0_stall_wake_test(void)
 {
     cs_hz = timer_clock_hz();
-    if (cpu_count < 3 || cs_hz == 0) {
-        kprintf("cpu0-stall: needs >= 3 cpus and a shared clock, skipped\n");
+    if (cpu_count < 2 || cs_hz == 0) {
+        kprintf("cpu0-stall: needs >= 2 cpus and a shared clock, skipped\n");
         return;
     }
+    unsigned online = sched_online_mask();
     cs_phase = 0;
     cs_n = cs_on_cpu0 = 0;
     cs_sleeper_cpu = -1;
@@ -1284,35 +1253,28 @@ void cpu0_stall_wake_test(void)
     struct timer_stats st0, st1;
     timer_get_stats(&st0);
 
+    /* 自己固定在第 0 顆、睡眠者固定在第 1 ~ n-1 顆(I-343)。以前沒有親和性,靠反覆睡 1 毫秒碰運氣
+       (24 次有 3 次逾時),後來改成跨 CPU 呼叫加上讓睡眠者自己離開第 0 顆的重試;現在兩者都是確定的 */
+    KASSERT(thread_set_affinity(0, 1u << 0) == 0);
+    KASSERT(sched_cpu_id() == 0);            /* 設定自己:返回前已經搬好 */
     int tid = thread_create_prio("cs-sleeper", cs_sleeper, NULL, PRIO_HIGH);
     if (tid <= 0)
         panic("cpu0-stall: cannot create sleeper (%d)", tid);
-    thread_sleep(5);                         /* 讓它在別顆 CPU 上跑起來、進入忙等 */
+    for (int w = 0; cs_sleeper_cpu < 1; w++) {       /* 等睡眠者在別顆 CPU 上進入忙等 */
+        if (w > 5000)
+            panic("cpu0-stall: the sleeper never started off cpu 0");
+        thread_sleep(1);
+    }
 
-    /* 讓第 0 顆 CPU 關中斷空轉 300 毫秒。沒有「把執行緒固定在某顆 CPU」的機制,以前靠反覆睡 1 毫秒
-       碰運氣被排到第 0 顆,24 次有 3 次一直排不上而逾時。現在:不在第 0 顆就以跨 CPU 呼叫讓第 0 顆
-       在 IPI 處理中(本來就關中斷)執行空轉;在第 0 顆就直接關中斷空轉。兩條路都確定是第 0 顆卡住。
-       跨 CPU 呼叫的發起者等待時也關著中斷,所以那段期間停住的是第 0 顆加發起者 — 需要至少 3 顆 CPU */
+    /* 讓第 0 顆 CPU 關中斷空轉 300 毫秒:就在這條(固定在第 0 顆的)執行緒上直接做 */
     struct cs_stall_ctx ctx;
-    int attempts = 0;
-    do {
-        if (++attempts > 50)
-            panic("cpu0-stall: the sleeper kept running on cpu 0");
-        for (int w = 0; cs_sleeper_cpu < 1; w++) {   /* 等睡眠者確實在第 0 顆以外的 CPU 上忙等 */
-            if (w > 5000)
-                panic("cpu0-stall: the sleeper never settled off cpu 0");
-            thread_sleep(1);
-        }
-        for (unsigned i = 0; i < sizeof(ctx); i++)
-            ((char *)&ctx)[i] = 0;
-        if (sched_cpu_id() == 0) {
-            unsigned long fl = arch_irq_save();
-            cs_stall_fn(&ctx);
-            arch_irq_restore(fl);
-        } else {
-            smp_call_mask(1u << 0, cs_stall_fn, &ctx);
-        }
-    } while (ctx.aborted);
+    for (unsigned i = 0; i < sizeof(ctx); i++)
+        ((char *)&ctx)[i] = 0;
+    unsigned long fl = arch_irq_save();
+    cs_stall_fn(&ctx);
+    arch_irq_restore(fl);
+    if (ctx.aborted)
+        panic("cpu0-stall: the pinned sleeper was running on cpu 0");
     if (!ctx.ran_on_cpu0)
         panic("cpu0-stall: the stall did not run on cpu 0");
     unsigned long hb0 = ctx.hb0, hb1 = ctx.hb1;
@@ -1320,6 +1282,7 @@ void cpu0_stall_wake_test(void)
     st1 = ctx.st1;
     cs_phase = 2;
     thread_join(tid);
+    KASSERT(thread_set_affinity(0, online) == 0);     /* 恢復不限制 */
 
     /* 只評估「整段都落在卡住期間」的睡眠:最後一次跨過結束點,不算 */
     unsigned wakes = 0, strict_over = 0;
@@ -1367,6 +1330,195 @@ void cpu0_stall_wake_test(void)
     if (strict_over && host_stalls == 0)
         panic("cpu0-stall: %u sleeps exceeded the %u ms bound without any host stall",
               strict_over, CS_STRICT_MS);
+}
+
+/*
+ * ---- CPU 親和性(I-343)----
+ * 1. 拒絕:空的 mask、含不在線上的 CPU、不存在的 tid
+ * 2. 固定:對每一顆在線上的 CPU k,一條固定在 k 的執行緒在睡眠、讓出、被同優先權的吃 CPU 執行緒
+ *    搶佔與竊取壓力之下取樣 AFF_SAMPLES 次,每一次 sched_cpu_id() 都必須是 k
+ * 3. 搬移:設定自己後立刻在新的 CPU 上;設定別條「正在執行」的執行緒,它在 AFF_MIGRATE_MS 內搬到
+ *    新的 CPU,之後再也不離開
+ * 4. 固定在最後一顆的即時工作,和固定在同一顆的高優先權吃 CPU 執行緒競爭,20 個週期不錯過期限
+ *    (錯過次數只容許等於量得到的主機停頓次數)
+ * 負對照:以 -DSCHED_AFFINITY_NEGCTL 建置(取出時忽略親和性),第 2 項必須失敗(別顆 CPU 從固定佇列取走)。
+ */
+#define AFF_SAMPLES    400
+#define AFF_MIGRATE_MS 20
+static volatile int aff_stop, aff_k;
+static volatile unsigned aff_bad, aff_seen, aff_done;
+static volatile int aff_cur = -1;
+static volatile unsigned aff_gen, aff_bad_after;
+
+static void aff_hog(void *arg)
+{
+    (void)arg;
+    while (!aff_stop)
+        ;
+}
+
+static void aff_pinned(void *arg)
+{
+    int k = (int)(uintptr_t)arg;
+    KASSERT(thread_set_affinity(0, 1u << k) == 0);
+    for (int i = 0; i < AFF_SAMPLES; i++) {
+        int c = sched_cpu_id();
+        aff_seen |= 1u << c;
+        if (c != k)
+            aff_bad++;
+        switch (i % 4) {
+        case 0: thread_sleep(1); break;
+        case 1: thread_yield(); break;
+        default: for (volatile int s = 0; s < 20000; s++) ; break;   /* 被同優先權的搶佔 */
+        }
+    }
+    aff_done = 1;
+}
+
+static void aff_mover(void *arg)
+{
+    (void)arg;
+    while (!aff_stop) {
+        /* aff_gen 非 0 = 測試端已確認搬到 aff_k、還沒開始下一輪。前後兩次讀到同一個非 0 值,
+           中間讀到的 aff_k 與取樣的 CPU 就屬於同一輪:不是 aff_k 就是搬到之後又離開 */
+        unsigned g1 = __atomic_load_n(&aff_gen, __ATOMIC_SEQ_CST);
+        int k = __atomic_load_n(&aff_k, __ATOMIC_SEQ_CST);
+        int c = sched_cpu_id();
+        unsigned g2 = __atomic_load_n(&aff_gen, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&aff_cur, c, __ATOMIC_SEQ_CST);
+        if (g1 && g1 == g2 && c != k)
+            aff_bad_after++;
+    }
+}
+
+static volatile unsigned rta_misses, rta_wrong_cpu, rta_releases;
+static volatile int rta_done;
+
+static void aff_rt_task(void *arg)
+{
+    int k = (int)(uintptr_t)arg;
+    struct rt_stats st;
+    KASSERT(thread_set_affinity(0, 1u << k) == 0);
+    thread_set_priority(PRIO_HIGH);
+    KASSERT(thread_set_periodic(10, 2) == 0);
+    for (int i = 0; i < 20; i++) {
+        KASSERT(thread_wait_period(&st) == 0);
+        if (sched_cpu_id() != k)
+            rta_wrong_cpu++;
+        uint64_t t = timer_ticks();
+        while (timer_ticks() < t + 1)
+            ;
+    }
+    rta_misses = st.misses;
+    rta_releases = st.releases;
+    KASSERT(thread_set_periodic(0, 0) == 0);
+    rta_done = 1;
+}
+
+void affinity_test(void)
+{
+    unsigned online = sched_online_mask();
+    int n = cpu_count;
+    int hogs[MAX_CPUS + 1];
+
+    /* 1. 拒絕 */
+    KASSERT(thread_set_affinity(0, 0) == -E_INVAL);
+    if (n < MAX_CPUS)
+        KASSERT(thread_set_affinity(0, online | (1u << n)) == -E_INVAL);
+    KASSERT(thread_set_affinity(0x7fffffff, online) == -E_SRCH);
+    KASSERT(thread_set_affinity(0, online) == 0);
+
+    /* 2. 每一顆 CPU 各固定一次;吃 CPU 的同優先權執行緒佔滿其他 CPU,製造竊取的機會 */
+    for (int k = 0; k < n; k++) {
+        aff_stop = 0;
+        aff_bad = aff_seen = aff_done = 0;
+        for (int i = 0; i < n; i++) {
+            hogs[i] = thread_create_prio("aff-hog", aff_hog, NULL, PRIO_NORMAL);
+            KASSERT(hogs[i] > 0);
+        }
+        int tid = thread_create_prio("aff-pin", aff_pinned, (void *)(uintptr_t)k, PRIO_NORMAL);
+        KASSERT(tid > 0);
+        thread_join(tid);
+        aff_stop = 1;
+        join_all(hogs, n);
+        kprintf("affinity: pinned to cpu %d: %u samples, off-cpu %u, seen mask %x\n",
+                k, AFF_SAMPLES, aff_bad, aff_seen);
+        if (aff_bad || aff_seen != (1u << k))
+            panic("affinity: thread pinned to cpu %d ran elsewhere (%u times, seen %x)", k, aff_bad, aff_seen);
+    }
+
+    /* 3a. 設定自己:返回時就在新的 CPU 上 */
+    for (int k = n - 1; k >= 0; k--) {
+        KASSERT(thread_set_affinity(0, 1u << k) == 0);
+        if (sched_cpu_id() != k)
+            panic("affinity: self migration to cpu %d returned on cpu %d", k, sched_cpu_id());
+        thread_yield();
+        thread_sleep(1);
+        KASSERT(sched_cpu_id() == k);
+    }
+    KASSERT(thread_set_affinity(0, online) == 0);
+
+    /* 3b. 設定另一條正在執行的執行緒 */
+    if (n >= 2) {
+        aff_stop = 0;
+        aff_gen = 0;
+        aff_bad_after = 0;
+        aff_cur = -1;
+        int tid = thread_create_prio("aff-move", aff_mover, NULL, PRIO_NORMAL);
+        KASSERT(tid > 0);
+        KASSERT(thread_set_affinity(0, 1u << 0) == 0);    /* 自己留在第 0 顆,讓出別顆給它 */
+        for (int round = 0; round < 2 * n; round++) {
+            int k = 1 + round % (n - 1);
+            __atomic_store_n(&aff_gen, 0u, __ATOMIC_SEQ_CST);     /* 先停止檢查,再換目標 */
+            __atomic_store_n(&aff_k, k, __ATOMIC_SEQ_CST);
+            KASSERT(thread_set_affinity(tid, 1u << k) == 0);
+            uint64_t t0 = timer_ticks();
+            while (aff_cur != k) {
+                if ((timer_ticks() - t0) * 1000 > (uint64_t)timer_hz() * AFF_MIGRATE_MS)
+                    panic("affinity: running thread not moved to cpu %d within %u ms (on %d)",
+                          k, AFF_MIGRATE_MS, aff_cur);
+                thread_sleep(1);
+            }
+            __atomic_store_n(&aff_gen, (unsigned)round + 1, __ATOMIC_SEQ_CST);
+            thread_sleep(5);                 /* 搬到之後觀察 5 毫秒:不可以離開 */
+        }
+        aff_stop = 1;
+        thread_join(tid);
+        KASSERT(thread_set_affinity(0, online) == 0);
+        kprintf("affinity: moved a running thread %d times, left the target afterwards %u times\n",
+                2 * n, aff_bad_after);
+        if (aff_bad_after)
+            panic("affinity: moved thread left its cpu %u times", aff_bad_after);
+    }
+
+    /* 4. 固定的即時工作:與同一顆的高優先權吃 CPU 執行緒競爭 */
+    {
+        int k = n - 1;
+        struct timer_stats ts0, ts1;
+        aff_stop = 0;
+        rta_done = 0;
+        rta_misses = rta_wrong_cpu = rta_releases = 0;
+        int nh = 0;
+        for (int i = 0; i < n + 1; i++) {    /* 每顆一條,加上一條一定和它擠在第 k 顆的 */
+            hogs[nh] = thread_create_prio("aff-rthog", aff_hog, NULL, PRIO_NORMAL);
+            KASSERT(hogs[nh] > 0);
+            nh++;
+        }
+        KASSERT(thread_set_affinity(hogs[n], 1u << k) == 0);
+        timer_get_stats(&ts0);
+        int tid = thread_create_prio("aff-rt", aff_rt_task, (void *)(uintptr_t)k, PRIO_NORMAL);
+        KASSERT(tid > 0);
+        thread_join(tid);
+        timer_get_stats(&ts1);
+        aff_stop = 1;
+        join_all(hogs, nh);
+        unsigned stalls = timer_bursts_at_least(&ts1, 8) - timer_bursts_at_least(&ts0, 8);
+        kprintf("affinity: rt task pinned to cpu %d: releases %u, misses %u, wrong cpu %u, host stalls >=8 ticks %u\n",
+                k, rta_releases, rta_misses, rta_wrong_cpu, stalls);
+        if (rta_wrong_cpu || rta_releases + rta_misses < 20 || rta_misses > stalls)
+            panic("affinity: pinned rt task: wrong cpu %u, releases %u, misses %u (host stalls %u)",
+                  rta_wrong_cpu, rta_releases, rta_misses, stalls);
+    }
 }
 
 /*
