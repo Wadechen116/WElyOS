@@ -87,6 +87,8 @@ long failinj_syscall(long op, long site, long n)
     }
     case FI_OP_RESERVED:
         return (long)pmm_reserved_count();
+    case FI_OP_UNFREED:
+        return (long)sched_unfreed_threads();
     case FI_OP_AVAIL_KB: {
         struct kheap_stats h;
         kheap_stats(&h);

@@ -227,6 +227,7 @@ int sched_report_overflow(uintptr_t sp, uintptr_t fault_addr);
 /* struct thread 的池子累計向 heap 取得的位元組數。執行緒結束後結構留在池子裡
    重複使用、不還給 heap(原因見 sched.c),測試核對 heap 用量時要把這部分算進去 */
 size_t sched_pool_bytes(void);
+unsigned sched_unfreed_threads(void);   /* 存活 + 已結束未回收(測試用:確認結束的執行緒都已回收) */
 
 /* 釋放快取中閒置的執行緒 stack(記憶體不足時,或測試要核對記憶體用量時呼叫) */
 void sched_trim(void);

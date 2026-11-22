@@ -143,6 +143,125 @@ static void disk_worker(void *arg)
     }
 }
 
+/*
+ * I-335:磁碟檔案系統(wfs)的配置失敗注入掃描。由 disk_demo 在 /disk/selftest 還在時呼叫;
+ * 沒有掛載磁碟時 disk_demo 已經提早返回,這裡不會執行(bare 模式自然略過)。
+ *
+ * wfs 的記憶體都在掛載時一次配好(nodes 表、scratch、檢查碼表、bcache 的 BCACHE_NBUF 頁),
+ * 平常的操作不配置。可注入的點只有:
+ *   - vfs_open 的 struct file(file_alloc 的 kzalloc;heap 要長大時另含一次 pmm)— 在建立檔案之前
+ *   - wfs_check_now → wfs_check 的三塊工作區(pmm_alloc_pages ×3)
+ * 核對:
+ *   - create:失敗回 -E_NOMEM,檔案不存在,磁碟上空閒區塊 / inode 數與 heap 用量不變
+ *   - write / link / unlink / sync:整段啟用注入也不能觸發(依設計不配置),而且全部成功
+ *   - check_now:失敗回 -E_NOMEM,pmm 空閒頁數與 heap 不變,之後再檢查一次成功
+ * bcache 的內容(哪些區塊在快取裡)依設計保留,不比較;只比磁碟上的計數(wfs_stats)。
+ */
+struct dfi_snap { uint32_t free_blocks, free_inodes; size_t heap_used, pmm_free; };
+
+static void dfi_take(struct dfi_snap *x)
+{
+    struct wfs_stats st;
+    struct kheap_stats h;
+    wfs_stats(&st);
+    kheap_stats(&h);
+    x->free_blocks = st.free_blocks;
+    x->free_inodes = st.free_inodes;
+    x->heap_used = h.heap_bytes - h.free_bytes;
+    x->pmm_free = pmm_free_count();
+}
+
+static void dfi_same(const struct dfi_snap *a, const char *what, int site, unsigned n)
+{
+    struct dfi_snap b;
+    dfi_take(&b);
+    if (a->free_blocks != b.free_blocks || a->free_inodes != b.free_inodes || a->heap_used != b.heap_used ||
+        a->pmm_free != b.pmm_free)
+        panic("disk: failinj %s site %d #%u leaked: blocks %u->%u inodes %u->%u heap %zu->%zu pmm %zu->%zu",
+              what, site, n, a->free_blocks, b.free_blocks, a->free_inodes, b.free_inodes,
+              a->heap_used, b.heap_used, a->pmm_free, b.pmm_free);
+}
+
+static void disk_failinj_test(void)
+{
+    static char data[3 * PAGE_SIZE];
+    unsigned points[2][2] = { { 0 } };
+    struct stat st;
+    struct file *f;
+
+    /* 暖身:成功做一次建立 / 寫入 / 刪除與檢查,讓 heap 的大小、目錄的區塊先穩定下來 */
+    KASSERT(vfs_open("/disk/selftest/fiW", O_CREAT | O_RDWR, &f) == 0);
+    KASSERT(vfs_write(f, data, sizeof(data)) == (long)sizeof(data));
+    vfs_close(f);
+    KASSERT(vfs_unlink("/disk/selftest/fiW") == 0 && vfs_sync() == 0 && wfs_check_now() == 0);
+
+    for (int site = 0; site < FI_NSITES; site++) {
+        /* 1. 建立檔案:唯一的配置點在建立之前,失敗時磁碟上什麼都沒發生 */
+        for (unsigned n = 1;; n++) {
+            KASSERT(n < 100);
+            struct dfi_snap a;
+            dfi_take(&a);
+            f = NULL;
+            failinj_arm((enum fi_site)site, n);
+            int r = vfs_open("/disk/selftest/fiA", O_CREAT | O_WRONLY, &f);
+            int fired = failinj_fired();
+            failinj_disarm();
+            if (!fired) {
+                KASSERT(r == 0);
+                vfs_close(f);
+                KASSERT(vfs_unlink("/disk/selftest/fiA") == 0 && vfs_sync() == 0);
+                dfi_same(&a, "create(cleanup)", site, n);
+                points[site][0] = n - 1;
+                break;
+            }
+            if (r != -E_NOMEM)
+                panic("disk: failinj create site %d #%u returned %d, want -E_NOMEM", site, n, r);
+            KASSERT(vfs_stat("/disk/selftest/fiA", &st) == -E_NOENT);
+            dfi_same(&a, "create", site, n);
+        }
+
+        /* 2. 寫入(配置新區塊與間接區塊)、link、unlink、sync:依設計沒有任何配置 */
+        KASSERT(vfs_open("/disk/selftest/fiB", O_CREAT | O_RDWR | O_TRUNC, &f) == 0);
+        failinj_arm((enum fi_site)site, 1);
+        long w = vfs_write(f, data, sizeof(data));
+        int lr = vfs_link("/disk/selftest/fiB", "/disk/selftest/fiC");
+        int ur = vfs_unlink("/disk/selftest/fiC");
+        int sr = vfs_sync();
+        int fired = failinj_fired();
+        failinj_disarm();
+        if (fired || w != (long)sizeof(data) || lr != 0 || ur != 0 || sr != 0)
+            panic("disk: failinj site %d reached wfs write/link/unlink/sync (fired %d w %ld link %d unlink %d "
+                  "sync %d)", site, fired, w, lr, ur, sr);
+        vfs_close(f);
+        KASSERT(vfs_unlink("/disk/selftest/fiB") == 0 && vfs_sync() == 0);
+
+        /* 3. 一致性檢查的三塊工作區 */
+        for (unsigned n = 1;; n++) {
+            KASSERT(n < 100);
+            struct dfi_snap a;
+            dfi_take(&a);
+            failinj_arm((enum fi_site)site, n);
+            int r = wfs_check_now();
+            fired = failinj_fired();
+            failinj_disarm();
+            if (!fired) {
+                KASSERT(r == 0);
+                dfi_same(&a, "check(ok)", site, n);
+                points[site][1] = n - 1;
+                break;
+            }
+            if (r != -E_NOMEM)
+                panic("disk: failinj check site %d #%u returned %d, want -E_NOMEM", site, n, r);
+            dfi_same(&a, "check", site, n);
+        }
+    }
+    /* 依設計:create 在 kmalloc 至少 1 點;check 只用 pmm(3 點),kmalloc 0 點 */
+    KASSERT(points[0][0] >= 1 && points[0][1] == 0 && points[1][1] == 3);
+    kprintf("disk: allocation-failure sweep: create %u+%u, check %u+%u failure points (kmalloc+pmm) all "
+            "returned E_NOMEM with nothing leaked; write/link/unlink/sync never allocate\n",
+            points[0][0], points[1][0], points[0][1], points[1][1]);
+}
+
 /* 磁碟上的檔案系統的自我測試。所有東西都放在 /disk/selftest 底下,結束時刪除,
    所以不影響磁碟上原有的內容,空閒的空間也要回到測試之前的數量 */
 void disk_demo(void)
@@ -160,9 +279,11 @@ void disk_demo(void)
     }
     /* 上一次測試如果中途被打斷,可能留下東西:先清掉。順便讓根目錄至少有一個區塊,
        之後的空間核對才有固定的基準 */
-    vfs_unlink("/disk/selftest/big");
-    vfs_unlink("/disk/selftest/prog");
-    vfs_unlink("/disk/selftest");
+    static const char *const leftovers[] = { "/disk/selftest/big", "/disk/selftest/prog", "/disk/selftest" };
+    for (unsigned i = 0; i < 3; i++) {
+        int r = vfs_unlink(leftovers[i]);
+        KASSERT(r == 0 || r == -E_NOENT);        /* 刪掉了,或本來就沒有 */
+    }
     KASSERT(vfs_mkdir("/disk/selftest") == 0 && vfs_unlink("/disk/selftest") == 0);
     wfs_stats(&s0);
 
@@ -260,6 +381,8 @@ void disk_demo(void)
                 "error and the scrub located 1 bad block among %lu checked\n",
                 (unsigned long)(s2.scrub_blocks ? s2.scrub_blocks : 1));
     }
+
+    disk_failinj_test();
 
     /* 全部刪除後,空間回到測試之前;再做一次完整檢查,應該找不到任何問題 */
     KASSERT(vfs_unlink("/disk/selftest") == 0);

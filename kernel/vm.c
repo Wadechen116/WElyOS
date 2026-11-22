@@ -46,6 +46,10 @@ extern char __kernel_start[], __text_end[], __rodata_end[];
 
 static pte_t *root;                          /* kernel 頁表的根表格 */
 
+/* prepaid 位元圖的容量:M 必須放得下(vm_set_anon_windows 檢查)。目前三架構的 M 約 249-257 */
+#define ANON_SLOT_MAX   1024u
+#define ANON_SLOT_WORDS (ANON_SLOT_MAX / 32)
+
 struct vm_space {
     pte_t *root;                             /* 這個位址空間的根表格 */
     unsigned asid;                           /* 位址空間編號(見 mmu.h);不支援的架構恆為 0 */
@@ -64,9 +68,12 @@ struct vm_space {
     struct mb_domain *dom;                   /* 持有一份參考 */
     unsigned long quota[MB_NCLASS];          /* 這個空間記在 dom 上的配額 */
     unsigned long data_tickets;              /* R1:未兌現 + 標 VM_TICKET 的已承諾映射數 */
-    unsigned long pt_tickets;                /* 替還不存在的中間表預留的票 */
+    unsigned long pt_tickets;                /* 替還不存在的中間表預留的票;恆等於 popcount(prepaid)(I-336) */
     unsigned long anon_tables;               /* E:已存在、且會被匿名記憶體區域用到的中間表數(BR5) */
     struct mb_exec_txn *txn;                 /* exec 交易中的新空間:記帳帶這個憑證(只有這個空間);NULL = 一般上限 */
+    /* I-336:承諾窗裡每一張可能的中間表一個位元(編號見 anon_slot)。1 = 這張表還不存在,
+       而且已經替它預付了一張 pt 票。受 vm_lk 保護。不變量 P1:pt_tickets == popcount(prepaid) */
+    uint32_t prepaid[ANON_SLOT_WORDS];
 };
 
 /*
@@ -79,6 +86,9 @@ struct vm_space {
 static struct { uintptr_t base, len; } anon_win[ANON_WIN_MAX];
 static unsigned n_anon_win;
 static unsigned long anon_pt_max;
+/* 第 l 層(0 = 最底層的表)第 i 個窗的第一張表,對應到 prepaid 的哪一個位元。
+   相鄰兩窗共用的那張表,後一窗的起點就是前一窗的終點:同一個位元(與 M 的扣除一致) */
+static unsigned long anon_slot_base[MMU_LEVELS][ANON_WIN_MAX];
 
 /*
  * 建頁表的用途(BR2)。不同區域之間不能借用承諾:
@@ -189,15 +199,57 @@ static int table_in_anon(uintptr_t va, int level)
     return 0;
 }
 
-/* 新建了一張表之後的 E / T 記帳(持有 vm_lk)。用票建的:T 減一、E 加一,總和不變。
-   legacy 建的而且落在匿名區域:E 加一;若因此 E + T 超過 M,代表那張表本來就算在某張票裡,
-   退掉一張票(連同它的 PGTABLE 配額 — legacy 建表時已經另外記過一頁),維持 E + T <= M */
+/*
+ * 第 level 層的項目所指的那張表(walk 的層號:level >= 1,表本身是 tables_at 的第 level - 1 層)
+ * 在 prepaid 位元圖中的編號;不在任何承諾窗裡回傳 -1。
+ * 編號與 vm_set_anon_windows 算 M 的方式一一對應:每層每窗連續編號,相鄰兩窗共用的表只佔一號,
+ * 所以編號一定 < M。
+ */
+static long anon_slot(uintptr_t va, int level)
+{
+    int l = level - 1;
+    unsigned sh = PAGE_SHIFT + (unsigned)level * MMU_BITS;
+    uintptr_t tn = va >> sh;
+    for (unsigned i = 0; i < n_anon_win; i++) {
+        uintptr_t first = anon_win[i].base >> sh;
+        uintptr_t last = (anon_win[i].base + anon_win[i].len - 1) >> sh;
+        if (tn >= first && tn <= last)
+            return (long)(anon_slot_base[l][i] + (unsigned long)(tn - first));
+    }
+    return -1;
+}
+
+static int prepaid_test(const struct vm_space *vs, long s)
+{
+    return s >= 0 && (vs->prepaid[s / 32] >> (s % 32)) & 1u;
+}
+
+static void prepaid_set(struct vm_space *vs, long s)   { vs->prepaid[s / 32] |= 1u << (s % 32); }
+static void prepaid_clear(struct vm_space *vs, long s) { vs->prepaid[s / 32] &= ~(1u << (s % 32)); }
+
+static unsigned long prepaid_count(const struct vm_space *vs)
+{
+    unsigned long n = 0;
+    for (unsigned w = 0; w < ANON_SLOT_WORDS; w++)
+        for (uint32_t x = vs->prepaid[w]; x; x &= x - 1)
+            n++;
+    return n;
+}
+
+/* 新建了一張表之後的 E / T 記帳(持有 vm_lk)。E 加一。
+   用票建的(WALK_ANON):票與位元已在 new_table 裡一起消耗,T 減一、E 加一,總和不變。
+   其他用途建的(legacy 已經另外記過一頁 PGTABLE):若這張表先前有預付的票(位元為 1),
+   那張票從此用不到 — 精確地退掉它(清位元、T 減一、退預留與配額),維持 P1 與 E + T <= M */
 static void anon_table_built(struct vm_space *vs, uintptr_t va, int level, enum walk_use use)
 {
     if (!vs || !vs->dom || !table_in_anon(va, level))
         return;
     vs->anon_tables++;
-    if (use != WALK_ANON && vs->pt_tickets > 0 && vs->anon_tables + vs->pt_tickets > anon_pt_max) {
+    long s = anon_slot(va, level);
+    if (use != WALK_ANON && prepaid_test(vs, s)) {
+        if (vs->pt_tickets == 0)
+            panic("vm: prepaid page-table slot without a ticket");
+        prepaid_clear(vs, s);
         vs->pt_tickets--;
         vs->quota[MB_PGTABLE]--;
         pmm_unreserve(1);
@@ -206,20 +258,24 @@ static void anon_table_built(struct vm_space *vs, uintptr_t va, int level, enum 
     }
 }
 
-/* 依用途配置一張新的中間表(持有 vm_lk)。失敗回傳 NULL,狀態不變 */
-static pte_t *new_table(struct vm_space *vs, enum walk_use use)
+/* 依用途配置一張新的中間表(持有 vm_lk)。va / level 指出它由第 level 層的哪一格指向。
+   失敗回傳 NULL,狀態不變 */
+static pte_t *new_table(struct vm_space *vs, enum walk_use use, uintptr_t va, int level)
 {
     pte_t *t;
 
     switch (use) {
-    case WALK_ANON:
-        if (!vs || vs->pt_tickets == 0)
-            panic("vm: anonymous-memory table without a reserved ticket");
+    case WALK_ANON: {
+        long s = vs ? anon_slot(va, level) : -1;
+        if (!vs || !prepaid_test(vs, s) || vs->pt_tickets == 0)
+            panic("vm: anonymous-memory table at %p level %d without a prepaid ticket", (void *)va, level);
         t = pmm_alloc_reserved();            /* 一定成功(pmm 的 N1) */
         memset(t, 0, PAGE_SIZE);
         table_pages++;
+        prepaid_clear(vs, s);                /* 票與位元一起消耗:P1 不變 */
         vs->pt_tickets--;                    /* 配額在承諾時已經記過 */
         return t;
+    }
     case WALK_LEGACY:
         if (vs && vs->dom && mb_quota_add_txn(vs->dom, MB_PGTABLE, 1, vs->txn) != 0)
             return NULL;
@@ -251,7 +307,7 @@ static pte_t *walk(struct vm_space *vs, pte_t *t, uintptr_t va, int target, int 
         if (!arch_pte_valid(*e)) {
             if (!create)
                 return NULL;
-            pte_t *next = new_table(vs, use);
+            pte_t *next = new_table(vs, use, va, level);
             if (!next)
                 return NULL;
             arch_pte_set(e, arch_pte_table((uintptr_t)next, use != WALK_KERNEL, level));
@@ -700,6 +756,7 @@ static void space_flush_fn(void *arg)
 /* 複製一張表格底下的所有對映到 child(僅用於使用者範圍)。呼叫時持有 vm_lk。
    base 為這張表格第 0 項對應的虛擬位址 */
 static unsigned long pt_need(uintptr_t va, uintptr_t len);   /* 定義在檔案後段(匿名記憶體) */
+static unsigned long pt_prepay(struct vm_space *vs, uintptr_t va, uintptr_t len, int set);
 
 /* fork 時,哪些頁屬於匿名記憶體的已承諾範圍(由行程記憶體模組在 mem.mx 之下同步傳入) */
 struct fork_anon {
@@ -778,6 +835,33 @@ static int fork_table(struct vm_space *child, pte_t *t, int level, uintptr_t bas
     return 0;
 }
 
+/*
+ * fork 成功之後(持有 vm_lk):子空間先前以 pt_need(上限 M)預留了最壞情況的頁表票,
+ * fork_table 已經建好實際需要的表。把子的各承諾範圍裡「仍然缺、而且在承諾窗內」的表標成已預付,
+ * 多出來的票(T - popcount)連同等量的 PGTABLE 配額精確退回 domain 與 pmm,讓 P1 成立。
+ * popcount <= 預留數:位元只標缺的表,而每張缺的表都算在某個範圍的 pt_need 裡,且編號 < M
+ */
+static void fork_settle_pt(struct vm_space *child, const struct vm_range *anon, unsigned nanon)
+{
+    if (!child->dom)
+        return;
+    for (unsigned i = 0; i < nanon; i++)
+        if (anon[i].len)
+            pt_prepay(child, anon[i].start, anon[i].len, 1);
+    unsigned long have = prepaid_count(child);
+    if (have > child->pt_tickets)
+        panic("vm: fork prepaid %lu tables but holds %lu tickets", have, child->pt_tickets);
+    unsigned long surplus = child->pt_tickets - have;
+    if (surplus) {
+        struct mb_bundle b = { .reserve = surplus };
+        b.quota[MB_PGTABLE] = surplus;
+        if (mb_release_bundle(child->dom, &b) != 0)
+            panic("vm: fork page-table surplus does not match the domain");
+        child->pt_tickets -= surplus;
+        child->quota[MB_PGTABLE] -= surplus;
+    }
+}
+
 struct vm_space *vm_space_fork(struct vm_space *parent, struct mb_domain *dom,
                                const struct vm_range *anon, unsigned nanon)
 {
@@ -839,6 +923,7 @@ struct vm_space *vm_space_fork(struct vm_space *parent, struct mb_domain *dom,
                 if (fa.marked != pending)
                     panic("vm: fork marked %lu parent pages but reserved %lu", fa.marked, pending);
                 parent->data_tickets += fa.marked;      /* 待生效的票轉為正式 */
+                fork_settle_pt(child, anon, nanon);     /* 最壞情況的頁表票收斂成精確的位元圖 */
             } else {
                 pmm_unreserve(pending);                 /* 失敗:父的待生效票全部退回,父的 PTE 沒有被改過 */
             }
@@ -1054,11 +1139,12 @@ static unsigned long pt_need(uintptr_t va, uintptr_t len)
     return n;
 }
 
-/* 範圍內「目前還不存在」的中間表數(持有 vm_lk)。表一旦建立就保留到位址空間銷毀(有界保留契約),
-   所以這裡看到已存在的表,之後也一直存在、不需要票。承諾只替缺的表預付票:
-   以前一律以 pt_need(假設一張都沒有)預付,同一段範圍反覆承諾(每建立一條執行緒就重新承諾
-   一格 stack)時每次多留 2 張票,一路累積到上限 M(I-335 注入掃描發現) */
-static unsigned long pt_missing(struct vm_space *vs, uintptr_t va, uintptr_t len)
+/* 範圍內「目前還不存在、在承諾窗內、而且還沒預付」的中間表數(持有 vm_lk);set 為 1 時順便把它們
+   標成已預付。表一旦建立就保留到位址空間銷毀(有界保留契約),所以已存在的表之後也一直存在、不需要票。
+   第 61 步只看「缺不缺」:範圍反覆承諾卻從未碰觸時,缺的表每次都再預付一次,累積到 M(I-336)。
+   現在每張可能的表只會有一張票:位元為 1 的不再收費。不在承諾窗內的表沒有編號,跳過
+   (承諾本身要求範圍在窗內;fork 的映像範圍在窗外,那些表已由 fork_table 建好或不會由 WALK_ANON 建) */
+static unsigned long pt_prepay(struct vm_space *vs, uintptr_t va, uintptr_t len, int set)
 {
     unsigned long n = 0;
     for (int l = 0; l < MMU_LEVELS - 1; l++) {
@@ -1066,11 +1152,29 @@ static unsigned long pt_missing(struct vm_space *vs, uintptr_t va, uintptr_t len
         for (uintptr_t i = va >> sh; i <= (va + len - 1) >> sh; i++) {
             int lvl = 0;
             pte_t *e = walk(vs, vs->root, i << sh, l + 1, 0, 0, WALK_LEGACY, &lvl);
-            if (!e || lvl != l + 1 || !arch_pte_valid(*e))
-                n++;                         /* 這一層的表(由上一層的這一格指向)還不存在 */
+            if (e && lvl == l + 1 && arch_pte_valid(*e))
+                continue;                    /* 已存在 */
+            long s = anon_slot(i << sh, l + 1);
+            if (s < 0 || prepaid_test(vs, s))
+                continue;                    /* 窗外,或已經有票 */
+            n++;
+            if (set)
+                prepaid_set(vs, s);
         }
     }
     return n;
+}
+
+/* [va, va + len) 是否完全落在承諾窗(窗由低到高排列;相鄰的窗可以接續)之內 */
+static int range_in_windows(uintptr_t va, uintptr_t len)
+{
+    uintptr_t end = va + len;
+    for (unsigned i = 0; i < n_anon_win && va < end; i++) {
+        uintptr_t wb = anon_win[i].base, we = wb + anon_win[i].len;
+        if (va >= wb && va < we)
+            va = we;
+    }
+    return va >= end;
 }
 
 void vm_set_anon_windows(const uintptr_t base[], const uintptr_t len[], unsigned n)
@@ -1084,16 +1188,20 @@ void vm_set_anon_windows(const uintptr_t base[], const uintptr_t len[], unsigned
         anon_win[i].len = len[i];
     }
     n_anon_win = n;
-    /* M:每一層把各區域的表數加起來,再扣掉相鄰兩區共用的同一張表 */
+    /* M:每一層把各區域的表數加起來,再扣掉相鄰兩區共用的同一張表。
+       同時替每層每窗的第一張表定出 prepaid 的編號(anon_slot):共用的那張沿用前一窗最後一張的編號 */
     unsigned long m = 0;
     for (int l = 0; l < MMU_LEVELS - 1; l++) {
         unsigned sh = PAGE_SHIFT + (unsigned)(l + 1) * MMU_BITS;
         for (unsigned i = 0; i < n; i++) {
+            int shared = i > 0 && ((base[i - 1] + len[i - 1] - 1) >> sh) == (base[i] >> sh);
+            anon_slot_base[l][i] = shared ? m - 1 : m;
             m += tables_at(base[i], base[i] + len[i], l);
-            if (i > 0 && ((base[i - 1] + len[i - 1] - 1) >> sh) == (base[i] >> sh))
+            if (shared)
                 m--;
         }
     }
+    KASSERT(m <= ANON_SLOT_MAX);
     anon_pt_max = m;
 }
 
@@ -1122,19 +1230,22 @@ int vm_space_commit(struct vm_space *vs, enum mb_class cls, uintptr_t va, uintpt
         return -E_INVAL;
     unsigned long n = (unsigned long)(len / PAGE_SIZE);
 
+    /* 只有承諾窗內的範圍能承諾:窗外的表沒有 prepaid 編號,無法保證「有票的 fault 一定建得出表」 */
+    if (!range_in_windows(va, len))
+        return -E_INVAL;
+
     unsigned long irq = spin_lock_irqsave(&vm_lk);
-    if (vs->anon_tables + vs->pt_tickets > anon_pt_max)
-        panic("vm: page-table tickets exceed the anonymous-region bound");
-    unsigned long room = anon_pt_max - vs->anon_tables - vs->pt_tickets;
-    unsigned long pt = pt_missing(vs, va, len);   /* 只替還不存在的表預付 */
-    if (pt > room)
-        pt = room;
+    if (vs->pt_tickets != prepaid_count(vs) || vs->anon_tables + vs->pt_tickets > anon_pt_max)
+        panic("vm: page-table tickets do not match the prepaid slots");
+    unsigned long pt = pt_prepay(vs, va, len, 0);   /* 只替缺的、還沒預付的表收費(I-336) */
     struct mb_bundle b = { .reserve = n + pt };
     b.quota[cls] = n;
     b.quota[MB_PGTABLE] = pt;
     int rc = -E_NOMEM;
     if (n + pt >= n && mb_commit_bundle_txn(vs->dom, &b, vs->txn) == 0) {   /* 完成點:配額與預留一起 */
         vs->data_tickets += n;
+        if (pt_prepay(vs, va, len, 1) != pt)     /* 同一把鎖內:與上面數到的相同 */
+            panic("vm: prepaid slot count changed under vm_lk");
         vs->pt_tickets += pt;
         vs->quota[cls] += n;
         vs->quota[MB_PGTABLE] += pt;

@@ -105,6 +105,7 @@ enum {
 #define FI_OP_DOMAIN    2     /* 呼叫者 domain 目前記帳的頁數 */
 #define FI_OP_RESERVED  3     /* pmm 的預留頁數 */
 #define FI_OP_AVAIL_KB  4     /* pmm 空閒 + heap 空閒 + 執行緒池(KB):不受 heap 成長、執行緒池影響 */
+#define FI_OP_UNFREED   5     /* 還沒釋放的執行緒數(存活 + 已結束未回收):等它回到基準值,代表收拾完了 */
 #define FI_SITE_KMALLOC 0
 #define FI_SITE_PMM     1
 

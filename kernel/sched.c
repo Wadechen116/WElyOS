@@ -1470,6 +1470,17 @@ int thread_id(void)
 }
 
 unsigned sched_thread_count(void)      { return nthreads; }
+
+/* 還沒釋放的執行緒數 = 存活 + 已結束但還沒回收。thread_exit 在同一段 sched_lock 內
+   把存活數減 1、待回收數加 1,所以在鎖內讀這個和,只有真正釋放(thread_free)時才會下降。
+   測試用它確認「之前結束的執行緒資源都已歸還」,不必猜要等多久 */
+unsigned sched_unfreed_threads(void)
+{
+    unsigned long flags = sched_lock();
+    unsigned n = nthreads + __atomic_load_n(&nzombies, __ATOMIC_SEQ_CST);
+    sched_unlock(flags);
+    return n;
+}
 unsigned long sched_switch_count(void) { return nswitches; }
 unsigned long sched_starve_boosts(void) { return nstarve_boosts; }
 

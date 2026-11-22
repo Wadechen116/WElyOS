@@ -1359,8 +1359,10 @@ static int wfs_format(uint32_t nblocks)
     ninodes = ninodes < 64 ? 64 : ninodes > MAX_INODES ? MAX_INODES : ninodes;
     ninodes = (ninodes + IPB - 1) / IPB * IPB;
     layout(&sb, nblocks, ninodes, 1);
-    if (sb.data_start + 8 > nblocks || csum_alloc() != 0)
-        return -E_NOSPC;                         /* 磁碟太小(或記憶體不足) */
+    if (sb.data_start + 8 > nblocks)
+        return -E_NOSPC;                         /* 磁碟太小 */
+    if (csum_alloc() != 0)
+        return -E_NOMEM;                         /* 記憶體不足:和磁碟大小分開回報 */
     memset(csum, 0, (size_t)sb.csum_blocks * BSIZE);
     memset(csum_dirty, 1, sb.csum_blocks);       /* 整張表都要寫到磁碟上 */
     csum_on = 1;

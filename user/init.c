@@ -252,8 +252,25 @@ static void fsw_settle(void)
     }
 }
 
+/* 掃描開始時「還沒釋放的執行緒數」(只有這條測試執行緒時)。拍快照前先等它回到這個值:
+   結束的執行緒(暖身的、fork / spawn 子行程的)在別顆 CPU 上分段歸還 stack 與票,
+   最後才回收結構。主機負載高時,快照曾經拍在歸還到一半的時候(預留差 -123 / -187 / -251,
+   正好是 stack 歸還的第 2 / 1 / 0 段之後),之後的數字永遠對不上 */
+static long fsw_threads0;
+
+static int fsw_quiesce(void)
+{
+    for (int w = 0; w < 5000; w++) {
+        if (sys_failinj(FI_OP_UNFREED, 0, 0) == fsw_threads0)
+            return 1;
+        sys_sleep(1);                            /* 讓出 CPU;條件是計數,不是時間 */
+    }
+    return 0;
+}
+
 static void fsw_take(struct fsw_snap *x)
 {
+    fsw_quiesce();
     fsw_settle();
     x->avail = sys_failinj(FI_OP_AVAIL_KB, 0, 0);
     x->resv = sys_failinj(FI_OP_RESERVED, 0, 0);
@@ -375,10 +392,128 @@ static int fsw_once(int op, int site, int n)
     return fired ? 0 : 1;
 }
 
+/* ---- I-335 第二輪:mmap / sbrk、管線讀寫、UDP ----
+   這幾種操作分兩類:
+   (1) 依設計不會碰到可注入的配置:mmap / sbrk 只做承諾(pmm_reserve 計數 + 頁表票),之後的 page fault
+       用 pmm_alloc_reserved 與 WALK_ANON 的票,兩者都不注入;munmap / sbrk 縮小只歸還;管線讀寫只搬
+       固定 4KB 緩衝區。對它們的核對是「整段啟用注入,也一次都不能觸發,而且全部成功」— 一旦有人在這些
+       路徑加上一般配置,這裡會立刻失敗(那等於破壞了「已承諾的記憶體一定兌現」的保證)。
+   (2) 真的會配置:udp_open(vfs_file_new 的 struct file)與 udp_recv / udp_send(sys_udp_io 的
+       NET_UDP_MAX 暫存區;send 與 recv 共用同一個配置點,在分支之前,所以只掃 recv,timeout 0 不需要
+       網路上有對端)。失敗時回傳 -E_NOMEM,帳回到原值。沒有網路(QEMU_NET=none)時 udp_open 在任何
+       配置之前回傳 -E_NETDOWN:整個 UDP 部分略過並印出 */
+enum { FSI_MEM, FSI_PIPEIO, FSI_UDPOPEN, FSI_UDPRECV, FSI_NOPS };
+static const char *const fsi_names[FSI_NOPS] = { "mmap+sbrk", "pipe_io", "udp_open", "udp_recv" };
+static int fsi_nonet;                            /* 沒有網路:UDP 兩項略過 */
+
+/* 子行程裡做 mmap / 碰觸 / munmap 與 sbrk 長大 / 碰觸 / 縮回,全程啟用注入。
+   在子行程做的原因:每次 mmap 的位址都往後移(mmap_next),碰觸時建立的中間頁表與它的票依設計保留到
+   位址空間銷毀;在父行程裡做,跨過一張頁表的邊界時看起來就像洩漏。子行程結束 = 一切歸還,父再比較 */
+static int fsi_mem_child(int site, int n)
+{
+    fsw_settle();                                /* fork 之後的 COW 頁先寫過:沒有票的 COW 複製走一般配置,會被注入 */
+    sys_failinj(FI_OP_ARM, site, n);
+    char *m = sys_mmap(4 * 4096);
+    if ((long)m < 0)
+        return 80;
+    for (int i = 0; i < 4; i++)
+        m[i * 4096] = (char)i;                   /* 兌現:用票,一定成功 */
+    if (sys_munmap(m) != 0)
+        return 81;
+    long old = sys_sbrk(3 * 4096);
+    if (old < 0)
+        return 82;
+    for (int i = 0; i < 3; i++)
+        ((volatile char *)old)[i * 4096] = 1;
+    if (sys_sbrk(-3 * 4096) != old + 3 * 4096)
+        return 83;
+    int fired = (int)sys_failinj(FI_OP_DISARM, 0, 0);
+    return fired ? 84 : 0;                       /* 84 = 注入碰到了不該配置的路徑 */
+}
+
+/* 回傳 -1 = 錯誤(已印出),0 = 碰到注入且正確失敗,1 = 沒碰到注入(本操作的掃描結束) */
+static int fsi_once(int op, int site, int n)
+{
+    static char iobuf[4096];
+    int st = 0, fds[2] = { -1, -1 };
+    long sock = -1, r;
+    struct fsw_snap a;
+
+    if (op == FSI_MEM) {
+        fsw_take(&a);
+        long pid = sys_fork();
+        if (pid < 0)
+            return fsw_report("mmap(fork)", site, n, "fork failed", pid), -1;
+        if (pid == 0)
+            sys_exit(fsi_mem_child(site, n));
+        if (sys_waitpid(pid, &st, 0) != pid || st != 0)
+            return fsw_report("mmap+sbrk", site, n, "child status", st), -1;
+        return fsw_same(&a, "mmap+sbrk", site, n, 0) ? 1 : -1;   /* 父 fork 過:預留不比(見 fsw_same) */
+    }
+    /* 準備(不在注入範圍內):管線、socket 先建好,快照之後才啟用 */
+    if (op == FSI_PIPEIO && sys_pipe(fds) != 0)
+        return fsw_report("pipe_io", site, n, "pipe", 0), -1;
+    if (op == FSI_UDPRECV && (sock = sys_udp_open(0)) < 0)
+        return fsw_report("udp_recv", site, n, "udp_open", sock), -1;
+    fsw_take(&a);
+    if (sys_failinj(FI_OP_ARM, site, n) != 0)
+        return fsw_report(fsi_names[op], site, n, "arm failed", 0), -1;
+    switch (op) {
+    case FSI_PIPEIO:
+        r = sys_write(fds[1], iobuf, sizeof(iobuf));            /* 剛好填滿 4KB:不會擋住 */
+        if (r == (long)sizeof(iobuf))
+            r = sys_read(fds[0], iobuf, sizeof(iobuf));
+        break;
+    case FSI_UDPOPEN:
+        r = sys_udp_open(0);
+        break;
+    default:
+        r = sys_udp_recv(sock, iobuf, sizeof(iobuf), 0, 0, 0);  /* timeout 0:只看一次 */
+        break;
+    }
+    int fired = (int)sys_failinj(FI_OP_DISARM, 0, 0);
+    int ok;
+    if (op == FSI_PIPEIO) {
+        ok = !fired && r == (long)sizeof(iobuf);
+        if (fired)
+            fsw_report("pipe_io", site, n, "injection reached pipe read/write", r);
+        if (sys_close(fds[0]) != 0 || sys_close(fds[1]) != 0)
+            ok = 0;
+        if (!ok)
+            return fsw_report("pipe_io", site, n, "returned", r), -1;
+        return 1;                                /* 收拾(close)在快照之後:不比較,下一輪重新建 */
+    }
+    if (fired && r != -E_NOMEM)
+        return fsw_report(fsi_names[op], site, n, "returned", r), -1;
+    if (!fired) {
+        long want_ok = op == FSI_UDPOPEN ? r >= 0 : r == -E_TIMEDOUT;
+        if (!want_ok)
+            return fsw_report(fsi_names[op], site, n, "failed without injection", r), -1;
+        if (op == FSI_UDPOPEN && sys_close(r) != 0)
+            return fsw_report("udp_open", site, n, "close", 0), -1;
+    }
+    /* udp_recv:比較時 socket 仍開著(兩邊快照都含它),比較完才關 */
+    int same = fsw_same(&a, fsi_names[op], site, n, 1);
+    if (sock >= 0 && sys_close(sock) != 0)
+        return fsw_report("udp_recv", site, n, "close", 0), -1;
+    if (!same)
+        return -1;
+    return fired ? 0 : 1;
+}
+
 static int mode_failsweep(void)
 {
     if (sys_failinj(FI_OP_AVAIL_KB, 0, 0) < 0)
         return 2;                                /* 沒有以 selftest 開機,或沒有 CAP_ADMIN */
+    /* 基準:前面的測試結束的執行緒也可能還沒回收完 — 等計數連續 50ms 不再下降才定下來 */
+    fsw_threads0 = sys_failinj(FI_OP_UNFREED, 0, 0);
+    for (int still = 0, w = 0; still < 50 && w < 5000; w++) {
+        sys_sleep(1);
+        long t = sys_failinj(FI_OP_UNFREED, 0, 0);
+        still = t < fsw_threads0 ? 0 : still + 1;
+        if (t < fsw_threads0)
+            fsw_threads0 = t;
+    }
     volatile char here;
     fsw_stack_hi = (uintptr_t)&here & ~(uintptr_t)4095;   /* 這一頁以下 128KB 涵蓋整個掃描的 stack 用量 */
     int points[FSW_NOPS][2];
@@ -399,6 +534,31 @@ static int mode_failsweep(void)
                 return 10 + op * 2 + site;      /* 哪個操作、哪個地點出錯(細節已印出) */
             points[op][site] = n - 1;
         }
+    /* 第二輪(I-335):沒有網路時 udp_open 在配置之前就回 -E_NETDOWN,UDP 兩項略過 */
+    long probe = sys_udp_open(0);
+    if (probe == -E_NETDOWN)
+        fsi_nonet = 1;
+    else if (probe < 0 || sys_close(probe) != 0)
+        return 60;
+    int fpoints[FSI_NOPS][2] = { { 0 } };
+    for (int op = 0; op < FSI_NOPS; op++)
+        for (int site = 0; site < 2 && !(fsi_nonet && op >= FSI_UDPOPEN); site++) {
+            fsw_warm = 1;
+            int wr = fsi_once(op, site, 100000);
+            fsw_warm = 0;
+            if (wr != 1)
+                return 61 + op * 2 + site;
+            int n = 1, r;
+            while ((r = fsi_once(op, site, n)) == 0)
+                if (++n > 200)
+                    return 3;
+            if (r < 0)
+                return 50 + op * 2 + site;
+            fpoints[op][site] = n - 1;
+            /* 依設計不配置的兩項:失敗點必須是 0(fsi_once 在觸發時已經回報錯誤,這裡是第二道) */
+            if ((op == FSI_MEM || op == FSI_PIPEIO) && n != 1)
+                return 69;
+        }
     struct line l = { .len = 0 };
     line_str(&l, "  [user] failsweep: failure points kmalloc+pmm:");
     for (int op = 0; op < FSW_NOPS; op++) {
@@ -408,6 +568,22 @@ static int mode_failsweep(void)
         line_num(&l, points[op][0]);
         line_str(&l, "+");
         line_num(&l, points[op][1]);
+    }
+    line_str(&l, "\n");                          /* 分兩行:一行最多 160 字元,太長會被截斷 */
+    line_out(&l);
+    l.len = 0;
+    line_str(&l, "  [user] failsweep: never or rarely allocating, kmalloc+pmm:");
+    for (int op = 0; op < FSI_NOPS; op++) {
+        line_str(&l, " ");
+        line_str(&l, fsi_names[op]);
+        if (fsi_nonet && op >= FSI_UDPOPEN) {
+            line_str(&l, " skipped(no net)");
+            continue;
+        }
+        line_str(&l, " ");
+        line_num(&l, fpoints[op][0]);
+        line_str(&l, "+");
+        line_num(&l, fpoints[op][1]);
     }
     line_str(&l, "\n");
     line_out(&l);

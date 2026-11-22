@@ -835,6 +835,76 @@ void anon_ticket_test(void)
 }
 
 /*
+ * I-336:同一段範圍反覆「承諾 → 歸還」、從未碰觸,頁表票只預付一次(prepaid 位元圖)。
+ * 每一輪之後 domain 的 PGTABLE 用量、pt_tickets、pmm 預留都與第一輪相同;
+ * 之後全部觸及仍然成功(P1:票 = 位元數,fault 不會缺票),legacy 建表時精確退票,destroy 後全部歸零。
+ * 負對照:改回第 61 步的 pt_missing(只看缺不缺)時,第二輪 pt_tickets 由 p 變成 2p,「不累積」斷言失敗。
+ */
+void anon_recommit_test(void)
+{
+    uintptr_t heap, hlen;
+    KASSERT(vm_anon_window(0, &heap, &hlen) == 0);
+    size_t r0 = pmm_reserved_count();
+    struct mb_domain *d = mb_domain_new(100000);
+    struct vm_space *vs = vm_space_create(d);
+    struct vm_ledger l;
+    struct mb_stats st;
+    KASSERT(d && vs);
+
+    const unsigned long n = 600;                     /* 跨兩張最底層表 */
+    const unsigned rounds = 16;
+    unsigned long p = 0, pg0 = 0;
+    for (unsigned k = 0; k < rounds; k++) {
+        KASSERT(vm_space_commit_anon(vs, heap, n * PAGE_SIZE) == 0);
+        vm_space_ledger(vs, &l);
+        mb_stats(d, &st);
+        if (k == 0) {
+            p = l.pt_tickets;
+            pg0 = st.used[MB_PGTABLE];
+            KASSERT(p > 0 && p == (unsigned long)(MMU_LEVELS - 1) + 1);   /* 2 張底層 + 每個上層 1 張 */
+        }
+        if (l.pt_tickets != p || st.used[MB_PGTABLE] != pg0 || l.anon_tables != 0)
+            panic("recommit: round %u pt_tickets %lu (first %lu) PGTABLE %lu (first %lu)",
+                  k, l.pt_tickets, p, st.used[MB_PGTABLE], pg0);
+        anon_check(vs, r0, "recommit");
+        vm_space_release_anon(vs, heap, n * PAGE_SIZE);
+        vm_space_ledger(vs, &l);
+        KASSERT(l.data_tickets == 0 && l.pt_tickets == p);           /* 頁表票保留到 destroy(有界保留) */
+    }
+
+    /* 窗外的範圍不能承諾 */
+    KASSERT(vm_space_commit_anon(vs, heap - PAGE_SIZE, 2 * PAGE_SIZE) == -E_INVAL);
+
+    /* 再承諾一次後全部觸及:不缺票,票全部消耗 */
+    KASSERT(vm_space_commit_anon(vs, heap, n * PAGE_SIZE) == 0);
+    for (unsigned long i = 0; i < n; i++)
+        KASSERT(vm_space_fault_anon(vs, heap + i * PAGE_SIZE) == 0);
+    vm_space_ledger(vs, &l);
+    KASSERT(l.data_tickets == 0 && l.pt_tickets == 0 && l.anon_tables == p);
+    anon_check(vs, r0, "recommit-touch");
+    vm_space_release_anon(vs, heap, n * PAGE_SIZE);
+
+    /* legacy 建表精確退票:承諾下一張底層表的範圍(預付 1 張),再用 vm_space_map 在那裡建表 */
+    uintptr_t nx = heap + 1024 * PAGE_SIZE;          /* 第三張底層表(還不存在) */
+    KASSERT(vm_space_commit_anon(vs, nx, PAGE_SIZE) == 0);
+    vm_space_ledger(vs, &l);
+    unsigned long q = l.pt_tickets;
+    KASSERT(q >= 1);
+    void *pg = pmm_alloc();
+    KASSERT(pg && vm_space_map(vs, nx, (uintptr_t)pg, VM_READ | VM_WRITE) == 0);
+    vm_space_ledger(vs, &l);
+    KASSERT(l.pt_tickets == 0 && l.anon_tables == p + q);
+    anon_check(vs, r0, "legacy-refund");
+    vm_space_release_anon(vs, nx, PAGE_SIZE);
+
+    vm_space_destroy(vs);
+    mb_stats(d, &st);
+    KASSERT(st.total == 0 && pmm_reserved_count() == r0 && mb_domain_put(d) == 0);
+    kprintf("anon: %u commit/release rounds of an untouched %lu-page range prepaid %lu table tickets once\n",
+            rounds, n, p);
+}
+
+/*
  * I-240 C3.2 (b1) 第 4、5 步:fork 的兩筆帳(R1)。父空間承諾 15 頁、觸及其中 10 頁,fork 之後:
  * 子空間 15 張票(每一頁承諾一張);父空間 5 張未兌現 + 10 張(那 10 頁變成 COW + TICKET)。
  * 一般配置把記憶體用到預留邊界之後:父寫入 10 頁(共用中,用票複製)、子寫入同樣 10 頁

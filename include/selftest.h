@@ -32,6 +32,7 @@ void membudget_test(void);               /* I-240 C3.2 (b1):配額計數(不下�
 void memhog_test(const char *mode);      /* I-240 C3.1:使用者把記憶體用到被拒絕,底線守住、全部歸還 */
 void pte_encoding_test(void);            /* I-240 C3.2 (b1):PTE 軟體位元(SHARED / COW / COW+TICKET)編碼往返 */
 void vm_ledger_test(void);               /* I-240 C3.2 (b1):位址空間帳本與 legacy 建表的配額 */
+void anon_recommit_test(void);           /* I-336:反覆承諾未碰觸的範圍,頁表票不累積 */
 void anon_ticket_test(void);             /* I-240 C3.2 (b1):匿名記憶體承諾後第一次觸及一定成功(I2) */
 void fork_ticket_test(void);             /* I-240 C3.2 (b1):fork 的兩筆帳,飽和後父子寫入與觸及都成功 */
 void thread_kobj_test(void);             /* I-240 C3.2 (b2):執行緒的 KOBJ 記帳、先準備後啟動 */

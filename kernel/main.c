@@ -309,6 +309,7 @@ void kmain(const struct boot_info *bi)
         pte_encoding_test();
         vm_ledger_test();
         anon_ticket_test();
+        anon_recommit_test();
         fork_ticket_test();
         stack_ticket_test();
         image_ticket_test();
