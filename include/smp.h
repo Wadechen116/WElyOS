@@ -37,6 +37,7 @@ void smp_ap_main(void) __attribute__((noreturn));
 #define IPI_RESCHED 1u       /* 你該重新排程了(need_resched 已由發送者設定) */
 #define IPI_CALL    2u       /* 執行跨 CPU 呼叫(見 smp_call_others) */
 #define IPI_STOP    4u       /* 系統 panic 了:立刻停下來 */
+#define IPI_CLKSYNC 8u       /* 參與計數器同步驗證的一輪取樣(見 kernel/clksync.c、I-337) */
 
 void smp_send(struct cpu *c, unsigned what);
 

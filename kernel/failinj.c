@@ -103,6 +103,11 @@ void failinj_enable(void)
     proc_sig_enable_sleep_check();           /* 睡下去時帶著可交付訊號 → 計數(I-334) */
 }
 
+int failinj_enabled(void)
+{
+    return fi_enabled;
+}
+
 _Static_assert(FI_SITE_KMALLOC == FI_KMALLOC && FI_SITE_PMM == FI_PMM, "failinj site numbering");
 
 long failinj_syscall(long op, long site, long n)

@@ -1370,22 +1370,22 @@ void thread_exit(void)
 }
 
 /*
- * 每顆 CPU 自己的計時器中斷都會呼叫(中斷關閉中)。
- * 「全系統只需要做一次」的工作(喚醒休眠者、防飢餓檢查)只由第 0 顆 CPU 負責,
- * 它也是唯一推進 tick 計數的 CPU(見 timer.c);時間片則是每顆 CPU 各算各的。
+ * 全系統只需要做一次的 tick 工作(喚醒休眠者、防飢餓檢查、即時工作的期限)。
+ * 由「把系統時間從 from 推進到 to」的那顆 CPU 呼叫(任何一顆都可能,見 timer.c 的 timer_advance),
+ * 呼叫時持有 time_lk、中斷關閉;一個 tick 只會有一顆 CPU 推進,所以每個 tick 恰好處理一次,
+ * 不會重複喚醒(喚醒本身也在 sched_lk 之內從串列取下,天生只有一次)。
+ * 逐個 tick 處理,與從前「第 0 顆 CPU 補記時每個 tick 呼叫一次」的語意相同(rt_check_deadlines
+ * 每次只推進一個週期)。補記上限 REAL_CATCHUP_MAX(100)個 tick。
  */
-void sched_tick(int charge)
+void sched_tick_global(uint64_t from, uint64_t to)
 {
-    struct cpu *c = this_cpu();
+    if (!this_cpu()->current)
+        return;                              /* 排程器尚未啟動:沒有休眠者 */
 
-    if (!c->current)
-        return;                              /* 排程器尚未啟動 */
-
-    spin_lock(&sched_lk);
-    if (c->id == 0) {
+    for (uint64_t now = from + 1; now <= to; now++) {
+        spin_lock(&sched_lk);
         /* 喚醒時間到的休眠者。串列已依喚醒時間排序,所以只看最前面的;
            第一個還沒到期,後面的一定也還沒,可以直接結束 */
-        uint64_t now = timer_ticks();
         while (sleepers && now >= sleepers->wake_tick) {
             struct thread *t = sleepers;
             sleepers = t->next;
@@ -1401,16 +1401,29 @@ void sched_tick(int charge)
         if ((unsigned)now % starve_scan_ticks == 0)
             starve_scan(now);
         rt_check_deadlines(now);
+        spin_unlock(&sched_lk);
     }
+}
 
-    /* 補記的 tick(中斷晚到的那段時間):時間已經在上面推進過了,但這顆 CPU 當時是被停住的,
+/*
+ * 每顆 CPU 自己的計時器中斷都會呼叫(中斷關閉中):這顆 CPU 自己的時間片與 CPU 時間。
+ * 全系統的工作在 sched_tick_global(由推進系統時間的那顆 CPU 做)。
+ */
+void sched_tick(int charge)
+{
+    struct cpu *c = this_cpu();
+
+    if (!c->current)
+        return;                              /* 排程器尚未啟動 */
+
+    /* 補記的 tick(中斷晚到的那段時間):時間已經在 timer.c 推進過了,但這顆 CPU 當時是被停住的,
        不是被目前這條執行緒用掉的 — 不記 CPU 時間、不扣時間片、不扣即時工作的預算。
        否則每次模擬器停頓,剛好在執行的那條執行緒就會被誤判為用了好幾毫秒(實測過:
        一個幾乎不做事的即時工作因此被判超出預算) */
-    if (!charge) {
-        spin_unlock(&sched_lk);
+    if (!charge)
         return;
-    }
+
+    spin_lock(&sched_lk);
 
     /* 時間片用完:有「優先權不低於自己」的人在等才換人。
        只有較低優先權的在等時不換,它們本來就輪不到 */

@@ -103,6 +103,7 @@ add_executable(welyos.elf
     kernel/runq_${WELYOS_RUNQ}.c
     kernel/spinlock.c
     kernel/smp.c
+    kernel/clksync.c
     kernel/sync.c
     kernel/vm.c
     kernel/proc.c

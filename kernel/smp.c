@@ -3,6 +3,7 @@
  */
 #include <stddef.h>
 #include "arch.h"
+#include "clksync.h"
 #include "cpu.h"
 #include "kprintf.h"
 #include "panic.h"
@@ -51,6 +52,8 @@ void smp_poll(void)
         call_fn(call_arg);
         __atomic_fetch_add(&call_acks, 1, __ATOMIC_SEQ_CST);
     }
+    if (p & IPI_CLKSYNC)
+        clksync_remote();                    /* 計數器同步驗證:自己有逾時,不會無限等 */
     /* IPI_RESCHED:不必做事。need_resched 已經設好,中斷返回前 sched_irq_exit 會處理 */
 }
 
@@ -236,6 +239,7 @@ void smp_init(const struct boot_info *bi, int run)
 
     if (nstarted == 1) {
         kprintf("smp: 1 cpu\n");
+        clksync_boot_check(1);               /* 只有一顆:不需要跨 CPU 一致,記下狀態即可 */
         return;
     }
     kprintf("smp: %d cpus started (hardware ids:", nstarted);
@@ -245,6 +249,7 @@ void smp_init(const struct boot_info *bi, int run)
 
     if (!run) {
         __atomic_store_n(&phase, PH_STANDBY, __ATOMIC_RELEASE);
+        clksync_boot_check(nstarted);        /* AP 待命中(開著中斷)、還沒有計時器:驗證共用計數器 */
         return;
     }
 
@@ -275,6 +280,7 @@ void smp_init(const struct boot_info *bi, int run)
     KASSERT(id_errors == 0);
     KASSERT(traps_ok == nstarted - 1);
     kprintf("smp: selftest ok\n");
+    clksync_boot_check(nstarted);            /* 必須在 smp_sched_start(AP 開始推進時間)之前 */
 }
 
 void smp_sched_start(void)

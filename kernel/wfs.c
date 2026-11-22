@@ -89,11 +89,13 @@
 #include "bcache.h"
 #include "blk.h"
 #include "crc32.h"
+#include "failinj.h"
 #include "fs.h"
 #include "kprintf.h"
 #include "kstring.h"
 #include "panic.h"
 #include "pmm.h"
+#include "sched.h"
 #include "sync.h"
 #include "timer.h"
 
@@ -1302,9 +1304,24 @@ static int csum_alloc_impl(void)
     return csum ? 0 : -E_NOMEM;
 }
 
+static int csum_inval_once;                      /* 測試用(I-338):1 = 下一次假裝版面計算出錯 */
+
 static int csum_alloc(void)
 {
+    if (csum_inval_once) {
+        csum_inval_once = 0;
+        return -E_INVAL;                         /* 和 csum_alloc_impl 的版面檢查失敗同一個錯誤碼 */
+    }
     return csum_alloc_impl();
+}
+
+/* 測試用(I-338):讓下一次 csum_alloc 回 -E_INVAL,驗證錯誤碼原樣傳遞。只在 selftest 開機時有效 */
+int wfs_test_csum_inval_once(void)
+{
+    if (!failinj_enabled())
+        return -E_PERM;
+    csum_inval_once = 1;
+    return 0;
 }
 
 /* superblock 的內容是否可信:記號、檢查碼(WFS2)、大小,以及各區的位置必須和依大小算出來的完全一致 */
@@ -1720,6 +1737,15 @@ uint32_t wfs_test_file_block(struct inode *in, uint32_t fb)
     uint32_t no = fb == 0xFFFFFFFFu ? wn(in)->d.indirect : bmap(wn(in), fb, 0, &berr);
     mutex_unlock(&wfs_lk);
     return no;
+}
+
+/* 測試用(I-338):wfs_lk 的狀態(不取鎖;在 sched_lock 內讀,和 mutex_lock / unlock 一致) */
+void wfs_test_lock_state(int *held, int *waiters)
+{
+    unsigned long flags = sched_lock();
+    *held = wfs_lk.owner != NULL;
+    *waiters = wfs_lk.wq.head != NULL;
+    sched_unlock(flags);
 }
 
 /* 測試用:把快取裡的東西都寫回去,然後整個清空,讓之後的讀取一定要碰磁碟 */

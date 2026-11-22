@@ -136,6 +136,7 @@ void user_demo(void)
     run_user("concurrent thread create/exit; fork after the main thread exited", UMODE_THREADMIX, 72);
     run_user("allocation-failure sweep: fork, thread_create, exec, spawn, pipe, mmap/sbrk, pipe I/O, UDP", UMODE_FAILSWEEP, 73);
     run_user("signal arriving in the return-to-user window still wakes the next sleep", UMODE_SIGRACE, 74);
+    run_user("memlimit lowered below use: committed pages usable, new requests E_NOMEM, admin raise", UMODE_MEMLOWER, 75);
     /* 週期性的即時工作:參數檢查、負載上限、需要特權、準時 */
     run_user("periodic real-time tasks", UMODE_RT, 29);
     /* 三重執行加投票:對其中一份注入位元翻轉、讓一份卡住、讓兩份都出錯 */

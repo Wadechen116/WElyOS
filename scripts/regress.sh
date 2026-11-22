@@ -102,6 +102,7 @@ for a in $ARCHS; do
   cases=("" "selftest" "selftest memtest stress" "bench")
   if [ "$QUICK" -eq 0 ]; then
     cases+=("memhog=file" "memhog=fork")      # I-240:使用者把記憶體用到被拒絕,kernel 保留底線守住
+    cases+=("memhog=threads" "memhog=stack" "memhog=maps" "memhog=exec")   # I-240 C3.2 T11:失敗都在系統呼叫回傳,不在 fault(預期結束碼 0)
     for c in $CRASH; do cases+=("crash=$c"); done
   fi
   ok=0

@@ -279,6 +279,8 @@ static void disk_failinj_test(void)
 #define MD_BLOCKS 256u                           /* 1MB:超過 WFS_MIN_DEV_BLOCKS,有檢查碼表與間接區塊空間 */
 static uint8_t *md_mem;
 static int md_fail_writes;                       /* 1 = 所有寫入都回 -E_IO(讓檔案系統轉為唯讀) */
+static int md_block_next_read;                   /* 1 = 下一次讀取停在 md_rw 裡,直到 md_release(I-338) */
+static struct semaphore md_entered = SEMAPHORE_INIT(0), md_release = SEMAPHORE_INIT(0);
 
 static int md_rw(struct blkdev *d, uint64_t lba, unsigned count, void *buf, int write)
 {
@@ -286,6 +288,10 @@ static int md_rw(struct blkdev *d, uint64_t lba, unsigned count, void *buf, int 
         return -E_IO;
     if (write && md_fail_writes)
         return -E_IO;
+    if (!write && __atomic_exchange_n(&md_block_next_read, 0, __ATOMIC_ACQ_REL)) {
+        sem_post(&md_entered);                   /* 呼叫者(檔案系統)此刻持有 wfs_lk */
+        sem_wait(&md_release);
+    }
     uint8_t *p = md_mem + lba * BLK_SECTOR;
     if (write)
         memcpy(p, buf, (size_t)count * BLK_SECTOR);
@@ -304,13 +310,17 @@ static uint32_t md_hash(void)                    /* FNV-1a:比較「失敗的掛
     return h;
 }
 
-struct mfi_snap { size_t heap_used, pmm_free; };
+/* avail = pmm 空閒 + heap 空閒 + 執行緒池:不受 heap 向 pmm 要頁、執行緒結構留在池子裡影響。
+   整個測試前後用它比(I-338 (1) 建了兩條執行緒,結構留在池子裡);逐點掃描沒有執行緒,照樣分開嚴格比 */
+struct mfi_snap { size_t heap_used, pmm_free, avail; unsigned long large; };
 static void mfi_take(struct mfi_snap *x)
 {
     struct kheap_stats h;
     kheap_stats(&h);
     x->heap_used = h.heap_bytes - h.free_bytes;
     x->pmm_free = pmm_free_count();
+    x->avail = x->pmm_free * PAGE_SIZE + h.free_bytes + sched_pool_bytes();
+    x->large = vm_large_pages();
 }
 
 /* 掃一種磁碟狀態;回傳成功掛載前觸發了幾個失敗點。成功之後依 leave 卸載(1 = 正常,0 = 斷電) */
@@ -364,11 +374,136 @@ static unsigned mfi_sweep(const char *what, int site, int expect_rc, int leave)
     return n - 1;
 }
 
+/*
+ * I-338 (1):已掛載、而且別的執行緒正持有 wfs_lk 時再呼叫 wfs_mount,必須回 -E_BUSY 且不碰鎖。
+ *   holder:lookup 取得 wfs_lk 後讀磁碟,停在 md_rw 裡(持鎖)
+ *   waiter:lookup 睡在 wfs_lk 的等待佇列
+ *   本執行緒:wfs_mount → -E_BUSY;鎖仍被持有、等待者仍在;放行後兩條都正常完成。
+ * 舊程式(mutex_init 在判斷之前)會把 owner / 等待佇列清掉:這裡的檢查立刻 panic;
+ * 即使略過檢查,holder 解鎖時 mutex_unlock 也會因「非擁有者解鎖」panic,waiter 永遠不會被叫醒。
+ */
+static struct inode *mb_root;
+static volatile int mb_rc[2] = { 1, 1 };
+
+static void mb_lookup(void *arg)
+{
+    int i = (int)(uintptr_t)arg;
+    struct inode *f;
+    mb_rc[i] = mb_root->ops->lookup(mb_root, "busy", &f);
+}
+
+static void wfs_mount_busy_test(void)
+{
+    struct inode *root, *f, *r2 = NULL;
+    int held, waiters;
+
+    memset(md_mem, 0, (size_t)MD_BLOCKS * PAGE_SIZE);
+    KASSERT(wfs_mount(&md_dev, &root) == 1);     /* 格式化 */
+    KASSERT(root->ops->create(root, "busy", I_FILE, &f) == 0);
+    KASSERT(f->refs == 0);
+    KASSERT(wfs_test_drop_cache() == 0);         /* 之後的 lookup 一定要讀磁碟 */
+    mb_root = root;
+    mb_rc[0] = mb_rc[1] = 1;
+
+    md_block_next_read = 1;
+    int th = thread_create("wfs-holder", mb_lookup, (void *)0);
+    KASSERT(th > 0);
+    sem_wait(&md_entered);                       /* holder 已持有 wfs_lk,停在磁碟讀取裡 */
+    int tw = thread_create("wfs-waiter", mb_lookup, (void *)1);
+    KASSERT(tw > 0);
+    for (int i = 0;; i++) {                      /* 等 waiter 真的睡在鎖上 */
+        wfs_test_lock_state(&held, &waiters);
+        if (held && waiters)
+            break;
+        if (i > 5000)
+            panic("wfs mount busy: waiter never queued on wfs_lk (held %d waiters %d)", held, waiters);
+        thread_sleep(1);
+    }
+
+    int rc = wfs_mount(&md_dev, &r2);
+    if (rc != -E_BUSY)
+        panic("wfs mount busy: second mount returned %d, want -E_BUSY", rc);
+    KASSERT(r2 == NULL);
+    wfs_test_lock_state(&held, &waiters);
+    if (!held || !waiters)
+        panic("wfs mount busy: second mount disturbed wfs_lk (held %d waiters %d); want 1 1", held, waiters);
+
+    sem_post(&md_release);                       /* holder 繼續,解鎖時叫醒 waiter */
+    thread_join(th);
+    thread_join(tw);
+    if (mb_rc[0] != 0 || mb_rc[1] != 0)
+        panic("wfs mount busy: lookups returned %d / %d", mb_rc[0], mb_rc[1]);
+    wfs_test_lock_state(&held, &waiters);
+    KASSERT(!held && !waiters);
+    KASSERT(wfs_check_now() == 0);
+    KASSERT(wfs_test_unmount(1) == 0);
+    kprintf("wfs: mount while mounted and the lock held returns -E_BUSY without touching the lock\n");
+}
+
+/*
+ * I-338 (2):版面計算出錯(csum_alloc 回 -E_INVAL)時,格式化與載入都必須原樣回報 -E_INVAL,
+ * 不可以偽裝成 -E_NOMEM;失敗的掛載不洩漏、不寫磁碟、不留下「已掛載」。
+ * 舊的 wfs_format 把任何非 0 都改成 -E_NOMEM:blank 那一輪失敗。
+ */
+static void wfs_csum_inval_test(void)
+{
+    static const struct { const char *what; int prep; } c[] = { { "format", 0 }, { "load", 1 } };
+    for (unsigned i = 0; i < 2; i++) {
+        struct inode *root;
+        struct wfs_stats st;
+        struct mfi_snap a, b;
+        memset(md_mem, 0, (size_t)MD_BLOCKS * PAGE_SIZE);
+        if (c[i].prep) {                         /* 先做出一個正常卸載過的檔案系統(WFS2,有檢查碼表) */
+            KASSERT(wfs_mount(&md_dev, &root) == 1);
+            KASSERT(wfs_test_unmount(1) == 0);
+        }
+        uint32_t h0 = md_hash();
+        mfi_take(&a);
+        KASSERT(wfs_test_csum_inval_once() == 0);
+        int rc = wfs_mount(&md_dev, &root);
+        mfi_take(&b);
+        wfs_stats(&st);
+        if (rc != -E_INVAL)
+            panic("wfs csum layout error (%s): mount returned %d, want -E_INVAL", c[i].what, rc);
+        if (st.mounted)
+            panic("wfs csum layout error (%s): still marked mounted", c[i].what);
+        if (a.pmm_free != b.pmm_free || a.heap_used != b.heap_used)
+            panic("wfs csum layout error (%s) leaked: pmm %zu->%zu heap %zu->%zu",
+                  c[i].what, a.pmm_free, b.pmm_free, a.heap_used, b.heap_used);
+        if (md_hash() != h0)
+            panic("wfs csum layout error (%s): the failed mount wrote to the disk", c[i].what);
+        KASSERT(wfs_mount(&md_dev, &root) == (c[i].prep ? 0 : 1));   /* 掛鉤只生效一次 */
+        KASSERT(wfs_test_unmount(1) == 0);
+    }
+    kprintf("wfs: checksum-table layout error is reported as -E_INVAL on format and load\n");
+}
+
+/* 暖身用:兩條同時存在的執行緒。I-338 (1) 會讓兩條測試執行緒同時存在;第一次達到這個同時數時,
+   kernel 會建一個之後保留的結構(實測 1 頁,第二次再跑同樣的測試損失為 0 — 是高水位,不是洩漏)。
+   先在量測起點之前達到同一個高水位,整個測試前後才能嚴格比較 */
+static struct semaphore mfi_warm_go;
+static void mfi_warm_thread(void *arg)
+{
+    (void)arg;
+    sem_wait(&mfi_warm_go);
+}
+
 void wfs_mount_failinj_test(void)
 {
+    {
+        sem_init(&mfi_warm_go, 0);
+        int t1 = thread_create("mfi-warm", mfi_warm_thread, NULL);
+        int t2 = thread_create("mfi-warm", mfi_warm_thread, NULL);
+        KASSERT(t1 > 0 && t2 > 0);
+        sem_post(&mfi_warm_go);
+        sem_post(&mfi_warm_go);
+        thread_join(t1);
+        thread_join(t2);
+    }
     struct mfi_snap before, after;
     unsigned pts[3][FI_NSITES];
 
+    sched_trim();                                /* 執行緒池與待回收的執行緒先收乾淨:前後量的是同一種狀態 */
     mfi_take(&before);
     md_mem = pmm_alloc_pages(MD_BLOCKS);
     KASSERT(md_mem);
@@ -418,12 +553,19 @@ void wfs_mount_failinj_test(void)
         KASSERT(f->refs == 0);
         KASSERT(wfs_test_unmount(1) == 0);
     }
+    wfs_mount_busy_test();                       /* I-338 (1) */
+    wfs_csum_inval_test();                       /* I-338 (2) */
     pmm_free_pages(md_mem, MD_BLOCKS);
     md_mem = NULL;
+    sched_trim();                                /* I-338 (1) 的兩條執行緒:join 之後結構與 kernel stack 進了池子 */
     mfi_take(&after);
-    if (before.pmm_free != after.pmm_free || before.heap_used != after.heap_used)
-        panic("wfs mount failinj: whole test leaked pmm %zu->%zu heap %zu->%zu",
-              before.pmm_free, after.pmm_free, before.heap_used, after.heap_used);
+    /* 唯一允許的差額:這段期間新的 kernel stack 落在還沒拆過的 2MB 直接對映區,保護頁把大分頁拆開,
+       多出的那張頁表目前不會合併回去(I-339,實測大分頁數 60 -> 59 時剛好少 1 頁)。差額必須剛好等於它 */
+    size_t split_bytes = (size_t)(before.large - after.large) * PAGE_SIZE;
+    if (after.large > before.large || before.avail != after.avail + split_bytes)
+        panic("wfs mount failinj: whole test leaked: available %zu->%zu bytes (pmm %zu->%zu heap used %zu->%zu, "
+              "large pages %lu->%lu)", before.avail, after.avail, before.pmm_free, after.pmm_free,
+              before.heap_used, after.heap_used, before.large, after.large);
     kprintf("wfs: mount/format allocation-failure sweep passed (pmm points %u/%u/%u, blank/clean/dirty); "
             "read-only state does not carry over to a new mount\n",
             pts[0][FI_PMM], pts[1][FI_PMM], pts[2][FI_PMM]);

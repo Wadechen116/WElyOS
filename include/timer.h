@@ -7,7 +7,18 @@ void timer_tick(void);          /* 由架構層的中斷處理程式在每次計
 /* 中斷晚到、一次補記好幾個 tick 時,第一個以外的用這個:時間照樣往前(喚醒休眠者、檢查期限),
    但不算成任何執行緒用掉的 CPU 時間 — 那段時間這顆 CPU 是被停住的,沒有人在執行 */
 void timer_tick_stolen(void);
-uint64_t timer_ticks(void);     /* 開機至今的 tick 數 */
+uint64_t timer_ticks(void);     /* 開機至今的 tick 數(任何一顆 CPU 都可能推進它,見 timer.c) */
+uint32_t timer_advances(int cpu);  /* 第 cpu 顆 CPU 推進過幾次系統時間(量測與測試用) */
+/*
+ * 共用計數器路徑(I-337)。kernel/clksync.c 驗證各 CPU 的計數器一致之後才讓 AP 推進時間;
+ * 驗證失敗時呼叫 timer_shared_disable() 退回「只有第 0 顆推進」(降級,不可逆)。
+ *   timer_shared_enabled()  目前是否走共用路徑(有共用計數器且未停用)
+ *   timer_tick_counts()     一個 tick 相當於幾個計數(timer_init 算好、之後唯讀;0 = 沒有共用計數器)。
+ *                           i386 沒有 64 位元除法,需要「每 tick 計數」的地方用它,不要自己除
+ */
+void     timer_shared_disable(void);
+int      timer_shared_enabled(void);
+uint64_t timer_tick_counts(void);
 unsigned timer_hz(void);        /* 每秒的 tick 數 */
 
 /*
@@ -43,10 +54,10 @@ void     timer_clock_marks(uint64_t *kmain, uint64_t *ready);
 uint64_t timer_clock_count(void);    /* 高精度時鐘的現值(架構層的計數器) */
 uint64_t timer_clock_hz(void);       /* 它每秒的計數;0 = 沒有可用的時鐘 */
 /*
- * 以真實時間為準的 tick(第 51 步)。timer_ticks() 只由第 0 顆 CPU 的計時器中斷推進,
- * 那顆 CPU 的中斷晚到時會暫時落後真實時間;拿它當「等多久」的起點,真正等到的時間就會不足。
+ * 以真實時間為準的 tick(第 51 步;I-337 起任何 CPU 都能推進)。timer_ticks() 在每顆 CPU 的計時器中斷裡
+ * 推進,所有 CPU 的中斷都晚到時會暫時落後真實時間;拿它當「等多久」的起點,真正等到的時間就會不足。
  *   timer_ticks_real()     現在「應該」是第幾個 tick:timer_ticks() 加上已經到期、還沒記的 tick
- *                          (由高精度時鐘與第 0 顆 CPU 下一個 tick 的預定時間算出)。永遠 >= timer_ticks()
+ *                          (由共用的高精度時鐘與全系統下一個 tick 的預定時間算出)。永遠 >= timer_ticks()
  *   timer_deadline_ms(ms)  「至少 ms 毫秒之後」對應的 tick;ms 為 0 時回傳 0(立刻到期)
  *   timer_expired(dl)      timer_ticks() >= dl。因為 timer_ticks() 不會超前真實時間,
  *                          到期時真實經過的時間一定 >= 要求的時間

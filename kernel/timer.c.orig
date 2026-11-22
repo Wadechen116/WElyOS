@@ -1,0 +1,300 @@
+/*
+ * timer.c - 系統時鐘(與架構無關)
+ *
+ * 架構層讓每顆 CPU 的硬體計時器每秒產生 hz 次中斷,每次中斷呼叫 timer_tick()。
+ * tick 計數是 kernel 的時間基準,之後的排程器也靠它切換工作。
+ */
+#include "arch.h"
+#include "cpu.h"
+#include "sched.h"
+#include "spinlock.h"
+#include "timer.h"
+#include "watchdog.h"
+
+/*
+ * 系統時間(I-337):任何一顆 CPU 都可以推進,不依賴第 0 顆。
+ *
+ * 真實時間的來源是所有 CPU 共用的硬體計數器(arch_clock_count:i386 TSC、RISC-V time CSR、
+ * AArch64 cntpct_el0)。g_deadline 是「下一個 tick 應該發生的計數值」。每顆 CPU 自己的計時器中斷
+ * 都看一次:計數已經超過 g_deadline,就用 trylock 搶推進權;搶到的 CPU 把 tick 補到現在,
+ * 並負責這幾個 tick 的全系統工作(喚醒休眠者、防飢餓、即時工作的期限,見 sched_tick_global)。
+ * 沒搶到的不等待(另一顆 CPU 正在做同一件事)。所以第 0 顆 CPU 關中斷或卡住時,
+ * 其他 CPU 照樣推進時間、叫醒休眠者。
+ *
+ * 速度:沒到期時每個 tick 只多一次共用快取列的讀取與一次計數器讀取;到期時每個 tick 只有
+ * 「最先到的那顆」做一次原子操作成功,其他頂多一次失敗的 trylock,不自旋。
+ * 安全:ticks 與 g_deadline 只在 time_lk 之內改,而且只會變大(單調);讀取端用序號
+ * (seqcount)拿到一致的一對,i386 上 64 位元不會讀到一半。
+ *
+ * 沒有共用計數器時(i386 沒有 TSC:g_iv == 0)退回舊做法:只有第 0 顆 CPU 推進,每次中斷 1 個 tick。
+ */
+static volatile uint64_t ticks;
+static volatile uint64_t g_deadline;   /* 下一個 tick 的計數值;g_iv == 0 時不用 */
+/* 一個 tick 相當於多少計數;0 = 沒有共用計數器。只在 timer_init 寫一次(中斷開啟、其他 CPU 啟動之前),
+   之後唯讀,所以不用原子操作(i386 上 64 位元的 __atomic 會需要 libatomic) */
+static uint64_t g_iv;
+static volatile uint32_t time_seq;     /* 奇數 = 寫入中 */
+static struct spinlock time_lk = SPINLOCK_INIT("timer-time", LK_TIME);
+static uint32_t adv_count[MAX_CPUS];   /* 每顆 CPU 推進過幾次系統時間(量測與測試用;time_lk 之內寫) */
+static unsigned tick_hz;
+
+/* 一次最多補幾個 tick:超過時(整台機器被暫停,例如除錯器)放棄補記、重新對時 */
+#define REAL_CATCHUP_MAX 100
+
+static void time_read(uint64_t *t, uint64_t *d)
+{
+    uint32_t s;
+    do {
+        s = __atomic_load_n(&time_seq, __ATOMIC_ACQUIRE);
+        *t = ticks;
+        *d = g_deadline;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    } while ((s & 1) || s != __atomic_load_n(&time_seq, __ATOMIC_RELAXED));
+}
+
+/* 呼叫時持有 time_lk */
+static void time_write(uint64_t t, uint64_t d)
+{
+    __atomic_store_n(&time_seq, time_seq + 1, __ATOMIC_RELAXED);
+    /* 完整屏障(Codex 209):「寫入中」的奇數標記必須先於下面的資料寫入被其他 CPU 看到。
+       release 屏障只保證「之前的」存取不會被排到之後,擋不住後面的資料寫入跑到奇數標記前面
+       (aarch64 / riscv64 是弱記憶體序) */
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    ticks = t;
+    g_deadline = d;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);     /* 資料寫完,才公布偶數(寫完) */
+    __atomic_store_n(&time_seq, time_seq + 1, __ATOMIC_RELAXED);
+}
+
+void timer_init(unsigned hz)
+{
+    tick_hz = hz;
+    arch_timer_init(hz);
+    uint64_t iv = arch_tick_interval();
+    if (iv && arch_clock_hz()) {
+        g_deadline = arch_clock_count() + iv;
+        g_iv = iv;
+    }
+}
+
+/*
+ * 試著把系統時間推進到現在。成功(真的推進了)回傳 1,此時仍持有 time_lk,
+ * *from、*to 是推進前後的 tick;呼叫端做完這段的全系統工作後放開 time_lk。
+ */
+static int timer_advance(uint64_t *from, uint64_t *to)
+{
+    uint64_t t, d, iv = g_iv;
+
+    if (iv == 0) {                            /* 沒有共用計數器:舊做法 */
+        if (this_cpu()->id != 0 || !spin_trylock(&time_lk))
+            return 0;
+        time_read(&t, &d);
+        time_write(t + 1, d);
+        *from = t;
+        *to = t + 1;
+        adv_count[0]++;
+        return 1;
+    }
+    time_read(&t, &d);
+    if (arch_clock_count() < d)               /* 常見情形:還沒到,什麼都不做 */
+        return 0;
+    if (!spin_trylock(&time_lk))              /* 別顆 CPU 正在推進:交給它 */
+        return 0;
+    time_read(&t, &d);                        /* 拿到鎖之後重讀:可能剛被推進過 */
+    uint64_t now = arch_clock_count();
+    unsigned n = 0;
+    while (d <= now && n < REAL_CATCHUP_MAX) {
+        d += iv;
+        n++;
+    }
+    if (d <= now)                             /* 落後太多:放棄補記、重新對時(與架構層相同) */
+        d = now + iv;
+    if (n == 0) {                             /* 別顆 CPU 剛推進過 */
+        spin_unlock(&time_lk);
+        return 0;
+    }
+    time_write(t + n, d);
+    adv_count[this_cpu()->id]++;
+    *from = t;
+    *to = t + n;
+    return 1;
+}
+
+static void timer_common(int charge)
+{
+    uint64_t from, to;
+    if (timer_advance(&from, &to)) {
+        sched_tick_global(from, to);          /* 這段 tick 的全系統工作只由推進的這顆 CPU 做一次 */
+        spin_unlock(&time_lk);
+    }
+    watchdog_tick();           /* 心跳,並看看隔壁的 CPU 是不是還活著 */
+    sched_tick(charge);        /* 這顆 CPU 自己的時間片(排程器未啟動時無作用) */
+}
+
+void timer_tick(void)
+{
+    timer_common(1);
+}
+
+void timer_tick_stolen(void)
+{
+    timer_common(0);           /* 只推進時間:不記 CPU 時間、不扣時間片與即時工作的預算 */
+}
+
+uint64_t timer_ticks(void)
+{
+    uint64_t t, d;
+    time_read(&t, &d);
+    return t;
+}
+
+uint32_t timer_advances(int cpu)
+{
+    return (cpu >= 0 && cpu < MAX_CPUS) ? __atomic_load_n(&adv_count[cpu], __ATOMIC_RELAXED) : 0;
+}
+
+/* 晚到的紀錄(見 timer.h)。中斷處理程式(各 CPU 都可能)寫入,以一把 spinlock 保護;只有幾條指令 */
+static struct timer_stats tstats;
+static struct spinlock tstat_lk = SPINLOCK_INIT("timer-stats", LK_TSTAT);
+static const unsigned bucket_lo[TIMER_BURST_BUCKETS] = { 2, 3, 4, 6, 7, 10 };
+
+void timer_note_catchup(int n, int resynced)
+{
+    if (n < 2 && !resynced)
+        return;
+    unsigned b = TIMER_BURST_BUCKETS - 1;
+    if (!resynced)
+        while (b > 0 && (unsigned)n < bucket_lo[b])
+            b--;
+    unsigned long fl = spin_lock_irqsave(&tstat_lk);
+    tstats.burst[b]++;
+    if (resynced)
+        tstats.resyncs++;
+    else if ((uint32_t)n > tstats.max_burst)
+        tstats.max_burst = (uint32_t)n;
+    spin_unlock_irqrestore(&tstat_lk, fl);
+}
+
+void timer_get_stats(struct timer_stats *st)
+{
+    unsigned long fl = spin_lock_irqsave(&tstat_lk);
+    *st = tstats;
+    spin_unlock_irqrestore(&tstat_lk, fl);
+}
+
+uint32_t timer_bursts_at_least(const struct timer_stats *st, unsigned k)
+{
+    uint32_t sum = 0;
+
+    for (unsigned b = 0; b < TIMER_BURST_BUCKETS; b++)
+        if (bucket_lo[b] >= k)
+            sum += st->burst[b];
+    return sum;
+}
+
+unsigned timer_hz(void)
+{
+    return tick_hz;
+}
+
+/*
+ * ---- 實際的日期時間 ----
+ *
+ * tick 只知道「開機之後過了多久」。要知道「現在是幾月幾號幾點」,得問硬體的即時時鐘
+ * (RTC):主機板上一個有電池的小時鐘,關機時也在走。讀它比較慢(i386 要好幾次 I/O),
+ * 所以只在開機時問一次,記下「開機那一刻是第幾秒」,之後的時間 = 那一刻 + 開機後經過的時間。
+ */
+static uint64_t boot_epoch;                  /* 開機那一刻的 Unix 時間(秒) */
+
+/* 64 位元除以 32 位元。不直接寫 n / d:i386 上那需要編譯器的輔助函式庫(見 sched.c 的說明)。
+   每次處理 16 個位元,被除數因此放得進 64 位元的一半;d 不可超過 65535 */
+static uint64_t div_u64(uint64_t n, uint32_t d, uint32_t *rem)
+{
+    uint64_t q = 0;
+    uint32_t r = 0;
+
+    for (int shift = 48; shift >= 0; shift -= 16) {
+        uint32_t part = (r << 16) | (uint32_t)((n >> shift) & 0xFFFF);
+        q |= (uint64_t)(part / d) << shift;
+        r = part % d;
+    }
+    if (rem)
+        *rem = r;
+    return q;
+}
+
+void timer_clock_init(void)
+{
+    uint64_t now = arch_rtc_read();
+    uint64_t up = div_u64(timer_ticks(), tick_hz ? tick_hz : 1, NULL);
+
+    boot_epoch = now > up ? now - up : 0;
+}
+
+uint64_t timer_epoch(uint32_t *usec)
+{
+    uint32_t rem = 0;
+    uint64_t sec = div_u64(timer_ticks(), tick_hz ? tick_hz : 1, &rem);
+
+    if (usec)
+        *usec = tick_hz ? rem * (1000000u / tick_hz) : 0;
+    return boot_epoch + sec;
+}
+
+/* ---- 開機時間的記號 ---- */
+static uint64_t mark_kmain, mark_ready;
+
+void timer_clock_mark(int which)
+{
+    uint64_t *m = which == CLOCK_MARK_KMAIN ? &mark_kmain : &mark_ready;
+    if (*m == 0)
+        *m = arch_clock_count();
+}
+
+void timer_clock_marks(uint64_t *kmain, uint64_t *ready)
+{
+    *kmain = mark_kmain;
+    *ready = mark_ready;
+}
+
+uint64_t timer_clock_count(void)
+{
+    return arch_clock_count();
+}
+
+uint64_t timer_clock_hz(void)
+{
+    return arch_clock_hz();
+}
+
+uint64_t timer_ticks_real(void)
+{
+    /* 一致的一對(tick, 下一個 tick 的計數值),再看計數器已經超過幾個預定時間:
+       那些是「已經到了、還沒有任何 CPU 記上」的 tick */
+    uint64_t t, d, iv = g_iv;
+    time_read(&t, &d);
+    if (iv == 0)
+        return t;
+    uint64_t now = arch_clock_count();
+    unsigned k = 0;
+    while (now >= d && k < REAL_CATCHUP_MAX) {
+        d += iv;
+        k++;
+    }
+    return t + k;
+}
+
+uint64_t timer_deadline_ms(unsigned ms)
+{
+    if (ms == 0)
+        return 0;
+    /* 現在位在第 r 個 tick 之中的某處;到第 r + n 個 tick 時,真實經過的時間至少 n - 1 個 tick,
+       所以 n = 無條件進位的 tick 數 + 1(與 thread_sleep 相同;32 位元運算,避開 i386 的 __udivdi3) */
+    unsigned n = (ms * timer_hz() + 999) / 1000 + 1;
+    return timer_ticks_real() + n;
+}
+
+int timer_expired(uint64_t deadline)
+{
+    return timer_ticks() >= deadline;
+}

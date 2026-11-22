@@ -27,6 +27,7 @@
 #include "timer.h"
 #include "vm.h"
 #include "watchdog.h"
+#include "failinj.h"
 #include "mmu.h"
 #include "netdev.h"
 #include "netif.h"
@@ -502,7 +503,10 @@ void memhog_test(const char *mode)
         KASSERT(rc == 0);
     }
     KASSERT(hog_min >= floor);                        /* 底線守住了 */
-    KASSERT(refusals > 0);                            /* 真的用到了底線,而不是別的上限先擋下 */
+    /* 真的用到了底線,而不是別的上限先擋下。exec 模式例外:它只碰單一行程的配額(2MB),
+       測的是「接近配額的 exec 鏈與低於用量時 exec 被拒」,碰不到系統底線 */
+    if (strcmp(mode, "exec") != 0)
+        KASSERT(refusals > 0);
     KASSERT(free1 + kept1 == free0 + kept0);          /* 其餘全部歸還(快取也可能縮小,所以兩邊相加比較) */
 }
 
@@ -935,6 +939,367 @@ void anon_recommit_test(void)
 }
 
 /*
+ * ==== I-240 C3.2 R1:生命週期整合、實體平衡、6.2 的負對照(草稿)====
+ *
+ * r1_check:核對「所有活著的空間 Σ(data_tickets + pt_tickets) == pmm 增加的預留」,
+ * 以及每個 domain(每個 domain 只有一個空間)的配額 == 該空間帳本:
+ * used[ANON] == anon_quota、used[PGTABLE] == pt_quota、total == 兩者之和。
+ */
+static void r1_check(struct vm_space *const *vs, struct mb_domain *const *ds, unsigned n,
+                     size_t r0, const char *where)
+{
+    unsigned long sum = 0;
+    for (unsigned i = 0; i < n; i++) {
+        struct vm_ledger l;
+        struct mb_stats st;
+        vm_space_ledger(vs[i], &l);
+        mb_stats(ds[i], &st);
+        sum += l.data_tickets + l.pt_tickets;
+        if (st.used[MB_ANON] != l.anon_quota || st.used[MB_PGTABLE] != l.pt_quota ||
+            st.total != st.used[MB_ANON] + st.used[MB_PGTABLE])
+            panic("r1: space %u domain ANON %lu PGTABLE %lu total %lu != ledger anon %lu pt %lu at %s",
+                  i, st.used[MB_ANON], st.used[MB_PGTABLE], st.total, l.anon_quota, l.pt_quota, where);
+    }
+    if (sum != pmm_reserved_count() - r0)
+        panic("r1: sum of tickets %lu != reserved %zu at %s", sum, pmm_reserved_count() - r0, where);
+}
+
+/* 由 R1 推導出的精確票數與配額(只看 Σ 抓不到「兩邊一起漏退」,要靠這個) */
+static void r1_expect(struct vm_space *vs, unsigned long dt, unsigned long quota, const char *where)
+{
+    struct vm_ledger l;
+    vm_space_ledger(vs, &l);
+    if (l.data_tickets != dt || l.anon_quota != quota)
+        panic("r1: data_tickets %lu anon_quota %lu, want %lu / %lu at %s",
+              l.data_tickets, l.anon_quota, dt, quota, where);
+}
+
+/*
+ * 實體平衡(設計「兩種平衡分開驗」):pmm 沒有「已配置」計數,所以掃描每頁的參考計數
+ * (pmm 的每一條配置路徑都把 refs 設為 1,釋放到 0 才清位元圖),已配置 = refs > 0 的頁數。
+ * usable 在基準點量一次(free + allocated),之後每個靜止點都必須相等 —
+ * 與預留無關:預留的頁仍算在 free 裡。掃描前後 free 不變才採用(否則重試),避免與中斷中的配置交錯。
+ */
+static size_t r1_usable0;                       /* 0 = 不做實體核對 */
+
+static size_t r1_pmm_allocated(void)
+{
+    size_t n = 0, np = pmm_total_pages();
+    uintptr_t b = pmm_mem_start();
+    for (size_t i = 0; i < np; i++)
+        if (pmm_refcount((void *)(b + (uintptr_t)i * PAGE_SIZE)) != 0)
+            n++;
+    return n;
+}
+
+static size_t r1_pmm_usable(void)
+{
+    for (int tries = 0; tries < 3; tries++) {
+        size_t f0 = pmm_free_count();
+        size_t a = r1_pmm_allocated();
+        if (pmm_free_count() == f0)
+            return f0 + a;
+    }
+    panic("r1: pmm free count kept changing during the allocated-page scan");
+}
+
+static void r1_phys(const char *where)
+{
+    if (!r1_usable0)
+        return;
+    struct pmm_snapshot s;
+    pmm_snapshot(&s);
+    size_t u = r1_pmm_usable();
+    if (u != r1_usable0 || s.reserved > s.free)
+        panic("r1: free + allocated = %zu, usable %zu (reserved %zu free %zu) at %s",
+              u, r1_usable0, s.reserved, s.free, where);
+}
+
+/*
+ * R1 生命週期情境(r1_lifecycle_test 與 pmm_balance_test 共用)。頁號都相對於 heap:
+ *   父承諾 [0,300)、觸及 [0,200) → fork(範圍 [0,300))→ 父 release [10,150)(140 頁,跨 3 段 64 頁)
+ *   → 子寫 20(只剩子:退票)、子寫 170(共用:用票複製)、父寫 180、父寫 5(共用:複製)
+ *   → 子 release [190,260)(10 頁共用 COW + 60 頁未兌現)→ 子觸及 270 → destroy 子
+ *   → 父寫 151(只剩父:退票)→ 以 [0,10) + [150,300) 兩段再 fork → 父寫 0(複製)、子寫 0(退票)
+ *   → 子 release [150,300)(150 頁,跨 3 段)→ 全部 destroy。
+ * 每一步:Σ 核對 + domain 核對 + 由 R1 推導的精確票數;phys 為真時加上實體平衡。
+ */
+static void r1_scenario(uintptr_t heap, int phys)
+{
+    const uintptr_t PG = PAGE_SIZE;
+    size_t r0 = pmm_reserved_count();
+    struct mb_domain *dp = mb_domain_new(100000), *dc = mb_domain_new(100000), *dc2 = mb_domain_new(100000);
+    struct vm_space *ps = vm_space_create(dp), *cs;
+    struct vm_space *vs[2];
+    struct mb_domain *ds[2];
+    struct mb_stats st;
+    KASSERT(dp && dc && dc2 && ps);
+    vs[0] = ps;
+    ds[0] = dp;
+#define R1_STEP(n, where) do { r1_check(vs, ds, (n), r0, (where)); if (phys) r1_phys(where); } while (0)
+
+    KASSERT(vm_space_commit_anon(ps, heap, 300 * PG) == 0);
+    for (unsigned long i = 0; i < 200; i++)
+        KASSERT(vm_space_fault_anon(ps, heap + i * PG) == 0);
+    R1_STEP(1, "touch");
+    r1_expect(ps, 100, 300, "touch");
+
+    struct vm_range r = { heap, 300 * PG };
+    cs = vm_space_fork(ps, dc, &r, 1);
+    KASSERT(cs);
+    vs[1] = cs;
+    ds[1] = dc;
+    R1_STEP(2, "fork");
+    r1_expect(ps, 300, 300, "fork/parent");             /* 100 未兌現 + 200 COW + TICKET */
+    r1_expect(cs, 300, 300, "fork/child");              /* 父的票 100 + pending 200 */
+
+    /* munmap 式的部分歸還:140 頁共用中的 COW + TICKET,跨 3 段 RELEASE_SEGMENT,每頁退一張票 */
+    vm_space_release_anon(ps, heap + 10 * PG, 140 * PG);
+    R1_STEP(2, "parent-release");
+    r1_expect(ps, 160, 160, "parent-release");
+    r1_expect(cs, 300, 300, "parent-release/child");
+    {
+        uintptr_t pa;
+        unsigned f;
+        KASSERT(vm_space_query(cs, heap + 20 * PG, &pa, &f) == 0 && (f & VM_COW) && (f & VM_TICKET));
+        KASSERT(pmm_refcount((void *)pa) == 1);         /* 父放手後只剩子 */
+    }
+
+    KASSERT(vm_space_fault(cs, heap + 20 * PG, 1) == 0);    /* 只剩子:退票 */
+    KASSERT(vm_space_fault(cs, heap + 170 * PG, 1) == 0);   /* 共用:用子的票複製 */
+    KASSERT(vm_space_fault(ps, heap + 180 * PG, 1) == 0);   /* 共用:用父的票複製 */
+    KASSERT(vm_space_fault(ps, heap + 5 * PG, 1) == 0);
+    R1_STEP(2, "cow-writes");
+    r1_expect(ps, 158, 160, "cow-writes/parent");
+    r1_expect(cs, 298, 300, "cow-writes/child");
+
+    vm_space_release_anon(cs, heap + 190 * PG, 70 * PG);    /* 10 頁共用 COW + 60 頁未兌現,跨 2 段 */
+    R1_STEP(2, "child-release");
+    r1_expect(cs, 228, 230, "child-release");
+    KASSERT(vm_space_fault_anon(cs, heap + 270 * PG) == 0);
+    R1_STEP(2, "child-touch");
+    r1_expect(cs, 227, 230, "child-touch");
+
+    vm_space_destroy(cs);
+    R1_STEP(1, "child-destroy");
+    r1_expect(ps, 158, 160, "child-destroy");
+    mb_stats(dc, &st);
+    KASSERT(st.total == 0);
+
+    KASSERT(vm_space_fault(ps, heap + 151 * PG, 1) == 0);   /* 子已不在:只剩父,退票 */
+    R1_STEP(1, "parent-reuse");
+    r1_expect(ps, 157, 160, "parent-reuse");
+
+    /* 再 fork:範圍避開已歸還的 [10,150)。父的可寫獨佔頁 = 5、151、180 → pending 3 */
+    struct vm_range r2[2] = { { heap, 10 * PG }, { heap + 150 * PG, 150 * PG } };
+    cs = vm_space_fork(ps, dc2, r2, 2);
+    KASSERT(cs);
+    vs[1] = cs;
+    ds[1] = dc2;
+    R1_STEP(2, "refork");
+    r1_expect(ps, 160, 160, "refork/parent");
+    r1_expect(cs, 160, 160, "refork/child");            /* 子的票 = 子承諾的每一頁 */
+
+    KASSERT(vm_space_fault(ps, heap, 1) == 0);              /* 共用:複製 */
+    KASSERT(vm_space_fault(cs, heap, 1) == 0);              /* 只剩子:退票 */
+    R1_STEP(2, "refork-writes");
+    r1_expect(ps, 159, 160, "refork-writes/parent");
+    r1_expect(cs, 159, 160, "refork-writes/child");
+
+    vm_space_release_anon(cs, heap + 150 * PG, 150 * PG);   /* 跨 3 段:每頁都有票 */
+    R1_STEP(2, "refork-release");
+    r1_expect(cs, 9, 10, "refork-release");
+
+    vm_space_destroy(cs);
+    vm_space_destroy(ps);
+#undef R1_STEP
+    KASSERT(pmm_reserved_count() == r0);
+    mb_stats(dp, &st);
+    KASSERT(st.total == 0);
+    mb_stats(dc2, &st);
+    KASSERT(st.total == 0);
+    KASSERT(mb_domain_put(dc2) == 0 && mb_domain_put(dc) == 0 && mb_domain_put(dp) == 0);
+    if (phys)
+        r1_phys("teardown");
+}
+
+/*
+ * I-240 C3.2 R1 生命週期整合:部分歸還(跨多段)、父子交錯 COW 寫入、子 destroy、父再 fork。
+ * 負對照:vm_space_release 對 VM_TICKET 的頁不 tickets++(COW 歸還不退票)→ Σ 仍平衡
+ * (帳本與 pmm 一起沒退),但 "parent-release" 的 r1_expect 得到 data_tickets 300 ≠ 160 而 panic;
+ * 只改帳本不改 pmm(漏 mb_release_bundle 的 reserve)→ r1_check 的 Σ panic。
+ */
+void r1_lifecycle_test(void)
+{
+    uintptr_t heap, hlen;
+    KASSERT(vm_anon_window(0, &heap, &hlen) == 0 && hlen >= 300 * PAGE_SIZE);
+    r1_scenario(heap, 0);
+    kprintf("r1: lifecycle ok (partial releases across 64-page segments, interleaved COW, "
+            "child destroy, re-fork; tickets == reservation at every step)\n");
+}
+
+/*
+ * 實體平衡與預留平衡分開驗:每個靜止點 free + allocated == usable(與預留無關),
+ * 情境跑兩次(第一次吸收 kmalloc 等一次性成長),兩次結束後的 free 必須相同。
+ * 負對照:vm_space_release 對獨佔頁漏掉 pmm_free(洩漏一頁)→ free + allocated 仍等於 usable
+ * (洩漏的頁仍是已配置),但第二次結束後 free 少 1 →「leaked」panic。這正是兩種平衡要分開的原因。
+ */
+void pmm_balance_test(void)
+{
+    uintptr_t heap, hlen;
+    KASSERT(vm_anon_window(0, &heap, &hlen) == 0 && hlen >= 300 * PAGE_SIZE);
+    r1_usable0 = r1_pmm_usable();
+    r1_phys("baseline");
+    r1_scenario(heap, 1);
+    size_t f1 = pmm_free_count();
+    r1_scenario(heap, 1);
+    size_t f2 = pmm_free_count();
+    if (f2 != f1)
+        panic("r1: second lifecycle run leaked %ld pages (free %zu -> %zu)", (long)f1 - (long)f2, f1, f2);
+    size_t u = r1_usable0;
+    r1_usable0 = 0;
+    kprintf("r1: physical balance ok (free + allocated == %zu usable pages at every quiescent point; "
+            "repeat run returned every page)\n", u);
+}
+
+/*
+ * 6.2「映像頁不記 IMAGE」:逐類核對 map_charged 的帳(只有 IMAGE 增加,ANON / STACK 不變,
+ * total 只多 IMAGE + 新頁表),fork 後子 domain 照抄 IMAGE,destroy 後全部退回。
+ * 既有測試中抓到這個回歸的是 image_ticket_test 的 KASSERT(st.used[MB_IMAGE] == 8)
+ * (mem_test.c:1208,HEAD c8d68ed);這裡另外抓「記成別的類別」與「fork / destroy 不搬 / 不退」。
+ * 限制:exec 真正的載入路徑(proc.c:289 呼叫 vm_space_map_charged(..., MB_IMAGE, ...))在這裡呼叫不到,
+ * 改類別的回歸需要使用者層 exec 測試或靜態探針。
+ */
+void image_class_test(void)
+{
+    uintptr_t base = 0x40000000u + 0x00100000u;
+#if UINTPTR_MAX > 0xffffffffu
+    base = 0x100000000ul + 0x00100000u;
+#endif
+    size_t r0 = pmm_reserved_count();
+    struct mb_domain *dp = mb_domain_new(100000), *dc = mb_domain_new(100000);
+    struct vm_space *ps = vm_space_create(dp);
+    struct mb_stats s0, s1;
+    KASSERT(dp && dc && ps);
+    mb_stats(dp, &s0);
+    for (int i = 0; i < 8; i++)
+        KASSERT(vm_space_map_charged(ps, MB_IMAGE, base + i * PAGE_SIZE, VM_READ | VM_WRITE));
+    mb_stats(dp, &s1);
+    if (s1.used[MB_IMAGE] - s0.used[MB_IMAGE] != 8 || s1.used[MB_ANON] != s0.used[MB_ANON] ||
+        s1.used[MB_STACK] != s0.used[MB_STACK] ||
+        s1.total - s0.total != 8 + (s1.used[MB_PGTABLE] - s0.used[MB_PGTABLE]))
+        panic("image: map_charged charged IMAGE +%lu ANON +%lu STACK +%lu total +%lu",
+              s1.used[MB_IMAGE] - s0.used[MB_IMAGE], s1.used[MB_ANON] - s0.used[MB_ANON],
+              s1.used[MB_STACK] - s0.used[MB_STACK], s1.total - s0.total);
+    struct vm_range r = { base, 8 * PAGE_SIZE };
+    struct vm_space *cs = vm_space_fork(ps, dc, &r, 1);
+    KASSERT(cs);
+    mb_stats(dc, &s1);
+    KASSERT(s1.used[MB_IMAGE] == 8 && s1.used[MB_ANON] == 0);
+    vm_space_destroy(cs);
+    mb_stats(dc, &s1);
+    KASSERT(s1.total == 0);
+    vm_space_destroy(ps);
+    mb_stats(dp, &s1);
+    KASSERT(s1.total == 0 && pmm_reserved_count() == r0);
+    KASSERT(mb_domain_put(dc) == 0 && mb_domain_put(dp) == 0);
+    kprintf("image: private pages charged to IMAGE only; fork copied and destroy returned them\n");
+}
+
+/*
+ * 6.2「exec 不呼叫 mb_exec_end」:探針 x = limit - total + 1 頁,落在 limit 之上、limit + pending 之內。
+ * 交易中帶憑證 → 成功(正對照,證明探針分得出兩種狀態);mb_exec_end 之後 → -E_NOMEM、帳不變。
+ * 另外新空間刻意「不」先 vm_space_clear_txn:它仍綁著憑證,end 之後經由 VM 的承諾也必須照一般上限。
+ * 負對照:拿掉 mb_exec_end(或 end 不清 active)→ 兩個「after end」斷言都失敗。
+ * 限制:proc.c 的 exec 路徑是否每條出口都呼叫 end,要使用者層 exec 測試或靜態探針。
+ */
+void exec_txn_end_test(void)
+{
+    uintptr_t heap, hlen;
+    KASSERT(vm_anon_window(0, &heap, &hlen) == 0);
+    size_t r0 = pmm_reserved_count();
+    struct mb_domain *d = mb_domain_new(400);
+    struct mb_exec_txn t;
+    struct mb_stats st, s1;
+    KASSERT(d);
+    struct vm_space *old = vm_space_create(d);
+    KASSERT(old && vm_space_commit_anon(old, heap, 300 * PAGE_SIZE) == 0);
+    KASSERT(mb_exec_begin(d, vm_space_quota_total(old), &t) == 0);
+    struct vm_space *nw = vm_space_create_txn(d, &t);
+    KASSERT(nw && vm_space_commit_anon(nw, heap, 300 * PAGE_SIZE) == 0);
+    vm_space_destroy(old);                                 /* 舊空間退完:total 回到上限內 */
+    mb_stats(d, &st);
+    KASSERT(st.total <= st.limit);
+    unsigned long x = st.limit - st.total + 1;
+    KASSERT(x <= t.pending);                               /* 探針落在放寬區間內 */
+    KASSERT(mb_quota_add_txn(d, MB_KOBJ, x, &t) == 0);    /* 正對照:交易中放寬 */
+    KASSERT(mb_quota_sub(d, MB_KOBJ, x) == 0);
+
+    mb_exec_end(&t);
+    mb_stats(d, &st);
+    if (mb_quota_add_txn(d, MB_KOBJ, x, &t) != -E_NOMEM)
+        panic("exec: charge after mb_exec_end still used the relaxed limit");
+    if (vm_space_commit_anon(nw, heap + 300 * PAGE_SIZE, x * PAGE_SIZE) != -E_NOMEM)
+        panic("exec: new space still bound to an ended transaction committed past the limit");
+    mb_stats(d, &s1);
+    KASSERT(s1.total == st.total && s1.used[MB_KOBJ] == st.used[MB_KOBJ]);
+    vm_space_clear_txn(nw);
+    vm_space_destroy(nw);
+    mb_stats(d, &st);
+    KASSERT(st.total == 0 && pmm_reserved_count() == r0 && mb_domain_put(d) == 0);
+    kprintf("exec: after mb_exec_end the token no longer relaxes the limit (probe %lu pages)\n", x);
+}
+
+/*
+ * 6.2 / 6.3「交易中途調低 limit」:最終檢查以檢查當下的 limit 為準。
+ * 正對照:調低前通過;limit 恰好等於新空間用量時通過(邊界);再低 1 → -E_NOMEM、
+ * 不算帳務錯誤、沒有副作用;交易中的放寬上限也跟著變低(新承諾被拒絕)。
+ * 失敗路徑照 proc.c:清憑證、銷毀新空間、結束交易,舊空間的帳原封不動。
+ * 負對照:check_final 改用 begin 時記下的 limit(或用 limit + pending 比較)→「lowered」斷言失敗。
+ */
+void exec_txn_lower_limit_test(void)
+{
+    uintptr_t heap, hlen;
+    KASSERT(vm_anon_window(0, &heap, &hlen) == 0);
+    size_t r0 = pmm_reserved_count();
+    struct mb_domain *d = mb_domain_new(400);
+    struct mb_exec_txn t;
+    struct mb_stats st, s1;
+    KASSERT(d);
+    struct vm_space *old = vm_space_create(d);
+    KASSERT(old && vm_space_commit_anon(old, heap, 300 * PAGE_SIZE) == 0);
+    KASSERT(mb_exec_begin(d, vm_space_quota_total(old), &t) == 0);
+    struct vm_space *nw = vm_space_create_txn(d, &t);
+    KASSERT(nw && vm_space_commit_anon(nw, heap, 300 * PAGE_SIZE) == 0);
+
+    unsigned long old_now = vm_space_quota_total(old);
+    mb_stats(d, &st);
+    unsigned long need = st.total - old_now;               /* 舊空間退完之後的用量 = 新空間的帳 */
+    KASSERT(need > 0 && need <= st.limit && mb_exec_check_final(&t, old_now) == 0);
+    mb_set_limit(d, need);
+    KASSERT(mb_exec_check_final(&t, old_now) == 0);       /* 邊界:恰好等於上限 */
+    mb_set_limit(d, need - 1);
+    unsigned long err0 = mb_accounting_errors();
+    mb_stats(d, &st);
+    if (mb_exec_check_final(&t, old_now) != -E_NOMEM)
+        panic("exec: final check accepted after the limit was lowered to %lu (need %lu)", need - 1, need);
+    KASSERT(mb_accounting_errors() == err0);
+    KASSERT(vm_space_commit_anon(nw, heap + 300 * PAGE_SIZE, PAGE_SIZE) == -E_NOMEM);   /* 放寬上限也變低 */
+    mb_stats(d, &s1);
+    KASSERT(s1.total == st.total);
+
+    vm_space_clear_txn(nw);
+    vm_space_destroy(nw);
+    mb_exec_end(&t);
+    mb_stats(d, &st);
+    KASSERT(st.total == vm_space_quota_total(old));
+    vm_space_destroy(old);
+    mb_stats(d, &st);
+    KASSERT(st.total == 0 && pmm_reserved_count() == r0 && mb_domain_put(d) == 0);
+    kprintf("exec: lowering the limit mid-transaction makes the final check refuse (need %lu)\n", need);
+}
+
+/*
  * I-240 C3.2 (b1) 第 4、5 步:fork 的兩筆帳(R1)。父空間承諾 15 頁、觸及其中 10 頁,fork 之後:
  * 子空間 15 張票(每一頁承諾一張);父空間 5 張未兌現 + 10 張(那 10 頁變成 COW + TICKET)。
  * 一般配置把記憶體用到預留邊界之後:父寫入 10 頁(共用中,用票複製)、子寫入同樣 10 頁
@@ -1179,6 +1544,373 @@ void stack_ticket_test(void)
     KASSERT(pmm_reserved_count() == r0 && mb_domain_put(d) == 0);
     kprintf("stack: a committed 255-page stack slot was fully touched after ordinary allocations "
             "reached the reservation\n");
+}
+
+/*
+ * I-240 C3.2 stack 測試 T1/T2/T4/T5 補強(Codex 166)。
+ * proc.c 的 alloc_user_stack / commit_user_stack / release_user_stack 與 proc_mem.c 的 stack fault
+ * 過濾都是 static、而且要有使用者行程,kernel 自我測試(排程器啟動前)叫不到。下面的 ts_* 在
+ * vm / stack 格層級逐行鏡射那些步驟(每個函式註明對應的產品行),帳本走的是真的 vm.c / membudget.c / pmm.c。
+ * 因此:vm.c / membudget.c / pmm.c 的負對照會讓這裡失敗;proc.c / proc_mem.c 的負對照必須同時改鏡射
+ * (或之後在 proc.c 加測試鉤子,像 proc_thread_failure_probe 那樣,讓這裡直接呼叫產品程式碼)。
+ * 「併發」以確定的交錯模擬(A、B 都先佔格,再依序承諾),不是兩條真的執行緒。
+ */
+#define TS_SLOTS 16u                         /* = PROC_MAX_THREADS(kernel/proc_internal.h:57) */
+#define TS_TOUCH_ON_COMMIT 4u                /* = USER_STACK_PAGES(kernel/proc_internal.h:56) */
+
+struct ts_geo { uintptr_t sbase, slen, slot; unsigned long pages; };
+
+static void ts_geo_get(struct ts_geo *g)
+{
+    KASSERT(vm_anon_window(2, &g->sbase, &g->slen) == 0);   /* 第三個承諾窗 = 16 格 stack 區 */
+    g->slot = g->slen / TS_SLOTS;
+    KASSERT(g->slen % TS_SLOTS == 0 && g->slot % PAGE_SIZE == 0 && g->slot >= 8 * PAGE_SIZE);
+    g->pages = g->slot / PAGE_SIZE - 1;                       /* 保護頁不承諾(proc.c:50) */
+}
+static uintptr_t ts_top(const struct ts_geo *g, unsigned s)   { return g->sbase + g->slen - (uintptr_t)s * g->slot; }  /* proc.c:54 */
+static uintptr_t ts_guard(const struct ts_geo *g, unsigned s) { return ts_top(g, s) - g->slot; }                      /* slot_base */
+static uintptr_t ts_base(const struct ts_geo *g, unsigned s)  { return ts_guard(g, s) + PAGE_SIZE; }
+
+/* proc.c:84-92:佔最低的空格 */
+static int ts_claim(uint32_t *slots)
+{
+    for (unsigned i = 0; i < TS_SLOTS; i++)
+        if (!(*slots & (1u << i))) {
+            *slots |= 1u << i;
+            return (int)i;
+        }
+    return -1;
+}
+/* proc.c:59-68:承諾整格並以票兌現最上面幾頁;失敗回傳非 0、什麼都沒改 */
+static int ts_commit(struct vm_space *vs, const struct ts_geo *g, unsigned s)
+{
+    int rc = vm_space_commit(vs, MB_STACK, ts_base(g, s), g->pages * PAGE_SIZE);
+    if (rc != 0)
+        return rc;
+    for (unsigned i = 1; i <= TS_TOUCH_ON_COMMIT; i++)
+        KASSERT(vm_space_fault_anon(vs, ts_top(g, s) - i * PAGE_SIZE) == 0);
+    return 0;
+}
+/* proc.c:99:承諾失敗,只放自己的格(負對照:改成 *slots = 0) */
+static void ts_rollback(uint32_t *slots, unsigned s) { *slots &= ~(1u << s); }
+/* proc.c:109-117:先清 ready、再退頁與票、最後放格 */
+static void ts_release(struct vm_space *vs, const struct ts_geo *g, uint32_t *slots, uint32_t *ready, unsigned s)
+{
+    *ready &= ~(1u << s);
+    vm_space_release(vs, MB_STACK, ts_base(g, s), g->pages * PAGE_SIZE);
+    *slots &= ~(1u << s);
+}
+/* proc_mem.c:85-98:stack 區的 fault 過濾(格不在、保護頁、未 ready → -1;否則用票兌現) */
+static int ts_fault(struct vm_space *vs, const struct ts_geo *g, uint32_t slots, uint32_t ready, uintptr_t addr)
+{
+    if (addr < g->sbase || addr >= g->sbase + g->slen)
+        return -1;
+    unsigned s = (unsigned)((g->sbase + g->slen - 1 - addr) / g->slot);
+    uintptr_t page = addr & ~(uintptr_t)(PAGE_SIZE - 1);
+    if (s >= TS_SLOTS || !(slots & (1u << s)) || page == ts_guard(g, s))
+        return -1;
+    if (!(ready & (1u << s)))
+        return -1;
+    return vm_space_fault_anon(vs, page) < 0 ? -1 : 0;
+}
+
+/* 一般配置吃到底線,再用應急配置把底線也吃光:之後只剩預留(兌現)拿得到頁 */
+static void ts_exhaust(void **normal, void **emerg)
+{
+    while (chain_take(normal, take_normal))
+        ;
+    if (emerg)
+        while (chain_take(emerg, take_emergency))
+            ;
+    KASSERT(pmm_alloc() == NULL);
+}
+
+static int ts_ledger_eq(const struct vm_ledger *a, const struct vm_ledger *b)
+{
+    return a->data_tickets == b->data_tickets && a->pt_tickets == b->pt_tickets &&
+           a->anon_tables == b->anon_tables && a->anon_quota == b->anon_quota && a->pt_quota == b->pt_quota;
+}
+static int ts_stats_eq(const struct mb_stats *a, const struct mb_stats *b)
+{
+    if (a->total != b->total)
+        return 0;
+    for (unsigned c = 0; c < MB_NCLASS; c++)
+        if (a->used[c] != b->used[c])
+            return 0;
+    return 1;
+}
+static void ts_pt_bound(struct vm_space *vs, const char *where)
+{
+    struct vm_ledger l;
+    vm_space_ledger(vs, &l);
+    if (l.anon_tables + l.pt_tickets > vm_anon_pt_max())
+        panic("stack: E %lu + T %lu > M %lu at %s", l.anon_tables, l.pt_tickets, vm_anon_pt_max(), where);
+}
+
+/*
+ * T5 + Codex 166:記憶體耗盡時歸還(執行緒結束)。已承諾並觸及 n 頁的一格,在一般配置與應急底線都被吃光、
+ * 而且 FI_PMM 第 1 次就注入失敗的情況下歸還:不 panic、不做任何一般配置(failinj 沒有觸發)、
+ * 格與 ready 位元清掉、退 255-n 張資料票、n 頁回到 pmm、STACK 配額 -255、E + T <= M、
+ * destroy 後 pmm 預留回到基準。
+ * 負對照:vm_space_release(vm.c:1290 起)在歸還路徑做一次一般配置(例如段開始時 pmm_alloc 一頁暫存)
+ *   → failinj_fired() 為 1(或拿到 NULL 而 panic),「歸還不配置」斷言失敗。
+ */
+void stack_release_exhausted_test(void)
+{
+    struct ts_geo g;
+    ts_geo_get(&g);
+    size_t r0 = pmm_reserved_count();
+    struct mb_domain *d = mb_domain_new(100000);
+    struct vm_space *vs = vm_space_create(d);
+    KASSERT(d && vs);
+    uint32_t slots = 0, ready = 0;
+
+    int s = ts_claim(&slots);
+    KASSERT(s == 0 && ts_commit(vs, &g, (unsigned)s) == 0);
+    ready |= 1u << s;
+    const unsigned long touched = 64;                      /* 含 commit 已兌現的 4 頁 */
+    for (unsigned long i = TS_TOUCH_ON_COMMIT + 1; i <= touched; i++)
+        KASSERT(ts_fault(vs, &g, slots, ready, ts_top(&g, (unsigned)s) - i * PAGE_SIZE) == 0);
+
+    struct vm_ledger l1, l2;
+    struct mb_stats st1, st2;
+    vm_space_ledger(vs, &l1);
+    KASSERT(l1.data_tickets == g.pages - touched);
+    anon_check(vs, r0, "release-exhausted: before");
+    ts_pt_bound(vs, "release-exhausted: before");
+
+    void *normal = NULL, *emerg = NULL;
+    ts_exhaust(&normal, &emerg);
+    mb_stats(d, &st1);
+    KASSERT(st1.used[MB_STACK] == g.pages);
+    size_t res1 = pmm_reserved_count(), free1 = pmm_free_count();
+
+    failinj_arm(FI_PMM, 1);                                /* 歸還路徑若做一般配置就會被抓到 */
+    ts_release(vs, &g, &slots, &ready, (unsigned)s);
+    int fired = failinj_fired();
+    failinj_disarm();
+    if (fired)
+        panic("stack: release under exhaustion made an ordinary allocation");
+
+    vm_space_ledger(vs, &l2);
+    mb_stats(d, &st2);
+    KASSERT(slots == 0 && ready == 0);
+    KASSERT(l2.data_tickets == 0 && l2.pt_tickets == l1.pt_tickets && l2.anon_tables == l1.anon_tables);
+    KASSERT(st2.used[MB_STACK] == 0 && st2.total == st1.total - g.pages);
+    KASSERT(pmm_reserved_count() == res1 - (g.pages - touched));   /* 只退未兌現的票,一張不多不少 */
+    KASSERT(pmm_free_count() == free1 + touched);                   /* 觸及過的頁全部回到 pmm */
+    anon_check(vs, r0, "release-exhausted: after");
+    ts_pt_bound(vs, "release-exhausted: after");
+
+    chain_free(&emerg);
+    chain_free(&normal);
+    KASSERT(ts_claim(&slots) == s);                         /* 格可重用 */
+    vm_space_destroy(vs);
+    mb_stats(d, &st2);
+    KASSERT(st2.total == 0 && pmm_reserved_count() == r0 && mb_domain_put(d) == 0);
+    kprintf("stack: slot with %lu touched pages released with memory exhausted: %lu tickets and %lu pages "
+            "returned, no ordinary allocation\n", touched, g.pages - touched, touched);
+}
+
+/*
+ * T4:兩個建立者都先佔格(A = 0、B = 1),A 承諾成功後 B 承諾失敗 — 一次因配額(mb_set_limit),
+ * 一次因 pmm 預留(一般配置吃到底線)。B 只放自己的格:stack_slots / stack_ready == A 的位元,
+ * A 的帳本、domain 用量、pmm 預留與 B 失敗前完全相同,A 整格仍可全部觸及;條件恢復後 B 可以重拿第 1 格。
+ * failinj 不適用於注入 commit 失敗:vm_space_commit 不做一般配置(只呼叫 pmm_reserve),
+ * 所以這裡反過來用 FI_PMM 證明「承諾路徑沒有一般配置」。
+ * 負對照:alloc_user_stack 的失敗回退(proc.c:99)改成清掉整張 stack_slots(鏡射 ts_rollback 同改)
+ *   → 「slots == A 的位元」斷言失敗;vm_space_commit 失敗時仍加了 data_tickets(vm.c:1246-1251 搬到 if 外)
+ *   → 帳本相等斷言失敗。
+ */
+void stack_concurrent_fail_test(void)
+{
+    struct ts_geo g;
+    ts_geo_get(&g);
+    size_t r0 = pmm_reserved_count();
+    struct mb_domain *d = mb_domain_new(100000);
+    struct vm_space *vs = vm_space_create(d);
+    KASSERT(d && vs);
+    uint32_t slots = 0, ready = 0;
+
+    int a = ts_claim(&slots), b = ts_claim(&slots);         /* 兩者都已佔格,尚未承諾 */
+    KASSERT(a == 0 && b == 1 && slots == 3u);
+    KASSERT(ts_commit(vs, &g, (unsigned)a) == 0);
+    ready |= 1u << a;
+
+    struct vm_ledger la, l;
+    struct mb_stats sa, st;
+    vm_space_ledger(vs, &la);
+    mb_stats(d, &sa);
+    size_t ra = pmm_reserved_count();
+
+    for (int round = 0; round < 2; round++) {
+        void *normal = NULL;
+        if (round == 0)
+            mb_set_limit(d, sa.total + g.pages - 1);        /* 差一頁:B 的配額不夠 */
+        else
+            ts_exhaust(&normal, NULL);                      /* pmm_reserve 失敗 */
+        failinj_arm(FI_PMM, 1);
+        int rc = ts_commit(vs, &g, (unsigned)b);
+        int fired = failinj_fired();
+        failinj_disarm();
+        KASSERT(rc == -E_NOMEM && !fired);
+        ts_rollback(&slots, (unsigned)b);
+
+        vm_space_ledger(vs, &l);
+        mb_stats(d, &st);
+        if (slots != (1u << a) || ready != (1u << a))
+            panic("stack: T4 round %d failed creator left slots 0x%x ready 0x%x", round, slots, ready);
+        KASSERT(ts_ledger_eq(&l, &la) && ts_stats_eq(&st, &sa) && pmm_reserved_count() == ra);
+        anon_check(vs, r0, round ? "T4 reserve-fail" : "T4 quota-fail");
+
+        chain_free(&normal);
+        mb_set_limit(d, 100000);
+        b = ts_claim(&slots);                               /* 重拿:仍是第 1 格 */
+        KASSERT(b == 1);
+    }
+
+    /* A 不受影響:整格觸及成功、資料票用完 */
+    for (unsigned long i = TS_TOUCH_ON_COMMIT + 1; i <= g.pages; i++)
+        KASSERT(ts_fault(vs, &g, slots, ready, ts_top(&g, (unsigned)a) - i * PAGE_SIZE) == 0);
+    vm_space_ledger(vs, &l);
+    KASSERT(l.data_tickets == 0);
+
+    /* 條件恢復後 B 承諾成功 */
+    KASSERT(ts_commit(vs, &g, (unsigned)b) == 0);
+    ready |= 1u << b;
+    vm_space_ledger(vs, &l);
+    KASSERT(l.data_tickets == g.pages - TS_TOUCH_ON_COMMIT);
+    ts_pt_bound(vs, "T4 both");
+    ts_release(vs, &g, &slots, &ready, (unsigned)b);
+    ts_release(vs, &g, &slots, &ready, (unsigned)a);
+    KASSERT(slots == 0 && ready == 0);
+    mb_stats(d, &st);
+    KASSERT(st.used[MB_STACK] == 0);
+    vm_space_destroy(vs);
+    mb_stats(d, &st);
+    KASSERT(st.total == 0 && pmm_reserved_count() == r0 && mb_domain_put(d) == 0);
+    kprintf("stack: T4 failed slot commit (quota, reservation) released only its own slot; "
+            "the other slot's tickets were untouched\n");
+}
+
+/*
+ * T1 完整性:新位址空間承諾一格(所有中間表都還不存在,承諾時預付 pt 票),再把一般配置與應急底線吃光、
+ * FI_PMM 第 1 次就注入失敗,第一次觸及仍成功:建了幾張表就正好消耗幾張 pt 票(T 減 = E 增)、
+ * 沒有一般配置;整格觸及後 T == 0、E + T <= M。
+ * 負對照:vm_space_commit 不收 pt 票(vm.c:1240 的 pt 改成 0、或拿掉 vm.c:1249 的 pt_tickets += pt)
+ *   → 第一次觸及在 new_table panic「anonymous-memory table ... without a prepaid ticket」(vm.c:270-271);
+ *   new_table 的 WALK_ANON 改用 table_alloc → failinj 觸發 / 飽和時拿不到表。
+ */
+void stack_pt_boundary_test(void)
+{
+    struct ts_geo g;
+    ts_geo_get(&g);
+    size_t r0 = pmm_reserved_count();
+    struct mb_domain *d = mb_domain_new(100000);
+    struct vm_space *vs = vm_space_create(d);
+    KASSERT(d && vs);
+    const unsigned s = 0;
+    KASSERT(vm_space_commit(vs, MB_STACK, ts_base(&g, s), g.pages * PAGE_SIZE) == 0);  /* 先不兌現 */
+    struct vm_ledger l0, l1;
+    vm_space_ledger(vs, &l0);
+    /* PGTABLE 配額 = 根表 1 頁(建立位址空間時就記,vm.c 的 vm_space_create)+ 預付的中間表票 */
+    if (!(l0.pt_tickets > 0 && l0.anon_tables == 0 && l0.pt_quota == l0.pt_tickets + 1))
+        panic("T1 commit ledger: pt_tickets %lu anon_tables %lu pt_quota %lu", l0.pt_tickets, l0.anon_tables, l0.pt_quota);
+    ts_pt_bound(vs, "T1 commit");
+
+    void *normal = NULL, *emerg = NULL;
+    ts_exhaust(&normal, &emerg);
+    uintptr_t va = ts_top(&g, s) - PAGE_SIZE;
+    failinj_arm(FI_PMM, 1);
+    int rc = vm_space_fault_anon(vs, va);
+    int fired = failinj_fired();
+    failinj_disarm();
+    KASSERT(rc == 0 && !fired);
+    vm_space_ledger(vs, &l1);
+    KASSERT(l1.anon_tables > 0 && l0.pt_tickets - l1.pt_tickets == l1.anon_tables);   /* 每張表一張票 */
+    KASSERT(l1.data_tickets == g.pages - 1 && l1.pt_quota == l0.pt_quota);           /* 配額在承諾時已記 */
+    uintptr_t pa;
+    unsigned fl;
+    KASSERT(vm_space_query(vs, va, &pa, &fl) == 0 && (fl & VM_WRITE));
+    anon_check(vs, r0, "T1 first touch");
+
+    for (uintptr_t a = va; a > ts_base(&g, s); a -= PAGE_SIZE)
+        KASSERT(vm_space_fault_anon(vs, a - PAGE_SIZE) == 0);
+    vm_space_ledger(vs, &l1);
+    KASSERT(l1.data_tickets == 0 && l1.pt_tickets == 0);
+    ts_pt_bound(vs, "T1 full");
+    anon_check(vs, r0, "T1 full");
+
+    chain_free(&emerg);
+    chain_free(&normal);
+    vm_space_release(vs, MB_STACK, ts_base(&g, s), g.pages * PAGE_SIZE);
+    vm_space_destroy(vs);
+    struct mb_stats st;
+    mb_stats(d, &st);
+    KASSERT(st.total == 0 && pmm_reserved_count() == r0 && mb_domain_put(d) == 0);
+    kprintf("stack: T1 first touch at the reservation boundary built %lu tables from %lu prepaid tickets\n",
+            l0.pt_tickets, l0.pt_tickets);
+}
+
+/*
+ * T2 保護頁:格的最低一頁不承諾、不對映。觸及它(頁內任一位址、讀或寫)在 VM 層與 stack fault 過濾層
+ * 都回傳 -1(行程因此被終止),帳本、domain 用量、pmm 預留都不變;STACK 配額只有 255 頁。
+ * 正對照:同一格的最低可用頁(保護頁上一頁)照常用一張票兌現。
+ * 限制:真正的「終止行程」路徑(proc_page_fault → 訊號)要使用者行程,這裡只驗到過濾器回傳 -1;
+ * 完整的 T2 還需要一個使用者模式測試(例如 crash=guard)。
+ * 負對照:commit_user_stack 把保護頁也承諾(proc.c:61 的 base 少加 PAGE_SIZE,鏡射 ts_base 同改)
+ *   → used[STACK] == 255 斷言失敗;拿掉 proc_mem.c:90 的 page == slot_base(鏡射 ts_fault 同改)
+ *   → 保護頁觸及回傳 0 並消耗一張票,「帳本不變」斷言失敗。
+ */
+void stack_guard_test(void)
+{
+    struct ts_geo g;
+    ts_geo_get(&g);
+    size_t r0 = pmm_reserved_count();
+    struct mb_domain *d = mb_domain_new(100000);
+    struct vm_space *vs = vm_space_create(d);
+    KASSERT(d && vs);
+    uint32_t slots = 0, ready = 0;
+    int s = ts_claim(&slots);
+    KASSERT(s == 0 && ts_commit(vs, &g, (unsigned)s) == 0);
+    ready |= 1u << s;
+    uint32_t s1 = (uint32_t)ts_claim(&slots);               /* 下面一格也在用:保護頁兩側都是有效 stack */
+    KASSERT(s1 == 1 && ts_commit(vs, &g, s1) == 0);
+    ready |= 1u << s1;
+
+    struct vm_ledger l0, l;
+    struct mb_stats st0, st;
+    vm_space_ledger(vs, &l0);
+    mb_stats(d, &st0);
+    KASSERT(st0.used[MB_STACK] == 2 * g.pages);              /* 保護頁沒有承諾 */
+    size_t res0 = pmm_reserved_count();
+
+    uintptr_t guard = ts_guard(&g, (unsigned)s);
+    const uintptr_t probes[] = { guard, guard + 8, guard + PAGE_SIZE - 1 };
+    for (unsigned i = 0; i < sizeof probes / sizeof probes[0]; i++) {
+        uintptr_t pa;
+        unsigned fl;
+        KASSERT(vm_space_query(vs, probes[i], &pa, &fl) != 0);
+        KASSERT(vm_space_fault(vs, probes[i], 1) == -1 && vm_space_fault(vs, probes[i], 0) == -1);
+        KASSERT(ts_fault(vs, &g, slots, ready, probes[i]) == -1);
+    }
+    vm_space_ledger(vs, &l);
+    mb_stats(d, &st);
+    if (!ts_ledger_eq(&l, &l0) || !ts_stats_eq(&st, &st0) || pmm_reserved_count() != res0)
+        panic("stack: touching the guard page changed the ledger (data %lu -> %lu)", l0.data_tickets, l.data_tickets);
+
+    /* 正對照:保護頁上一頁照常兌現,正好用一張票 */
+    KASSERT(ts_fault(vs, &g, slots, ready, ts_base(&g, (unsigned)s)) == 0);
+    vm_space_ledger(vs, &l);
+    KASSERT(l.data_tickets == l0.data_tickets - 1);
+    anon_check(vs, r0, "T2");
+
+    ts_release(vs, &g, &slots, &ready, s1);
+    ts_release(vs, &g, &slots, &ready, (unsigned)s);
+    vm_space_destroy(vs);
+    mb_stats(d, &st);
+    KASSERT(st.total == 0 && pmm_reserved_count() == r0 && mb_domain_put(d) == 0);
+    kprintf("stack: T2 guard page faults without consuming tickets\n");
 }
 
 /*

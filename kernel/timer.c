@@ -1,7 +1,7 @@
 /*
  * timer.c - 系統時鐘(與架構無關)
  *
- * 架構層讓硬體計時器每秒產生 hz 次中斷,每次中斷呼叫 timer_tick()。
+ * 架構層讓每顆 CPU 的硬體計時器每秒產生 hz 次中斷,每次中斷呼叫 timer_tick()。
  * tick 計數是 kernel 的時間基準,之後的排程器也靠它切換工作。
  */
 #include "arch.h"
@@ -11,46 +11,176 @@
 #include "timer.h"
 #include "watchdog.h"
 
-/* volatile:在中斷處理程式中被修改,主程式每次都必須重新讀取 */
+/*
+ * 系統時間(I-337):任何一顆 CPU 都可以推進,不依賴第 0 顆。
+ *
+ * 真實時間的來源是所有 CPU 共用的硬體計數器(arch_clock_count:i386 TSC、RISC-V time CSR、
+ * AArch64 cntpct_el0)。g_deadline 是「下一個 tick 應該發生的計數值」。每顆 CPU 自己的計時器中斷
+ * 都看一次:計數已經超過 g_deadline,就用 trylock 搶推進權;搶到的 CPU 把 tick 補到現在,
+ * 並負責這幾個 tick 的全系統工作(喚醒休眠者、防飢餓、即時工作的期限,見 sched_tick_global)。
+ * 沒搶到的不等待(另一顆 CPU 正在做同一件事)。所以第 0 顆 CPU 關中斷或卡住時,
+ * 其他 CPU 照樣推進時間、叫醒休眠者。
+ *
+ * 速度:沒到期時每個 tick 只多一次共用快取列的讀取與一次計數器讀取;到期時每個 tick 只有
+ * 「最先到的那顆」做一次原子操作成功,其他頂多一次失敗的 trylock,不自旋。
+ * 安全:ticks 與 g_deadline 只在 time_lk 之內改,而且只會變大(單調);讀取端用序號
+ * (seqcount)拿到一致的一對,i386 上 64 位元不會讀到一半。
+ *
+ * 沒有共用計數器時(i386 沒有 TSC:g_iv == 0)退回舊做法:只有第 0 顆 CPU 推進,每次中斷 1 個 tick。
+ */
 static volatile uint64_t ticks;
+static volatile uint64_t g_deadline;   /* 下一個 tick 的計數值;g_iv == 0 時不用 */
+/* 一個 tick 相當於多少計數;0 = 沒有共用計數器。只在 timer_init 寫一次(中斷開啟、其他 CPU 啟動之前),
+   之後唯讀,所以不用原子操作(i386 上 64 位元的 __atomic 會需要 libatomic) */
+static uint64_t g_iv;
+/* 共用計數器路徑是否啟用(I-337 同步驗證)。開機時為 1:smp_init 之前只有第 0 顆 CPU 有計時器中斷,
+   用它自己的計數器推進不會有跨 CPU 的問題。kernel/clksync.c 驗證任何一顆 AP 失敗時呼叫
+   timer_shared_disable() 清成 0,之後退回「只有第 0 顆推進」的舊路徑(降級狀態)。只會由 1 變 0 */
+static volatile int g_shared = 1;
+static volatile uint32_t time_seq;     /* 奇數 = 寫入中 */
+static struct spinlock time_lk = SPINLOCK_INIT("timer-time", LK_TIME);
+static uint32_t adv_count[MAX_CPUS];   /* 每顆 CPU 推進過幾次系統時間(量測與測試用;time_lk 之內寫) */
 static unsigned tick_hz;
+
+/* 一次最多補幾個 tick:超過時(整台機器被暫停,例如除錯器)放棄補記、重新對時 */
+#define REAL_CATCHUP_MAX 100
+
+static void time_read(uint64_t *t, uint64_t *d)
+{
+    uint32_t s;
+    do {
+        s = __atomic_load_n(&time_seq, __ATOMIC_ACQUIRE);
+        *t = ticks;
+        *d = g_deadline;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    } while ((s & 1) || s != __atomic_load_n(&time_seq, __ATOMIC_RELAXED));
+}
+
+/* 呼叫時持有 time_lk */
+static void time_write(uint64_t t, uint64_t d)
+{
+    __atomic_store_n(&time_seq, time_seq + 1, __ATOMIC_RELAXED);
+    /* 完整屏障(Codex 209):「寫入中」的奇數標記必須先於下面的資料寫入被其他 CPU 看到。
+       release 屏障只保證「之前的」存取不會被排到之後,擋不住後面的資料寫入跑到奇數標記前面
+       (aarch64 / riscv64 是弱記憶體序) */
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    ticks = t;
+    g_deadline = d;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);     /* 資料寫完,才公布偶數(寫完) */
+    __atomic_store_n(&time_seq, time_seq + 1, __ATOMIC_RELAXED);
+}
 
 void timer_init(unsigned hz)
 {
     tick_hz = hz;
     arch_timer_init(hz);
+    uint64_t iv = arch_tick_interval();
+    if (iv && arch_clock_hz()) {
+        g_deadline = arch_clock_count() + iv;
+        g_iv = iv;
+    }
+}
+
+/*
+ * 試著把系統時間推進到現在。成功(真的推進了)回傳 1,此時仍持有 time_lk,
+ * *from、*to 是推進前後的 tick;呼叫端做完這段的全系統工作後放開 time_lk。
+ */
+/* 目前生效的每 tick 計數:共用路徑停用時視同沒有共用計數器 */
+static uint64_t live_iv(void)
+{
+    return __atomic_load_n(&g_shared, __ATOMIC_ACQUIRE) ? g_iv : 0;
+}
+
+static int timer_advance(uint64_t *from, uint64_t *to)
+{
+    uint64_t t, d, iv = live_iv();
+
+    if (iv == 0) {                            /* 沒有共用計數器:舊做法 */
+        if (this_cpu()->id != 0 || !spin_trylock(&time_lk))
+            return 0;
+        time_read(&t, &d);
+        time_write(t + 1, d);
+        *from = t;
+        *to = t + 1;
+        adv_count[0]++;
+        return 1;
+    }
+    time_read(&t, &d);
+    if (arch_clock_count() < d)               /* 常見情形:還沒到,什麼都不做 */
+        return 0;
+    if (!spin_trylock(&time_lk))              /* 別顆 CPU 正在推進:交給它 */
+        return 0;
+    time_read(&t, &d);                        /* 拿到鎖之後重讀:可能剛被推進過 */
+    uint64_t now = arch_clock_count();
+    unsigned n = 0;
+    while (d <= now && n < REAL_CATCHUP_MAX) {
+        d += iv;
+        n++;
+    }
+    if (d <= now)                             /* 落後太多:放棄補記、重新對時(與架構層相同) */
+        d = now + iv;
+    if (n == 0) {                             /* 別顆 CPU 剛推進過 */
+        spin_unlock(&time_lk);
+        return 0;
+    }
+    time_write(t + n, d);
+    adv_count[this_cpu()->id]++;
+    *from = t;
+    *to = t + n;
+    return 1;
+}
+
+static void timer_common(int charge)
+{
+    uint64_t from, to;
+    if (timer_advance(&from, &to)) {
+        sched_tick_global(from, to);          /* 這段 tick 的全系統工作只由推進的這顆 CPU 做一次 */
+        spin_unlock(&time_lk);
+    }
+    watchdog_tick();           /* 心跳,並看看隔壁的 CPU 是不是還活著 */
+    sched_tick(charge);        /* 這顆 CPU 自己的時間片(排程器未啟動時無作用) */
 }
 
 void timer_tick(void)
 {
-    /* 每顆 CPU 都有自己的計時器中斷,但系統時間只由第 0 顆 CPU 推進,
-       否則 N 顆 CPU 時間就會走快 N 倍 */
-    if (this_cpu()->id == 0)
-        ticks++;
-    watchdog_tick();           /* 心跳,並看看隔壁的 CPU 是不是還活著 */
-    sched_tick(1);             /* 喚醒休眠者、扣時間片(排程器未啟動時無作用) */
+    timer_common(1);
 }
 
 void timer_tick_stolen(void)
 {
-    if (this_cpu()->id == 0)
-        ticks++;
-    watchdog_tick();
-    sched_tick(0);             /* 只推進時間:不記 CPU 時間、不扣時間片與即時工作的預算 */
+    timer_common(0);           /* 只推進時間:不記 CPU 時間、不扣時間片與即時工作的預算 */
+}
+
+uint64_t timer_ticks(void)
+{
+    uint64_t t, d;
+    time_read(&t, &d);
+    return t;
 }
 
 /*
- * 32 位元架構(i386)讀取 64 位元變數需要兩條指令,中間若剛好發生
- * 計時器中斷,會讀到高低半部不一致的值。連讀兩次直到相同即可避免。
+ * 停用共用計數器路徑(I-337 同步驗證失敗時,由 kernel/clksync.c 呼叫)。之後只有第 0 顆 CPU
+ * 每次中斷推進 1 個 tick。ticks 只增不減:正在推進的 CPU 會照常做完它那一次(在 time_lk 之內),
+ * 之後的推進全走舊路徑,所以時間仍單調。不可逆:降級後不會自己恢復。
  */
-uint64_t timer_ticks(void)
+void timer_shared_disable(void)
 {
-    uint64_t a, b;
-    do {
-        a = ticks;
-        b = ticks;
-    } while (a != b);
-    return a;
+    __atomic_store_n(&g_shared, 0, __ATOMIC_RELEASE);
+}
+
+int timer_shared_enabled(void)
+{
+    return live_iv() != 0;
+}
+
+uint64_t timer_tick_counts(void)
+{
+    return g_iv;
+}
+
+uint32_t timer_advances(int cpu)
+{
+    return (cpu >= 0 && cpu < MAX_CPUS) ? __atomic_load_n(&adv_count[cpu], __ATOMIC_RELAXED) : 0;
 }
 
 /* 晚到的紀錄(見 timer.h)。中斷處理程式(各 CPU 都可能)寫入,以一把 spinlock 保護;只有幾條指令 */
@@ -167,22 +297,17 @@ uint64_t timer_clock_hz(void)
     return arch_clock_hz();
 }
 
-/* 一次最多補算幾個 tick:和架構層中斷裡的補記上限相同(超過時架構層放棄補記、重新對時,
-   那些 tick 永遠不會被記上;這裡也不算它們,兩邊才一致) */
-#define REAL_CATCHUP_MAX 100
-
 uint64_t timer_ticks_real(void)
 {
-    /* 先讀預定時間、再讀 tick 計數(寫入端的順序相反,見 arch.h):
-       讀到新的預定時間就一定讀到新的計數;交錯時頂多多算 1 個 tick — 只會讓等待變長,不會變短 */
-    uint64_t d = arch_tick_deadline();
-    uint64_t t = timer_ticks();
-    uint64_t iv = arch_tick_interval();
-    if (d == 0 || iv == 0)
+    /* 一致的一對(tick, 下一個 tick 的計數值),再看計數器已經超過幾個預定時間:
+       那些是「已經到了、還沒有任何 CPU 記上」的 tick */
+    uint64_t t, d, iv = live_iv();
+    time_read(&t, &d);
+    if (iv == 0)
         return t;
     uint64_t now = arch_clock_count();
     unsigned k = 0;
-    while (now >= d && k < REAL_CATCHUP_MAX) {   /* 每一個已經過去的預定時間 = 一個該記而還沒記的 tick */
+    while (now >= d && k < REAL_CATCHUP_MAX) {
         d += iv;
         k++;
     }

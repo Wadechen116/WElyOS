@@ -40,8 +40,17 @@ void pipe_kobj_test(void);               /* I-240 C3.2 (b2):檔案與管線由�
 void user_stack_rollback_test(void);     /* Codex 191:建立執行緒失敗時 stack 與格子退回 */
 void ramfs_eof_test(void);               /* Codex 209:寫入失敗時 ramfs 檔案長度不變 */
 void stack_ticket_test(void);            /* I-240 C3.2 (c1):承諾的 stack 在飽和後整格可觸及 */
+void stack_release_exhausted_test(void); /* I-240 T5 / Codex 166:記憶體耗盡時歸還 stack 格不配置、票精確退回 */
+void stack_concurrent_fail_test(void);   /* I-240 T4:一格承諾失敗只放自己的格與票 */
+void stack_pt_boundary_test(void);       /* I-240 T1:預付 pt 票讓飽和時的第一次觸及建得出中間表 */
+void stack_guard_test(void);             /* I-240 T2:保護頁觸及不消耗票、帳本不變 */
 void image_ticket_test(void);            /* I-240 C3.2 (c2):映像私有頁記 IMAGE 配額,fork 後寫入一定成功 */
 void exec_txn_test(void);                /* I-240 C3.2 (c3):exec 交易的放寬上限 */
+void r1_lifecycle_test(void);            /* I-240 C3.2 R1:部分歸還、交錯 COW、子 destroy、再 fork 的票帳 */
+void pmm_balance_test(void);             /* I-240 C3.2:實體平衡 free + allocated == usable,與預留分開驗 */
+void image_class_test(void);             /* I-240 C3.2 6.2:映像頁只記 IMAGE,fork 照抄、destroy 退回 */
+void exec_txn_end_test(void);            /* I-240 C3.2 6.2:mb_exec_end 之後憑證不再放寬 */
+void exec_txn_lower_limit_test(void);    /* I-240 C3.2 6.2:交易中途調低 limit,最終檢查拒絕 */
 void pte_tear_test(void);                /* I-090:頁表項目 64 位元寫入不撕裂(需要 2 顆 CPU) */
 void crash_test(const char *cmd);        /* crash=<種類>:故意觸發錯誤(排程器啟動之前可以做的那些) */
 
@@ -51,7 +60,9 @@ void sync_demo(void);                    /* mutex、號誌、條件變數 */
 void prio_demo(void);                    /* 優先權、搶佔延遲、優先權繼承、防飢餓 */
 void smp_sched_demo(void);               /* 多顆 CPU 同時排程 */
 void rt_demo(void);                      /* 週期性的即時工作 */
-void sleep_wall_test(void);              /* 睡眠以真實時間計不可提早醒(高精度時鐘量) */
+void sleep_wall_test(void);
+void clksync_test(void);                 /* I-337:跨 CPU 計數器同步驗證(含注入偏移的負對照) */
+void cpu0_stall_wake_test(void);         /* 第 0 顆 CPU 關中斷 300 ms 時休眠者照樣醒(I-337) */              /* 睡眠以真實時間計不可提早醒(高精度時鐘量) */
 void sched_stress(void);                 /* stress:大量執行緒 */
 void sched_crash_test(const char *cmd);  /* crash=<種類>:需要排程器的那些 */
 void spin_irqs_off(void *arg);           /* crash=wdog 用:關著中斷空轉的執行緒 */

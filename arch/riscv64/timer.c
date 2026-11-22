@@ -47,14 +47,20 @@ uint64_t arch_clock_count(void)
     return read_time();
 }
 
+/* RISC-V 的 CSR 存取預設與記憶體存取是弱排序(Zicsr)。以 fence iorw,iorw 夾住 time 的讀取:
+   之前的記憶體讀取(例如看到 ack)完成後才讀,讀完之後才做之後的存取。這是盡力而為的做法 —
+   規格沒有明說 fence 對 time CSR 的效果,實測以計數器同步檢查的結果佐證(I-342) */
+uint64_t arch_clock_count_ordered(void)
+{
+    __asm__ volatile("fence iorw, iorw" ::: "memory");
+    uint64_t t = read_time();
+    __asm__ volatile("fence iorw, iorw" ::: "memory");
+    return t;
+}
+
 uint64_t arch_clock_hz(void)
 {
     return TIMEBASE_HZ;
-}
-
-uint64_t arch_tick_deadline(void)
-{
-    return __atomic_load_n(&cpus[0].timer_deadline, __ATOMIC_ACQUIRE);
 }
 
 uint64_t arch_tick_interval(void)
@@ -107,7 +113,6 @@ void timer_interrupt(void)
             timer_tick();
         else
             timer_tick_stolen();         /* 補記的:不算成誰的 CPU 時間 */
-        __atomic_thread_fence(__ATOMIC_RELEASE);   /* tick 計數先於預定時間被看見(見 arch.h) */
         deadline += interval;
         n++;
     }

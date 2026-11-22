@@ -102,19 +102,23 @@ uint64_t arch_clock_count(void)
     return have ? rdtsc() : 0;
 }
 
-/*
- * PIT 的中斷只送到第 0 顆 CPU,tsc_deadline 只有它在中斷裡改。別顆 CPU 讀這個 64 位元的值
- * 要兩條指令,可能剛好讀到改到一半的:連讀兩次直到相同(和 timer_ticks 的做法一樣)
- */
-uint64_t arch_tick_deadline(void)
+/* CPUID 在所有 x86 處理器上都是序列化指令(Intel SDM:RDTSC 本身不序列化,之前的指令可能還沒做完、
+   之後的讀取也可能提前)。前後各一次:讀數不會早於之前的記憶體讀取(例如看到對方的 ack),
+   之後的寫入(例如發出請求)也不會早於讀數。LFENCE 要 SSE2,沒有 TSC 的老型號不一定有,所以不用 */
+static void cpuid_serialize(void)
 {
-    uint64_t a, b;
-    do {
-        a = *(volatile uint64_t *)&tsc_deadline;
-        b = *(volatile uint64_t *)&tsc_deadline;
-    } while (a != b);
-    __atomic_thread_fence(__ATOMIC_ACQUIRE);
-    return tsc_interval ? a : 0;
+    uint32_t a = 0, b, c = 0, d;
+    __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d) : : "memory");
+}
+
+uint64_t arch_clock_count_ordered(void)
+{
+    if (!arch_clock_count())                     /* 順便確定有沒有 TSC */
+        return 0;
+    cpuid_serialize();
+    uint64_t t = rdtsc();
+    cpuid_serialize();
+    return t;
 }
 
 uint64_t arch_tick_interval(void)
@@ -194,7 +198,6 @@ void irq_handler(uint32_t irq)
                     timer_tick();
                 else
                     timer_tick_stolen();         /* 補記的:不算成誰的 CPU 時間 */
-                __atomic_thread_fence(__ATOMIC_RELEASE);   /* tick 計數先於預定時間被看見(見 arch.h) */
                 tsc_deadline += tsc_interval;
                 n++;
             }

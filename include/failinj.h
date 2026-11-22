@@ -14,6 +14,7 @@ enum fi_site { FI_KMALLOC, FI_PMM, FI_NSITES };
 void failinj_arm(enum fi_site site, unsigned nth);   /* 目前執行緒的第 nth 次(從 1 起)失敗 */
 void failinj_disarm(void);
 int  failinj_fired(void);
+int  failinj_enabled(void);                          /* 1 = 以 selftest 開機(測試專用的掛鉤只在此時生效) */
 void failinj_enable(void);                           /* 以 selftest 開機時呼叫;之後系統呼叫才有效 */
 long failinj_syscall(long op, long site, long n);    /* SYS_failinj(呼叫者已確認有 CAP_ADMIN) */                            /* 這次啟用之後是否真的注入過 */
 

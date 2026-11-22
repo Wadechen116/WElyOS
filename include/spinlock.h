@@ -38,6 +38,7 @@ enum lock_rank {
     LK_TEST_INNER = 11,          /* 自我測試的內層鎖(test-b) */
     LK_PSTATE     = 20,          /* 行程的狀態(proc.c 的 pstate_lk) */
     LK_INODE      = 30,          /* inode 的參考計數(vfs.c);pstate 之內唯一會拿的鎖 */
+    LK_TIME       = 35,          /* 系統時間的推進權(timer.c 的 time_lk;只用 trylock 取得,之內會拿 sched_lk) */
     LK_SCHED      = 40,          /* 排程器(sched.c 的 sched_lk) */
     LK_RUNQ       = 45,          /* 執行佇列(runq-overflow / runq;只在排程器的鎖之內使用) */
     LK_STACKS     = 50,          /* 執行緒 stack 的快取 */

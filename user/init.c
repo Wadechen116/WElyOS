@@ -714,6 +714,136 @@ static int mode_sigrace(void)
     return lost ? 20 + lost : 74;
 }
 
+/* ---- UMODE_MEMLOWER ---- */
+
+/* I-240 C3.2 B7 端到端:把配額調到「已承諾量」以下。
+   已經答應過(sbrk / mmap 承諾)的每一頁仍然要寫得進去、不被終止;之後的 sbrk / mmap /
+   建執行緒 / fork 都當場 -E_NOMEM;有 CAP_ADMIN 的行程調回原值之後又可以成長。
+   沒有 CAP_ADMIN 的行程調回去得到 -E_PERM,已承諾的頁同樣照用。
+   負對照:fault 時才檢查配額 → 第 2 步碰到未觸過的已承諾頁時子行程被終止(1760 起的碼)。 */
+static int in_child(int (*fn)(void));
+
+#define ML_SBRK   (2 << 20)
+#define ML_MAP    (2 << 20)
+
+static void ml_thread(long unused)
+{
+    (void)unused;
+    sys_thread_exit();
+}
+
+static void ml_fill(char *p, unsigned long len, unsigned long from, char tag)
+{
+    for (unsigned long i = from; i < len; i += 4096)
+        p[i] = (char)(tag + i / 4096);
+}
+
+static int ml_check(const char *p, unsigned long len, char tag)
+{
+    for (unsigned long i = 0; i < len; i += 4096)
+        if (p[i] != (char)(tag + i / 4096))
+            return 1;
+    return 0;
+}
+
+static int ml_admin(void)
+{
+    long def = sys_memlimit(0);
+    long base = sys_sbrk(0);
+
+    /* 1. 承諾 2MB heap + 2MB 對映,各只先碰前半 */
+    if (sys_sbrk(ML_SBRK) != base)
+        return 1;
+    char *h = (char *)base, *m = sys_mmap(ML_MAP);
+    if ((long)m < 0)
+        return 2;
+    ml_fill(h, ML_SBRK / 2, 0, 11);
+    ml_fill(m, ML_MAP / 2, 0, 22);
+
+    /* 2. 調到 1MB:低於已承諾量(4MB 加上行程本身約 1.1MB)。調低一律允許 */
+    if (sys_memlimit(1024) != 1024 || sys_memlimit(0) != 1024)
+        return 3;
+    ml_fill(h, ML_SBRK, ML_SBRK / 2, 11);        /* 後半從沒碰過:靠承諾時的預留頁兌現 */
+    ml_fill(m, ML_MAP, ML_MAP / 2, 22);
+    if (ml_check(h, ML_SBRK, 11) || ml_check(m, ML_MAP, 22))
+        return 4;
+
+    /* 3. 新的要求當場拒絕,狀態不變 */
+    if (sys_sbrk(4096) != -E_NOMEM || sys_sbrk(0) != base + ML_SBRK)
+        return 5;
+    if ((long)sys_mmap(4096) != -E_NOMEM)
+        return 6;
+    if (sys_thread_create(ml_thread, 0) != -E_NOMEM)   /* 新執行緒要預付 255 頁 stack */
+        return 7;
+    long pid = sys_fork();                       /* 子行程沿用 1MB 配額,承諾不到 */
+    if (pid == 0)
+        sys_exit(99);
+    if (pid != -E_NOMEM) {
+        if (pid > 0)
+            sys_waitpid(pid, 0, 0);
+        return 8;
+    }
+
+    /* 4. 歸還一部分之後仍在配額以上:照樣拒絕(配額不因歸還自動恢復) */
+    if (sys_munmap(m) != 0 || sys_sbrk(-ML_SBRK) != base + ML_SBRK)
+        return 9;
+    if (sys_sbrk(4096) != -E_NOMEM || (long)sys_mmap(4096) != -E_NOMEM)
+        return 10;
+
+    /* 5. 管理者調回原值:又可以成長,新答應的頁照樣能用 */
+    if (sys_memlimit(def) != def)
+        return 11;
+    if (sys_sbrk(1 << 20) != base)
+        return 12;
+    m = sys_mmap(1 << 20);
+    if ((long)m < 0)
+        return 13;
+    ml_fill(h, 1 << 20, 0, 33);
+    ml_fill(m, 1 << 20, 0, 44);
+    if (ml_check(h, 1 << 20, 33) || ml_check(m, 1 << 20, 44))
+        return 14;
+    if (sys_munmap(m) != 0 || sys_sbrk(-(1 << 20)) != base + (1 << 20))
+        return 15;
+    return 0;
+}
+
+static int ml_user(void)
+{
+    sys_capdrop(CAP_ADMIN);
+    if (sys_memlimit(4096) != 4096)
+        return 1;
+    long base = sys_sbrk(0);
+    if (sys_sbrk(1 << 20) != base)
+        return 2;
+    if (sys_memlimit(1024) != 1024)              /* 沒有特權也可以調低 */
+        return 3;
+    ml_fill((char *)base, 1 << 20, 0, 55);       /* 一頁都沒碰過:全部靠承諾 */
+    if (ml_check((char *)base, 1 << 20, 55))
+        return 4;
+    if (sys_sbrk(4096) != -E_NOMEM)
+        return 5;
+    if (sys_memlimit(4096) != -E_PERM || sys_memlimit(0) != 1024)
+        return 6;                                /* 調回去需要特權,配額不變 */
+    return 0;
+}
+
+static int mode_memlower(void)
+{
+    int rc = in_child(ml_admin);
+    if (rc < 0 || rc >= 128)
+        return 1760;                             /* 碰已承諾的頁被終止:配額在 fault 時檢查了 */
+    if (rc != 0)
+        return 1700 + rc;
+    rc = in_child(ml_user);
+    if (rc < 0 || rc >= 128)
+        return 1761;
+    if (rc != 0)
+        return 1730 + rc;
+    puts_("  [user] memlimit lowered below use: committed pages still usable, new requests E_NOMEM, "
+          "admin raise restores growth\n");
+    return 75;
+}
+
 /* ---- UMODE_FSQUOTA ---- */
 
 /* I-240 C3.2 (d):ramfs 的 FS 配額。放棄 CAP_ADMIN 的子行程一直寫檔,必須停在 FS 上限、
@@ -3371,6 +3501,8 @@ static int umain(long mode)
         return mode_threadmix();
     case UMODE_FSQUOTA:
         return mode_fsquota();
+    case UMODE_MEMLOWER:
+        return mode_memlower();
 
     case UMODE_PERM: {
         /* 同一組測試在記憶體檔案系統與磁碟上各做一次 */

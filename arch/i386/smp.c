@@ -330,7 +330,7 @@ void arch_smp_cpu_init(void)
 }
 
 /* 啟動「目前這顆 AP」的計時器:LAPIC 內建的計時器,週期性地發出向量 48 的中斷。
-   (開機的 CPU 繼續使用 PIT,系統時間由它推進;AP 的計時器只用來算時間片) */
+   (開機的 CPU 繼續使用 PIT。系統時間由任何一顆 CPU 依 TSC 推進,見 kernel/timer.c 與 I-337) */
 void arch_timer_init_cpu(void)
 {
     lapic[LAPIC_TMR_DIV / 4] = TMR_DIV_16;
@@ -350,7 +350,7 @@ void lapic_interrupt(uint32_t vector)
 {
     sched_irq_enter();
     if (vector == VEC_LAPIC_TIMER)
-        timer_tick();                        /* 在 AP 上只會扣時間片,不推進系統時間 */
+        timer_tick();                        /* 扣時間片;TSC 已過下一個 tick 時也推進系統時間 */
     else
         smp_ipi_handler();
     lapic[LAPIC_EOI / 4] = 0;                /* 回應之後 LAPIC 才會再送下一個 */

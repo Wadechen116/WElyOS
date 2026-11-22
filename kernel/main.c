@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include "arch.h"
 #include "blackbox.h"
+#include "clksync.h"
 #include "blk.h"
 #include "boot_info.h"
 #include "console.h"
@@ -312,8 +313,17 @@ void kmain(const struct boot_info *bi)
         anon_recommit_test();
         fork_ticket_test();
         stack_ticket_test();
+        stack_release_exhausted_test();
+        stack_concurrent_fail_test();
+        stack_pt_boundary_test();
+        stack_guard_test();
         image_ticket_test();
         exec_txn_test();
+        r1_lifecycle_test();
+        pmm_balance_test();
+        image_class_test();
+        exec_txn_end_test();
+        exec_txn_lower_limit_test();
     }
 
     /* 啟動計時器(1000Hz,一個 tick 1ms)與排程器,再開中斷。
@@ -391,6 +401,8 @@ void kmain(const struct boot_info *bi)
         smp_sched_demo();
         rt_demo();
         sleep_wall_test();
+        cpu0_stall_wake_test();
+        clksync_test();
         pte_tear_test();
         thread_kobj_test();
         pipe_kobj_test();
@@ -432,6 +444,8 @@ void kmain(const struct boot_info *bi)
         KASSERT(!safe_mode);
     /* 走到這裡表示開機順利完成:記下來。之後即使被直接關掉電源,也不算「開機失敗」。
        安全模式不在這裡記:要等有人看過、正常離開之後(見 shutdown) */
+    /* I-337:開機約 1 秒後再驗證一次計數器同步,抓漂移(selftest 已做過時不重做) */
+    clksync_recheck();
     if (!safe_mode)
         blackbox_log(BB_HEALTHY, "boot completed");
     timer_clock_mark(CLOCK_MARK_READY);
@@ -448,6 +462,14 @@ void kmain(const struct boot_info *bi)
         memhog_test("file");
     if (cmdline_has(bi->cmdline, "memhog=fork"))
         memhog_test("fork");
+    if (cmdline_has(bi->cmdline, "memhog=threads"))
+        memhog_test("threads");
+    if (cmdline_has(bi->cmdline, "memhog=stack"))
+        memhog_test("stack");
+    if (cmdline_has(bi->cmdline, "memhog=maps"))
+        memhog_test("maps");
+    if (cmdline_has(bi->cmdline, "memhog=exec"))
+        memhog_test("exec");
     int shell = !autoexit || cmdline_has(bi->cmdline, "shell");
     if (shell) {
         kprintf("starting /bin/sh (type \"help\" for a list of commands)\n");

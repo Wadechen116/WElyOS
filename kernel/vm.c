@@ -134,6 +134,12 @@ static unsigned long table_pages;            /* 頁表用掉的頁數(含根) */
 static int enabled;                          /* 分頁是否已開啟 */
 static unsigned long large_pages;            /* 目前以大分頁對映的數量 */
 
+/* 目前以大分頁對映的數量(測試用:kernel stack 的保護頁會把直接對映的大分頁拆開,拆一次多一張頁表) */
+unsigned long vm_large_pages(void)
+{
+    return __atomic_load_n(&large_pages, __ATOMIC_RELAXED);
+}
+
 /* 一個大分頁的大小:i386 為 4MB,RISC-V / AArch64 為 2MB */
 #define LARGE_SIZE ((uintptr_t)PAGE_SIZE << (MMU_LARGE_LEVEL * MMU_BITS))
 

@@ -161,20 +161,20 @@ void arch_backtrace(uintptr_t pc, uintptr_t fp);
 /*
  * 高精度時鐘(效能量測用):
  *   arch_clock_count() 一個單調遞增的 64 位元計數器(i386 TSC、RISC-V time CSR、AArch64 cntpct_el0),
- *                      從模擬器重置起算;所有 CPU 共用同一個時間基準(QEMU 上如此)
+ *                      從模擬器重置起算;所有 CPU 必須共用同一個時間基準(QEMU 上如此;
+ *                      kernel/timer.c 以它推進系統時間,見 I-337)
  *   arch_clock_hz()    它每秒增加的次數;0 = 這台機器沒有可用的計數器
- * 只用來量「經過了多久」,不參與排程與計時器(那些以 tick 為單位)。
  */
 uint64_t arch_clock_count(void);
+/* 同上,但讀取指令與前後的記憶體存取依程式順序執行(I-342):i386 以 CPUID 夾住 RDTSC、
+   aarch64 以 ISB 夾住 CNTPCT_EL0、riscv64 以 fence 夾住 time CSR。較慢,只給計數器同步檢查這類
+   「讀數必須和前後的旗標交接有明確先後」的地方用,一般路徑仍用 arch_clock_count */
+uint64_t arch_clock_count_ordered(void);
 uint64_t arch_clock_hz(void);
 /*
- * 推進系統時間的那顆 CPU(第 0 顆)「下一個 tick 的預定時間」(以 arch_clock_count 的單位)與
- * 一個 tick 的長度。那顆 CPU 的中斷晚到時,現在的時鐘值會超過這個預定時間:
- * 超過了多少,就是系統時間暫時落後真實時間多少(kernel/timer.c 的 timer_ticks_real 用它)。
- * 寫入端(中斷處理)先推進 tick 計數、再推進預定時間,中間有 release 屏障;
- * 讀取端先讀預定時間、再讀 tick 計數。兩者都回傳 0 = 沒有這個資訊(例如 i386 沒有 TSC)。
+ * 一個 tick 相當於多少 arch_clock_count 的計數;0 = 沒有可用的共用計數器(例如 i386 沒有 TSC)。
+ * kernel/timer.c 以它和共用計數器讓任何一顆 CPU 都能推進系統時間(I-337)。
  */
-uint64_t arch_tick_deadline(void);
 uint64_t arch_tick_interval(void);
 
 /* 測試用:執行一個非法指令,觸發「非法指令」例外 */
