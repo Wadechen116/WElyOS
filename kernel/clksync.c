@@ -220,7 +220,9 @@ static int judge(const struct bracket *s, uint64_t tol, struct clksync_cpu *o)
     uint64_t lo = o->min_low > 0 ? (uint64_t)o->min_low : 0;
     uint64_t hi = o->max_high < 0 ? (uint64_t)-o->max_high : 0;
     o->max_abs = lo > hi ? lo : hi;
-    /* 等同 Codex 模型的規則:每個樣本的 remote 都在 [before − tol, after + tol] 之內 */
+    /* 每個樣本的 remote 都在 [before − tol, after + tol] 之內(等同交集與 ±tol 相交)。
+       Codex 的模型(tests/host/proc/probe_i337_counter_sync.c)用的是聯集規則,較保守,
+       會把交接延遲也算進去;這裡刻意不同,見 DEVLOG 第 67 步 I-342 */
     if (o->min_low > (int64_t)tol || o->max_high < -(int64_t)tol)
         return CLKSYNC_R_OFFSET;
     return CLKSYNC_R_NONE;
