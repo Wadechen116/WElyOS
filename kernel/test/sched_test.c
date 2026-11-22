@@ -374,14 +374,18 @@ static void latency_spinner(void *arg)
         ;
 }
 
-/* 其他 CPU 上的同優先權忙碌執行緒:「同優先權必須等對方的時間片」的前提是沒有閒置的 CPU。
-   有閒著的 CPU 時,工作竊取會立刻把剛醒的睡眠者拿去跑(延遲 1 tick,是更好的行為)— 自從任一 CPU
-   都能叫醒睡眠者(I-337),睡眠者被排到別顆 CPU 的機會變多,i386 6 次有 1 次量到 1 而誤判 */
-static volatile int lat_hog_stop;
+/* 其他 CPU 上的高優先權忙碌執行緒:「同優先權必須等對方的時間片」的前提是,剛醒的睡眠者只能和
+   spinner 搶同一顆 CPU。有閒著的 CPU 時,工作竊取會立刻把它拿去跑(延遲 1 tick,是更好的行為);
+   任一 CPU 都能叫醒睡眠者(I-337)之後這種情形變多,i386 6 次有 1 次量到 1 而誤判。
+   第一版用「同優先權」的忙碌執行緒佔住其他 CPU 仍不對:睡眠者可能落在某顆忙碌執行緒時間片快用完的
+   CPU 上,延遲 1 是合理的(riscv64 出現一次)。改成高優先權:它們不讓出、也不竊取比自己低的工作,
+   睡眠者只能等 spinner — spinner 在睡眠者入睡時剛拿到全新的時間片 */
+static volatile int lat_hog_stop, lat_hog_running;
 
 static void lat_hog(void *arg)
 {
     (void)arg;
+    __atomic_fetch_add(&lat_hog_running, 1, __ATOMIC_SEQ_CST);
     while (!lat_hog_stop)
         ;
 }
@@ -395,12 +399,19 @@ static unsigned latency_run(int sleeper_prio, unsigned *jitter)
 
     lat_sleeping = lat_done = 0;
     lat_hog_stop = 0;
+    lat_hog_running = 0;
     if (sleeper_prio == PRIO_NORMAL)             /* 同優先權那一輪:其他 CPU 都佔住 */
         for (int i = 1; i < cpu_count && nh < MAX_CPUS; i++) {
-            int h = thread_create_prio("lat-hog", lat_hog, NULL, PRIO_NORMAL);
+            int h = thread_create_prio("lat-hog", lat_hog, NULL, PRIO_HIGH);
             KASSERT(h > 0);
             hogs[nh++] = h;
         }
+    /* 等它們都真的在跑(各佔一顆 CPU)才開始:剛建立時可能還沒排上,短時間內仍有閒著的 CPU
+       會把睡眠者拿走(高優先權版本 12 次仍有 1 次量到 1) */
+    for (int w = 0; __atomic_load_n(&lat_hog_running, __ATOMIC_SEQ_CST) < (int)nh; w++) {
+        KASSERT(w < 5000);
+        thread_sleep(1);
+    }
     timer_get_stats(&a);
     t[0] = thread_create_prio("spinner", latency_spinner, NULL, PRIO_NORMAL);
     t[1] = thread_create_prio("sleeper", latency_sleeper, NULL, sleeper_prio);
@@ -1193,11 +1204,21 @@ static volatile unsigned cs_n, cs_on_cpu0;
 static uint64_t cs_t0[CS_MAX_SAMPLES], cs_d[CS_MAX_SAMPLES];   /* 每次睡眠的起點與長度(時鐘計數) */
 static uint64_t cs_hz;
 
+static void *volatile cs_sleeper_self;           /* 睡眠者自己(卡住的處理函式用來判斷被打斷的是不是它) */
+static volatile int cs_sleeper_cpu = -1;         /* 睡眠者忙等時所在的 CPU */
+
 static void cs_sleeper(void *arg)
 {
     (void)arg;
-    while (cs_phase == 0)
-        ;                                    /* 忙等:不能用 sleep,否則要靠第 0 顆以外的 CPU 叫醒 — 那正是待測項目 */
+    cs_sleeper_self = thread_current();
+    /* 忙等:卡住期間不能靠 sleep 開始(那正是待測項目)。落在第 0 顆時睡 1 毫秒讓出,醒來時有機會換到
+       別顆 CPU — 沒有「固定在某顆 CPU」的機制,高優先權又一直忙等的它不會自己離開第 0 顆 */
+    while (cs_phase == 0) {
+        int c = sched_cpu_id();
+        cs_sleeper_cpu = c;
+        if (c == 0)
+            thread_sleep(1);
+    }
     while (cs_phase == 1) {
         uint64_t t0 = timer_clock_count();
         thread_sleep(CS_SLEEP_MS);
@@ -1212,52 +1233,92 @@ static void cs_sleeper(void *arg)
     }
 }
 
+/* 在第 0 顆 CPU 上、中斷關閉中執行:空轉 CS_STALL_MS 毫秒,前後記下心跳、tick 與時鐘 */
+struct cs_stall_ctx {
+    int ran_on_cpu0, aborted;
+    unsigned long hb0, hb1;
+    uint64_t tk0, tk1, c0, c1;
+    struct timer_stats st1;
+};
+
+static void cs_stall_fn(void *arg)
+{
+    struct cs_stall_ctx *x = arg;
+    x->ran_on_cpu0 = sched_cpu_id() == 0;
+    /* 被打斷的正是睡眠者(它在卡住開始前忙等,可能剛好在第 0 顆上):它會跟著卡住、無法被搬走,
+       這一輪不算 — 放棄,讓測試稍後重試(18 次曾有 1 次因此一次都沒醒) */
+    if (this_cpu()->current == cs_sleeper_self) {
+        x->aborted = 1;
+        return;
+    }
+    x->hb0 = this_cpu()->heartbeat;
+    x->tk0 = timer_ticks();
+    x->c0 = timer_clock_count();
+    cs_phase = 1;
+    while ((timer_clock_count() - x->c0) * 1000 < cs_hz * CS_STALL_MS)
+        ;                                    /* 關中斷空轉:第 0 顆不處理計時器中斷、不推進時間 */
+    x->tk1 = timer_ticks();
+    x->hb1 = this_cpu()->heartbeat;
+    x->c1 = timer_clock_count();
+    timer_get_stats(&x->st1);                /* 還在關中斷中取:不含第 0 顆開中斷後自己的補記 */
+    /* 卡住結束:在第 0 顆恢復中斷「之前」就換階段。以前由發起者在跨 CPU 呼叫返回後才設,
+       中間第 0 顆已經開中斷、睡眠者可能被排上去,階段卻還是 1 → 被誤算成「卡住時跑在第 0 顆」
+       (第 68 步完整回歸 aarch64 兩次) */
+    cs_phase = 2;
+}
+
 void cpu0_stall_wake_test(void)
 {
     cs_hz = timer_clock_hz();
-    if (cpu_count < 2 || cs_hz == 0) {
-        kprintf("cpu0-stall: needs >= 2 cpus and a shared clock, skipped\n");
+    if (cpu_count < 3 || cs_hz == 0) {
+        kprintf("cpu0-stall: needs >= 3 cpus and a shared clock, skipped\n");
         return;
     }
     cs_phase = 0;
     cs_n = cs_on_cpu0 = 0;
+    cs_sleeper_cpu = -1;
+    cs_sleeper_self = NULL;
     uint32_t adv0[MAX_CPUS];
     for (int i = 0; i < MAX_CPUS; i++)
         adv0[i] = timer_advances(i);
     struct timer_stats st0, st1;
     timer_get_stats(&st0);
 
-    for (int i = 0; i < 5000 && sched_cpu_id() != 0; i++)
-        thread_sleep(1);                     /* 換到第 0 顆 CPU 上(此時第 0 顆還在正常運作) */
     int tid = thread_create_prio("cs-sleeper", cs_sleeper, NULL, PRIO_HIGH);
     if (tid <= 0)
         panic("cpu0-stall: cannot create sleeper (%d)", tid);
     thread_sleep(5);                         /* 讓它在別顆 CPU 上跑起來、進入忙等 */
 
-    /* 睡過之後可能被排到別顆 CPU:關中斷之前再移回第 0 顆;關中斷後確認,不是就開中斷重試 */
-    unsigned long fl = 0;
-    for (int tries = 0;; tries++) {
-        for (int i = 0; i < 5000 && sched_cpu_id() != 0; i++)
+    /* 讓第 0 顆 CPU 關中斷空轉 300 毫秒。沒有「把執行緒固定在某顆 CPU」的機制,以前靠反覆睡 1 毫秒
+       碰運氣被排到第 0 顆,24 次有 3 次一直排不上而逾時。現在:不在第 0 顆就以跨 CPU 呼叫讓第 0 顆
+       在 IPI 處理中(本來就關中斷)執行空轉;在第 0 顆就直接關中斷空轉。兩條路都確定是第 0 顆卡住。
+       跨 CPU 呼叫的發起者等待時也關著中斷,所以那段期間停住的是第 0 顆加發起者 — 需要至少 3 顆 CPU */
+    struct cs_stall_ctx ctx;
+    int attempts = 0;
+    do {
+        if (++attempts > 50)
+            panic("cpu0-stall: the sleeper kept running on cpu 0");
+        for (int w = 0; cs_sleeper_cpu < 1; w++) {   /* 等睡眠者確實在第 0 顆以外的 CPU 上忙等 */
+            if (w > 5000)
+                panic("cpu0-stall: the sleeper never settled off cpu 0");
             thread_sleep(1);
-        fl = arch_irq_save();
-        if (sched_cpu_id() == 0)
-            break;
-        arch_irq_restore(fl);
-        if (tries > 100)
-            panic("cpu0-stall: could not get onto cpu 0");
-    }
-    unsigned long hb0 = this_cpu()->heartbeat;
-    uint64_t tk0 = timer_ticks();
-    uint64_t c0 = timer_clock_count();
-    cs_phase = 1;
-    while ((timer_clock_count() - c0) * 1000 < cs_hz * CS_STALL_MS)
-        ;                                    /* 關中斷空轉:第 0 顆不處理計時器中斷、不推進時間 */
-    uint64_t tk1 = timer_ticks();
-    unsigned long hb1 = this_cpu()->heartbeat;
-    uint64_t c1 = timer_clock_count();
-    timer_get_stats(&st1);                   /* 還在關中斷中取:不含第 0 顆開中斷後自己的補記 */
+        }
+        for (unsigned i = 0; i < sizeof(ctx); i++)
+            ((char *)&ctx)[i] = 0;
+        if (sched_cpu_id() == 0) {
+            unsigned long fl = arch_irq_save();
+            cs_stall_fn(&ctx);
+            arch_irq_restore(fl);
+        } else {
+            smp_call_mask(1u << 0, cs_stall_fn, &ctx);
+        }
+    } while (ctx.aborted);
+    if (!ctx.ran_on_cpu0)
+        panic("cpu0-stall: the stall did not run on cpu 0");
+    unsigned long hb0 = ctx.hb0, hb1 = ctx.hb1;
+    uint64_t tk0 = ctx.tk0, tk1 = ctx.tk1, c1 = ctx.c1;
+    st1 = ctx.st1;
     cs_phase = 2;
-    arch_irq_restore(fl);
     thread_join(tid);
 
     /* 只評估「整段都落在卡住期間」的睡眠:最後一次跨過結束點,不算 */

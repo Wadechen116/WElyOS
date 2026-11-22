@@ -317,6 +317,7 @@ void kmain(const struct boot_info *bi)
         stack_concurrent_fail_test();
         stack_pt_boundary_test();
         stack_guard_test();
+        anon_commit_map_test();
         image_ticket_test();
         exec_txn_test();
         r1_lifecycle_test();
@@ -403,6 +404,7 @@ void kmain(const struct boot_info *bi)
         sleep_wall_test();
         cpu0_stall_wake_test();
         clksync_test();
+        kstack_pool_test();                  /* I-339:要能建立執行緒,所以在排程器啟動之後 */
         pte_tear_test();
         thread_kobj_test();
         pipe_kobj_test();

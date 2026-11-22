@@ -68,6 +68,7 @@ static void bit_clear(size_t i) { bitmap[i / 8] &= (uint8_t)~(1u << (i % 8)); }
 /* 兩個範圍 [a, a+alen) 與 [b, b+blen) 是否重疊 */
 enum { ALLOC_NORMAL, ALLOC_EMERGENCY, ALLOC_RESERVED };
 static void *alloc_pages_locked(size_t n, int mode);
+static int fits_normal_locked(size_t n);
 
 static int overlaps(uint64_t a, uint64_t alen, uint64_t b, uint64_t blen)
 {
@@ -167,6 +168,42 @@ void *pmm_alloc_pages(size_t n)
     if (failinj_check(FI_PMM))               /* 測試:假裝配置失敗(include/failinj.h);應急與預留的配置不注入 */
         return NULL;
     return alloc_pages_ref(n, ALLOC_NORMAL);
+}
+
+/* 對齊配置:起點的實體位址是 align_pages 頁的倍數、連續 n 頁(I-339 的 kernel stack 區塊要一整個 2MB)。
+   一般配置的規則(底線、預留、故障注入)都適用。很少用(每個區塊一次),所以直接掃位元圖;
+   不動 hint(它的意義是「比 hint 小的頁都不是空閒的」,在別處配置不會破壞) */
+void *pmm_alloc_pages_aligned(size_t n, size_t align_pages)
+{
+    if (failinj_check(FI_PMM))
+        return NULL;
+    if (n == 0 || align_pages == 0)
+        return NULL;
+    unsigned long flags = spin_lock_irqsave(&pmm_lk);
+    void *p = NULL;
+    if (n > nfree || !fits_normal_locked(n)) {
+        floor_refusals++;
+        goto out;
+    }
+    uintptr_t abytes = (uintptr_t)align_pages << PAGE_SHIFT;
+    uintptr_t first_pa = (mem_start + abytes - 1) & ~(abytes - 1);
+    for (size_t i = (first_pa - mem_start) >> PAGE_SHIFT; i + n <= npages; i += align_pages) {
+        size_t j = 0;
+        while (j < n && !bit_test(i + j))
+            j++;
+        if (j < n)
+            continue;                          /* 這個對齊位置有頁在使用中:試下一個 */
+        for (j = 0; j < n; j++) {
+            bit_set(i + j);
+            refs[i + j] = 1;
+        }
+        nfree -= n;
+        p = (void *)(mem_start + (i << PAGE_SHIFT));
+        break;
+    }
+out:
+    spin_unlock_irqrestore(&pmm_lk, flags);
+    return p;
 }
 
 void *pmm_alloc_pages_reserve(size_t n)

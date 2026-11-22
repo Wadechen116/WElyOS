@@ -312,7 +312,7 @@ static uint32_t md_hash(void)                    /* FNV-1a:比較「失敗的掛
 
 /* avail = pmm 空閒 + heap 空閒 + 執行緒池:不受 heap 向 pmm 要頁、執行緒結構留在池子裡影響。
    整個測試前後用它比(I-338 (1) 建了兩條執行緒,結構留在池子裡);逐點掃描沒有執行緒,照樣分開嚴格比 */
-struct mfi_snap { size_t heap_used, pmm_free, avail; unsigned long large; };
+struct mfi_snap { size_t heap_used, pmm_free, avail; unsigned long large; size_t kstack; };
 static void mfi_take(struct mfi_snap *x)
 {
     struct kheap_stats h;
@@ -321,6 +321,7 @@ static void mfi_take(struct mfi_snap *x)
     x->pmm_free = pmm_free_count();
     x->avail = x->pmm_free * PAGE_SIZE + h.free_bytes + sched_pool_bytes();
     x->large = vm_large_pages();
+    x->kstack = sched_kstack_pages();
 }
 
 /* 掃一種磁碟狀態;回傳成功掛載前觸發了幾個失敗點。成功之後依 leave 卸載(1 = 正常,0 = 斷電) */
@@ -559,13 +560,13 @@ void wfs_mount_failinj_test(void)
     md_mem = NULL;
     sched_trim();                                /* I-338 (1) 的兩條執行緒:join 之後結構與 kernel stack 進了池子 */
     mfi_take(&after);
-    /* 唯一允許的差額:這段期間新的 kernel stack 落在還沒拆過的 2MB 直接對映區,保護頁把大分頁拆開,
-       多出的那張頁表目前不會合併回去(I-339,實測大分頁數 60 -> 59 時剛好少 1 頁)。差額必須剛好等於它 */
-    size_t split_bytes = (size_t)(before.large - after.large) * PAGE_SIZE;
-    if (after.large > before.large || before.avail != after.avail + split_bytes)
+    /* 不允許任何差額(I-339:kernel stack 來自留著重複使用的區塊,不在執行期拆大分頁)。
+       這段測試同時存在的執行緒遠少於一個區塊的容量,區塊數也必須不變 */
+    if (after.large != before.large || before.avail != after.avail || after.kstack != before.kstack)
         panic("wfs mount failinj: whole test leaked: available %zu->%zu bytes (pmm %zu->%zu heap used %zu->%zu, "
-              "large pages %lu->%lu)", before.avail, after.avail, before.pmm_free, after.pmm_free,
-              before.heap_used, after.heap_used, before.large, after.large);
+              "large pages %lu->%lu, kernel stack pages %zu->%zu)", before.avail, after.avail, before.pmm_free,
+              after.pmm_free, before.heap_used, after.heap_used, before.large, after.large, before.kstack,
+              after.kstack);
     kprintf("wfs: mount/format allocation-failure sweep passed (pmm points %u/%u/%u, blank/clean/dirty); "
             "read-only state does not carry over to a new mount\n",
             pts[0][FI_PMM], pts[1][FI_PMM], pts[2][FI_PMM]);

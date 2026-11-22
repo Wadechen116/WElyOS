@@ -92,7 +92,10 @@ void thread_join(int tid);
 int thread_set_periodic(unsigned period_ms, unsigned budget_ms);
 int thread_wait_period(struct rt_stats *st);
 
-size_t sched_stack_cache_pages(void);    /* 閒置 stack 快取佔住的實體頁數 */
+/* kernel stack 區塊(I-339):每塊 2MB、slots_per_chunk 格,需求驅動地增加、留著重複使用 */
+struct kstack_stats { unsigned used, hwm, chunks, slots_per_chunk; };
+void sched_kstack_stats(struct kstack_stats *out);
+size_t sched_kstack_pages(void);         /* 區塊佔住的實體頁數(不歸還) */
 void thread_yield(void);                 /* 主動讓出 CPU,排到隊伍最後 */
 void thread_sleep(unsigned ms);          /* 休眠至少 ms 毫秒(精度為一個 tick) */
 void thread_exit(void) __attribute__((noreturn));   /* 結束目前的執行緒 */

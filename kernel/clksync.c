@@ -216,14 +216,14 @@ static int judge(const struct bracket *s, uint64_t tol, struct clksync_cpu *o)
         return CLKSYNC_R_WIDE;
     if (o->min_low > o->max_high)
         return CLKSYNC_R_NONMONOTONIC;          /* 各樣本互相矛盾:沒有一個 δ 能同時滿足(漂移或讀數錯亂) */
-    /* 確定的偏差下限:交集包含 0 時為 0;整個交集都在 0 的某一側時,是離 0 較近的那一端 */
-    uint64_t lo = o->min_low > 0 ? (uint64_t)o->min_low : 0;
-    uint64_t hi = o->max_high < 0 ? (uint64_t)-o->max_high : 0;
+    /* 最壞情況的偏差:交集兩端絕對值的較大者(Codex 205:以前回報的是離 0 最近的一端,卻標成 max) */
+    uint64_t lo = o->min_low < 0 ? (uint64_t)-o->min_low : (uint64_t)o->min_low;
+    uint64_t hi = o->max_high < 0 ? (uint64_t)-o->max_high : (uint64_t)o->max_high;
     o->max_abs = lo > hi ? lo : hi;
-    /* 每個樣本的 remote 都在 [before − tol, after + tol] 之內(等同交集與 ±tol 相交)。
-       Codex 的模型(tests/host/proc/probe_i337_counter_sync.c)用的是聯集規則,較保守,
-       會把交接延遲也算進去;這裡刻意不同,見 DEVLOG 第 67 步 I-342 */
-    if (o->min_low > (int64_t)tol || o->max_high < -(int64_t)tol)
+    /* 不確定就判失敗(Codex 205):整個可能偏差的交集都要在 ±tol 之內。只要求「和 ±tol 有重疊」的話,
+       交集 [tol − 10, tol + 10] 也會被接受,而真實偏差可能已經超過 tol。交集的寬度不超過最窄的那個
+       樣本區間(實測約 2000 計數,遠小於 tol),所以這不會再把交接延遲算進去 */
+    if (o->min_low < -(int64_t)tol || o->max_high > (int64_t)tol)
         return CLKSYNC_R_OFFSET;
     return CLKSYNC_R_NONE;
 }

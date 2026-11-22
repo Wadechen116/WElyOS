@@ -47,11 +47,11 @@
 #include "timer.h"
 #include "vm.h"
 #include "membudget.h"
+#include "mmu.h"
 
 #define STACK_PAGES   4u                     /* 每條執行緒的 stack:16KB */
 #define STACK_SIZE    (STACK_PAGES * PAGE_SIZE)
 #define TIME_SLICE_MS 10u                    /* 時間片長度(毫秒) */
-#define STACK_CACHE_MAX 32u                  /* 最多保留幾條閒置的 stack 供重複使用 */
 #define STARVE_MS     100u                   /* 可執行卻等超過這麼久就暫時提升(防飢餓) */
 #define STARVE_SCAN_MS 10u                   /* 每隔多久檢查一次 */
 
@@ -327,73 +327,210 @@ int wq_wake_all(struct wait_queue *wq)
 }
 
 /*
- * 執行緒的 stack:配置 STACK_PAGES + 1 頁,最低的一頁是「保護頁」(guard page),
- * 把它從頁表移除。stack 往低位址成長,用過頭就會碰到保護頁,立刻觸發 page fault,
- * 不會悄悄寫壞相鄰的記憶體。
+ * 執行緒的 stack(I-339):來自「stack 區塊」(chunk)。每個區塊是一塊對齊 2MB 的實體記憶體
+ * (= 直接對映的一個大分頁),切成 KSTACK_SLOTS 格,每格 STACK_PAGES + 1 頁,最低的一頁是「保護頁」:
  *
  *     低位址                                              高位址
  *     | 保護頁(不對映) |        可用的 stack(16KB)        |
  *     ^ stack           ^ stack_lo                          ^ stack_hi
  *
- * 快取:結束的執行緒把 stack 放進 stack_cache,下次建立直接取用。
- * 省下的不只是頁面配置,還有「移除保護頁對映 + 清 TLB」與結束時的「對映回來 + 清 TLB」,
- * 這兩個才是比較貴的操作。閒置的 stack 用它自己的第一個可用位元組串成串列。
+ * 區塊建立時把每格的保護頁一次移除(只拆這一個大分頁、最多多一張頁表),之後永遠不再對映回來。
+ * 區塊用完就再建一個(需求驅動,沒有固定的執行緒上限);區塊建好就留著重複使用,不歸還:
+ *   - 歸還就得把保護頁對映回去並合併回大分頁;合併(表格 -> 大分頁)在 AArch64 必須
+ *     break-before-make,那段期間整個 2MB 沒有對映,別的 CPU 的 stack / heap 可能正在裡面,不安全
+ *   - 留著的代價有上限:區塊數 <= ceil(同時存在的 stack 最高數 / KSTACK_SLOTS) + 並行建立的 CPU 數,
+ *     與執行緒建立 / 結束的次數無關(churn 不會再拆任何大分頁)
+ * 執行期間(區塊夠用時)配置 / 歸還只是位元圖的一個位元:不改頁表、不配置頁表、不需要 TLB shootdown。
+ * 區塊尾端剩下的頁(512 - KSTACK_SLOTS * 5 = 2 頁)的最後一頁放區塊的描述(串列、位元圖),不用 heap。
+ * 歸還時核對位址與位元(不是區塊裡的格、沒對齊、重複歸還都會 panic:故障偵測,不讓錯誤擴散)。
  */
+#define KSTACK_CHUNK_PAGES ((size_t)1 << (MMU_LARGE_LEVEL * MMU_BITS))   /* 512:一個 2MB 大分頁 */
+#define KSTACK_CHUNK_BYTES ((uintptr_t)KSTACK_CHUNK_PAGES * PAGE_SIZE)
+#define KSTACK_SLOT_PAGES  (STACK_PAGES + 1u)
+#define KSTACK_SLOT_BYTES  ((uintptr_t)KSTACK_SLOT_PAGES * PAGE_SIZE)
+#define KSTACK_SLOTS       ((unsigned)(KSTACK_CHUNK_PAGES / KSTACK_SLOT_PAGES))   /* 102 */
+#define KSTACK_MAP_WORDS   ((KSTACK_SLOTS + 31u) / 32u)
+_Static_assert(KSTACK_CHUNK_PAGES - (size_t)KSTACK_SLOTS * KSTACK_SLOT_PAGES >= 1,
+               "a chunk needs one spare page for its descriptor");
+
+struct kstack_chunk {                        /* 放在區塊的最後一頁(不在任何一格裡) */
+    struct kstack_chunk *next;
+    char *base;                              /* 區塊起點(第 0 格的保護頁),對齊 KSTACK_CHUNK_BYTES */
+    unsigned used;
+    uint32_t map[KSTACK_MAP_WORDS];          /* bit = 1:使用中 */
+};
+_Static_assert(sizeof(struct kstack_chunk) <= PAGE_SIZE, "descriptor fits in the spare page");
+
 static struct spinlock stack_lk = SPINLOCK_INIT("stack-cache", LK_STACKS);
-static char *stack_cache;                    /* 閒置 stack 的串列(存的是配置區塊起點) */
-static unsigned stack_cached;
+static struct kstack_chunk *kstack_chunks;   /* 受 stack_lk 保護;只加不減 */
+static unsigned kstack_nchunks, kstack_used, kstack_hwm;   /* 受 stack_lk 保護 */
+
+/* 向 pmm 要一塊對齊 KSTACK_CHUNK_BYTES 的 KSTACK_CHUNK_PAGES 頁。pmm 沒有對齊配置,
+   所以多要 KSTACK_CHUNK_PAGES - 1 頁,再把頭尾多出來的還回去(每頁參考計數各自獨立,可以分段歸還) */
+/* 一整個 2MB 對齊的區塊:pmm 直接找對齊的位置。以前先要 2 × 512 − 1 頁再切出對齊的一段,
+   需要約 4MB 連續空閒頁,記憶體零碎時明明有對齊的 2MB 空著也拿不到 */
+static char *chunk_pages_alloc(void)
+{
+    return pmm_alloc_pages_aligned(KSTACK_CHUNK_PAGES, KSTACK_CHUNK_PAGES);
+}
+
+/* 建一個新區塊並掛上串列。不可持有 stack_lk:pmm 配置、vm_unmap(拆大分頁 + TLB shootdown 的跨 CPU 呼叫)。
+   失敗回傳 -1、什麼都不變 */
+static int kstack_chunk_grow(void)
+{
+    char *base = chunk_pages_alloc();
+    if (!base)
+        return -1;
+    for (unsigned i = 0; i < KSTACK_SLOTS; i++) {
+        if (vm_unmap((uintptr_t)base + i * KSTACK_SLOT_BYTES) == 0)
+            continue;
+        /* 整個區塊在同一個 2MB 大分頁裡:只有第一次 unmap 需要配置頁表(拆開),之後不會失敗 */
+        if (i != 0)
+            panic("sched: guard unmap %u failed after the chunk was split", i);
+        pmm_free_pages(base, KSTACK_CHUNK_PAGES);
+        return -1;
+    }
+    struct kstack_chunk *c = (struct kstack_chunk *)(base + KSTACK_CHUNK_BYTES - PAGE_SIZE);
+    memset(c, 0, sizeof(*c));
+    c->base = base;
+    unsigned long flags = spin_lock_irqsave(&stack_lk);
+    c->next = kstack_chunks;
+    kstack_chunks = c;
+    kstack_nchunks++;
+    spin_unlock_irqrestore(&stack_lk, flags);
+    return 0;
+}
+
+static char *stack_take_locked(void)
+{
+    for (struct kstack_chunk *c = kstack_chunks; c; c = c->next) {
+        if (c->used == KSTACK_SLOTS)
+            continue;
+        for (unsigned w = 0; w < KSTACK_MAP_WORDS; w++) {
+            uint32_t freebits = ~c->map[w];
+            if (w == KSTACK_MAP_WORDS - 1 && KSTACK_SLOTS % 32u)
+                freebits &= (1u << (KSTACK_SLOTS % 32u)) - 1u;      /* 最後一個字只有前面幾個位元是真的格 */
+            if (!freebits)
+                continue;
+            unsigned b = 0;                      /* 最低的 1:手寫掃描。__builtin_ctz 在沒有 Zbb 的 riscv64 會呼叫 libgcc 的 __ctzdi2(kernel 沒有連結 libgcc) */
+            while (!(freebits & (1u << b)))
+                b++;
+            c->map[w] |= 1u << b;
+            c->used++;
+            if (++kstack_used > kstack_hwm)
+                kstack_hwm = kstack_used;
+            return c->base + (w * 32u + b) * KSTACK_SLOT_BYTES;
+        }
+        panic("sched: kernel stack chunk %p used count %u disagrees with its bitmap", (void *)c->base, c->used);
+    }
+    return NULL;
+}
 
 static char *stack_alloc(void)
 {
-    unsigned long flags = spin_lock_irqsave(&stack_lk);
-    char *st = stack_cache;
-    if (st) {
-        stack_cache = *(char **)(st + PAGE_SIZE);
-        stack_cached--;
+    for (;;) {
+        unsigned long flags = spin_lock_irqsave(&stack_lk);
+        char *st = stack_take_locked();
+        spin_unlock_irqrestore(&stack_lk, flags);
+        if (st)
+            return st;
+        /* 全部的區塊都滿了:在鎖外建一個新的再重試(別的 CPU 同時也可能建了一個,重試時一併可用) */
+        if (kstack_chunk_grow() != 0)
+            return NULL;                     /* 呼叫者照「記憶體不足」處理 */
     }
-    spin_unlock_irqrestore(&stack_lk, flags);
-    if (st)
-        return st;
-
-    st = pmm_alloc_pages(STACK_PAGES + 1);
-    if (!st)
-        return NULL;
-    if (vm_unmap((uintptr_t)st) != 0) {      /* 移除保護頁的對映 */
-        pmm_free_pages(st, STACK_PAGES + 1);
-        return NULL;
-    }
-    return st;
 }
 
-/* 閒置 stack 快取目前佔住的實體頁數(測試核對「記憶體全部回來了」時要扣掉) */
-size_t sched_stack_cache_pages(void)
+/* 從串列拿掉一個區塊。持有 stack_lk;回傳它 */
+static struct kstack_chunk *kstack_unlink_locked(struct kstack_chunk *c)
 {
-    unsigned long flags = spin_lock_irqsave(&stack_lk);
-    size_t n = (size_t)stack_cached * (STACK_PAGES + 1);
-    spin_unlock_irqrestore(&stack_lk, flags);
-    return n;
+    for (struct kstack_chunk **pp = &kstack_chunks; *pp; pp = &(*pp)->next)
+        if (*pp == c) {
+            *pp = c->next;
+            kstack_nchunks--;
+            return c;
+        }
+    panic("sched: kernel stack chunk %p not on the list", (void *)c->base);
 }
 
-/* 把一條 stack 真正還給 pmm:保護頁要先對映回來,否則下一個拿到這頁的人無法使用 */
-static void stack_release(char *st)
+/* 把一個已拿下的全空區塊還給 pmm(不可持有 stack_lk:vm_map 可能做跨 CPU 的 TLB 清除)。
+   保護頁先重新對映(恆等對映),頁才能交給別人用。拆開的頁表留著 — 合併回大分頁在 aarch64 上
+   要 break-before-make、不安全(見 DEVLOG 第 68 步);它的上限是實體記憶體 / 2MB,與執行緒數無關 */
+static void kstack_chunk_release(struct kstack_chunk *c)
 {
-    if (vm_map((uintptr_t)st, (uintptr_t)st, VM_READ | VM_WRITE) != 0)
-        panic("sched: cannot remap guard page %p", (void *)st);
-    pmm_free_pages(st, STACK_PAGES + 1);
+    char *base = c->base;                    /* c 在區塊的最後一頁:先記下,釋放之後就不能再碰 */
+    for (unsigned i = 0; i < KSTACK_SLOTS; i++) {
+        uintptr_t g = (uintptr_t)base + i * KSTACK_SLOT_BYTES;
+        if (vm_map(g, g, VM_READ | VM_WRITE) != 0)
+            panic("sched: cannot remap guard page %p", (void *)g);
+    }
+    pmm_free_pages(base, KSTACK_CHUNK_PAGES);
 }
 
 static void stack_free(char *st)
 {
+    char *base = (char *)((uintptr_t)st & ~(KSTACK_CHUNK_BYTES - 1));
+    uintptr_t off = (uintptr_t)st - (uintptr_t)base;
     unsigned long flags = spin_lock_irqsave(&stack_lk);
-    if (stack_cached < STACK_CACHE_MAX) {
-        *(char **)(st + PAGE_SIZE) = stack_cache;
-        stack_cache = st;
-        stack_cached++;
-        st = NULL;
+    struct kstack_chunk *c = kstack_chunks;
+    while (c && c->base != base)
+        c = c->next;
+    if (!c || off % KSTACK_SLOT_BYTES != 0 || off / KSTACK_SLOT_BYTES >= KSTACK_SLOTS)
+        panic("sched: freeing %p which is not a kernel stack slot", (void *)st);
+    unsigned i = (unsigned)(off / KSTACK_SLOT_BYTES);
+    if (!(c->map[i / 32u] & (1u << (i % 32u))) || c->used == 0)
+        panic("sched: kernel stack %p freed twice", (void *)st);
+    c->map[i / 32u] &= ~(1u << (i % 32u));
+    c->used--;
+    kstack_used--;
+    /* 區塊全空、而且已經另有一塊空區塊:這塊還給 pmm(最多保留一塊備用)。
+       只增不減的話,一次 1000 條執行緒的高峰會永久佔住約 20MB(stress 測試抓到) */
+    struct kstack_chunk *victim = NULL;
+    if (c->used == 0) {
+        unsigned empty = 0;
+        for (struct kstack_chunk *e = kstack_chunks; e; e = e->next)
+            if (e->used == 0)
+                empty++;
+        if (empty > 1)
+            victim = kstack_unlink_locked(c);
     }
     spin_unlock_irqrestore(&stack_lk, flags);
-    if (st)
-        stack_release(st);
+    if (victim)
+        kstack_chunk_release(victim);
+}
+
+/* 歸還所有全空的區塊(sched_trim 用:測試核對「記憶體全部回來了」之前) */
+static void kstack_release_empty(void)
+{
+    for (;;) {
+        unsigned long flags = spin_lock_irqsave(&stack_lk);
+        struct kstack_chunk *e = kstack_chunks;
+        while (e && e->used != 0)
+            e = e->next;
+        struct kstack_chunk *victim = e ? kstack_unlink_locked(e) : NULL;
+        spin_unlock_irqrestore(&stack_lk, flags);
+        if (!victim)
+            return;
+        kstack_chunk_release(victim);
+    }
+}
+
+void sched_kstack_stats(struct kstack_stats *out)
+{
+    unsigned long flags = spin_lock_irqsave(&stack_lk);
+    out->used = kstack_used;
+    out->hwm = kstack_hwm;
+    out->chunks = kstack_nchunks;
+    out->slots_per_chunk = KSTACK_SLOTS;
+    spin_unlock_irqrestore(&stack_lk, flags);
+}
+
+/* 區塊目前佔住的實體頁數(全空的區塊最多留一塊備用;sched_trim 會全部歸還) */
+size_t sched_kstack_pages(void)
+{
+    unsigned long flags = spin_lock_irqsave(&stack_lk);
+    size_t n = (size_t)kstack_nchunks * KSTACK_CHUNK_PAGES;
+    spin_unlock_irqrestore(&stack_lk, flags);
+    return n;
 }
 
 /*
@@ -466,19 +603,7 @@ void sched_trim(void)
        呼叫者要的是「所有已結束的執行緒都收乾淨」,所以先等到沒有待回收的為止 */
     while (__atomic_load_n(&nzombies, __ATOMIC_SEQ_CST) != 0)
         thread_yield();
-
-    for (;;) {
-        unsigned long flags = spin_lock_irqsave(&stack_lk);
-        char *st = stack_cache;
-        if (st) {
-            stack_cache = *(char **)(st + PAGE_SIZE);
-            stack_cached--;
-        }
-        spin_unlock_irqrestore(&stack_lk, flags);
-        if (!st)
-            break;
-        stack_release(st);
-    }
+    kstack_release_empty();                  /* 全空的 kernel stack 區塊(含備用的那塊)還給 pmm */
 }
 
 /*
@@ -1085,8 +1210,12 @@ static void starve_scan(uint64_t now)
         int n = runq_peek(p, cand, RUNQ_PEEK_MAX);
         for (int i = 0; i < n; i++) {
             struct thread *t = thread_of(cand[i]);
+            /* now < ready_since:這條執行緒是在這一輪補記中才就緒的 — 推進時間的 CPU 先把系統時間寫到最新,
+               再逐個 tick 補做全系統的工作,就緒時記下的 ready_since(= 最新的 tick)可能比正在補做的 now 新。
+               以前直接相減,無號數下溢成極大值,剛醒的執行緒立刻被當成「等太久」提升到最高優先權
+               (I-337 之後才出現:優先權延遲測試偶發量到同優先權延遲 1,排程紀錄顯示剛醒的執行緒是 p7) */
             if (t->state != T_READY || t->prio != p || t->starve_boost ||
-                now - t->ready_since < starve_ticks)
+                now < t->ready_since || now - t->ready_since < starve_ticks)
                 continue;
             t->starve_boost = 1;
             nstarve_boosts++;

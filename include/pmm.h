@@ -20,6 +20,7 @@ void pmm_init(const struct boot_info *bi);
    內容不保證為 0 */
 void *pmm_alloc(void);
 void *pmm_alloc_pages(size_t n);
+void *pmm_alloc_pages_aligned(size_t n, size_t align_pages);   /* 起點對齊 align_pages 頁(一般配置的規則都適用) */
 
 /*
  * 每一頁有一個參考計數:有幾個「擁有者」。配置時為 1。

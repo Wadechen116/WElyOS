@@ -197,6 +197,8 @@ static int hog_worker(int rep, int go, int rel)
     msg[0] = thr_bad ? 'X' : 'D';
     if (sys_write(rep, msg, 2) != 2)
         return 7;
+    if (sys_close(rep) != 0)                     /* 回報完就關:父行程靠「寫入端全關 → EOF」發現有人沒回報就死了 */
+        return 10;
     if (sys_read(rel, &c, 1) != 0)
         return 8;
     return thr_bad ? 9 : 0;
@@ -247,14 +249,21 @@ static int hog_threads(int touch)
     int refused = ferr == -E_NOMEM || nomem_thr;
     if (ferr != 0 && ferr != -E_NOMEM)
         bad = 1;
-    /* 記憶體已經被拒絕:這時才讓所有執行緒觸 stack — 只能用預付的預留頁 */
+    /* 記憶體已經被拒絕:這時才讓所有執行緒觸 stack — 只能用預付的預留頁。
+       父行程先關掉自己的寫入端;工作行程送出 'D' 後也關掉自己的(被終止的,隨行程結束自動關閉)。
+       所以只要有工作行程提早死掉,其他人回報完之後寫入端就全部關閉,讀取收到 EOF(0),立刻判定失敗。
+       以前父行程一直持有寫入端,死掉的那個的回報永遠不來,只能等回歸腳本 60 秒逾時。
+       (不用看守執行緒:記憶體已被拒絕時建不出來,而且之後的 fork 要求只剩一條執行緒) */
+    if (sys_close(rep[1]) != 0)
+        bad = 1;
     if (sys_close(go[1]) != 0)
         bad = 1;
     int done = 0;
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < n && !bad; i++) {
         char msg[2];
-        if (sys_read(rep[0], msg, 2) != 2 || msg[0] != 'D')
-            bad = 1;
+        long r = sys_read(rep[0], msg, 2);
+        if (r != 2 || msg[0] != 'D')
+            bad = 1;                             /* r == 0:所有寫入端都關了,有工作行程沒回報就死了 */
         else
             done++;
     }
@@ -279,11 +288,13 @@ static int hog_threads(int touch)
         if (sys_waitpid(kids[i], &st, 0) != kids[i] || st != 0)
             bad = 1;                             /* 在 fault 被終止也在這裡被抓到 */
     }
-    if (sys_close(rep[0]) != 0 || sys_close(rep[1]) != 0)
+    if (sys_close(rep[0]) != 0)
         bad = 1;
     if (touch && !bad) {
         /* 越過格子:碰保護頁,行程必須被終止(負值或 128 以上),而不是無聲擴張 */
-        long pid = sys_fork();
+        long pid;
+        for (int t = 0; (pid = sys_fork()) == -E_BUSY && t < 5000; t++)
+            sys_sleep(1);                        /* 保險:fork 要求只剩一條執行緒 */
         if (pid == 0)
             sys_exit(overflow_child());
         int st = 0;

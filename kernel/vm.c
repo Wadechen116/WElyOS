@@ -49,6 +49,10 @@ static pte_t *root;                          /* kernel 頁表的根表格 */
 /* prepaid 位元圖的容量:M 必須放得下(vm_set_anon_windows 檢查)。目前三架構的 M 約 249-257 */
 #define ANON_SLOT_MAX   1024u
 #define ANON_SLOT_WORDS (ANON_SLOT_MAX / 32)
+/* I-340:承諾位元圖(committed map)。承諾窗的位址範圍 [cmap_lo, ...) 每一頁一個位元,
+   一頁位元圖涵蓋 PAGE_SIZE * 8 頁(4KB 頁 = 128MB)。窗合計 512MB → 4 頁 */
+#define CMAP_PAGES_MAX  8u
+#define CMAP_BITS_PER_PAGE ((unsigned long)PAGE_SIZE * 8u)
 
 struct vm_space {
     pte_t *root;                             /* 這個位址空間的根表格 */
@@ -74,6 +78,12 @@ struct vm_space {
     /* I-336:承諾窗裡每一張可能的中間表一個位元(編號見 anon_slot)。1 = 這張表還不存在,
        而且已經替它預付了一張 pt 票。受 vm_lk 保護。不變量 P1:pt_tickets == popcount(prepaid) */
     uint32_t prepaid[ANON_SLOT_WORDS];
+    /* I-340:哪些頁目前已承諾(vm_space_commit 設、vm_space_release 清、fork 照抄父的)。
+       vm_space_fault_anon 只兌現位元為 1 的頁:保護頁、mmap 之間的空頁、已歸還的部分在 VM 層就被拒絕,
+       不再只靠行程記憶體模組的過濾。受 vm_lk 保護。有 domain 的空間在建立時就配好(cmap_pages 頁),
+       之後的承諾 / 歸還 / fault 都不做一般配置(保留「commit 只呼叫 pmm_reserve」的性質)。
+       不變量 C1:位元為 1 的頁 ⊆ 承諾窗;data_tickets 只可能花在位元為 1 的頁上 */
+    uint32_t *cmap[CMAP_PAGES_MAX];
 };
 
 /*
@@ -89,6 +99,14 @@ static unsigned long anon_pt_max;
 /* 第 l 層(0 = 最底層的表)第 i 個窗的第一張表,對應到 prepaid 的哪一個位元。
    相鄰兩窗共用的那張表,後一窗的起點就是前一窗的終點:同一個位元(與 M 的扣除一致) */
 static unsigned long anon_slot_base[MMU_LEVELS][ANON_WIN_MAX];
+static uintptr_t cmap_lo;                    /* 位元 0 對應的頁 = 第一個承諾窗的起點 */
+static unsigned cmap_pages;                  /* 每個有 domain 的空間配幾頁位元圖(開機時由窗算出) */
+
+/* 每個有 domain 的位址空間固定記到 KOBJ 的頁數(承諾位元圖;測試算預期帳目用) */
+unsigned long vm_space_kobj_pages(void)
+{
+    return cmap_pages;
+}
 
 /*
  * 建頁表的用途(BR2)。不同區域之間不能借用承諾:
@@ -482,6 +500,57 @@ static int user_range(uintptr_t va)
     return va >= USER_BASE && va < USER_TOP;
 }
 
+/* I-340 承諾位元圖的工具。idx = (va - cmap_lo) / PAGE_SIZE。呼叫者保證範圍在承諾窗內(commit 已驗),
+   fault 的查詢自己檢查邊界 */
+static void cmap_free(struct vm_space *vs)
+{
+    for (unsigned i = 0; i < CMAP_PAGES_MAX; i++)
+        if (vs->cmap[i]) {
+            pmm_free(vs->cmap[i]);
+            vs->cmap[i] = NULL;
+        }
+}
+
+static int cmap_test(const struct vm_space *vs, uintptr_t va)
+{
+    if (va < cmap_lo)
+        return 0;
+    unsigned long idx = (unsigned long)((va - cmap_lo) >> PAGE_SHIFT);
+    unsigned long pg = idx / CMAP_BITS_PER_PAGE, off = idx % CMAP_BITS_PER_PAGE;
+    if (pg >= cmap_pages || !vs->cmap[pg])
+        return 0;                            /* 窗外、或沒有位元圖(dom 為 NULL):一律視為未承諾 */
+    return (vs->cmap[pg][off / 32] >> (off % 32)) & 1u;
+}
+
+enum cmap_op { CMAP_COUNT, CMAP_SET, CMAP_CLEAR };
+
+/* 對 [va, va + n 頁) 做 op,回傳「操作之前」已為 1 的位元數。以 32 位元一字處理:
+   最壞情況(整個 256MB heap 窗)是 2048 個字,在 vm_lk 內是有界的 */
+static unsigned long cmap_range(struct vm_space *vs, uintptr_t va, unsigned long n, enum cmap_op op)
+{
+    KASSERT(va >= cmap_lo);
+    unsigned long idx = (unsigned long)((va - cmap_lo) >> PAGE_SHIFT), had = 0;
+    while (n) {
+        unsigned long pg = idx / CMAP_BITS_PER_PAGE, off = idx % CMAP_BITS_PER_PAGE;
+        KASSERT(pg < cmap_pages && vs->cmap[pg]);
+        uint32_t *w = &vs->cmap[pg][off / 32];
+        unsigned b = (unsigned)(off % 32);
+        unsigned long k = 32u - b;
+        if (k > n)
+            k = n;
+        uint32_t m = (k == 32 ? 0xffffffffu : ((1u << k) - 1u)) << b;
+        for (uint32_t x = *w & m; x; x &= x - 1)
+            had++;
+        if (op == CMAP_SET)
+            *w |= m;
+        else if (op == CMAP_CLEAR)
+            *w &= ~m;
+        idx += k;
+        n -= k;
+    }
+    return had;
+}
+
 struct vm_space *vm_space_create(struct mb_domain *dom)
 {
     return vm_space_create_txn(dom, NULL);
@@ -518,6 +587,32 @@ struct vm_space *vm_space_create_txn(struct mb_domain *dom, struct mb_exec_txn *
         }
         vs->dom = dom;
         vs->quota[MB_PGTABLE] = 1;
+        /* I-340:承諾位元圖。一次配好,之後的 commit / release / fault 都不配置。
+           這幾頁是這個位址空間專用的 kernel 物件,記到 domain 的 KOBJ(destroy 時隨 quota[] 一起退回);
+           不記帳的話,每個行程有 16KB 不在任何人的帳上 */
+        if (cmap_pages && mb_quota_add_txn(dom, MB_KOBJ, cmap_pages, vs->txn) != 0) {
+            if (mb_quota_sub(dom, MB_PGTABLE, 1) != 0 || mb_domain_put(dom) != 0)
+                panic("vm: committed-map rollback mismatch");
+            if (txn)
+                mb_exec_unbind(txn, vs);
+            kfree(vs);
+            return NULL;
+        }
+        vs->quota[MB_KOBJ] += cmap_pages;
+        for (unsigned i = 0; i < cmap_pages; i++) {
+            vs->cmap[i] = pmm_alloc();
+            if (!vs->cmap[i]) {
+                cmap_free(vs);
+                if (mb_quota_sub(dom, MB_KOBJ, cmap_pages) != 0 ||
+                    mb_quota_sub(dom, MB_PGTABLE, 1) != 0 || mb_domain_put(dom) != 0)
+                    panic("vm: committed-map rollback mismatch");
+                if (txn)
+                    mb_exec_unbind(txn, vs);
+                kfree(vs);
+                return NULL;
+            }
+            memset(vs->cmap[i], 0, PAGE_SIZE);
+        }
     }
 
     unsigned long irq = spin_lock_irqsave(&vm_lk);
@@ -532,7 +627,10 @@ struct vm_space *vm_space_create_txn(struct mb_domain *dom, struct mb_exec_txn *
     spin_unlock_irqrestore(&vm_lk, irq);
 
     if (!vs->root) {
-        if (dom && (mb_quota_sub(dom, MB_PGTABLE, 1) != 0 || mb_domain_put(dom) != 0))
+        cmap_free(vs);
+        /* 位元圖記的 KOBJ 也要退(第一版漏了:配置失敗掃描在 exec 的第 5 次 pmm 配置 — 根表 — 抓到帳少退 4 頁) */
+        if (dom && ((cmap_pages && mb_quota_sub(dom, MB_KOBJ, cmap_pages) != 0) ||
+                    mb_quota_sub(dom, MB_PGTABLE, 1) != 0 || mb_domain_put(dom) != 0))
             panic("vm: root table quota rollback mismatch");
         if (txn)
             mb_exec_unbind(txn, vs);
@@ -600,6 +698,7 @@ void vm_space_destroy(struct vm_space *vs)
             panic("vm: address space ledger does not match its domain");
     }
     spin_unlock_irqrestore(&vm_lk, irq);
+    cmap_free(vs);
     if (vs->dom && mb_domain_put(vs->dom) != 0)
         panic("vm: domain released with memory still charged");
     kfree(vs);
@@ -930,6 +1029,10 @@ struct vm_space *vm_space_fork(struct vm_space *parent, struct mb_domain *dom,
                     panic("vm: fork marked %lu parent pages but reserved %lu", fa.marked, pending);
                 parent->data_tickets += fa.marked;      /* 待生效的票轉為正式 */
                 fork_settle_pt(child, anon, nanon);     /* 最壞情況的頁表票收斂成精確的位元圖 */
+                /* I-340:子的票照抄父的承諾(q = 父的票 + pending),承諾範圍也照抄父的位元圖。
+                   兩邊的位元圖都在 create 時配好,這裡只複製,不會失敗 */
+                for (unsigned i = 0; i < cmap_pages; i++)
+                    memcpy(child->cmap[i], parent->cmap[i], PAGE_SIZE);
             } else {
                 pmm_unreserve(pending);                 /* 失敗:父的待生效票全部退回,父的 PTE 沒有被改過 */
             }
@@ -1209,6 +1312,14 @@ void vm_set_anon_windows(const uintptr_t base[], const uintptr_t len[], unsigned
     }
     KASSERT(m <= ANON_SLOT_MAX);
     anon_pt_max = m;
+    /* I-340:承諾位元圖涵蓋 [第一窗起點, 最後一窗終點) */
+    if (n > 0) {
+        unsigned long span = (unsigned long)((base[n - 1] + len[n - 1] - base[0]) >> PAGE_SHIFT);
+        unsigned long pages = (span + CMAP_BITS_PER_PAGE - 1) / CMAP_BITS_PER_PAGE;
+        KASSERT(pages <= CMAP_PAGES_MAX);
+        cmap_lo = base[0];
+        cmap_pages = (unsigned)pages;
+    }
 }
 
 unsigned long vm_anon_pt_max(void) { return anon_pt_max; }
@@ -1243,6 +1354,11 @@ int vm_space_commit(struct vm_space *vs, enum mb_class cls, uintptr_t va, uintpt
     unsigned long irq = spin_lock_irqsave(&vm_lk);
     if (vs->pt_tickets != prepaid_count(vs) || vs->anon_tables + vs->pt_tickets > anon_pt_max)
         panic("vm: page-table tickets do not match the prepaid slots");
+    /* I-340:同一頁不能承諾兩次(會讓一頁持有兩張票、之後的歸還只退一張)。什麼都沒改就拒絕 */
+    if (cmap_range(vs, va, n, CMAP_COUNT) != 0) {
+        spin_unlock_irqrestore(&vm_lk, irq);
+        return -E_INVAL;
+    }
     unsigned long pt = pt_prepay(vs, va, len, 0);   /* 只替缺的、還沒預付的表收費(I-336) */
     struct mb_bundle b = { .reserve = n + pt };
     b.quota[cls] = n;
@@ -1255,6 +1371,7 @@ int vm_space_commit(struct vm_space *vs, enum mb_class cls, uintptr_t va, uintpt
         vs->pt_tickets += pt;
         vs->quota[cls] += n;
         vs->quota[MB_PGTABLE] += pt;
+        cmap_range(vs, va, n, CMAP_SET);        /* 與票在同一個完成點生效 */
         rc = 0;
     }
     spin_unlock_irqrestore(&vm_lk, irq);
@@ -1268,6 +1385,13 @@ int vm_space_fault_anon(struct vm_space *vs, uintptr_t va)
         return -1;
 
     unsigned long irq = spin_lock_irqsave(&vm_lk);
+    /* I-340:只兌現已承諾的頁。在 walk 之前檢查:未承諾的位址不能用掉預付的頁表票、也不能用掉
+       同一空間別處的資料票(保護頁、mmap 之間的空頁、已歸還的部分)。不 panic:這是使用者的錯誤位址,
+       呼叫者照一般的非法存取處理(-1 → 終止行程) */
+    if (!cmap_test(vs, va)) {
+        spin_unlock_irqrestore(&vm_lk, irq);
+        return -1;
+    }
     int rc = 1;
     pte_t *e = walk(vs, vs->root, va, 0, 1, 0, WALK_ANON, NULL);   /* 缺的表用預付的票:不會失敗 */
     if (!arch_pte_valid(*e)) {
@@ -1302,6 +1426,10 @@ void vm_space_release(struct vm_space *vs, enum mb_class cls, uintptr_t va, uint
         unsigned long seg = total - done < RELEASE_SEGMENT ? total - done : RELEASE_SEGMENT;
         unsigned long tickets = 0;
         unsigned long irq = spin_lock_irqsave(&vm_lk);
+        /* I-340:歸還的每一頁都必須是已承諾的;否則票與配額會被多退(帳務錯誤,不是使用者錯誤) */
+        uintptr_t sva = va + done * PAGE_SIZE;
+        if (cmap_range(vs, sva, seg, CMAP_CLEAR) != seg)
+            panic("vm: releasing %lu pages at %p that were not all committed", seg, (void *)sva);
         for (unsigned long i = 0; i < seg; i++) {
             uintptr_t a = va + (done + i) * PAGE_SIZE;
             int level = 0;

@@ -44,6 +44,8 @@ void stack_release_exhausted_test(void); /* I-240 T5 / Codex 166:記憶體耗盡
 void stack_concurrent_fail_test(void);   /* I-240 T4:一格承諾失敗只放自己的格與票 */
 void stack_pt_boundary_test(void);       /* I-240 T1:預付 pt 票讓飽和時的第一次觸及建得出中間表 */
 void stack_guard_test(void);             /* I-240 T2:保護頁觸及不消耗票、帳本不變 */
+void anon_commit_map_test(void);         /* I-340:VM 層拒絕已承諾範圍外的匿名 fault、不耗票 */
+void kstack_pool_test(void);             /* I-339:kernel stack 區塊長大後,第二輪與 churn 完全不改變記憶體 / 頁表 / 大分頁 */
 void image_ticket_test(void);            /* I-240 C3.2 (c2):映像私有頁記 IMAGE 配額,fork 後寫入一定成功 */
 void exec_txn_test(void);                /* I-240 C3.2 (c3):exec 交易的放寬上限 */
 void r1_lifecycle_test(void);            /* I-240 C3.2 R1:部分歸還、交錯 COW、子 destroy、再 fork 的票帳 */

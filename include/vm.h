@@ -184,4 +184,6 @@ struct vm_ledger { unsigned long data_tickets, pt_tickets, anon_tables, anon_quo
 void vm_space_ledger(struct vm_space *vs, struct vm_ledger *out);   /* 同一把鎖內讀出(測試用) */
 unsigned long vm_large_pages(void);      /* 目前以大分頁對映的數量(測試用) */
 
+unsigned long vm_space_kobj_pages(void);   /* 每個有 domain 的空間固定記到 KOBJ 的頁數(I-340 的承諾位元圖) */
+
 #endif

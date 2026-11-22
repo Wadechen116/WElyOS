@@ -460,7 +460,7 @@ static size_t retained_pages(void)
 {
     struct kheap_stats hs;
     kheap_stats(&hs);
-    return hs.heap_bytes / PAGE_SIZE + vm_table_pages() + sched_stack_cache_pages();
+    return hs.heap_bytes / PAGE_SIZE + vm_table_pages() + sched_kstack_pages();
 }
 
 void memhog_test(const char *mode)
@@ -724,7 +724,8 @@ void vm_ledger_test(void)
     struct vm_space *vs = vm_space_create(d);
     KASSERT(vs);
     mb_stats(d, &st);
-    KASSERT(st.used[MB_PGTABLE] == 1 && st.total == 1 && st.refs == 2);   /* 根表;空間持有一份參考 */
+    const unsigned long ko = vm_space_kobj_pages();                       /* I-340 的承諾位元圖(KOBJ) */
+    KASSERT(st.used[MB_PGTABLE] == 1 && st.used[MB_KOBJ] == ko && st.total == 1 + ko && st.refs == 2);   /* 根表;空間持有一份參考 */
 
     void *p1 = pmm_alloc(), *p2 = pmm_alloc(), *p3 = pmm_alloc();
     KASSERT(p1 && p2 && p3);
@@ -740,7 +741,7 @@ void vm_ledger_test(void)
     uintptr_t far = USER_BASE + ((uintptr_t)PAGE_SIZE << MMU_BITS);
     KASSERT(vm_space_map(vs, far, (uintptr_t)p3, VM_READ | VM_WRITE) != 0);
     mb_stats(d, &st);
-    KASSERT(st.used[MB_PGTABLE] == MMU_LEVELS && st.total == MMU_LEVELS);
+    KASSERT(st.used[MB_PGTABLE] == MMU_LEVELS && st.total == MMU_LEVELS + ko);
     pmm_free(p3);
 
     vm_space_destroy(vs);                                                  /* p1、p2 隨空間釋放 */
@@ -955,8 +956,10 @@ static void r1_check(struct vm_space *const *vs, struct mb_domain *const *ds, un
         vm_space_ledger(vs[i], &l);
         mb_stats(ds[i], &st);
         sum += l.data_tickets + l.pt_tickets;
+        /* 總數 = ANON + PGTABLE + 這個空間的承諾位元圖(KOBJ,I-340) */
         if (st.used[MB_ANON] != l.anon_quota || st.used[MB_PGTABLE] != l.pt_quota ||
-            st.total != st.used[MB_ANON] + st.used[MB_PGTABLE])
+            st.used[MB_KOBJ] != vm_space_kobj_pages() ||
+            st.total != st.used[MB_ANON] + st.used[MB_PGTABLE] + st.used[MB_KOBJ])
             panic("r1: space %u domain ANON %lu PGTABLE %lu total %lu != ledger anon %lu pt %lu at %s",
                   i, st.used[MB_ANON], st.used[MB_PGTABLE], st.total, l.anon_quota, l.pt_quota, where);
     }
@@ -1860,7 +1863,8 @@ void stack_pt_boundary_test(void)
  * 完整的 T2 還需要一個使用者模式測試(例如 crash=guard)。
  * 負對照:commit_user_stack 把保護頁也承諾(proc.c:61 的 base 少加 PAGE_SIZE,鏡射 ts_base 同改)
  *   → used[STACK] == 255 斷言失敗;拿掉 proc_mem.c:90 的 page == slot_base(鏡射 ts_fault 同改)
- *   → 保護頁觸及回傳 0 並消耗一張票,「帳本不變」斷言失敗。
+ *   → I-340 之後 VM 層仍拒絕(保護頁不在承諾位元圖裡),這個測試照樣通過 — 這正是縱深防禦的目的;
+ *   要讓它失敗必須同時拿掉 vm.c vm_space_fault_anon 的 cmap_test(此時直接呼叫 VM 的那一行也失敗)。
  */
 void stack_guard_test(void)
 {
@@ -1893,6 +1897,7 @@ void stack_guard_test(void)
         KASSERT(vm_space_query(vs, probes[i], &pa, &fl) != 0);
         KASSERT(vm_space_fault(vs, probes[i], 1) == -1 && vm_space_fault(vs, probes[i], 0) == -1);
         KASSERT(ts_fault(vs, &g, slots, ready, probes[i]) == -1);
+        KASSERT(vm_space_fault_anon(vs, probes[i]) == -1);   /* I-340:繞過過濾器,VM 層自己拒絕 */
     }
     vm_space_ledger(vs, &l);
     mb_stats(d, &st);
@@ -1911,6 +1916,214 @@ void stack_guard_test(void)
     mb_stats(d, &st);
     KASSERT(st.total == 0 && pmm_reserved_count() == r0 && mb_domain_put(d) == 0);
     kprintf("stack: T2 guard page faults without consuming tickets\n");
+}
+
+/*
+ * I-340:VM 層自己拒絕「不在已承諾範圍內」的匿名 fault(縱深防禦;不靠 proc_mem.c 的過濾)。
+ * 每一個拒絕都在「空間裡還有很多票」的狀態下做,並核對帳本、domain、pmm 預留、頁表與 anon_tables 全部不變
+ * (未承諾的位址不能用掉別處的資料票,也不能用掉預付的頁表票)。
+ *   1. 窗內但沒承諾的頁:heap 承諾段的下一頁、mmap 段之後的空頁、stack 格的保護頁(直接呼叫 VM,不經 ts_fault)
+ *   2. 部分歸還:尾端(sbrk 縮小)與中段(一頁)歸還後,那些頁的 fault 失敗;沒歸還的照常兌現;
+ *      尾端重新承諾後又能兌現;重複承諾同一頁被拒絕(-E_INVAL)、帳不變
+ *   3. fork:子繼承父的承諾範圍(含中段的洞);子歸還一頁不影響父(位元圖是複本,不共用)
+ * 負對照(各自單獨做,預期失敗的斷言):
+ *   - 拿掉 vm.c vm_space_fault_anon 的 cmap_test → 第 1 步的 fault 回傳 0、消耗一張票,KASSERT(... == -1) 失敗
+ *   - vm_space_release 的 CMAP_CLEAR 改成 CMAP_COUNT → 第 2 步歸還過的頁仍可兌現,斷言失敗
+ *   - 拿掉 vm_space_fork 的 memcpy(child->cmap...) → 第 3 步子對已承諾頁的 fault 回傳 -1,斷言失敗
+ *   - vm_space_commit 拿掉重複承諾的檢查 → 第 2 步的 -E_INVAL 斷言失敗
+ */
+static void cm_expect_refused(struct vm_space *vs, struct mb_domain *d, uintptr_t va, const char *what)
+{
+    struct vm_ledger l0, l;
+    struct mb_stats st0, st;
+    vm_space_ledger(vs, &l0);
+    mb_stats(d, &st0);
+    size_t res0 = pmm_reserved_count();
+    unsigned long pages0 = vm_space_pages(vs);
+    KASSERT(l0.data_tickets > 0);                            /* 有票可用:拒絕不是因為缺票 */
+    if (vm_space_fault_anon(vs, va) != -1)
+        panic("cmap: anonymous fault at %p (%s) outside every committed range was honoured", (void *)va, what);
+    uintptr_t pa;
+    KASSERT(vm_space_query(vs, va, &pa, NULL) != 0);
+    vm_space_ledger(vs, &l);
+    mb_stats(d, &st);
+    if (!ts_ledger_eq(&l, &l0) || !ts_stats_eq(&st, &st0) || pmm_reserved_count() != res0 ||
+        vm_space_pages(vs) != pages0)
+        panic("cmap: refused fault at %p (%s) changed the ledger (data %lu -> %lu, pt %lu -> %lu)",
+              (void *)va, what, l0.data_tickets, l.data_tickets, l0.pt_tickets, l.pt_tickets);
+}
+
+void anon_commit_map_test(void)
+{
+    uintptr_t heap, hlen, mm, mlen;
+    KASSERT(vm_anon_window(0, &heap, &hlen) == 0 && vm_anon_window(1, &mm, &mlen) == 0);
+    struct ts_geo g;
+    ts_geo_get(&g);
+    const uintptr_t PG = PAGE_SIZE;
+    size_t r0 = pmm_reserved_count();
+    struct mb_domain *dp = mb_domain_new(100000), *dc = mb_domain_new(100000);
+    struct vm_space *ps = vm_space_create(dp);
+    KASSERT(dp && dc && ps);
+
+    /* 承諾:heap 8 頁、mmap 4 頁、stack 第 0 格(兌現最上面 4 頁) */
+    KASSERT(vm_space_commit_anon(ps, heap, 8 * PG) == 0);
+    KASSERT(vm_space_commit_anon(ps, mm, 4 * PG) == 0);
+    KASSERT(ts_commit(ps, &g, 0) == 0);
+    struct vm_ledger l;
+    vm_space_ledger(ps, &l);
+    KASSERT(l.data_tickets == 8 + 4 + g.pages - TS_TOUCH_ON_COMMIT);
+
+    /* 1. 窗內、沒承諾 */
+    cm_expect_refused(ps, dp, heap + 8 * PG, "past the committed heap");
+    cm_expect_refused(ps, dp, heap + 600 * PG, "uncommitted heap, needs a new table");
+    cm_expect_refused(ps, dp, mm + 4 * PG, "gap after an mmap block");
+    cm_expect_refused(ps, dp, ts_guard(&g, 0), "stack guard page, filter bypassed");
+    cm_expect_refused(ps, dp, ts_guard(&g, 0) + PG - 1, "last byte of the guard page");
+    cm_expect_refused(ps, dp, ts_base(&g, 1), "stack slot 1, never committed");
+
+    /* 2. 部分歸還 */
+    KASSERT(vm_space_fault_anon(ps, heap + 3 * PG) == 0);
+    vm_space_release_anon(ps, heap + 6 * PG, 2 * PG);        /* 尾端:sbrk 縮小 */
+    vm_space_release_anon(ps, heap + 2 * PG, PG);            /* 中段:把一段切成兩段 */
+    cm_expect_refused(ps, dp, heap + 6 * PG, "released heap tail");
+    cm_expect_refused(ps, dp, heap + 7 * PG, "released heap tail");
+    cm_expect_refused(ps, dp, heap + 2 * PG, "released heap middle");
+    KASSERT(vm_space_fault_anon(ps, heap + 3 * PG) == 1);    /* 沒歸還、已兌現 */
+    KASSERT(vm_space_fault_anon(ps, heap + 1 * PG) == 0);    /* 沒歸還、未兌現:用票 */
+    vm_space_ledger(ps, &l);
+    unsigned long dt = l.data_tickets;
+    KASSERT(vm_space_commit_anon(ps, heap + 5 * PG, 2 * PG) == -E_INVAL);   /* heap+5 已承諾:整個拒絕 */
+    vm_space_ledger(ps, &l);
+    KASSERT(l.data_tickets == dt);
+    cm_expect_refused(ps, dp, heap + 6 * PG, "after a refused double commit");
+    KASSERT(vm_space_commit_anon(ps, heap + 6 * PG, 2 * PG) == 0);          /* 尾端重新承諾 */
+    KASSERT(vm_space_fault_anon(ps, heap + 7 * PG) == 0);
+    anon_check(ps, r0, "cmap-partial");
+
+    /* 3. fork:範圍 = 父目前的承諾(heap 的洞在 [2,3)) */
+    struct vm_range r[4] = {
+        { heap, 2 * PG }, { heap + 3 * PG, 5 * PG }, { mm, 4 * PG }, { ts_base(&g, 0), g.pages * PG },
+    };
+    struct vm_space *cs = vm_space_fork(ps, dc, r, 4);
+    KASSERT(cs);
+    cm_expect_refused(cs, dc, heap + 2 * PG, "child: hole inherited from the parent");
+    cm_expect_refused(cs, dc, ts_guard(&g, 0), "child: guard page");
+    cm_expect_refused(cs, dc, mm + 4 * PG, "child: mmap gap");
+    KASSERT(vm_space_fault_anon(cs, heap + 4 * PG) == 0);    /* 父也沒兌現:子用自己的票 */
+    KASSERT(vm_space_fault_anon(cs, mm + 3 * PG) == 0);
+    vm_space_release_anon(cs, heap + 5 * PG, PG);
+    cm_expect_refused(cs, dc, heap + 5 * PG, "child: released after fork");
+    KASSERT(vm_space_fault_anon(ps, heap + 5 * PG) == 0);    /* 父不受子的歸還影響 */
+
+    vm_space_destroy(cs);
+    vm_space_destroy(ps);
+    struct mb_stats st;
+    mb_stats(dp, &st);
+    KASSERT(st.total == 0);
+    mb_stats(dc, &st);
+    KASSERT(st.total == 0 && pmm_reserved_count() == r0);
+    KASSERT(mb_domain_put(dp) == 0 && mb_domain_put(dc) == 0);
+    kprintf("cmap: anonymous faults outside committed ranges are refused by the VM layer "
+            "(guard page, mmap gap, released tail and middle, fork child) without using a ticket\n");
+}
+
+/*
+ * I-339:kernel stack 不在執行期拆直接對映的大分頁(只在建立新區塊時拆一次,區塊留著重複使用)。
+ *   第 1 輪:同時存在的執行緒超過目前空閒的格數 10 條 → 至少多一個區塊,總共至少 2 個;每條都寫自己的 stack。
+ *   基準 = 第 1 輪結束、回收之後(已長大)的 pmm 空閒頁、頁表頁數、大分頁數、區塊數。
+ *   第 2 輪:完全相同的建立數;全部活著時與結束回收後,上述數字都必須「完全等於」基準(沒有容許差額)。
+ *   churn:在既有容量內反覆建立 / 結束 400 條(每批 8 條),結束後仍完全等於基準。
+ * 負對照(之後實測,見 DEVLOG):
+ *   (1) stack_free 改成「vm_map 保護頁 + 把整個區塊還給 pmm」(或 stack_alloc 每次都 grow)→ 第 2 輪區塊數 /
+ *       大分頁數 / 頁表頁數改變 → panic;
+ *   (2) 把 stack_alloc 換回舊的「pmm_alloc_pages + vm_unmap 保護頁」、stack_free 換回「vm_map + pmm_free_pages」
+ *       → stack 落在沒拆過的 2MB 區時大分頁數下降、頁表頁數上升 → 第 2 輪或 churn panic
+ *       (舊的實作有 32 條的 stack 快取,churn 的批次要大於 32 才看得到,所以第 2 輪用超過一個區塊的數量)。
+ */
+static volatile int kpool_go;
+static void kpool_worker(void *arg)
+{
+    volatile char probe[256];                    /* 真的用到 stack:確定可寫、沒有碰到保護頁 */
+    for (unsigned i = 0; i < sizeof probe; i++)
+        probe[i] = (char)(uintptr_t)arg;
+    while (!__atomic_load_n(&kpool_go, __ATOMIC_ACQUIRE))
+        thread_sleep(1);
+    for (unsigned i = 0; i < sizeof probe; i++)
+        KASSERT(probe[i] == (char)(uintptr_t)arg);
+}
+
+struct kpool_snap { size_t pmm_free; unsigned long large, tables; struct kstack_stats ks; };
+static void kpool_take(struct kpool_snap *x)
+{
+    x->pmm_free = pmm_free_count();
+    x->large = vm_large_pages();
+    x->tables = vm_table_pages();
+    sched_kstack_stats(&x->ks);
+}
+static void kpool_check(const struct kpool_snap *b, const char *when, int alive)
+{
+    struct kpool_snap x;
+    kpool_take(&x);
+    /* 全部活著時區塊會重新長出來(全空的區塊會還給 pmm,最多留一塊備用),所以那時只要求大分頁與頁表
+       不變 — 重新長出的區塊要落在已經拆過的區域;全部結束後一切都要和基準完全相同 */
+    if (x.large != b->large || x.tables != b->tables ||
+        (!alive && (x.pmm_free != b->pmm_free || x.ks.chunks != b->ks.chunks || x.ks.used != b->ks.used)))
+        panic("kstack pool: %s: pmm %zu->%zu large %lu->%lu tables %lu->%lu chunks %u->%u used %u->%u", when,
+              b->pmm_free, x.pmm_free, b->large, x.large, b->tables, x.tables, b->ks.chunks, x.ks.chunks,
+              b->ks.used, x.ks.used);
+}
+
+/* 同時建立 n 條、全部活著時呼叫 alive_check(可為 NULL)、放行、全部 join、回收 */
+static void kpool_round(unsigned n, const struct kpool_snap *b, const char *when)
+{
+    static int tid[512];
+    KASSERT(n <= sizeof tid / sizeof tid[0]);
+    __atomic_store_n(&kpool_go, 0, __ATOMIC_RELEASE);
+    for (unsigned i = 0; i < n; i++) {
+        tid[i] = thread_create("kpool", kpool_worker, (void *)(uintptr_t)(i + 1));
+        KASSERT(tid[i] > 0);
+    }
+    if (b)
+        kpool_check(b, when, 1);
+    __atomic_store_n(&kpool_go, 1, __ATOMIC_RELEASE);
+    for (unsigned i = 0; i < n; i++)
+        thread_join(tid[i]);
+    sched_trim();
+}
+
+void kstack_pool_test(void)
+{
+    struct kpool_snap s0, base;
+    sched_trim();
+    kpool_take(&s0);
+    unsigned per = s0.ks.slots_per_chunk;
+    KASSERT(per == 512u / (4u + 1u));            /* STACK_PAGES = 4 */
+    unsigned free_slots = s0.ks.chunks * per - s0.ks.used;
+    unsigned n = free_slots + 10u;               /* 一定要長大 */
+    if (n < per + 10u)
+        n = per + 10u;                           /* 超過一個區塊的容量 */
+
+    kpool_round(n, NULL, NULL);                  /* 第 1 輪:可以長大 */
+    kpool_take(&base);
+    /* 高峰時需要的區塊數;結束後全空的區塊還給 pmm,最多留一塊備用(只增不減的話,一次高峰會永久
+       佔住記憶體 — stress 測試 1000 條時約 20MB) */
+    unsigned peak = (s0.ks.used + n + per - 1) / per;
+    KASSERT(base.ks.used == s0.ks.used && base.ks.chunks <= s0.ks.chunks + 1);
+    /* 拆大分頁、新增頁表的次數不超過高峰時新增的區塊數(頁表留著:合併回大分頁不安全,上限 = 實體記憶體 / 2MB) */
+    unsigned grown = peak > s0.ks.chunks ? peak - s0.ks.chunks : 0;
+    KASSERT(grown >= 1 && s0.large - base.large <= grown && base.tables - s0.tables <= grown);
+    KASSERT(s0.pmm_free - base.pmm_free <= 512u + grown + 64u);   /* 備用區塊 + 頁表 + 執行緒結構池的成長 */
+
+    kpool_round(n, &base, "second round, all alive");   /* 第 2 輪:什麼都不能變 */
+    kpool_check(&base, "second round, after join", 0);
+
+    for (unsigned k = 0; k < 50; k++)            /* churn:400 條,每批 8 條 */
+        kpool_round(8, &base, "churn, alive");
+    kpool_check(&base, "churn, after join", 0);
+
+    kprintf("kstack: %u stacks/chunk, %u concurrent threads needed %u chunks, %u kept after (one spare at most); "
+            "second round and 400-thread churn leave pmm / large pages (%lu) / page tables (%lu) exactly unchanged\n",
+            per, n, peak, base.ks.chunks, base.large, base.tables);
 }
 
 /*
