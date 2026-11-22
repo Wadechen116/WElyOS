@@ -5,6 +5,7 @@
  */
 #define PROC_OWNER_SIG              /* 這個檔案是這一組狀態的擁有者(見 proc_internal.h) */
 #include "proc_internal.h"
+#include "failinj.h"
 
 /*
  * ---- 訊號 ----
@@ -328,10 +329,28 @@ void user_return_check(void *tf)
     if (thread_killed())
         proc_thread_exit();
     pmem_apply_injection(p);                     /* 故障注入(SYS_seu):等著翻轉的位元由行程自己在這裡動手 */
-    if (p->sig.pending)                          /* 不上鎖先看一眼,理由同上 */
+    int injected = 0;
+    /* I-334:以前是「沒有待處理訊號才看打斷標記並清掉」,兩次都不上鎖讀。訊號若剛好在兩次讀取
+       之間送達(送的一方在 sched_lk 內先設 pending 再設 interrupted),打斷標記被清掉、訊號卻沒交付,
+       接下來的睡眠就睡滿。現在只要任一個成立就交給 deliver_signal:它在鎖內清打斷標記、
+       同時重新讀 pending — 和送的一方在同一把鎖下,不會再有「清掉了卻沒看到」的空檔 */
+    int pend = p->sig.pending != 0;              /* 不上鎖先看一眼:快速路徑,真正的決定在鎖內 */
+    if (!pend)
+        injected = failinj_sig_window(p);        /* 測試:撐大這個空檔,平常什麼都不做 */
+    if (pend || thread_interrupted())
         deliver_signal(p, tf);
-    else if (thread_interrupted())
-        thread_clear_interrupt();                /* 訊號已經由別條執行緒處理了 */
+    /* 測試的那一次返回:核對不變量 — 回到使用者模式時,不可以有可交付的待處理訊號、
+       打斷標記卻已經清掉(接下來的睡眠就不會被叫醒) */
+    if (injected) {
+        unsigned long flags = sched_lock();
+        int bad = 0;
+        for (int s = 1; s < NSIG; s++)
+            if ((p->sig.pending & (1u << s)) && p->sig.handler[s] != SIG_DFL && p->sig.handler[s] != SIG_IGN)
+                bad = 1;
+        if (bad && !thread_interrupted())
+            failinj_note_lost_wake();
+        sched_unlock(flags);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -375,4 +394,20 @@ int psig_report_stop(struct proc *p)
 {
     p->sig.stop_reported = 1;
     return p->sig.stopped;
+}
+
+/* 測試用(I-334):行程有沒有可交付(處理方式不是預設、不是忽略)的待處理訊號。
+   由 thread_sleep 在 sched_lk 內呼叫,sig 的欄位也由同一把鎖保護 */
+static int sig_deliverable_locked(void *data)
+{
+    struct proc *p = data;
+    for (int s = 1; s < NSIG; s++)
+        if ((p->sig.pending & (1u << s)) && p->sig.handler[s] != SIG_DFL && p->sig.handler[s] != SIG_IGN)
+            return 1;
+    return 0;
+}
+
+void proc_sig_enable_sleep_check(void)
+{
+    sched_sleep_check = sig_deliverable_locked;
 }

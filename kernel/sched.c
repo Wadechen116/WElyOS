@@ -41,6 +41,7 @@
 #include "pmm.h"
 #include "runq.h"
 #include "sched.h"
+#include "failinj.h"
 #include "smp.h"
 #include "spinlock.h"
 #include "timer.h"
@@ -1135,6 +1136,10 @@ void thread_sleep(unsigned ms)
         sched_unlock(flags);
         return;
     }
+    /* 測試(I-334):睡下去的這一刻,行程若有可交付的待處理訊號而打斷標記是 0,
+       這次睡眠就不會被它叫醒 — 記一筆。只在自我測試註冊了檢查函式時才做 */
+    if (sched_sleep_check && self->data && sched_sleep_check(self->data))
+        failinj_note_sleep_pending();
     sleep_until_locked(self, timer_ticks_real() + n);   /* 以真實時間為起點:見 timer.h 的 timer_ticks_real */
     sched_unlock(flags);
 }
@@ -1474,6 +1479,8 @@ unsigned sched_thread_count(void)      { return nthreads; }
 /* 還沒釋放的執行緒數 = 存活 + 已結束但還沒回收。thread_exit 在同一段 sched_lock 內
    把存活數減 1、待回收數加 1,所以在鎖內讀這個和,只有真正釋放(thread_free)時才會下降。
    測試用它確認「之前結束的執行緒資源都已歸還」,不必猜要等多久 */
+int (*sched_sleep_check)(void *data);     /* 見 thread_sleep;NULL = 不檢查 */
+
 unsigned sched_unfreed_threads(void)
 {
     unsigned long flags = sched_lock();

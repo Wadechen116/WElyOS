@@ -590,6 +590,108 @@ static int mode_failsweep(void)
     return 73;
 }
 
+/* ---- UMODE_SIGRACE ---- */
+
+/* I-334:返回使用者模式時,kernel 先不上鎖讀「有沒有待處理訊號」,沒有的話再讀「是否被打斷」並清掉。
+   訊號若剛好在這兩次讀取之間送達,打斷標記被清掉、訊號卻沒交付,接下來的睡眠就會睡滿。
+   測試:父行程寫一個位元組到管線叫醒子行程(它睡 3ms 再送 SIGUSR1),接著啟用延遲注入 —
+   這次系統呼叫返回時在兩次讀取之間忙等 15ms,訊號剛好落在這個空檔裡。父行程接著睡 2 秒:
+   訊號在睡之前還沒交付,睡眠就必須被它叫醒;睡滿了 = 遺失喚醒 */
+static volatile int sr_seen;
+static volatile uint64_t sr_tick;               /* 處理函式執行時的 tick */
+
+static void sr_handler(int sig)
+{
+    (void)sig;
+    struct sysinfo t;
+    if (sys_sysinfo(&t) == 0)
+        sr_tick = t.uptime_ticks;
+    sr_seen++;
+}
+
+static int mode_sigrace(void)
+{
+    long me = sys_getpid();
+    if (sys_signal(SIGUSR1, sr_handler) < 0)
+        return 2;
+    long lw0 = sys_failinj(FI_OP_LOSTWAKE, 0, 0);
+    long sp0 = sys_failinj(FI_OP_SLEEPPEND, 0, 0);
+    int lost = 0, raced = 0, benign = 0;
+    for (int k = 0; k < 60; k++) {
+        int fds[2];
+        if (sys_pipe(fds) != 0)
+            return 3;
+        int before = sr_seen;
+        long pid = sys_fork();
+        if (pid == 0) {
+            char c;
+            if (sys_read(fds[0], &c, 1) != 1)
+                sys_exit(3);
+            sys_sleep(3);                        /* 等父行程讀過「待處理訊號」、進入 15ms 的空檔中段 */
+            sys_exit(sys_kill(me, SIGUSR1) == 0 ? 0 : 2);
+        }
+        if (pid < 0)
+            return 4;
+        if (sys_write(fds[1], "x", 1) != 1)      /* 叫醒子行程:它睡 3ms 後送訊號 */
+            return 6;
+        if (sys_failinj(FI_OP_SIGWIN, 0, 15) != 0)  /* 這次返回在兩次讀取之間忙等 15ms */
+            return 5;
+        if (sr_seen == before) {                 /* 還沒交付:接下來的睡眠必須被叫醒 */
+            raced++;
+            struct sysinfo t0, t1;
+            if (sys_sysinfo(&t0) != 0)
+                return 7;
+            sys_sleep(2000);
+            if (sys_sysinfo(&t1) != 0)
+                return 8;
+            /* 只有「睡滿了,而且處理函式在睡眠開始之後才執行」才算遺失喚醒。
+               訊號若在 sr_seen 檢查之後、睡眠之前送達,它在 sysinfo 返回時就被交付了,
+               接下來的睡眠睡滿是正確的(aarch64 上父行程在 CPU0、延遲期間關中斷時會發生) */
+            if (t1.uptime_ticks - t0.uptime_ticks >= 1000) {
+                if (sr_seen != before && sr_tick >= t0.uptime_ticks + 1000)
+                    lost++;
+                else
+                    benign++;                    /* 處理函式在睡眠之前就執行了:睡滿是正確的 */
+            }
+        }
+        int st = -1;
+        while (sys_waitpid(pid, &st, 0) == -E_INTR)
+            ;
+        if (st != 0)
+            return 9;
+        for (int w = 0; sr_seen == before; w++) {    /* 最後一定要交付 */
+            if (w > 3000)
+                return 10;
+            sys_sleep(1);
+        }
+        if (sys_close(fds[0]) != 0 || sys_close(fds[1]) != 0)
+            return 11;
+    }
+    struct line l = { .len = 0 };
+    line_str(&l, "  [user] sigrace: ");
+    line_num(&l, raced);
+    long bad = sys_failinj(FI_OP_LOSTWAKE, 0, 0) - lw0;
+    line_str(&l, " of 60 rounds reached the sleep with the signal still pending, lost wakeups ");
+    line_num(&l, lost);
+    long sp = sys_failinj(FI_OP_SLEEPPEND, 0, 0) - sp0;
+    line_str(&l, "\n");                          /* 分兩行:一行最多 160 字元 */
+    line_out(&l);
+    l.len = 0;
+    line_str(&l, "  [user] sigrace: full sleeps after an earlier delivery ");
+    line_num(&l, benign);
+    line_str(&l, ", bad returns ");
+    line_num(&l, bad);
+    line_str(&l, ", sleeps with a deliverable signal ");
+    line_num(&l, sp);
+    line_str(&l, "\n");
+    line_out(&l);
+    if (bad)
+        return 40 + (bad > 30 ? 30 : (int)bad);
+    if (sp)
+        return 30 + (sp > 9 ? 9 : (int)sp);
+    return lost ? 20 + lost : 74;
+}
+
 /* ---- UMODE_FSQUOTA ---- */
 
 /* I-240 C3.2 (d):ramfs 的 FS 配額。放棄 CAP_ADMIN 的子行程一直寫檔,必須停在 FS 上限、
@@ -3239,6 +3341,8 @@ static int umain(long mode)
     case UMODE_THREADCHURN:
         return mode_threadchurn();
 
+    case UMODE_SIGRACE:
+        return mode_sigrace();
     case UMODE_FAILSWEEP:
         return mode_failsweep();
     case UMODE_THREADMIX:

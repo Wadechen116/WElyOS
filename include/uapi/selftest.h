@@ -45,5 +45,6 @@ enum {
     UMODE_FSQUOTA,       /* ramfs 的 FS 配額:一般使用者寫到上限得到 E_NOSPC,管理者可越過,刪檔後歸還 */
     UMODE_THREADMIX,     /* 多條執行緒同時建立 / 結束;主執行緒先結束後,由其他執行緒 fork */
     UMODE_FAILSWEEP,     /* 配置失敗注入掃過 fork / 建立執行緒 / exec / spawn / pipe / mmap+sbrk / 管線讀寫 / UDP 的每個配置點 */
+    UMODE_SIGRACE,       /* 訊號在返回使用者模式的空檔送達:之後的睡眠必須被叫醒(I-334) */
 };
 #endif

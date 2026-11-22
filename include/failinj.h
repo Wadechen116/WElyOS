@@ -25,4 +25,9 @@ static inline int failinj_check(enum fi_site site)
     return __atomic_load_n(&failinj_armed, __ATOMIC_RELAXED) ? failinj_check_slow(site) : 0;
 }
 
+/* 延遲注入(I-334):把返回使用者模式時兩次讀取之間的空檔撐大,讓訊號競爭可以穩定重現 */
+int  failinj_sig_window(const void *proc);         /* 1 = 這次忙等了(測試對象的那一次返回) */
+void failinj_note_lost_wake(void);
+void failinj_note_sleep_pending(void);           /* 睡下去時帶著可交付訊號(I-334 不變量)*/
+
 #endif

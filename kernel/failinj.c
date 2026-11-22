@@ -13,6 +13,8 @@
 #include "membudget.h"
 #include "uapi/errno.h"
 #include "uapi/syscall.h"
+#include "timer.h"
+#include "proc.h"
 
 int failinj_armed;
 static struct thread *fi_thread;
@@ -55,11 +57,50 @@ int failinj_check_slow(enum fi_site site)
     return 1;
 }
 
+static const void *fi_sigwin_proc;               /* 延遲注入的對象行程(NULL = 關) */
+static unsigned fi_sigwin_ms;
+static int fi_sigwin_left;                       /* 第幾次經過時忙等:1 = 啟用的那次系統呼叫自己的返回 */
+
+/* 只作用一次:啟用它的那次系統呼叫返回使用者模式時忙等,之後自動關閉。
+   (系統呼叫執行期間的中斷返回的是 kernel,不經過這裡,所以不會被別的返回搶走。)
+   每次返回都忙等的話,連計時器中斷的返回也會被拖慢,行程幾乎不前進 */
+static unsigned long fi_lost_wakes;               /* 違反「返回時不可帶著可交付訊號卻已清掉打斷」的次數 */
+
+static unsigned long fi_sleep_pending;
+
+void failinj_note_sleep_pending(void)
+{
+    __atomic_fetch_add(&fi_sleep_pending, 1, __ATOMIC_RELAXED);
+}
+
+void failinj_note_lost_wake(void)
+{
+    __atomic_fetch_add(&fi_lost_wakes, 1, __ATOMIC_RELAXED);
+}
+
+int failinj_sig_window(const void *proc)
+{
+    if (!proc || __atomic_load_n(&fi_sigwin_proc, __ATOMIC_ACQUIRE) != proc)
+        return 0;
+    if (__atomic_sub_fetch(&fi_sigwin_left, 1, __ATOMIC_ACQ_REL) != 0)
+        return 0;
+    __atomic_store_n(&fi_sigwin_proc, NULL, __ATOMIC_RELEASE);
+    uint64_t hz = timer_clock_hz();
+    if (!hz)
+        return 1;
+    uint64_t per_ms = hz >> 10;                      /* 約 1/1024 秒:避免 32 位元架構上的 64 位元除法 */
+    uint64_t end = timer_clock_count() + per_ms * fi_sigwin_ms;
+    while (timer_clock_count() < end)                /* 硬體計數器:關中斷時也會前進 */
+        ;
+    return 1;
+}
+
 static int fi_enabled;                       /* 只在以 selftest 開機時為 1 */
 
 void failinj_enable(void)
 {
     fi_enabled = 1;
+    proc_sig_enable_sleep_check();           /* 睡下去時帶著可交付訊號 → 計數(I-334) */
 }
 
 _Static_assert(FI_SITE_KMALLOC == FI_KMALLOC && FI_SITE_PMM == FI_PMM, "failinj site numbering");
@@ -87,6 +128,17 @@ long failinj_syscall(long op, long site, long n)
     }
     case FI_OP_RESERVED:
         return (long)pmm_reserved_count();
+    case FI_OP_SIGWIN:
+        if (n < 0 || n > 20)
+            return -E_INVAL;
+        fi_sigwin_ms = (unsigned)n;
+        fi_sigwin_left = 1;
+        __atomic_store_n(&fi_sigwin_proc, n ? thread_data() : NULL, __ATOMIC_RELEASE);
+        return 0;
+    case FI_OP_SLEEPPEND:
+        return (long)__atomic_load_n(&fi_sleep_pending, __ATOMIC_RELAXED);
+    case FI_OP_LOSTWAKE:
+        return (long)__atomic_load_n(&fi_lost_wakes, __ATOMIC_RELAXED);
     case FI_OP_UNFREED:
         return (long)sched_unfreed_threads();
     case FI_OP_AVAIL_KB: {

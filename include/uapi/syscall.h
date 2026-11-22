@@ -105,6 +105,9 @@ enum {
 #define FI_OP_DOMAIN    2     /* 呼叫者 domain 目前記帳的頁數 */
 #define FI_OP_RESERVED  3     /* pmm 的預留頁數 */
 #define FI_OP_AVAIL_KB  4     /* pmm 空閒 + heap 空閒 + 執行緒池(KB):不受 heap 成長、執行緒池影響 */
+#define FI_OP_SIGWIN    6     /* 這次呼叫返回使用者模式時,在「讀待處理訊號」與「讀被打斷」之間忙等 n 毫秒(只一次) */
+#define FI_OP_LOSTWAKE  7     /* 延遲注入那次返回時,帶著可交付訊號、打斷標記卻已清掉的次數(必須是 0) */
+#define FI_OP_SLEEPPEND 8     /* 睡下去時行程帶著可交付訊號、打斷標記卻是 0 的次數(必須是 0) */
 #define FI_OP_UNFREED   5     /* 還沒釋放的執行緒數(存活 + 已結束未回收):等它回到基準值,代表收拾完了 */
 #define FI_SITE_KMALLOC 0
 #define FI_SITE_PMM     1

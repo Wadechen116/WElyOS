@@ -59,4 +59,6 @@ void user_return_check(void *tf);
 #include "uapi/syscall.h"
 #include "uapi/proc.h"
 #include "uapi/net.h"
+void proc_sig_enable_sleep_check(void);   /* 自我測試:睡眠時檢查可交付訊號(I-334) */
+
 #endif
