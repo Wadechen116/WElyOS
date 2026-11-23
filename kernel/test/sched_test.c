@@ -834,7 +834,7 @@ static void smp_worker(void *arg)
  *   4. 會讓即時工作合計超過上限的要求被拒絕
  */
 static volatile int rt_hog_stop;
-static volatile unsigned rt_max_late;
+static volatile unsigned rt_max_late, rt_late_jump;
 
 static void rt_hog(void *arg)
 {
@@ -863,6 +863,8 @@ static void rt_task(void *arg)
        (因此量到的「晚到」可能比實際多 1 個 tick) */
     /* 第一個週期以真實時間為起點(sched.c 用 timer_ticks_real,見 timer.h):預期值也要用同一個基準,
        否則第 0 顆 CPU 的 tick 落後時,落後的量會被誤算成「晚到」 */
+    struct timer_stats lt0, lt1;
+    timer_get_stats(&lt0);
     uint64_t expect = timer_ticks_real() + 20;
     KASSERT(thread_set_periodic(20, 5) == 0);
     KASSERT(thread_effective_prio(thread_current()) == PRIO_RT);
@@ -883,6 +885,10 @@ static void rt_task(void *arg)
                 (unsigned)st.overruns, (unsigned)st.period_ms, late);   /* 失敗時留下是哪一項 */
     KASSERT(st.releases == 10 && st.misses == 0 && st.overruns == 0 && st.period_ms == 20);
     rt_max_late = late;
+    /* 晚到超過 3 個 tick(量測 +1、喚醒通知 1、跨 CPU 1)只容許一種量得到的例外:這段期間計時器
+       一次跳過 >= late 個 tick(虛擬 CPU 被主機停住)。第 71 步 aarch64 memtest stress 量到一次 4 */
+    timer_get_stats(&lt1);
+    rt_late_jump = late > 3 ? timer_bursts_at_least(&lt1, late) - timer_bursts_at_least(&lt0, late) : 0;
 
     /*
      * 超出預算:這個週期用 12 毫秒(預算 5)。仍然在 20 毫秒的期限內做完。
@@ -1015,7 +1021,12 @@ void rt_demo(void)
     kprintf("rt: a 20 ms periodic task ran 10 periods on time with every CPU busy (worst lateness %u "
             "tick%s); a budget overrun and 2 missed deadlines were detected; 80%% load was refused\n",
             rt_max_late, rt_max_late == 1 ? "" : "s");
-    KASSERT(rt_max_late <= 3);
+    if (rt_max_late > 3 && !rt_late_jump)
+        panic("rt test: worst lateness %u ticks with no timer jump of %u+ ticks in the window",
+              rt_max_late, rt_max_late);
+    if (rt_max_late > 3)
+        kprintf("rt: lateness %u explained by %u timer jump(s) of %u+ ticks\n",
+                rt_max_late, rt_late_jump, rt_max_late);
 
     rt_long_ready = rt_long_stop = 0;
     int tl = thread_create("rt-long", rt_long_task, NULL), ts = thread_create("rt-short", rt_short_task, NULL);
@@ -1109,6 +1120,48 @@ static uint64_t tick_lag_probe(uint64_t hz)
     return timer_clock_count() - c0;
 }
 
+/*
+ * 同樣的情境套在即時工作的第一個週期(I-346 / Codex 004):第 0 顆關中斷 5 毫秒後設定 RLP_PERIOD 個 tick
+ * 的週期,開中斷後等第一個週期開始。週期起點對齊 tick 邊界(與 sleep 不同,不加 1),從 tick 中間設定時
+ * 真實經過 (週期-1, 週期] 個 tick,所以合約下限是 週期-1 個 tick。
+ * 以落後的 tick 加上補記為起點時,開中斷一次補完,週期幾乎立刻開始 — 低於下限,或起點已經過去(記 miss)。
+ * 週期取 16 而不是 2:第一版用 2,aarch64 memtest stress 下 8 次有 1 次在一般模式記到 miss — 主機只要在
+ * 「設定週期」與「開始等」之間停住 >= 2 個 tick,錯過就是正確的結果。唯一容許的例外要量得到:
+ * 視窗內計時器一次跳過 >= RLP_PERIOD-1 個 tick(和 rt_short_task 的做法相同)。
+ * 這裡假設 1 tick = 1 毫秒(timer_init(1000)),開頭檢查。
+ */
+#define RLP_PERIOD 16
+static uint64_t rt_lag_probe(uint64_t hz)
+{
+    for (int i = 0; i < 5000 && sched_cpu_id() != 0; i++)
+        thread_sleep(1);
+    unsigned long fl = arch_irq_save();
+    if (sched_cpu_id() != 0) {
+        arch_irq_restore(fl);
+        panic("sleep test: could not get onto cpu 0 for the rt probe");
+    }
+    uint64_t t0 = timer_clock_count();
+    while ((timer_clock_count() - t0) * 1000 < hz * 5)
+        ;
+    struct timer_stats ts0, ts1;
+    timer_get_stats(&ts0);
+    KASSERT(thread_set_periodic(RLP_PERIOD, 1) == 0);
+    uint64_t c0 = timer_clock_count();
+    arch_irq_restore(fl);
+    struct rt_stats st;
+    KASSERT(thread_wait_period(&st) == 0);
+    uint64_t d = timer_clock_count() - c0;
+    KASSERT(thread_set_periodic(0, 0) == 0);
+    timer_get_stats(&ts1);
+    unsigned jump = timer_bursts_at_least(&ts1, RLP_PERIOD - 1) - timer_bursts_at_least(&ts0, RLP_PERIOD - 1);
+    /* 起點若已經過去,thread_wait_period 會記一次 miss 再等下一個週期(時間反而變長),
+       所以「沒有 miss」與「經過時間 >= 下限」兩個都要檢查 */
+    if (st.misses > jump)
+        panic("rt period set during a tick lag: first release already passed (%u misses, timer jumps "
+              "of %u+ ticks: %u)", st.misses, RLP_PERIOD - 1, jump);
+    return st.misses ? ~0ULL : d;             /* 量到的例外:不判時間 */
+}
+
 void sleep_wall_test(void)
 {
     uint64_t hz = timer_clock_hz();
@@ -1122,6 +1175,13 @@ void sleep_wall_test(void)
     if (lag * 1000 < hz)
         panic("timer deadline taken during a tick lag expired early (%llu counts, clock %llu Hz)",
               (unsigned long long)lag, (unsigned long long)hz);
+    KASSERT(timer_hz() == 1000);             /* rt_lag_probe 以 1 tick = 1 毫秒換算下限 */
+    uint64_t rlag = rt_lag_probe(hz);
+    kprintf("sleep: a %u ms rt period set while cpu 0 had 5 ms of ticks pending began after %llu "
+            "clock counts\n", RLP_PERIOD, (unsigned long long)rlag);
+    if (rlag != ~0ULL && rlag * 1000 < hz * (RLP_PERIOD - 1))
+        panic("rt period set during a tick lag began early (%llu counts, clock %llu Hz)",
+              (unsigned long long)rlag, (unsigned long long)hz);
     int hogs[MAX_CPUS], n = 0;
     sw_stop = 0;
     for (int i = 0; i < cpu_count && i < MAX_CPUS; i++)
@@ -1525,6 +1585,7 @@ static void aff_rt_task(void *arg)
 }
 
 static void affinity_hol_test(void);     /* 第 5 項,定義在後面 */
+static void affinity_starve_test(void);  /* 第 6 項 */
 
 void affinity_test(void)
 {
@@ -1631,6 +1692,7 @@ void affinity_test(void)
                   rta_wrong_cpu, rta_releases, rta_misses, stalls);
     }
     affinity_hol_test();                     /* 5 */
+    affinity_starve_test();                  /* 6 */
 }
 
 /*
@@ -1717,6 +1779,85 @@ static void affinity_hol_test(void)
     if (bcpu != 1 || aran)
         panic("affinity: head-of-line blocking: B ran on cpu %d (expected 1 within %u ms), A ran %d",
               bcpu, HOL_MS, aran);
+}
+
+/*
+ * 6. 固定佇列的防飢餓(I-347):AS_N 條低優先權執行緒(超過一次掃描的 24 個)固定在同一顆,
+ *    那一顆被固定的高優先權執行緒佔住 AS_HOG_MS。每一條都必須在佔用期間靠提升跑到。
+ *    「新節點一再插到最前面、把舊的推出掃描範圍」的最壞情形在 QEMU 裡無法確定觸發,
+ *    由 host 模型(tests/host/sched/starve_scan_probe.c 與掃描位置版)涵蓋
+ */
+#define AS_N      30
+#define AS_HOG_MS 400
+static volatile int as_go, as_hgo, as_hog_done, as_up;
+static volatile unsigned as_ran, as_ran_during;
+
+static void as_hog(void *arg)
+{
+    (void)arg;
+    /* 先睡著等固定完成才開始計時:否則建立後可能先在第 0 顆忙等,把測試執行緒(固定在第 0 顆)餓到
+       防飢餓提升才輪得到設定親和性,吃掉犧牲者約 100 ms 的時間預算(審查第 71 步時指出) */
+    while (!__atomic_load_n(&as_hgo, __ATOMIC_SEQ_CST))
+        thread_sleep(1);
+    __atomic_fetch_add(&as_up, 1, __ATOMIC_SEQ_CST);
+    uint64_t t0 = timer_ticks();
+    while ((timer_ticks() - t0) * 1000 < (uint64_t)timer_hz() * AS_HOG_MS)
+        ;
+    as_hog_done = 1;
+}
+
+static void as_victim(void *arg)
+{
+    (void)arg;
+    while (!__atomic_load_n(&as_go, __ATOMIC_SEQ_CST))
+        thread_sleep(1);                     /* 固定前可能在別顆跑:先睡著等,醒來時已固定 */
+    __atomic_fetch_add(&as_ran, 1, __ATOMIC_SEQ_CST);
+    if (!as_hog_done)
+        __atomic_fetch_add(&as_ran_during, 1, __ATOMIC_SEQ_CST);
+}
+
+static void affinity_starve_test(void)
+{
+    if (cpu_count < 2) {
+        /* 只有一顆時「固定在第 0 顆」等於全部線上的 CPU,存成不限制、走 runq,測不到固定佇列 */
+        kprintf("affinity: pinned starvation test needs >= 2 cpus, skipped\n");
+        return;
+    }
+    unsigned online = sched_online_mask();
+    int k = -1, v[AS_N];
+    for (int c = 1; c < cpu_count && c < 32; c++)
+        if (online & (1u << c))
+            k = c;                           /* 從線上的 CPU 挑一顆不是第 0 顆的(不假設最後一顆在線上) */
+    if (k < 0) {
+        kprintf("affinity: pinned starvation test needs an online cpu other than 0, skipped\n");
+        return;
+    }
+    as_go = as_hgo = as_hog_done = as_up = 0;
+    as_ran = as_ran_during = 0;
+    KASSERT(thread_set_affinity(0, 1u << 0) == 0);        /* 自己不在第 k 顆 */
+    for (int i = 0; i < AS_N; i++) {
+        v[i] = thread_create_prio("as-victim", as_victim, NULL, PRIO_LOW);
+        KASSERT(v[i] > 0 && thread_set_affinity(v[i], 1u << k) == 0);
+    }
+    unsigned long b0 = sched_starve_boosts();
+    int h = thread_create_prio("as-hog", as_hog, NULL, PRIO_HIGH);
+    KASSERT(h > 0 && thread_set_affinity(h, 1u << k) == 0);
+    __atomic_store_n(&as_hgo, 1, __ATOMIC_SEQ_CST);
+    for (int w = 0; !as_up; w++) {
+        KASSERT(w < 5000);
+        thread_sleep(1);
+    }
+    thread_sleep(2);                         /* 佔用者已在第 k 顆上 */
+    __atomic_store_n(&as_go, 1, __ATOMIC_SEQ_CST);
+    thread_join(h);
+    unsigned during = as_ran_during;
+    join_all(v, AS_N);
+    unsigned long boosts = sched_starve_boosts() - b0;
+    KASSERT(thread_set_affinity(0, online) == 0);
+    kprintf("affinity: starvation guard on cpu %d: %u of %d pinned low threads ran during a %u ms "
+            "high-priority hog (%lu boosts)\n", k, during, AS_N, AS_HOG_MS, boosts);
+    if (during != AS_N || boosts < AS_N)
+        panic("affinity: pinned starvation: %u of %d ran during the hog, %lu boosts", during, AS_N, boosts);
 }
 
 /*

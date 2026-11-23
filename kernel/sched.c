@@ -166,6 +166,7 @@ static unsigned rt_util_total;
 #define PICK_DIVERT_MAX 8
 struct pinq {
     struct thread *head[PRIO_LEVELS], *tail[PRIO_LEVELS];
+    struct thread *scan[PRIO_LEVELS];        /* 飢餓掃描下次從哪一個開始(NULL = 從頭);見 starve_scan */
     unsigned mask;                           /* bit p = 1:優先權 p 非空 */
 };
 static struct pinq pinqs[MAX_CPUS];
@@ -356,12 +357,22 @@ static void pin_unlink(struct thread *t)
         t->pin_next->pin_prev = t->pin_prev;
     else
         q->tail[p] = t->pin_prev;
+    if (q->scan[p] == t)
+        q->scan[p] = t->pin_next;            /* 掃描位置指著它:往後移一個(NULL = 下次從頭) */
     if (!q->head[p])
         q->mask &= ~(1u << p);
     t->pin_next = t->pin_prev = NULL;
     t->pin_cpu = 0;
 }
 
+/*
+ * 不變式(Codex 004 查證):front=1 的唯一呼叫點是 schedule() 把本 CPU 正在執行、被搶佔且時間片未用完的
+ * prev 放回本 CPU 的固定佇列;其他入隊一律尾插。一個節點要被前插必須先在執行,而執行前已離開佇列,
+ * 所以每條佇列每層最多只有一個「反覆被前插的新節點」。兩層防飢餓保障:
+ *   1. 就算只看前 PIN_SCAN_MAX 個,這個不變式下也足以看到被它擋住的舊節點;
+ *   2. 掃描位置(scan)不依賴這個不變式,日後新增前插來源時上界仍成立(I-347)。
+ * 新增 front=1 的呼叫點時,必須重新檢查第 1 點。
+ */
 static void pin_push(struct thread *t, int cpu, int front)
 {
     t->ready_since = timer_ticks();
@@ -1433,12 +1444,18 @@ static void starve_scan(uint64_t now)
             update_prio(t);                  /* 移到最高優先權的佇列;必要時要求重新排程 */
         }
     }
-    /* 固定佇列(I-343):和 runq 一樣看每層前 PIN_SCAN_MAX 個。以前只看頭:被搶佔的執行緒插回最前面、
-       ready_since 是新的,會一再遮住後面等很久的(Codex 第 69 步審查)。
-       update_prio 會把 t 移出這層,所以先記下下一個再處理 */
+    /* 固定佇列(I-343 / I-347):每層從上次停下的位置繼續看 PIN_SCAN_MAX 個,看到尾端下次從頭開始。
+       只看頭(第 69 步)或每次都從頭看前 24 個(第 70 步第一版)都不夠:被搶佔的執行緒插回最前面、
+       ready_since 是新的,一再插入就能讓後面等很久的永遠落在看得到的範圍之外(Codex host 模型
+       tests/host/sched/starve_scan_probe.c)。插到前面的不會影響掃描位置往後推進,所以長度 L 的
+       佇列,每個節點至少每 ceil(L / PIN_SCAN_MAX) + 1 次掃描被看一次(每 starve_scan_ticks 掃一次):
+       等了 starve_ticks 之後,最多再過 (ceil(L / PIN_SCAN_MAX) + 1) × starve_scan_ticks 個 tick 就會被提升
+       (L 不超過執行緒總數)。成本與以前相同,每層每次掃描最多 24 個。
+       update_prio 會把 t 移出這層(pin_unlink 同時更新掃描位置),所以先記下下一個再處理 */
     for (int i = 0; i < cpu_count && i < MAX_CPUS; i++) {
         for (int p = PRIO_MAX - 1; p >= PRIO_MIN; p--) {
-            struct thread *t = pinqs[i].head[p], *next;
+            struct pinq *q = &pinqs[i];
+            struct thread *t = q->scan[p] ? q->scan[p] : q->head[p], *next = NULL;
             for (int k = 0; t && k < PIN_SCAN_MAX; k++, t = next) {
                 next = t->pin_next;
                 if (t->starve_boost || now < t->ready_since || now - t->ready_since < starve_ticks)
@@ -1448,6 +1465,7 @@ static void starve_scan(uint64_t now)
                 nstarve_boosts++;
                 update_prio(t);
             }
+            q->scan[p] = t;                  /* 停在這裡:下次從它開始;NULL = 看到尾端了,下次從頭 */
         }
     }
 }
@@ -1702,7 +1720,9 @@ int thread_set_periodic(unsigned period_ms, unsigned budget_ms)
         self->rt_used = 0;
         self->rt_throttled = self->rt_waiting = 0;
         self->rt_releases = self->rt_misses = self->rt_overruns = self->rt_max_used = 0;
-        self->rt_release = timer_ticks_real() + period;  /* 第一個週期從現在(真實時間)開始 */
+        /* 第一個週期從現在開始。用 timer_wait_base() 而不是 timer_ticks_real():降級時(I-346)第一個
+           晚到的中斷照常 +1,與 sleep、timer_deadline_ms 用同一個起點,降級時只會變晚、不會提早一格 */
+        self->rt_release = timer_wait_base() + period;
         rt_assign_levels();
         update_prio(self);
     }
