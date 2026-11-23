@@ -43,8 +43,11 @@ static volatile uint64_t sx_inj_off, sx_inj_delay;
 
 /* ---- 結果 ---- */
 static volatile int g_state = CLKSYNC_UNCHECKED;
-static struct clksync_result g_res[2];
-static volatile int g_have[2];
+static struct clksync_result g_res[3];      /* 0 開機、1 再驗證、2 換到備援之後 */
+static volatile int g_have[3];
+static volatile int g_fallback;              /* 1 = 已換到備援計數器而且合格 */
+static int g_force;                          /* enum clksync_force_mode;只在 smp_init 之前設定 */
+static uint64_t g_ok_at;                     /* 最近一次合格驗證開始時的計數(目前來源的單位) */
 
 /*
  * 讀計數器:讀取指令本身也要依程式順序,不可被提前或延後到交接旗標的存取之外(I-342)。
@@ -253,6 +256,7 @@ static int run(struct clksync_result *res)
        (CPU 數 - 1) × 重試次數 × 2 × 20 tick,遠小於看門狗的 5000 tick */
     unsigned long fl = arch_irq_save();
     res->ref = this_cpu()->id;
+    res->src = timer_clock_name();
     res->at = read_count();
     res->ok = 1;
     for (int c = 0; c < res->ncpu; c++) {
@@ -302,9 +306,12 @@ const char *clksync_reason_name(int r)
     case CLKSYNC_R_WIDE:         return "every bracket too wide to judge";
     case CLKSYNC_R_OFFSET:       return "counter offset beyond a quarter tick";
     case CLKSYNC_R_BUSY:         return "another check in progress";
+    case CLKSYNC_R_FORCED:       return "forced by boot parameter (test)";
     }
     return "?";
 }
+
+static const char *const check_name[3] = { "#1", "#2", "fallback" };
 
 static void print_result(int which, const struct clksync_result *r)
 {
@@ -312,9 +319,9 @@ static void print_result(int which, const struct clksync_result *r)
         const struct clksync_cpu *o = &r->cpu[c];
         if (c == r->ref || (c != 0 && !cpus[c].started))
             continue;
-        kprintf("clksync: check #%d cpu %d vs cpu %d: max offset %u/1000 tick (%llu counts, "
+        kprintf("clksync: check %s (%s) cpu %d vs cpu %d: max offset %u/1000 tick (%llu counts, "
                 "range %lld..%lld), tightest bracket %llu counts, used %u/%u, wide %u, attempts %u: %s\n",
-                which + 1, c, r->ref, clksync_milli_ticks(o->max_abs, r->iv),
+                check_name[which], r->src ? r->src : "?", c, r->ref, clksync_milli_ticks(o->max_abs, r->iv),
                 (unsigned long long)o->max_abs, (long long)o->min_low, (long long)o->max_high,
                 (unsigned long long)o->tightest, o->used, CLKSYNC_SAMPLES, o->wide, o->attempts,
                 clksync_reason_name(o->reason));
@@ -322,29 +329,69 @@ static void print_result(int which, const struct clksync_result *r)
 }
 
 /* 失敗即關閉:停用共用路徑、記黑盒子、印出看得到的開機訊息 */
-static void degrade(int which, const struct clksync_result *r)
+static void degrade(const char *what, int reason, int bad_cpu)
 {
     timer_shared_disable();
     __atomic_store_n(&g_state, CLKSYNC_DEGRADED, __ATOMIC_SEQ_CST);
-    kprintf("clksync: DEGRADED (check #%d): %s (cpu %d); system time is advanced by cpu 0 only "
-            "until a shared fallback counter exists\n", which + 1, clksync_reason_name(r->reason), r->bad_cpu);
-    blackbox_log(BB_NOTE, "clksync degraded (check %d): %s, cpu %d; cpu0-only time",
-                 which + 1, clksync_reason_name(r->reason), r->bad_cpu);
+    kprintf("clksync: DEGRADED (check %s, counter %s): %s (cpu %d); system time is advanced by cpu 0 only\n",
+            what, timer_clock_name(), clksync_reason_name(reason), bad_cpu);
+    blackbox_log(BB_NOTE, "clksync degraded (check %s, %s): %s, cpu %d; cpu0-only time",
+                 what, timer_clock_name(), clksync_reason_name(reason), bad_cpu);
+}
+
+/*
+ * 一次驗證不合格(I-341):先換到備援計數器並完整驗證;不行才降級。
+ * 換來源之後的驗證失敗不再換(arch 層只有一個備援,timer_clock_fallback 會回 0)。
+ */
+static void failed(int which, const struct clksync_result *r)
+{
+    const char *old = timer_clock_name();
+    kprintf("clksync: check %s rejected counter %s: %s (cpu %d)\n", check_name[which], old,
+            clksync_reason_name(r->reason), r->bad_cpu);
+    if (g_force == CLKSYNC_FORCE_CPU0ONLY || !timer_clock_fallback()) {
+        degrade(check_name[which], r->reason, r->bad_cpu);
+        return;
+    }
+    kprintf("clksync: switched shared counter %s -> %s (%llu Hz); validating it\n", old, timer_clock_name(),
+            (unsigned long long)timer_clock_hz());
+    struct clksync_result *f = &g_res[2];
+    int ok = run(f);
+    __atomic_store_n(&g_have[2], 1, __ATOMIC_SEQ_CST);
+    print_result(2, f);
+    if (!ok) {
+        degrade(check_name[2], f->reason, f->bad_cpu);
+        return;
+    }
+    g_ok_at = f->at;
+    __atomic_store_n(&g_fallback, 1, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_state, CLKSYNC_OK, __ATOMIC_SEQ_CST);
+    kprintf("clksync: fallback counter %s ok on %d cpus (tolerance %llu counts = 1/4 tick)\n",
+            f->src, f->ncpu, (unsigned long long)f->tol);
+    blackbox_log(BB_NOTE, "clksync: %s rejected (%s, cpu %d); shared counter now %s, validated",
+                 old, clksync_reason_name(r->reason), r->bad_cpu, f->src);
 }
 
 static void live(int which)
 {
     struct clksync_result *r = &g_res[which];
     int ok = run(r);
+    if (which == 0 && g_force != CLKSYNC_FORCE_NONE && r->reason != CLKSYNC_R_NO_COUNTER) {
+        /* 測試:真正的驗證照做、照印,再把結果改成不合格,讓切換 / 降級路徑真的被執行 */
+        ok = 0;
+        r->ok = 0;
+        r->reason = CLKSYNC_R_FORCED;
+        r->bad_cpu = -1;
+    }
     __atomic_store_n(&g_have[which], 1, __ATOMIC_SEQ_CST);
     print_result(which, r);
     if (!ok) {
-        degrade(which, r);
+        failed(which, r);
         return;
     }
+    g_ok_at = r->at;
     __atomic_store_n(&g_state, CLKSYNC_OK, __ATOMIC_SEQ_CST);
-    kprintf("clksync: check #%d ok: %d cpus share one counter (tolerance %llu counts = 1/4 tick)\n",
-            which + 1, r->ncpu, (unsigned long long)r->tol);
+    kprintf("clksync: check %s ok: %d cpus share counter %s (tolerance %llu counts = 1/4 tick)\n",
+            check_name[which], r->ncpu, r->src, (unsigned long long)r->tol);
 }
 
 void clksync_boot_check(int ncpu)
@@ -363,9 +410,10 @@ void clksync_recheck(void)
     if (__atomic_load_n(&g_state, __ATOMIC_SEQ_CST) != CLKSYNC_OK || done)
         return;                                  /* 單核、已降級、或已經再驗證過 */
     done = 1;
-    /* 距離第一次驗證至少 1 秒(timer_clock_hz() 個計數):用比較,不用除法 */
+    /* 距離最近一次合格驗證至少 1 秒(timer_clock_hz() 個計數):用比較,不用除法。
+       g_ok_at 是目前來源的單位(換過來源時是備援驗證的起點),不會和舊來源混用 */
     uint64_t hz = timer_clock_hz();
-    while (read_count() - g_res[0].at < hz)
+    while (read_count() - g_ok_at < hz)
         thread_sleep(10);
     live(1);
 }
@@ -377,9 +425,19 @@ int clksync_state(void)
 
 const struct clksync_result *clksync_last(int which)
 {
-    if (which < 0 || which > 1 || !__atomic_load_n(&g_have[which], __ATOMIC_SEQ_CST))
+    if (which < 0 || which > 2 || !__atomic_load_n(&g_have[which], __ATOMIC_SEQ_CST))
         return NULL;
     return &g_res[which];
+}
+
+int clksync_fallback_used(void)
+{
+    return __atomic_load_n(&g_fallback, __ATOMIC_SEQ_CST);
+}
+
+void clksync_force(int mode)
+{
+    g_force = mode;
 }
 
 int clksync_run_dry(struct clksync_result *out)

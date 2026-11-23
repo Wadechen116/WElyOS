@@ -97,6 +97,22 @@ uint64_t arch_tick_interval(void)
     return interval;
 }
 
+/* I-341:cntpct_el0 是架構上全系統共用的單一時基,沒有「另一個」共用計數器可以退回(見 arch.h) */
+int arch_clock_fallback(void)
+{
+    return 0;
+}
+
+const char *arch_clock_name(void)
+{
+    return "cntpct";
+}
+
+void arch_clock_test_mode(int mode)
+{
+    (void)mode;
+}
+
 /*
  * GIC 中「每顆 CPU 各自一份」的設定,每顆 CPU 都要在自己身上做一次:
  *   - CPU interface(GICC_*):這顆 CPU 接不接受中斷、優先權門檻

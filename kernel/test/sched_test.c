@@ -1235,8 +1235,117 @@ static void cs_stall_fn(void *arg)
     cs_phase = 2;
 }
 
+/* text 裡有沒有 sub(黑盒子紀錄的比對用) */
+static int has_sub(const char *text, const char *sub)
+{
+    for (; *text; text++) {
+        const char *a = text, *b = sub;
+        while (*a && *b && *a == *b) {
+            a++;
+            b++;
+        }
+        if (!*b)
+            return 1;
+    }
+    return 0;
+}
+
+/*
+ * I-341:降級模式(只由第 0 顆推進時間;clock=cpu0only 強制進入,或真的沒有可用的共用計數器)。
+ * 這個模式仍是單點,測試證明的是「它至少讓系統維持正確,而且被報告出來」:
+ *   1. 時間照常前進,速率與高精度時鐘相符(有時鐘時)
+ *   2. 證據:第 0 顆關中斷 300 ms 期間時間停住、其他 CPU 一次都沒有推進(單點確實存在 — 這是預期,
+ *      不是失敗;若有別顆推進,表示降級沒有生效,判失敗)
+ *   3. 第 0 顆恢復後,睡眠照常結束(系統沒有卡住)
+ *   4. 黑盒子(有磁碟時)有本次開機的「clksync degraded」紀錄
+ */
+static void cpu0_stall_degraded_test(void)
+{
+    const struct clksync_result *r0 = clksync_last(0);
+    if (timer_shared_enabled() || !r0)
+        panic("cpu0-stall: degraded mode expected (shared %d, boot check %s)", timer_shared_enabled(),
+              r0 ? "done" : "missing");
+    cs_hz = timer_clock_hz();
+    kprintf("cpu0-stall: degraded mode (%s, counter %s): only cpu 0 advances time\n",
+            clksync_reason_name(r0->reason), timer_clock_name());
+
+    uint64_t t0 = timer_ticks(), c0 = timer_clock_count();
+    thread_sleep(100);
+    uint64_t t1 = timer_ticks(), c1 = timer_clock_count();
+    if (t1 - t0 < 100)
+        panic("cpu0-stall: degraded: a 100 ms sleep ended after %llu ticks", (unsigned long long)(t1 - t0));
+    if (cs_hz && (c1 - c0) * 1000 < cs_hz * 90)   /* tick 跑得比真實時間快:少於 90 ms 就算了 100 tick */
+        panic("cpu0-stall: degraded: 100 ticks in %llu counts (< 90 ms at %llu Hz)",
+              (unsigned long long)(c1 - c0), (unsigned long long)cs_hz);
+
+    if (cpu_count >= 2 && cs_hz) {
+        uint32_t adv0[MAX_CPUS];
+        for (int i = 0; i < MAX_CPUS; i++)
+            adv0[i] = timer_advances(i);
+        cs_sleeper_self = NULL;              /* 這裡沒有睡眠者:卡住的處理函式不會中止 */
+        /* 固定在第 0 顆直接卡住(I-343),不再用跨 CPU 呼叫加重試 */
+        unsigned online = sched_online_mask();
+        KASSERT(thread_set_affinity(0, 1u << 0) == 0);
+        KASSERT(sched_cpu_id() == 0);
+        struct cs_stall_ctx ctx;
+        for (unsigned i = 0; i < sizeof(ctx); i++)
+            ((char *)&ctx)[i] = 0;
+        struct timer_stats ds0, ds1;
+        timer_get_stats(&ds0);
+        unsigned long fl = arch_irq_save();
+        cs_stall_fn(&ctx);
+        arch_irq_restore(fl);
+        /* I-346(方案 A):恢復時架構層補記的 tick 必須被丟掉 — 開中斷後系統時間不可以一次跳過去。
+           等第 0 顆處理完恢復後的第一次中斷(睡 2 ms),再看時間前進了多少、丟掉了多少 */
+        uint64_t tr0 = ctx.tk1;
+        thread_sleep(2);
+        uint64_t tr1 = timer_ticks();
+        timer_get_stats(&ds1);
+        uint32_t dropped = ds1.degraded_dropped - ds0.degraded_dropped;
+        KASSERT(thread_set_affinity(0, online) == 0);     /* 恢復不限制 */
+        cs_phase = 0;
+        uint32_t others = 0;
+        for (int i = 1; i < MAX_CPUS; i++)
+            others += timer_advances(i) - adv0[i];
+        uint64_t t2 = timer_ticks();
+        thread_sleep(20);                    /* 第 0 顆恢復後必須照常醒來 */
+        uint64_t t3 = timer_ticks();
+        kprintf("cpu0-stall: degraded: cpu0 irqs off %u ms: ticks +%llu (expected ~0: single point), "
+                "other cpus advanced %u times; after recovery a 20 ms sleep took %llu ticks\n",
+                CS_STALL_MS, (unsigned long long)(ctx.tk1 - ctx.tk0), others, (unsigned long long)(t3 - t2));
+        if (!ctx.ran_on_cpu0)
+            panic("cpu0-stall: degraded: the stall did not run on cpu 0");
+        if (others != 0)
+            panic("cpu0-stall: degraded: %u advances by other cpus (degrade not in effect)", others);
+        kprintf("cpu0-stall: degraded: after recovery time moved +%llu ticks around a 2 ms sleep, "
+                "%u catch-up ticks dropped (max run %u): sleeps can only get longer\n",
+                (unsigned long long)(tr1 - tr0), dropped, ds1.degraded_max_run);
+        if (dropped < CS_STALL_MS / 4 || tr1 - tr0 > 20)
+            panic("cpu0-stall: degraded: catch-up not dropped (dropped %u, time +%llu ticks)",
+                  dropped, (unsigned long long)(tr1 - tr0));
+        if (ctx.tk1 - ctx.tk0 > 1)
+            panic("cpu0-stall: degraded: time advanced %llu ticks with cpu 0 stalled",
+                  (unsigned long long)(ctx.tk1 - ctx.tk0));
+    }
+
+    if (blackbox_enabled()) {
+        struct bb_record r;
+        int found = 0;
+        for (unsigned i = 0; !found && blackbox_read(i, &r) == 0; i++)
+            if (r.boot == blackbox_boot() && r.type == BB_NOTE && has_sub(r.text, "clksync degraded"))
+                found = 1;
+        if (!found)
+            panic("cpu0-stall: degraded mode not recorded in the black box");
+        kprintf("cpu0-stall: degraded mode is recorded in the black box\n");
+    }
+}
+
 void cpu0_stall_wake_test(void)
 {
+    if (clksync_state() == CLKSYNC_DEGRADED) {
+        cpu0_stall_degraded_test();          /* I-341:降級模式有不同的(較弱的)保證 */
+        return;
+    }
     cs_hz = timer_clock_hz();
     if (cpu_count < 2 || cs_hz == 0) {
         kprintf("cpu0-stall: needs >= 2 cpus and a shared clock, skipped\n");
@@ -1415,6 +1524,8 @@ static void aff_rt_task(void *arg)
     rta_done = 1;
 }
 
+static void affinity_hol_test(void);     /* 第 5 項,定義在後面 */
+
 void affinity_test(void)
 {
     unsigned online = sched_online_mask();
@@ -1519,6 +1630,93 @@ void affinity_test(void)
             panic("affinity: pinned rt task: wrong cpu %u, releases %u, misses %u (host stalls %u)",
                   rta_wrong_cpu, rta_releases, rta_misses, stalls);
     }
+    affinity_hol_test();                     /* 5 */
+}
+
+/*
+ * 5. 固定佇列的隊頭阻塞(Codex 第 69 步審查):第 0 顆的同優先權佇列是 [A(只允許 0), B(允許 0、1)],
+ *    第 1 顆閒下來時必須拿得到 B,不能等 A。第 0、1 顆先各被一條固定的高優先權執行緒佔住,
+ *    讓 A、B 依序排進第 0 顆的佇列;接著放掉第 1 顆,B 必須在 HOL_MS 內在第 1 顆上執行,
+ *    這時第 0 顆仍被佔住(A 不可能先跑)。只看隊頭的舊版:B 要等第 0 顆放掉才會跑
+ */
+#define HOL_MS 20
+static volatile int hol_stop0, hol_stop1, hol_up, hol_go, hol_b_cpu = -1, hol_a_ran;
+
+static void hol_hog(void *arg)
+{
+    __atomic_fetch_add(&hol_up, 1, __ATOMIC_SEQ_CST);
+    volatile int *stop = arg;
+    while (!*stop)
+        ;
+}
+
+/* A、B 先睡著等閘門:建立後、固定前可能被閒著的 CPU 拿去跑,不能在那時就跑完結束。
+   固定之後醒來只能排進第 0 顆的佇列(第 0、1 顆都在跑更高的),之後不會再執行 */
+static void hol_wait_gate(void)
+{
+    while (!__atomic_load_n(&hol_go, __ATOMIC_SEQ_CST))
+        thread_sleep(1);
+}
+
+static void hol_a(void *arg)
+{
+    (void)arg;
+    hol_wait_gate();
+    hol_a_ran = 1;
+}
+
+static void hol_b(void *arg)
+{
+    (void)arg;
+    hol_wait_gate();
+    hol_b_cpu = sched_cpu_id();
+}
+
+static void affinity_hol_test(void)
+{
+    if (cpu_count < 3) {
+        kprintf("affinity: head-of-line test needs >= 3 cpus, skipped\n");
+        return;
+    }
+    unsigned online = sched_online_mask();
+    KASSERT(thread_set_affinity(0, 1u << 2) == 0);        /* 自己在第 2 顆 */
+    hol_stop0 = hol_stop1 = hol_up = hol_go = hol_a_ran = 0;
+    hol_b_cpu = -1;
+    int h0 = thread_create_prio("hol-hog0", hol_hog, (void *)&hol_stop0, PRIO_HIGH);
+    int h1 = thread_create_prio("hol-hog1", hol_hog, (void *)&hol_stop1, PRIO_HIGH);
+    KASSERT(h0 > 0 && h1 > 0);
+    KASSERT(thread_set_affinity(h0, 1u << 0) == 0 && thread_set_affinity(h1, 1u << 1) == 0);
+    for (int w = 0; hol_up < 2; w++) {
+        KASSERT(w < 5000);
+        thread_sleep(1);
+    }
+    thread_sleep(5);                                      /* 兩條都已搬到自己的 CPU 上 */
+    int a = thread_create_prio("hol-a", hol_a, NULL, PRIO_NORMAL);
+    KASSERT(a > 0 && thread_set_affinity(a, 1u << 0) == 0);
+    thread_sleep(5);                                      /* A 先排進第 0 顆的佇列 */
+    int b = thread_create_prio("hol-b", hol_b, NULL, PRIO_NORMAL);
+    KASSERT(b > 0 && thread_set_affinity(b, (1u << 0) | (1u << 1)) == 0);
+    thread_sleep(5);                                      /* B 排在 A 後面(第 0、1 顆都在跑更高的) */
+    KASSERT(hol_b_cpu == -1 && !hol_a_ran);
+    __atomic_store_n(&hol_go, 1, __ATOMIC_SEQ_CST);      /* A、B 都在第 0 顆的佇列裡,打開閘門也跑不了 */
+    thread_sleep(2);
+    KASSERT(hol_b_cpu == -1 && !hol_a_ran);
+    hol_stop1 = 1;                                        /* 放掉第 1 顆 */
+    uint64_t t0 = timer_ticks();
+    while (hol_b_cpu == -1 && (timer_ticks() - t0) * 1000 <= (uint64_t)timer_hz() * HOL_MS)
+        thread_sleep(1);
+    int bcpu = hol_b_cpu, aran = hol_a_ran;
+    hol_stop0 = 1;
+    thread_join(h0);
+    thread_join(h1);
+    thread_join(a);
+    thread_join(b);
+    KASSERT(thread_set_affinity(0, online) == 0);
+    kprintf("affinity: head-of-line: B behind cpu-0-only A ran on cpu %d within %u ms (A ran first %d)\n",
+            bcpu, HOL_MS, aran);
+    if (bcpu != 1 || aran)
+        panic("affinity: head-of-line blocking: B ran on cpu %d (expected 1 within %u ms), A ran %d",
+              bcpu, HOL_MS, aran);
 }
 
 /*
@@ -1530,6 +1728,78 @@ void affinity_test(void)
  *    c. 清除注入 → 必須合格
  *    三次都是乾跑(clksync_run_dry):不改變系統時間的模式,做完共用路徑必須仍然啟用。
  */
+static int r0_present_ok(const struct clksync_result *r)
+{
+    return r && r->ok;
+}
+
+/*
+ * I-341:每一顆 CPU 看到的系統時間都在前進,而且和共用計數器一致(換來源之後尤其要確認)。
+ * 在每顆 CPU 上(跨 CPU 呼叫,自己直接呼叫)讀 timer_ticks_real 與計數器,間隔 200 ms 讀兩次:
+ * 每顆 CPU 的 tick 增量與計數器換算的增量相差不超過 3 tick。只用乘法比較,不用 64 位元除法。
+ * clock=hpet32 時另外確認 32 位元延伸真的跨過了繞回(計數器值超過 2^32)。
+ */
+struct cv_snap { volatile uint64_t tk[MAX_CPUS], ck[MAX_CPUS]; };
+
+static void cv_fn(void *arg)
+{
+    struct cv_snap *x = arg;
+    int c = this_cpu()->id;
+    x->ck[c] = timer_clock_count();
+    x->tk[c] = timer_ticks_real();
+}
+
+static void cv_take(struct cv_snap *x, int n)
+{
+    unsigned long fl = arch_irq_save();      /* 自己那一份和跨 CPU 呼叫之間不換 CPU */
+    cv_fn(x);
+    smp_call_mask(n >= 32 ? ~0u : (1u << n) - 1, cv_fn, x);
+    arch_irq_restore(fl);
+}
+
+static void clock_view_test(int n)
+{
+    static struct cv_snap a, b;
+    uint64_t hz = timer_clock_hz();
+    unsigned th = timer_hz();
+
+    if (!timer_shared_enabled() || hz == 0)
+        return;
+    if (has_sub(timer_clock_name(), "hpet32")) {
+        /* 起始值在繞回前約 2 秒(arch/i386/timer.c):最多等 6 秒看延伸值跨過 2^32 */
+        uint64_t prev = timer_clock_count();
+        for (int i = 0; i < 600 && timer_clock_count() <= 0xFFFFFFFFull; i++) {
+            thread_sleep(10);
+            uint64_t now = timer_clock_count();
+            if (now <= prev)
+                panic("clock-view: hpet32 counter went backwards (%llu -> %llu)",
+                      (unsigned long long)prev, (unsigned long long)now);
+            prev = now;
+        }
+        if (timer_clock_count() <= 0xFFFFFFFFull)
+            panic("clock-view: hpet32 counter never crossed 2^32 (%llu)", (unsigned long long)timer_clock_count());
+        kprintf("clock-view: hpet32 extension crossed the 32-bit wrap (now %llu)\n",
+                (unsigned long long)timer_clock_count());
+    }
+    for (int c = 0; c < MAX_CPUS; c++)
+        a.tk[c] = a.ck[c] = b.tk[c] = b.ck[c] = 0;
+    cv_take(&a, n);
+    thread_sleep(200);
+    cv_take(&b, n);
+    for (int c = 0; c < n; c++) {
+        if (c != 0 && !cpus[c].started)
+            continue;
+        uint64_t dt = b.tk[c] - a.tk[c], dc = b.ck[c] - a.ck[c];
+        /* |dt × hz − dc × th| ≤ 3 × hz:dt 約 200、hz < 2^33,乘積遠小於 2^63 */
+        uint64_t l = dt * hz, r = dc * th, diff = l > r ? l - r : r - l;
+        kprintf("clock-view: cpu %d saw +%llu ticks over %llu counts (%s)\n", c, (unsigned long long)dt,
+                (unsigned long long)dc, timer_clock_name());
+        if (dt < 150 || diff > 3 * hz)
+            panic("clock-view: cpu %d: +%llu ticks vs %llu counts at %llu Hz (counter %s)", c,
+                  (unsigned long long)dt, (unsigned long long)dc, (unsigned long long)hz, timer_clock_name());
+    }
+}
+
 void clksync_test(void)
 {
     int n = smp_started();
@@ -1544,14 +1814,32 @@ void clksync_test(void)
         kprintf("clksync-test: no shared counter, degraded as required\n");
         return;
     }
-    clksync_recheck();                       /* 開機後不到 1 秒時會睡到滿 1 秒 */
+    const struct clksync_result *rf = clksync_last(0);
+    if (clksync_state() == CLKSYNC_DEGRADED && rf && rf->reason == CLKSYNC_R_FORCED && !clksync_last(2)) {
+        /* I-341:clock=cpu0only(或沒有備援計數器的架構 / 機器上的 clock=fallback)。
+           降級行為由 cpu0_stall_wake_test 驗證;這裡確認狀態一致。i386 有 HPET 時 clock=fallback
+           不應走到這裡 — 由 regress.sh 檢查輸出裡的切換訊息 */
+        KASSERT(!timer_shared_enabled() && !clksync_fallback_used());
+        kprintf("clksync-test: forced degrade: cpu0-only time as required (counter %s)\n", timer_clock_name());
+        return;
+    }
+    if (clksync_fallback_used()) {
+        const struct clksync_result *r2 = clksync_last(2);
+        KASSERT(r0_present_ok(r2));
+        kprintf("clksync-test: fallback counter %s in use (boot check on %s: %s)\n", r2->src,
+                rf ? rf->src : "?", rf ? clksync_reason_name(rf->reason) : "never checked");
+    }
+    clksync_recheck();                       /* 最近一次合格驗證後不到 1 秒時會睡到滿 1 秒 */
     if (clksync_state() != CLKSYNC_OK) {
         const struct clksync_result *bad = clksync_last(1) ? clksync_last(1) : clksync_last(0);
         panic("clksync-test: shared counter rejected: %s (cpu %d)",
               bad ? clksync_reason_name(bad->reason) : "never checked", bad ? bad->bad_cpu : -1);
     }
-    const struct clksync_result *r0 = clksync_last(0), *r1 = clksync_last(1);
+    /* 換過來源時,開機驗證(舊來源、不合格)不算;以備援來源的驗證當「第一次」 */
+    const struct clksync_result *r0 = clksync_fallback_used() ? clksync_last(2) : clksync_last(0);
+    const struct clksync_result *r1 = clksync_last(1);
     KASSERT(r0 && r1 && r0->ok && r1->ok && timer_shared_enabled());
+    KASSERT(r1->src == r0->src);             /* 再驗證的是目前(同一個)來源 */
     for (int c = 0; c < n; c++) {
         if (c == r0->ref)
             continue;
@@ -1591,4 +1879,5 @@ void clksync_test(void)
         panic("clksync-test: clean dry run rejected: %s (cpu %d)", clksync_reason_name(t.reason), t.bad_cpu);
     if (clksync_state() != CLKSYNC_OK || !timer_shared_enabled())
         panic("clksync-test: a dry run changed the time mode");
+    clock_view_test(n);
 }

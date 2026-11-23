@@ -15,9 +15,11 @@
  * 取樣不採用(無法判斷),太多時整輪重試;採用的取樣偏移區間都必須落在 ±tol 之內。
  * tol = 四分之一個 tick(timer_tick_counts() >> 2,不用 64 位元除法)。
  *
- * 失敗即關閉(fail closed):任何一顆 AP 不合格、或沒有共用計數器時,停用共用路徑
- * (timer_shared_disable),退回只由第 0 顆推進時間,並記在黑盒子與開機訊息裡。
- * 這是降級狀態:之後的議題會在 i386 加上共用的備援計數器(HPET / ACPI PM timer)。
+ * 不合格時(I-341):先換到備援的共用計數器(timer_clock_fallback;i386 TSC → HPET),
+ * 對新來源做同樣的完整驗證;合格就繼續由任何 CPU 推進(狀態 OK、fallback = 1)。
+ * 沒有備援、或備援也不合格時才失敗即關閉(fail closed):停用共用路徑(timer_shared_disable),
+ * 退回只由第 0 顆推進時間(降級,仍是單點)。每一步都記在黑盒子與開機訊息裡。
+ * riscv64 / aarch64 的計數器在架構上就是全系統共用的單一時基,沒有備援(見 arch.h)。
  */
 
 enum clksync_state {
@@ -36,6 +38,14 @@ enum clksync_reason {
     CLKSYNC_R_WIDE,          /* 重試後可用的取樣仍太少(區間都太寬,無法判斷) */
     CLKSYNC_R_OFFSET,        /* 偏移區間超出 ±tol(固定偏移或漂移) */
     CLKSYNC_R_BUSY,          /* 另一次驗證正在進行(只會出現在測試的乾跑) */
+    CLKSYNC_R_FORCED,        /* 測試:開機參數 clock=fallback / clock=cpu0only 強制判定不合格 */
+};
+
+/* 測試用的強制降級(只在 selftest 時由 kmain 設定,見 clksync_force) */
+enum clksync_force_mode {
+    CLKSYNC_FORCE_NONE = 0,
+    CLKSYNC_FORCE_FALLBACK,  /* 開機驗證強制不合格 → 走「換到備援計數器並驗證」 */
+    CLKSYNC_FORCE_CPU0ONLY,  /* 開機驗證強制不合格,而且不用備援 → 走「只由第 0 顆推進」的降級 */
 };
 
 #define CLKSYNC_SAMPLES  16      /* 每顆 AP 每輪的取樣數 */
@@ -58,6 +68,7 @@ struct clksync_result {
     uint64_t iv;                 /* 每 tick 計數 */
     uint64_t at;                 /* 驗證開始時的計數值 */
     int      ref;                /* 參考 CPU(執行驗證的那一顆;開機驗證時是第 0 顆) */
+    const char *src;             /* 驗證的是哪一個計數器(timer_clock_name) */
     struct clksync_cpu cpu[MAX_CPUS];   /* 以 CPU 編號索引;參考 CPU 那一格不填 */
 };
 
@@ -71,7 +82,11 @@ void clksync_remote(void);
 /* 查詢(測試與診斷用) */
 int         clksync_state(void);                  /* enum clksync_state */
 const char *clksync_reason_name(int reason);
-const struct clksync_result *clksync_last(int which);   /* 0 = 開機驗證、1 = 1 秒後的再驗證;未做為 NULL */
+/* 0 = 開機驗證、1 = 1 秒後的再驗證、2 = 換到備援計數器之後的驗證;未做為 NULL */
+const struct clksync_result *clksync_last(int which);
+int         clksync_fallback_used(void);          /* 1 = 已換到備援計數器(而且驗證合格) */
+/* 測試:kmain 在 smp_init 之前呼叫(只在 selftest 時),影響開機驗證;enum clksync_force_mode */
+void        clksync_force(int mode);
 uint32_t    clksync_milli_ticks(uint64_t counts, uint64_t iv);  /* 計數換成千分之一 tick(上限 4000) */
 
 /*

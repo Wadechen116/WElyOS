@@ -19,6 +19,11 @@
  * 所以另外用 TSC(time stamp counter,CPU 內建、隨時間遞增的 64 位元計數器)
  * 當作獨立的時間來源:PIT 中斷只負責「叫醒」,實際該記幾個 tick 由 TSC
  * 經過了多少時間來決定。CPU 不支援 TSC 時退回每次中斷記一個 tick。
+ *
+ * 共用時鐘的來源(I-341):arch_clock_count() 是 kernel/timer.c 推進系統時間用的共用計數器。
+ * 首選 TSC;另外在開機時探測 HPET 主計數器(hpet.c)當備援。CPU 沒有 TSC 時一開始就用 HPET;
+ * TSC 不合格(clksync 驗證失敗)時由 kernel/timer.c 呼叫 arch_clock_fallback() 切到 HPET。
+ * 切換只會 TSC → HPET 一次,只在 timer.c 的序號寫入區間內做(讀者不會把兩種單位混用)。
  */
 #include <stdint.h>
 #include "arch.h"
@@ -29,6 +34,7 @@
 #include "timer.h"
 #include "sched.h"
 #include "trap.h"
+#include "hpet.h"
 
 #define PIC1_CMD   0x20
 #define PIC1_DATA  0x21
@@ -50,6 +56,13 @@
 static uint64_t tsc_interval;  /* 一個 tick 相當於多少 TSC 計數;0 = 不使用 TSC */
 static uint64_t tsc_deadline;  /* 下一個 tick 應該發生的 TSC 值 */
 static uint64_t tsc_hz;        /* TSC 每秒的計數(校正得到);0 = 沒有 TSC */
+
+enum { SRC_UNSET = 0, SRC_TSC, SRC_HPET, SRC_NONE };
+static volatile int clk_src;   /* 目前的共用時鐘;SRC_UNSET = arch_timer_init 之前(開機最早期) */
+static uint64_t hpet_hz;       /* HPET 每秒計數;0 = 沒有或不合格 */
+static uint64_t hpet_iv;       /* 一個 tick 相當於多少 HPET 計數 */
+static int test_hpet32;        /* 測試(clock=hpet32):把 HPET 當 32 位元用,開機後約 2 秒繞回 */
+#define HPET32_WRAP_MS 2000u
 
 static uint64_t rdtsc(void)
 {
@@ -73,7 +86,7 @@ static int cpu_has_tsc(void)
  * 這段期間 TSC 增加的量就是「10ms 的 TSC 計數」。
  * 不用 channel 0 是因為它接著 IRQ 0,而此時中斷還沒開。
  */
-static uint32_t tsc_per_10ms(void)
+static uint32_t per_10ms(uint64_t (*rd)(void))
 {
     uint16_t count = PIT_HZ / 100;                       /* 10ms */
 
@@ -82,10 +95,10 @@ static uint32_t tsc_per_10ms(void)
     outb(PIT_CH2, (uint8_t)(count & 0xFF));
     outb(PIT_CH2, (uint8_t)(count >> 8));
 
-    uint64_t t0 = rdtsc();
+    uint64_t t0 = rd();
     while (!(inb(PORT_SPKR) & 0x20))
         ;
-    return (uint32_t)(rdtsc() - t0);     /* 10ms 內的計數,32 位元足夠 */
+    return (uint32_t)(rd() - t0);        /* 10ms 內的計數,32 位元足夠(TSC < 400 GHz、HPET < 4.29 GHz) */
 }
 
 uint64_t arch_tsc_per_tick(void)
@@ -94,12 +107,23 @@ uint64_t arch_tsc_per_tick(void)
 }
 
 /* 開機最早期(kmain 開頭)計時器還沒校正,也要能讀:是否有 TSC 第一次用到時才問 CPUID */
-uint64_t arch_clock_count(void)
+static uint64_t early_count(void)
 {
     static int have = -1;
     if (have < 0)
         have = cpu_has_tsc();
     return have ? rdtsc() : 0;
+}
+
+/* 熱路徑:每顆 CPU 每 tick 一次。一次讀取 clk_src 加一個分支;TSC 路徑與以前相同 */
+uint64_t arch_clock_count(void)
+{
+    switch (__atomic_load_n(&clk_src, __ATOMIC_ACQUIRE)) {
+    case SRC_TSC:   return rdtsc();
+    case SRC_HPET:  return hpet_read();
+    case SRC_NONE:  return 0;
+    default:        return early_count();
+    }
 }
 
 /* CPUID 在所有 x86 處理器上都是序列化指令(Intel SDM:RDTSC 本身不序列化,之前的指令可能還沒做完、
@@ -113,6 +137,15 @@ static void cpuid_serialize(void)
 
 uint64_t arch_clock_count_ordered(void)
 {
+    int src = __atomic_load_n(&clk_src, __ATOMIC_ACQUIRE);
+    if (src == SRC_HPET) {
+        /* HPET 是 uncached 的記憶體讀取:x86 的讀取之間不會互相重排(和 RDTSC 不同,它本身就是讀取),
+           只要擋住編譯器 */
+        __asm__ volatile("" ::: "memory");
+        uint64_t t = hpet_read();
+        __asm__ volatile("" ::: "memory");
+        return t;
+    }
     if (!arch_clock_count())                     /* 順便確定有沒有 TSC */
         return 0;
     cpuid_serialize();
@@ -123,13 +156,67 @@ uint64_t arch_clock_count_ordered(void)
 
 uint64_t arch_tick_interval(void)
 {
-    return tsc_interval;
+    switch (__atomic_load_n(&clk_src, __ATOMIC_ACQUIRE)) {
+    case SRC_TSC:   return tsc_interval;
+    case SRC_HPET:  return hpet_iv;
+    default:        return 0;
+    }
 }
 
-/* 校正是以 PIT 量 10ms 得到的:精度受 PIT 的 1 個計數(約 0.84 微秒)與輪詢延遲限制,約千分之一 */
+/* TSC 的校正是以 PIT 量 10ms 得到的:精度受 PIT 的 1 個計數(約 0.84 微秒)與輪詢延遲限制,約千分之一。
+   HPET 的頻率來自它自己回報的週期(規格精確),PIT 只用來交叉驗證 */
 uint64_t arch_clock_hz(void)
 {
-    return tsc_hz;
+    switch (__atomic_load_n(&clk_src, __ATOMIC_ACQUIRE)) {
+    case SRC_TSC:   return tsc_hz;
+    case SRC_HPET:  return hpet_hz;
+    case SRC_NONE:  return 0;
+    default:        return 0;                    /* 還沒校正 */
+    }
+}
+
+/*
+ * 切到備援時鐘(I-341)。只能由 kernel/timer.c 在序號寫入區間、持有 time_lk 時呼叫。
+ * 回傳 1 = 已切到 HPET(之後 arch_clock_* 都是 HPET 的值);0 = 沒有備援(維持原樣)。
+ */
+int arch_clock_fallback(void)
+{
+    if (__atomic_load_n(&clk_src, __ATOMIC_ACQUIRE) != SRC_TSC || hpet_hz == 0)
+        return 0;
+    __atomic_store_n(&clk_src, SRC_HPET, __ATOMIC_RELEASE);
+    return 1;
+}
+
+const char *arch_clock_name(void)
+{
+    switch (__atomic_load_n(&clk_src, __ATOMIC_ACQUIRE)) {
+    case SRC_TSC:   return "tsc";
+    case SRC_HPET:  return hpet_is32() ? "hpet32" : "hpet";
+    case SRC_NONE:  return "none";
+    default:        return "early";
+    }
+}
+
+void arch_clock_test_mode(int mode)
+{
+    test_hpet32 = (mode == ARCH_CLOCK_TEST_HPET32);
+}
+
+/* 探測 HPET,並以 PIT 量 10ms 交叉驗證它回報的頻率(誤差 2% 以內;PIT 輪詢的誤差約千分之一) */
+static void hpet_probe(unsigned hz)
+{
+    uint64_t h = hpet_init(test_hpet32, HPET32_WRAP_MS);
+    if (h == 0)
+        return;
+    uint32_t got = per_10ms(hpet_read);
+    uint32_t want = (uint32_t)h / 100u;          /* h < 2^32(hpet_init 保證) */
+    uint32_t slack = want / 50u;
+    if (got + slack < want || got > want + slack) {
+        kprintf("hpet: rate check failed: %u counts in 10 ms, expected %u; not used\n", got, want);
+        return;
+    }
+    hpet_iv = (uint32_t)h / hz;
+    hpet_hz = h;
 }
 
 static void pic_remap(void)
@@ -162,13 +249,18 @@ void arch_timer_init(unsigned hz)
     outb(PIT_CH0, (uint8_t)(divisor >> 8));
 
     if (cpu_has_tsc()) {
-        uint32_t d = tsc_per_10ms();
+        uint32_t d = per_10ms(rdtsc);
         tsc_hz = (uint64_t)d * 100;
         /* 換算成一個 tick 的計數:d * 100 / hz。拆成兩步避免 32 位元溢位,
            也避開 64 位元除法(i386 上需要 libgcc 的 __udivdi3) */
         tsc_interval = (uint64_t)(d / hz) * 100 + (d % hz) * 100 / hz;
         tsc_deadline = rdtsc() + tsc_interval;
     }
+    hpet_probe(hz);                              /* 有 TSC 時也探測:備援要在需要之前就準備好 */
+    int src = tsc_interval ? SRC_TSC : hpet_hz ? SRC_HPET : SRC_NONE;
+    __atomic_store_n(&clk_src, src, __ATOMIC_RELEASE);
+    kprintf("clock: shared counter %s (%llu Hz), fallback %s\n", arch_clock_name(),
+            (unsigned long long)arch_clock_hz(), src == SRC_TSC && hpet_hz ? "hpet" : "none");
 }
 
 /*

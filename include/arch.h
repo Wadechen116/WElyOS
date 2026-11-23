@@ -176,6 +176,22 @@ uint64_t arch_clock_hz(void);
  * kernel/timer.c 以它和共用計數器讓任何一顆 CPU 都能推進系統時間(I-337)。
  */
 uint64_t arch_tick_interval(void);
+/*
+ * 備援時鐘(I-341):
+ *   arch_clock_fallback() 把共用計數器切到備援來源(i386:TSC → HPET 主計數器)。回傳 1 = 已切換,
+ *                         之後 arch_clock_count / _ordered / _hz / arch_tick_interval 都是新來源的值;
+ *                         0 = 沒有備援。只能由 kernel/timer.c 的 timer_clock_fallback() 呼叫(它負責讓
+ *                         讀者不會把新舊兩種單位混用)。riscv64 / aarch64 的計數器在架構上就是全系統共用的
+ *                         單一時基(time CSR 來自 ACLINT mtime;cntpct_el0 來自 system counter),沒有備援,回傳 0。
+ *   arch_clock_name()     目前來源的名稱(診斷用)
+ *   arch_clock_test_mode() 測試用,timer_init 之前呼叫:ARCH_CLOCK_TEST_HPET32 = 把 HPET 當 32 位元用、
+ *                         起始值設在繞回前約 2 秒(驗證 32 位元延伸);其他架構忽略
+ */
+#define ARCH_CLOCK_TEST_NONE   0
+#define ARCH_CLOCK_TEST_HPET32 1
+int         arch_clock_fallback(void);
+const char *arch_clock_name(void);
+void        arch_clock_test_mode(int mode);
 
 /* 測試用:執行一個非法指令,觸發「非法指令」例外 */
 void arch_test_illegal(void);

@@ -68,6 +68,22 @@ uint64_t arch_tick_interval(void)
     return interval;
 }
 
+/* I-341:time CSR 是架構上全系統共用的單一時基,沒有「另一個」共用計數器可以退回(見 arch.h) */
+int arch_clock_fallback(void)
+{
+    return 0;
+}
+
+const char *arch_clock_name(void)
+{
+    return "time";
+}
+
+void arch_clock_test_mode(int mode)
+{
+    (void)mode;
+}
+
 /* SBI 呼叫慣例:a7 = 擴充 ID,a6 = 功能 ID,a0.. = 參數;ecall 後 a0 = 錯誤碼 */
 static void sbi_set_timer(uint64_t when)
 {

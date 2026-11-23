@@ -215,6 +215,41 @@ for a in $ARCHS; do
     else
       fail=1; echo "  $a 無磁碟無網路測試失敗(結束碼 $brc),輸出在 $OUT/$a-bare.txt"
     fi
+
+    # I-341:共用計數器的降級路徑。每一行:額外的 QEMU 參數|開機參數|輸出裡必須出現的文字(以 ; 分隔)
+    # 全部預期結束碼 0(降級是「正確但較弱」的模式,不是失敗)
+    if [ "$a" = i386 ]; then
+      clk_cases=(
+        "|selftest clock=fallback|switched shared counter tsc -> hpet;fallback counter hpet ok;clksync: check #2 (hpet)"
+        "|selftest clock=hpet32|switched shared counter tsc -> hpet32;forced 32-bit (test);hpet32 extension crossed"
+        "|selftest clock=cpu0only|clksync: DEGRADED;cpu0-stall: degraded mode;clksync-test: forced degrade"
+        "-cpu qemu32,-tsc|selftest|clock: shared counter hpet;clksync: check #1 (hpet)"
+        "-machine hpet=off|selftest clock=fallback|hpet: no ACPI HPET table;clksync: DEGRADED;cpu0-stall: degraded mode"
+      )
+    else
+      clk_cases=("|selftest clock=fallback|clksync: DEGRADED;cpu0-stall: degraded mode;clksync-test: forced degrade")
+    fi
+    for cc in "${clk_cases[@]}"; do
+      IFS='|' read -r qx cl want_txt <<< "$cc"
+      log="$OUT/$a-clk-${cl// /+}${qx:+-${qx//[ ,=]/_}}.txt"
+      cpu_env=(); qargs=()
+      case "$qx" in
+        "-cpu "*) cpu_env=(QEMU_CPU="${qx#-cpu }") ;;   # qemu.sh 自己帶 -cpu:改用環境變數
+        "") ;;
+        *) read -r -a qargs <<< "$qx" ;;
+      esac
+      env "${cpu_env[@]}" timeout -k 10 90 scripts/qemu.sh "$a" "build/$a/welyos.elf" "${qargs[@]}" \
+          -append "autoexit $cl" > "$log" 2>&1 < /dev/null
+      crc=$?
+      miss=""
+      IFS=';' read -r -a wl <<< "$want_txt"
+      for w in "${wl[@]}"; do grep -qF "$w" "$log" || miss="$miss [$w]"; done
+      if [ "$crc" -eq 0 ] && guest_exit_ok "$log" 0 && [ -z "$miss" ]; then
+        echo "$a: 計數器降級情境「${qx:+$qx }$cl」通過"
+      else
+        fail=1; echo "  $a 計數器降級情境「${qx:+$qx }$cl」失敗(結束碼 $crc,缺少:${miss:- 無}),輸出在 $log"
+      fi
+    done
   fi
 
   if [ "$REPEAT" -gt 0 ]; then

@@ -330,6 +330,10 @@ void kmain(const struct boot_info *bi)
     /* 啟動計時器(1000Hz,一個 tick 1ms)與排程器,再開中斷。
        timer_init 只是設定硬體,中斷要到 arch_irq_enable 才會真的進來。
        從開中斷那一刻起,main 也會和其他執行緒一樣被搶佔 */
+    /* I-341 測試:clock=hpet32 把 HPET 當 32 位元計數器用(起始值設在繞回前約 2 秒),
+       要在 timer_init 探測 HPET 之前設定。只在 selftest 時有效 */
+    if (selftest && cmdline_has(bi->cmdline, "clock=hpet32"))
+        arch_clock_test_mode(ARCH_CLOCK_TEST_HPET32);
     timer_init(1000);
     sched_init();
     arch_irq_enable();
@@ -365,6 +369,14 @@ void kmain(const struct boot_info *bi)
     }
 
     /* 啟動其他 CPU。selftest 時所有 CPU 一起跑一輪並行測試 */
+    /* I-341 測試:讓開機的計數器驗證強制不合格,真的執行「換到備援計數器」或「只由第 0 顆推進」的路徑。
+       只在 selftest 時有效(安全模式已在上面把 selftest 清成 0) */
+    if (selftest) {
+        if (cmdline_has(bi->cmdline, "clock=fallback") || cmdline_has(bi->cmdline, "clock=hpet32"))
+            clksync_force(CLKSYNC_FORCE_FALLBACK);
+        else if (cmdline_has(bi->cmdline, "clock=cpu0only"))
+            clksync_force(CLKSYNC_FORCE_CPU0ONLY);
+    }
     smp_init(bi, cmdline_has(bi->cmdline, "selftest"));
 
     sched_crash_test(bi->cmdline);

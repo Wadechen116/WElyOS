@@ -37,6 +37,7 @@
 #include "timer.h"
 #include "trap.h"
 #include "vm.h"
+#include "acpi.h"
 
 #define TRAMP_ADDR   0x8000u                 /* 跳板放置的位址;SIPI 的頁號 = 0x08 */
 
@@ -166,8 +167,12 @@ static const uint8_t *acpi_table(uint32_t pa, uint32_t *len)
     return t;
 }
 
-/* 找出 MADT。失敗回傳 NULL */
-static const uint8_t *find_madt(uint32_t *len)
+/*
+ * 依簽章找出一張 ACPI 表格(例如 "APIC" = MADT、"HPET")。失敗回傳 NULL。
+ * 也給 arch/i386/hpet.c 用(I-341):HPET 的位址同樣只能從 ACPI 表格得知。
+ * 只在開機時、單一 CPU 上呼叫(phys() 需要 vm 已啟用)。
+ */
+const uint8_t *acpi_find_table(const char sig[4], uint32_t *len)
 {
     const uint8_t *bios = phys(0xE0000, 0x20000);
     if (!bios)
@@ -184,7 +189,7 @@ static const uint8_t *find_madt(uint32_t *len)
             return NULL;
         for (uint32_t i = 36; i + 4 <= rlen; i += 4) {
             const uint8_t *t = acpi_table(rd32(rsdt + i), len);
-            if (t && memcmp(t, "APIC", 4) == 0)
+            if (t && memcmp(t, sig, 4) == 0)
                 return t;
         }
         return NULL;
@@ -218,7 +223,7 @@ static void short_delay(unsigned n)
 int arch_smp_discover(const struct boot_info *bi, uint64_t *ids, int max)
 {
     uint32_t len;
-    const uint8_t *madt = find_madt(&len);
+    const uint8_t *madt = acpi_find_table("APIC", &len);
     int n = 0;
 
     if (!madt) {

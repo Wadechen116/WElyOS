@@ -8334,3 +8334,43 @@ Codex 的模型(`drift_hidden_by_bracket_uncertainty_case`)與 msg 215:開機與
 
 
 第 69 步完整回歸(build/c32a/regress-69.txt):全部符合預期 — 三架構各 30/30 個情境、磁碟跨開機 16/16 階段、1/4/8 CPU 重複各 3/3;架構檢查有效;靜態檢查新增 0 個需要處理的提示。
+
+## 第 70 步:I-240 結案 — 第 69 步的不可變副本
+
+第 69 步提交為 20e35ee。照第 69 步同樣的程序建 `build/milestones/c32-step69`:`git archive HEAD` → 拋棄式目錄重建三架構(0 警告)→ 複製 kernel → 從副本開機跑 selftest(4 CPU),i386、riscv64、aarch64 全部回傳 0、客體印出「exit: code 0 to the emulator」、沒有 panic;紀錄裡有 pmm 對齊配置、親和性、kstack、r1、cpu0 卡住、計數器同步的結果。完整回歸 regress-69(全部符合預期;它跑的原始碼和這個 commit 相同,之後只多了 DEVLOG 的一行)也放進副本。`manifest.txt` 有各檔案的 SHA-256;檔案設為唯讀。
+
+這個副本包含 Codex msg 211 指出的 memhog 初始回報修正,I-240 的所有驗收條件(實作、測試與負對照;Codex 獨立驗收;提交、完整回歸、不可變副本)都在同一個版本上滿足,改為已解決。
+
+### I-341 稿子的驗證:測出降級模式的睡眠提早醒(I-346)
+
+`build/pending/i341-on-i343.patch` 套到 c32-step69 的拋棄式副本,三架構建置 0 警告。完整回歸(副本沒有 git,靜態檢查無法比對,以 `-k` 跑 QEMU 部分):原本的 30 個情境、磁碟 16 階段、1/4/8 CPU 重複全部通過;新的時鐘情境中,i386 `clock=fallback`、`clock=hpet32`、沒有 TSC 三個通過,**四個失敗**:i386 `clock=cpu0only`、i386 `hpet=off` 加 `clock=fallback`、riscv64 與 aarch64 的 `clock=fallback`,都在 `sleep_wall_test` 的 `tick_lag_probe` panic — 第 0 顆關中斷 5 ms 時取的 1 ms 期限,開中斷後只過了 0.05~0.08 ms 就到期。
+
+原因:降級時 `timer_ticks_real` 不往前看,架構層卻照樣在恢復時補記落後的 tick。這是第 67 步改成共用計數器後降級路徑留下的錯誤,不是稿子帶進來的;稿子的強制降級情境第一次把它測出來。開成 I-346。修正牽涉降級模式的保證要怎麼定(例如降級時不批次補記、只讓時間落後而睡眠只會變長;或只在第 0 顆上用本地計數器往前看),先請 Codex 審查設計,修好之前稿子不套用。
+
+### Codex 第 69 步審查:固定佇列的隊頭阻塞與飢餓掃描
+
+Codex(msg 20261123-001)指出 I-343 的兩處只看佇列頭:
+
+- **隊頭阻塞**:別顆 CPU 的同優先權固定佇列是 [A(只允許那顆), B(也允許這顆)] 時,`pin_best` 只看頭,這顆閒著也拿不到 B。安全性不受影響(不會跑錯 CPU),但 CPU 閒置、B 被延遲。修正:每層最多看前 PIN_SCAN_MAX 個(與 runq 的 peek 同為 24),成本仍有上限;自己佇列的頭一定允許自己(P1),一般情況不多走。新增 `affinity_hol_test`(需要 3 顆以上 CPU):第 0、1 顆各被固定的高優先權執行緒佔住,A(只允許 0)、B(允許 0、1)依序排進第 0 顆的佇列,放掉第 1 顆後 B 必須在 20 ms 內在第 1 顆上執行。第一版測試自己有競態:A 在被固定前就被閒著的第 3 顆拿去跑完結束,`thread_set_affinity` 回傳找不到(i386 4 CPU);改成 A、B 先睡著等閘門。三架構 3/4/8 CPU 各 2 次通過;負對照(拿掉掃描、只看頭)B 一直沒執行而 panic。另外,第一次寫負對照時把掃描上限改成 1,但迴圈結束時指標已前進到第二個節點,仍會選到 B — 突變本身無效,改成整段拿掉才正確。
+- **飢餓掃描**:固定佇列部分只看每層的頭;被搶佔、插回最前面的執行緒 ready_since 是新的,會一再遮住後面等很久的。改成每層看前 24 個(先記下下一個,因為提升會把它移到別層)。這一項還沒有能確定觸發的測試,開成 I-347,請 Codex 提供 host 模型。
+
+### I-346 修正(方案 A)與 I-341 套用
+
+第 70 步完整回歸(regress-70,含 I-343 兩項修正與 affinity_hol_test)全部符合預期:三架構各 30/30、磁碟 16/16、1/4/8 CPU 各 3/3,靜態檢查新增 0 個需要處理的提示。
+
+使用者採納 Codex(msg 20261123-002)的建議,I-346 先做方案 A。因為 I-341 稿子也改 `timer_advance`,先把 `build/pending/i341-on-i343.patch` 套到工作樹(無衝突),再在上面實作:
+
+- `timer_advance` 多一個 `charge` 參數:降級(走舊路徑)時,`timer_tick_stolen`(charge = 0)送來的補記 tick 一律丟掉,只記 `deg_dropped` 與連續丟掉的最大值,經 `timer_get_stats` 的 `degraded_dropped`、`degraded_max_run` 報告。
+- 只丟掉補記還不夠:第一版四個情境中 i386 `clock=cpu0only` 與 aarch64 仍失敗(1 ms 期限 0.78~0.83 ms 到期)。原因是第 0 顆開中斷後送達的第一個中斷照常 +1,但那一格的時間其實已經過了。補記都丟掉之後,晚到的最多只有這一格,所以新增 `timer_wait_base()`:降級時在 `timer_ticks_real()` 上多加 1,`thread_sleep` 與 `timer_deadline_ms` 改用它。`timer_ticks_real` 本身不改(即時工作的週期起點與測試都以它比對)。
+- 降級的 CPU0 卡住測試新增檢查:恢復後丟掉的補記 tick 至少 CS_STALL_MS/4(實測 99~103,架構層一次最多補記 100 個)、恢復前後系統時間只前進幾格(實測 +4~+6),沒有一次跳過去。
+
+結果:i386 `clock=cpu0only`、i386 `hpet=off` 加 `clock=fallback`、riscv64 / aarch64 `clock=fallback` 各 2 次通過,1 ms 期限實際 1.75~3.3 ms;i386 `clock=fallback`、`clock=hpet32`、沒有 TSC 也通過。負對照:只少了 +1 → 0.78~0.83 ms 到期(上面第一版);保留 +1、只拿掉丟棄 → 0.06~0.08 ms 到期,兩次都 panic。第一次做這個負對照時,複製檔案的指令回傳錯誤,`&&` 後面的突變沒有執行,結果「通過」— 檢查副本才發現突變不在;重做後才得到上面的失敗。教訓:負對照要先確認突變真的在副本裡(grep),再看結果。
+
+明訂的降級保證(寫在 kernel/timer.c):時間單調、睡眠只會變長不會提早;代價是時間落後實際經過的時間,睡眠、即時期限檢查、防飢餓與由 tick 推算的日曆時間都相應延後,落後量看 `degraded_*`。要準確的日曆時間,長期要把排程用的單調時鐘與日曆時鐘分開(Codex 建議)。
+
+I-341 改為部分解決:HPET 備援與三個測試用開機參數都已執行與驗證;HPET 也沒有時仍是只由第 0 顆推進(單點),ACPI PM timer 第二層備援還沒做。
+
+名詞:HPET — 高精度事件計時器(High Precision Event Timer),PC 上全系統共用的硬體計數器;ACPI PM timer — 進階組態與電源介面(Advanced Configuration and Power Interface)的電源管理計時器(Power Management timer),24 或 32 位元的共用計數器。
+
+
+第 70 步完整回歸 b(build/c32a/regress-70b.txt,含 I-341 與 I-346 方案 A):全部符合預期 — 三架構各 30/30、磁碟 16/16、7 個計數器降級情境全部通過、1/4/8 CPU 重複各 3/3;靜態檢查新增 0 個需要處理的提示。

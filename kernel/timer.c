@@ -26,13 +26,19 @@
  * 安全:ticks 與 g_deadline 只在 time_lk 之內改,而且只會變大(單調);讀取端用序號
  * (seqcount)拿到一致的一對,i386 上 64 位元不會讀到一半。
  *
- * 沒有共用計數器時(i386 沒有 TSC:g_iv == 0)退回舊做法:只有第 0 顆 CPU 推進,每次中斷 1 個 tick。
+ * 沒有共用計數器時(i386 沒有 TSC 也沒有 HPET:g_iv == 0)退回舊做法:只有第 0 顆 CPU 推進,每次中斷 1 個 tick。
+ *
+ * 換時鐘來源(I-341):首選來源(i386 TSC)驗證不合格時,timer_clock_fallback() 切到備援(i386 HPET)。
+ * 新舊來源的計數單位不同,所以「切換來源、重設 g_iv 與 g_deadline」整段在 time_lk 之內、序號為奇數的
+ * 區間裡完成;需要「計數器現值 + (deadline, iv)」一致的讀者(time_snap)在同一個序號區間內讀計數器,
+ * 跨過切換就重讀。持鎖推進的 CPU 在鎖內重讀一切,所以也不會混用。
  */
 static volatile uint64_t ticks;
 static volatile uint64_t g_deadline;   /* 下一個 tick 的計數值;g_iv == 0 時不用 */
-/* 一個 tick 相當於多少計數;0 = 沒有共用計數器。只在 timer_init 寫一次(中斷開啟、其他 CPU 啟動之前),
-   之後唯讀,所以不用原子操作(i386 上 64 位元的 __atomic 會需要 libatomic) */
-static uint64_t g_iv;
+/* 一個 tick 相當於多少計數;0 = 沒有共用計數器。timer_init 寫一次;之後只有 timer_clock_fallback 會改
+   (持 time_lk、序號為奇數時)。讀者以 time_snap 在序號保護下讀(i386 上 64 位元不會讀到一半;
+   64 位元的 __atomic 會需要 libatomic,所以不用) */
+static volatile uint64_t g_iv;
 /* 共用計數器路徑是否啟用(I-337 同步驗證)。開機時為 1:smp_init 之前只有第 0 顆 CPU 有計時器中斷,
    用它自己的計數器推進不會有跨 CPU 的問題。kernel/clksync.c 驗證任何一顆 AP 失敗時呼叫
    timer_shared_disable() 清成 0,之後退回「只有第 0 顆推進」的舊路徑(降級狀態)。只會由 1 變 0 */
@@ -52,6 +58,20 @@ static void time_read(uint64_t *t, uint64_t *d)
         s = __atomic_load_n(&time_seq, __ATOMIC_ACQUIRE);
         *t = ticks;
         *d = g_deadline;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    } while ((s & 1) || s != __atomic_load_n(&time_seq, __ATOMIC_RELAXED));
+}
+
+/* 一致的 (tick, deadline, iv) 與「同一個區間內」讀到的計數器現值:跨過換來源就重讀(I-341) */
+static void time_snap(uint64_t *t, uint64_t *d, uint64_t *iv, uint64_t *now)
+{
+    uint32_t s;
+    do {
+        s = __atomic_load_n(&time_seq, __ATOMIC_ACQUIRE);
+        *t = ticks;
+        *d = g_deadline;
+        *iv = g_iv;
+        *now = arch_clock_count();
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
     } while ((s & 1) || s != __atomic_load_n(&time_seq, __ATOMIC_RELAXED));
 }
@@ -88,15 +108,39 @@ void timer_init(unsigned hz)
 /* 目前生效的每 tick 計數:共用路徑停用時視同沒有共用計數器 */
 static uint64_t live_iv(void)
 {
-    return __atomic_load_n(&g_shared, __ATOMIC_ACQUIRE) ? g_iv : 0;
+    uint64_t t, d, iv, now;
+    time_snap(&t, &d, &iv, &now);            /* g_iv 可能被換來源改寫:在序號保護下讀 */
+    return __atomic_load_n(&g_shared, __ATOMIC_ACQUIRE) ? iv : 0;
 }
 
-static int timer_advance(uint64_t *from, uint64_t *to)
-{
-    uint64_t t, d, iv = live_iv();
+/*
+ * I-346 降級的保證(Codex msg 20261123-002 的方案 A):沒有可用的共用計數器時,系統時間只隨第 0 顆
+ * 「真的送達」的計時器中斷逐次 +1,架構層補記的 tick(timer_tick_stolen)一律丟掉、只記數。
+ * 原因:降級時任何 CPU 都無法往前看「已經到了、還沒記上」的 tick(timer_ticks_real 只能回傳 t),
+ * 若恢復時批次補記,落後期間取的期限會提早到期(sleep 承諾「至少」被打破)。
+ * 代價(明訂、不是缺陷):時間仍單調,但會落後實際經過的時間;睡眠、即時工作的期限檢查、
+ * 防飢餓都相應延後;由 tick 推算的日曆時間也會落後。落後量見 timer_stats 的 degraded_*。
+ * 正常(共用計數器)模式不受影響
+ */
+static uint32_t deg_dropped, deg_run, deg_max_run;   /* 只有第 0 顆在中斷中寫;讀取用 atomic */
 
-    if (iv == 0) {                            /* 沒有共用計數器:舊做法 */
-        if (this_cpu()->id != 0 || !spin_trylock(&time_lk))
+static int timer_advance(uint64_t *from, uint64_t *to, int charge)
+{
+    uint64_t t, d, iv, now;
+
+    time_snap(&t, &d, &iv, &now);
+    if (!__atomic_load_n(&g_shared, __ATOMIC_ACQUIRE) || iv == 0) {   /* 沒有可用的共用計數器:舊做法 */
+        if (this_cpu()->id != 0)
+            return 0;
+        if (!charge) {                        /* 補記的 tick:丟掉(見上方 I-346) */
+            __atomic_store_n(&deg_dropped, deg_dropped + 1, __ATOMIC_RELAXED);
+            deg_run++;
+            if (deg_run > deg_max_run)
+                __atomic_store_n(&deg_max_run, deg_run, __ATOMIC_RELAXED);
+            return 0;
+        }
+        deg_run = 0;
+        if (!spin_trylock(&time_lk))
             return 0;
         time_read(&t, &d);
         time_write(t + 1, d);
@@ -105,13 +149,18 @@ static int timer_advance(uint64_t *from, uint64_t *to)
         adv_count[0]++;
         return 1;
     }
-    time_read(&t, &d);
-    if (arch_clock_count() < d)               /* 常見情形:還沒到,什麼都不做 */
+    if (now < d)                              /* 常見情形:還沒到,什麼都不做 */
         return 0;
     if (!spin_trylock(&time_lk))              /* 別顆 CPU 正在推進:交給它 */
         return 0;
-    time_read(&t, &d);                        /* 拿到鎖之後重讀:可能剛被推進過 */
-    uint64_t now = arch_clock_count();
+    /* 拿到鎖之後重讀:可能剛被推進過,也可能剛換了來源(換來源只在鎖內做,所以鎖內讀到的一定一致) */
+    if (!__atomic_load_n(&g_shared, __ATOMIC_ACQUIRE)) {
+        spin_unlock(&time_lk);                /* 剛被降級:這次不推進,下一次中斷走舊做法 */
+        return 0;
+    }
+    time_read(&t, &d);
+    iv = g_iv;
+    now = arch_clock_count();
     unsigned n = 0;
     while (d <= now && n < REAL_CATCHUP_MAX) {
         d += iv;
@@ -133,7 +182,7 @@ static int timer_advance(uint64_t *from, uint64_t *to)
 static void timer_common(int charge)
 {
     uint64_t from, to;
-    if (timer_advance(&from, &to)) {
+    if (timer_advance(&from, &to, charge)) {
         sched_tick_global(from, to);          /* 這段 tick 的全系統工作只由推進的這顆 CPU 做一次 */
         spin_unlock(&time_lk);
     }
@@ -210,6 +259,8 @@ void timer_get_stats(struct timer_stats *st)
     unsigned long fl = spin_lock_irqsave(&tstat_lk);
     *st = tstats;
     spin_unlock_irqrestore(&tstat_lk, fl);
+    st->degraded_dropped = __atomic_load_n(&deg_dropped, __ATOMIC_RELAXED);
+    st->degraded_max_run = __atomic_load_n(&deg_max_run, __ATOMIC_RELAXED);
 }
 
 uint32_t timer_bursts_at_least(const struct timer_stats *st, unsigned k)
@@ -292,6 +343,37 @@ uint64_t timer_clock_count(void)
     return arch_clock_count();
 }
 
+/*
+ * 換到備援的共用計數器(I-341;由 kernel/clksync.c 在首選來源驗證不合格時呼叫)。
+ * 回傳 1 = 已換(呼叫端接著必須驗證新來源);0 = 沒有備援。
+ * 整段在 time_lk 之內、序號為奇數時做:換來源、g_iv 換成新單位、g_deadline 以新來源的現值重設。
+ * ticks 不變(時間單調;換的那一刻最多少記不到一個 tick 的零頭)。開機標記是舊單位,清成 0(= 不知道)。
+ */
+int timer_clock_fallback(void)
+{
+    unsigned long fl = spin_lock_irqsave(&time_lk);
+    __atomic_store_n(&time_seq, time_seq + 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    int ok = arch_clock_fallback();
+    if (ok) {
+        uint64_t iv = arch_tick_interval();
+        g_iv = iv;
+        g_deadline = arch_clock_count() + iv;
+        mark_kmain = mark_ready = 0;
+    }
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    __atomic_store_n(&time_seq, time_seq + 1, __ATOMIC_RELAXED);
+    spin_unlock_irqrestore(&time_lk, fl);
+    if (ok && (g_iv == 0 || arch_clock_hz() == 0))
+        timer_shared_disable();              /* 不應發生(arch 層保證);萬一發生,寧可降級也不用 0 當間隔 */
+    return ok && timer_shared_enabled();
+}
+
+const char *timer_clock_name(void)
+{
+    return arch_clock_name();
+}
+
 uint64_t timer_clock_hz(void)
 {
     return arch_clock_hz();
@@ -301,17 +383,23 @@ uint64_t timer_ticks_real(void)
 {
     /* 一致的一對(tick, 下一個 tick 的計數值),再看計數器已經超過幾個預定時間:
        那些是「已經到了、還沒有任何 CPU 記上」的 tick */
-    uint64_t t, d, iv = live_iv();
-    time_read(&t, &d);
-    if (iv == 0)
+    uint64_t t, d, iv, now;
+    time_snap(&t, &d, &iv, &now);
+    if (!__atomic_load_n(&g_shared, __ATOMIC_ACQUIRE) || iv == 0)
         return t;
-    uint64_t now = arch_clock_count();
     unsigned k = 0;
     while (now >= d && k < REAL_CATCHUP_MAX) {
         d += iv;
         k++;
     }
     return t + k;
+}
+
+uint64_t timer_wait_base(void)
+{
+    /* 降級時第 0 顆關中斷期間 tick 停住;開中斷後送達的第一個中斷照常 +1,但那一格的時間其實已經過了。
+       其餘補記的都丟掉(timer_advance),所以晚到的最多就這一格 */
+    return timer_ticks_real() + (timer_shared_enabled() ? 0 : 1);
 }
 
 uint64_t timer_deadline_ms(unsigned ms)
@@ -321,7 +409,7 @@ uint64_t timer_deadline_ms(unsigned ms)
     /* 現在位在第 r 個 tick 之中的某處;到第 r + n 個 tick 時,真實經過的時間至少 n - 1 個 tick,
        所以 n = 無條件進位的 tick 數 + 1(與 thread_sleep 相同;32 位元運算,避開 i386 的 __udivdi3) */
     unsigned n = (ms * timer_hz() + 999) / 1000 + 1;
-    return timer_ticks_real() + n;
+    return timer_wait_base() + n;
 }
 
 int timer_expired(uint64_t deadline)

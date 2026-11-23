@@ -169,6 +169,7 @@ struct pinq {
     unsigned mask;                           /* bit p = 1:優先權 p 非空 */
 };
 static struct pinq pinqs[MAX_CPUS];
+#define PIN_SCAN_MAX RUNQ_PEEK_MAX           /* 每層佇列最多看幾個(與 runq 的 peek 相同) */
 static unsigned char pin_tie[MAX_CPUS];
 
 /* 負對照:定義後,取出時忽略親和性(固定測試必須因此失敗);正式建置絕不定義 */
@@ -382,8 +383,14 @@ static struct thread *pin_best(int cpu)
                 continue;
             if (best && p <= best->prio)
                 break;                       /* 這顆剩下的都不會更好 */
+            /* 不只看頭(Codex 第 69 步審查):別顆的佇列可能是 [A(只允許那顆), B(也允許這顆)],
+               只看頭時 B 要等 A,這顆閒著也拿不到。和 runq 的 peek 一樣最多看 PIN_SCAN_MAX 個,
+               成本仍有上限;自己的佇列頭一定允許自己(P1),不會多走 */
             struct thread *h = pinqs[c].head[p];
-            if (AFF_IGNORE || allowed_on(h, cpu)) {
+            for (int k = 0; h && k < PIN_SCAN_MAX; k++, h = h->pin_next)
+                if (AFF_IGNORE || allowed_on(h, cpu))
+                    break;
+            if (h && (AFF_IGNORE || allowed_on(h, cpu))) {
                 best = h;
                 break;
             }
@@ -1426,16 +1433,21 @@ static void starve_scan(uint64_t now)
             update_prio(t);                  /* 移到最高優先權的佇列;必要時要求重新排程 */
         }
     }
-    /* 固定佇列(I-343):同樣只看每層的頭。提升後移到 PRIO_MAX 那層,這個迴圈不再看到它 */
+    /* 固定佇列(I-343):和 runq 一樣看每層前 PIN_SCAN_MAX 個。以前只看頭:被搶佔的執行緒插回最前面、
+       ready_since 是新的,會一再遮住後面等很久的(Codex 第 69 步審查)。
+       update_prio 會把 t 移出這層,所以先記下下一個再處理 */
     for (int i = 0; i < cpu_count && i < MAX_CPUS; i++) {
         for (int p = PRIO_MAX - 1; p >= PRIO_MIN; p--) {
-            struct thread *t = pinqs[i].head[p];
-            if (!t || t->starve_boost || now < t->ready_since || now - t->ready_since < starve_ticks)
-                continue;
-            KASSERT(t->state == T_READY && t->prio == p);
-            t->starve_boost = 1;
-            nstarve_boosts++;
-            update_prio(t);
+            struct thread *t = pinqs[i].head[p], *next;
+            for (int k = 0; t && k < PIN_SCAN_MAX; k++, t = next) {
+                next = t->pin_next;
+                if (t->starve_boost || now < t->ready_since || now - t->ready_since < starve_ticks)
+                    continue;
+                KASSERT(t->state == T_READY && t->prio == p);
+                t->starve_boost = 1;
+                nstarve_boosts++;
+                update_prio(t);
+            }
         }
     }
 }
@@ -1539,7 +1551,7 @@ void thread_sleep(unsigned ms)
        這次睡眠就不會被它叫醒 — 記一筆。只在自我測試註冊了檢查函式時才做 */
     if (sched_sleep_check && self->data && sched_sleep_check(self->data))
         failinj_note_sleep_pending();
-    sleep_until_locked(self, timer_ticks_real() + n);   /* 以真實時間為起點:見 timer.h 的 timer_ticks_real */
+    sleep_until_locked(self, timer_wait_base() + n);    /* 以真實時間為起點:見 timer.h 的 timer_wait_base */
     sched_unlock(flags);
 }
 

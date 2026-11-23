@@ -38,6 +38,8 @@
 #define PTE_P   0x001ULL
 #define PTE_RW  0x002ULL
 #define PTE_US  0x004ULL
+#define PTE_PWT 0x008ULL                  /* write-through */
+#define PTE_PCD 0x010ULL                  /* cache disable */
 #define PTE_PS  0x080ULL
 #define PTE_G   0x100ULL
 #define PTE_SW_SHARED 0x200ULL            /* bit 9~11 保留給軟體使用,硬體忽略 */
@@ -98,6 +100,9 @@ pte_t arch_pte_leaf(uintptr_t pa, unsigned flags, int level)
 
     if (flags & VM_WRITE)
         e |= PTE_RW;
+    if (flags & VM_DEVICE)
+        e |= PTE_PCD | PTE_PWT;              /* 裝置暫存器(LAPIC、HPET):不可快取,不靠 BIOS 的 MTRR(I-341)。
+                                                PAT 維持開機預設時 PCD=1、PWT=1 即 UC */
     if (flags & VM_USER)
         e |= PTE_US;
     else if (has_pge)
@@ -148,6 +153,8 @@ unsigned arch_pte_flags(pte_t e)
         f |= VM_WRITE;
     if (e & PTE_US)
         f |= VM_USER;
+    if (e & PTE_PCD)
+        f |= VM_DEVICE;
     if (!has_nx || !(e & PTE_NX))
         f |= VM_EXEC;                        /* 沒有 NX 的 CPU:有對映就可執行 */
     f |= vm_sw_decode(((e & PTE_SW_SHARED) ? 1u : 0u) | ((e & PTE_SW_COW) ? 2u : 0u));

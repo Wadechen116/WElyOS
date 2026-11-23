@@ -19,6 +19,9 @@ uint32_t timer_advances(int cpu);  /* 第 cpu 顆 CPU 推進過幾次系統時�
 void     timer_shared_disable(void);
 int      timer_shared_enabled(void);
 uint64_t timer_tick_counts(void);
+/* I-341:換到備援的共用計數器(i386 TSC → HPET)。1 = 已換,呼叫端必須接著驗證;0 = 沒有備援 */
+int         timer_clock_fallback(void);
+const char *timer_clock_name(void);      /* 目前共用計數器的名稱(tsc / hpet / hpet32 / time / cntpct / none) */
 unsigned timer_hz(void);        /* 每秒的 tick 數 */
 
 /*
@@ -35,6 +38,9 @@ struct timer_stats {
     uint32_t burst[TIMER_BURST_BUCKETS];    /* 各組的累計次數 */
     uint32_t max_burst;                     /* 單次補記最多幾個 tick */
     uint32_t resyncs;                       /* 晚太多、放棄補記直接重新對時的次數(算在「10 以上」) */
+    /* I-346:降級(沒有共用計數器)時不補記,系統時間落後實際時間。累計丟掉的 tick 與連續丟掉最多幾個 */
+    uint32_t degraded_dropped;
+    uint32_t degraded_max_run;
 };
 void timer_note_catchup(int n, int resynced);   /* 架構層:這次中斷補記了 n 個 tick */
 void timer_get_stats(struct timer_stats *st);
@@ -64,6 +70,9 @@ uint64_t timer_clock_hz(void);       /* 它每秒的計數;0 = 沒有可用的�
  * 架構層沒有高精度時鐘時,timer_ticks_real() 等於 timer_ticks()(無從得知落後多少)。
  */
 uint64_t timer_ticks_real(void);
+/* 「至少等多久」的起點(thread_sleep、timer_deadline_ms 用):timer_ticks_real(),降級時再加 1 —
+   補記的 tick 被丟掉(I-346)後,恢復時最多只剩一個「已經過了、照常記上」的晚到中斷,往前多算一個就夠 */
+uint64_t timer_wait_base(void);
 uint64_t timer_deadline_ms(unsigned ms);
 int      timer_expired(uint64_t deadline);
 #endif
