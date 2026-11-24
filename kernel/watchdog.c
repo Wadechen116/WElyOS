@@ -17,6 +17,8 @@
  */
 #include "cpu.h"
 #include "panic.h"
+#include "sched.h"
+#include "timer.h"
 #include "watchdog.h"
 
 static unsigned timeout_ticks = 5000;        /* 預設 5 秒(1 tick = 1ms) */
@@ -28,10 +30,56 @@ void watchdog_set_timeout(unsigned ms)
     timeout_ticks = ms;
 }
 
+/*
+ * 階段看門狗(I-350):心跳看門狗只抓「某顆 CPU 關著中斷卡死」;中斷照常進來、卻有執行緒永遠等不到
+ * (喚醒遺失、排程死結)時,所有 CPU 都有心跳,它看不出來 — 第 72 步 aarch64 降級模式的親和性測試
+ * 就這樣靜靜卡到 90 秒逾時,沒有留下任何現場。自我測試的一個階段可以設期限;每顆 CPU 的每次
+ * 計時器中斷比較一次(一次讀取 + 比較),逾時的第一顆 CPU 印出排程器狀態再 panic。
+ * 用高精度時鐘量:降級時系統 tick 會落後(I-346),不能拿它量「真的過了多久」。
+ */
+static const char *stage_name;
+static const volatile unsigned *stage_progress;
+static uint64_t stage_start, stage_limit;    /* 時鐘計數;只在 stage_armed == 0 時改 */
+static volatile int stage_armed, stage_fired;   /* 32 位元旗標:i386 沒有 64 位元的 atomic */
+static volatile unsigned stage_gen;          /* 每次設定加一:讀者比較前後,換過就不算(像 seqlock) */
+
+void watchdog_stage(const char *name, unsigned secs, const volatile unsigned *progress)
+{
+    uint64_t hz = timer_clock_hz();
+    __atomic_store_n(&stage_armed, 0, __ATOMIC_SEQ_CST);     /* 先停,再改內容(讀者只在 armed 時讀) */
+    __atomic_add_fetch(&stage_gen, 1, __ATOMIC_SEQ_CST);
+    if (!name || hz == 0)
+        return;
+    stage_name = name;
+    stage_progress = progress;
+    stage_start = timer_clock_count();
+    stage_limit = hz * secs;
+    __atomic_store_n(&stage_armed, 1, __ATOMIC_SEQ_CST);     /* 內容寫好之後才啟用 */
+}
+
+static void stage_check(void)
+{
+    unsigned g = __atomic_load_n(&stage_gen, __ATOMIC_SEQ_CST);
+    if (!__atomic_load_n(&stage_armed, __ATOMIC_SEQ_CST))
+        return;
+    uint64_t start = stage_start, lim = stage_limit;
+    if (__atomic_load_n(&stage_gen, __ATOMIC_SEQ_CST) != g)
+        return;                              /* 讀的期間被重設:這次不算,下一次中斷再看 */
+    if (timer_clock_count() - start < lim)
+        return;
+    if (__atomic_exchange_n(&stage_fired, 1, __ATOMIC_SEQ_CST))
+        return;                              /* 別顆 CPU 已經在報了 */
+    sched_dump_state();
+    panic("watchdog: self-test stage \"%s\" did not finish in time (progress %d; threads above)", stage_name,
+          stage_progress ? (int)*stage_progress : -1);
+}
+
 void watchdog_tick(void)
 {
     struct cpu *me = this_cpu();
     unsigned long now = ++me->heartbeat;
+
+    stage_check();
 
     if (cpu_count < 2 || (now & 63) != 0)
         return;

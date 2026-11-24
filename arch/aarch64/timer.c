@@ -138,7 +138,7 @@ void arch_timer_init(unsigned hz)
 
     __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
     counter_hz = freq;
-    interval = freq / hz;                        /* 每個 tick 的計數 */
+    interval = (freq + hz - 1) / hz;             /* 每個 tick 的計數;無條件進位:tick 只可以比真實時間慢 */
     arch_timer_init_cpu();
 }
 

@@ -109,6 +109,9 @@ unsigned long sched_switch_count(void);  /* 累計的 context switch 次數 */
 unsigned long sched_starve_boosts(void); /* 累計的防飢餓提升次數 */
 void sched_trace_dump(int cpu, unsigned last); /* 印出第 cpu 顆 CPU 最近 last 次切換(測試失敗時用) */
 int sched_trace_dump_all(unsigned last);       /* 印出所有 CPU 的紀錄;回傳有紀錄的 CPU 數 */
+/* 印出所有執行緒、休眠串列、各 CPU 目前的執行緒與固定佇列(診斷用,只在 panic 之前呼叫:不取鎖,
+   讀到的是盡力而為的快照)。I-350 的階段看門狗使用 */
+void sched_dump_state(void);
 
 /*
  * 行程支援(kernel/proc.c 使用):

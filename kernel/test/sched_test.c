@@ -1230,43 +1230,84 @@ void sleep_wall_test(void)
 #define CS_HARD_MS    100                /* 絕對上限:遠小於修正前的 ~300 ms,也容得下模擬器的主機停頓 */
 #define CS_MAX_SAMPLES 64
 static volatile int cs_phase;            /* 0 = 準備、1 = 第 0 顆關中斷中、2 = 結束 */
-static volatile unsigned cs_n, cs_on_cpu0;
-static uint64_t cs_t0[CS_MAX_SAMPLES], cs_d[CS_MAX_SAMPLES];   /* 每次睡眠的起點與長度(時鐘計數) */
 static uint64_t cs_hz;
 
-static void *volatile cs_sleeper_self;           /* 睡眠者自己(卡住的處理函式用來判斷被打斷的是不是它) */
-static volatile int cs_sleeper_cpu = -1;         /* 睡眠者忙等時所在的 CPU */
+/*
+ * 睡眠者:[0] = 受測(固定在第 1 顆;只有 2 顆 CPU 時固定在第 1 顆),[1] = 對照(I-349,固定在第 2 顆,
+ * 做一模一樣的事;只有 2 顆 CPU 時不建立)。對照只用來分類失敗的原因(兩邊一起慢 = 全系統,
+ * 只有受測慢 = 受測路徑),不影響通過 / 失敗 — 見 cs_diagnose。
+ */
+struct cs_sleeper_rec {
+    int pin;                                 /* 固定在哪一顆 */
+    volatile int cpu;                        /* 忙等時所在的 CPU(-1 = 還沒開始) */
+    volatile unsigned n, on_cpu0;
+    uint64_t t0[CS_MAX_SAMPLES], d[CS_MAX_SAMPLES];   /* 每次睡眠的起點與長度(時鐘計數) */
+};
+static struct cs_sleeper_rec cs_rec[2];
+static void *volatile cs_sleeper_self;           /* 受測睡眠者(卡住的處理函式用來判斷被打斷的是不是它) */
 
 static void cs_sleeper(void *arg)
 {
-    (void)arg;
-    cs_sleeper_self = thread_current();
-    /* 固定在第 1 ~ n-1 顆(I-343):返回時已經不在第 0 顆,之後也不會再被排到第 0 顆 */
-    KASSERT(thread_set_affinity(0, sched_online_mask() & ~1u) == 0);
-    KASSERT(sched_cpu_id() != 0);
+    struct cs_sleeper_rec *r = arg;
+    if (r == &cs_rec[0])
+        cs_sleeper_self = thread_current();
+    /* 固定在指定的那一顆(I-343):返回時已經不在第 0 顆,之後也不會再被排到第 0 顆 */
+    KASSERT(thread_set_affinity(0, 1u << r->pin) == 0);
+    KASSERT(sched_cpu_id() == r->pin);
     /* 忙等:卡住期間不能靠 sleep 開始(那正是待測項目) */
     while (cs_phase == 0)
-        cs_sleeper_cpu = sched_cpu_id();
+        r->cpu = sched_cpu_id();
     while (cs_phase == 1) {
         uint64_t t0 = timer_clock_count();
         thread_sleep(CS_SLEEP_MS);
         uint64_t d = timer_clock_count() - t0;
         if (cs_phase == 1 && sched_cpu_id() == 0)
-            cs_on_cpu0++;                    /* 不可能:第 0 顆關著中斷 */
-        if (cs_n < CS_MAX_SAMPLES) {
-            cs_t0[cs_n] = t0;
-            cs_d[cs_n] = d;
-            cs_n++;
+            r->on_cpu0++;                    /* 不可能:第 0 顆關著中斷 */
+        if (r->n < CS_MAX_SAMPLES) {
+            r->t0[r->n] = t0;
+            r->d[r->n] = d;
+            r->n++;
         }
     }
 }
 
-/* 在第 0 顆 CPU 上、中斷關閉中執行:空轉 CS_STALL_MS 毫秒,前後記下心跳、tick 與時鐘 */
+/* 只評估「整段都落在卡住期間」的睡眠(最後一次跨過結束點的不算):醒來次數、最壞、超過設計上限的次數 */
+static void cs_eval(const struct cs_sleeper_rec *r, uint64_t c1, unsigned *wakes, uint64_t *worst, unsigned *over)
+{
+    *wakes = *over = 0;
+    *worst = 0;
+    for (unsigned i = 0; i < r->n; i++) {
+        if (r->t0[i] + r->d[i] > c1)
+            continue;
+        (*wakes)++;
+        if (r->d[i] > *worst)
+            *worst = r->d[i];
+        if (r->d[i] * 1000 > cs_hz * CS_STRICT_MS)
+            (*over)++;
+    }
+}
+
+/*
+ * 在第 0 顆 CPU 上、中斷關閉中執行:空轉 CS_STALL_MS 毫秒,前後記下心跳、tick 與時鐘。
+ * I-349 診斷(不影響通過 / 失敗):
+ *   - 每 CS_WIN_MS 一個窗,記下窗末的時鐘與已提交的 tick(timer_ticks,不用 _real:後者會把欠帳估回來,
+ *     掩蓋「已提交的 tick 落後」)— 窗內落後量 = 時鐘增量 / 每 tick 計數 − tick 增量(Codex 008)
+ *   - 這個關中斷、不拿任何鎖的空轉迴圈本身就是「進度計」:每窗迴圈次數,和卡住前同樣關中斷量的
+ *     一個基準窗比較;虛擬 CPU 拿到的主機時間變少時會下降(Codex 012:不是絕對證據,只附加)
+ *   - 其他每顆 CPU 的心跳增量(本地計時器中斷次數)
+ */
+#define CS_WIN_MS   50
+#define CS_WIN_MAX  (CS_STALL_MS / CS_WIN_MS + 1)
 struct cs_stall_ctx {
     int ran_on_cpu0, aborted;
     unsigned long hb0, hb1;
     uint64_t tk0, tk1, c0, c1;
     struct timer_stats st1;
+    uint32_t base_iter;                      /* 卡住前同樣關中斷空轉一個窗的迴圈次數 */
+    unsigned nwin;
+    uint64_t win_c[CS_WIN_MAX], win_t[CS_WIN_MAX];   /* 每窗末的時鐘與已提交 tick */
+    uint32_t win_iter[CS_WIN_MAX];
+    unsigned long hb_other0[MAX_CPUS], hb_other1[MAX_CPUS];
 };
 
 static void cs_stall_fn(void *arg)
@@ -1279,12 +1320,36 @@ static void cs_stall_fn(void *arg)
         x->aborted = 1;                      /* 固定之後不可能發生(I-343):呼叫端視為失敗 */
         return;
     }
+    /* 進度計的基準:卡住前,同樣關中斷、同樣的迴圈空轉一個窗(這段期間別顆照常推進,不影響測試) */
+    uint64_t b0 = timer_clock_count();
+    uint32_t it = 0;
+    while ((timer_clock_count() - b0) * 1000 < cs_hz * CS_WIN_MS)
+        it++;
+    x->base_iter = it;
+    for (int i = 0; i < cpu_count && i < MAX_CPUS; i++)
+        x->hb_other0[i] = cpus[i].heartbeat;
     x->hb0 = this_cpu()->heartbeat;
     x->tk0 = timer_ticks();
     x->c0 = timer_clock_count();
     cs_phase = 1;
-    while ((timer_clock_count() - x->c0) * 1000 < cs_hz * CS_STALL_MS)
-        ;                                    /* 關中斷空轉:第 0 顆不處理計時器中斷、不推進時間 */
+    uint64_t wend = x->c0;
+    it = 0;
+    for (;;) {                               /* 關中斷空轉:第 0 顆不處理計時器中斷、不推進時間 */
+        uint64_t now = timer_clock_count();
+        it++;
+        if ((now - wend) * 1000 >= cs_hz * CS_WIN_MS && x->nwin < CS_WIN_MAX) {
+            x->win_c[x->nwin] = now;
+            x->win_t[x->nwin] = timer_ticks();
+            x->win_iter[x->nwin] = it;
+            x->nwin++;
+            wend = now;
+            it = 0;
+        }
+        if ((now - x->c0) * 1000 >= cs_hz * CS_STALL_MS)
+            break;
+    }
+    for (int i = 0; i < cpu_count && i < MAX_CPUS; i++)
+        x->hb_other1[i] = cpus[i].heartbeat;
     x->tk1 = timer_ticks();
     x->hb1 = this_cpu()->heartbeat;
     x->c1 = timer_clock_count();
@@ -1400,6 +1465,71 @@ static void cpu0_stall_degraded_test(void)
     }
 }
 
+/*
+ * I-349 第一階段(與 Codex 011/012 討論的結論):只分類、不豁免。每一次都印一行診斷(收集校準資料),
+ * 原本會失敗的照樣失敗。各訊號(候選門檻,待校準):
+ *   lag   = 窗內落後量:時鐘增量 − tick 增量 × 每 tick 計數 > 2 個 tick 的計數 → 該窗落後;
+ *           連續 >= 3 窗 = SUSTAINED,只有零星 = SPIKE,沒有 = NONE
+ *   scope = 對照睡眠者也有超過設計上限的 = SYSTEM-WIDE;只有受測 = TARGET-LOCAL;沒有對照(2 顆 CPU)= NO-CONTROL
+ *   prog  = 進度計最慢一窗相對基準的百分比(主機給這顆虛擬 CPU 的時間變少時下降)
+ *   irq   = 其他每顆 CPU 的本地計時器中斷次數(和 lag 共用計時器路徑,只當一致性檢查)
+ *   lock  = time_lk / sched_lk 的持有時間:第一階段沒有量(印 not-measured)
+ * 標籤:SUSTAINED 且 SYSTEM-WIDE 且進度計明顯下降(< 80%,候選)= ENVIRONMENT-SUSPECT;
+ *       TARGET-LOCAL,或沒有落後也沒有進度下降卻超過上限 = KERNEL-CANDIDATE;其他 = INCONCLUSIVE。
+ * 標籤只是診斷:不改變任何 panic 條件。門檻要用無注入 / 單次停頓 / 持續落後三種資料校準後再討論。
+ */
+static void cs_diagnose(const struct cs_stall_ctx *x, unsigned over_t, unsigned over_r, int have_ref)
+{
+    uint64_t iv = timer_tick_counts();
+    unsigned lag_w = 0, run = 0, max_run = 0;
+    uint64_t pc = x->c0, pt = x->tk0;
+    uint32_t min_pct = 100;
+    for (unsigned w = 0; w < x->nwin; w++) {
+        uint64_t dc = x->win_c[w] - pc, dt = x->win_t[w] - pt;
+        int lag = iv && dc > dt * iv + 2 * iv;
+        lag_w += (unsigned)lag;
+        run = lag ? run + 1 : 0;
+        if (run > max_run)
+            max_run = run;
+        /* 進度百分比 = 本窗迴圈次數 × 100 / 基準:用 32 位元除法(i386 沒有 64 位元除法);
+           次數大到乘 100 會溢位時先一起右移。窗只在滿一個窗長時才記,所以每窗都完整 */
+        if (x->base_iter) {
+            uint32_t a = x->win_iter[w], b = x->base_iter;
+            while (a > 0xFFFFFFFFu / 100u) {
+                a >>= 1;
+                b >>= 1;
+            }
+            uint32_t pct = b ? a * 100u / b : 100;
+            if (pct < min_pct)
+                min_pct = pct;
+        }
+        pc = x->win_c[w];
+        pt = x->win_t[w];
+    }
+    const char *lag = max_run >= 3 ? "SUSTAINED" : lag_w ? "SPIKE" : "NONE";
+    const char *scope = !have_ref ? "NO-CONTROL" : over_t && over_r ? "SYSTEM-WIDE" :
+                        over_t ? "TARGET-LOCAL" : over_r ? "CONTROL-ONLY" : "NONE";
+    /* 基準是 0(量不到)時進度未知:不可以當成 100% 而誤標 KERNEL-CANDIDATE(Codex 013) */
+    int prog_known = x->base_iter != 0 && x->nwin != 0;
+    const char *label = "OK";
+    if (over_t) {
+        if (max_run >= 3 && have_ref && over_r && prog_known && min_pct < 80)
+            label = "ENVIRONMENT-SUSPECT";
+        else if ((have_ref && !over_r) || (!lag_w && prog_known && min_pct >= 80))
+            label = "KERNEL-CANDIDATE";
+        else
+            label = "INCONCLUSIVE";
+    }
+    kprintf("cpu0-stall: diagnosis: %s (lag %s, %u of %u windows lagging, longest run %u; scope %s, "
+            "over target %u control %u; progress %s%u%% of baseline; lock not-measured)\n",
+            label, lag, lag_w, x->nwin, max_run, scope, over_t, over_r,
+            prog_known ? "min " : "unknown, ", prog_known ? min_pct : 0u);
+    kprintf("cpu0-stall: diagnosis: irqs per cpu during the stall:");
+    for (int i = 0; i < cpu_count && i < MAX_CPUS; i++)
+        kprintf(" %d:+%lu", i, x->hb_other1[i] - x->hb_other0[i]);
+    kprintf("\n");
+}
+
 void cpu0_stall_wake_test(void)
 {
     if (clksync_state() == CLKSYNC_DEGRADED) {
@@ -1413,9 +1543,15 @@ void cpu0_stall_wake_test(void)
     }
     unsigned online = sched_online_mask();
     cs_phase = 0;
-    cs_n = cs_on_cpu0 = 0;
-    cs_sleeper_cpu = -1;
     cs_sleeper_self = NULL;
+    int have_ref = cpu_count >= 3 && (online & 6u) == 6u;   /* 對照固定在第 2 顆:要在線上 */
+    if (!(online & 2u))
+        panic("cpu0-stall: cpu 1 is not online");
+    for (int k = 0; k < 2; k++) {
+        cs_rec[k].pin = k + 1;
+        cs_rec[k].cpu = -1;
+        cs_rec[k].n = cs_rec[k].on_cpu0 = 0;
+    }
     uint32_t adv0[MAX_CPUS];
     for (int i = 0; i < MAX_CPUS; i++)
         adv0[i] = timer_advances(i);
@@ -1426,10 +1562,13 @@ void cpu0_stall_wake_test(void)
        (24 次有 3 次逾時),後來改成跨 CPU 呼叫加上讓睡眠者自己離開第 0 顆的重試;現在兩者都是確定的 */
     KASSERT(thread_set_affinity(0, 1u << 0) == 0);
     KASSERT(sched_cpu_id() == 0);            /* 設定自己:返回前已經搬好 */
-    int tid = thread_create_prio("cs-sleeper", cs_sleeper, NULL, PRIO_HIGH);
+    int tid = thread_create_prio("cs-sleeper", cs_sleeper, &cs_rec[0], PRIO_HIGH);
     if (tid <= 0)
         panic("cpu0-stall: cannot create sleeper (%d)", tid);
-    for (int w = 0; cs_sleeper_cpu < 1; w++) {       /* 等睡眠者在別顆 CPU 上進入忙等 */
+    int rtid = have_ref ? thread_create_prio("cs-control", cs_sleeper, &cs_rec[1], PRIO_HIGH) : 0;
+    if (rtid < 0)
+        panic("cpu0-stall: cannot create control sleeper (%d)", rtid);
+    for (int w = 0; cs_rec[0].cpu < 1 || (have_ref && cs_rec[1].cpu < 1); w++) {   /* 等睡眠者進入忙等 */
         if (w > 5000)
             panic("cpu0-stall: the sleeper never started off cpu 0");
         thread_sleep(1);
@@ -1451,20 +1590,15 @@ void cpu0_stall_wake_test(void)
     st1 = ctx.st1;
     cs_phase = 2;
     thread_join(tid);
+    if (rtid > 0)
+        thread_join(rtid);
     KASSERT(thread_set_affinity(0, online) == 0);     /* 恢復不限制 */
 
-    /* 只評估「整段都落在卡住期間」的睡眠:最後一次跨過結束點,不算 */
-    unsigned wakes = 0, strict_over = 0;
-    uint64_t worst = 0;
-    for (unsigned i = 0; i < cs_n; i++) {
-        if (cs_t0[i] + cs_d[i] > c1)
-            continue;
-        wakes++;
-        if (cs_d[i] > worst)
-            worst = cs_d[i];
-        if (cs_d[i] * 1000 > cs_hz * CS_STRICT_MS)
-            strict_over++;
-    }
+    unsigned wakes, strict_over, rwakes = 0, rover = 0;
+    uint64_t worst, rworst = 0;
+    cs_eval(&cs_rec[0], c1, &wakes, &worst, &strict_over);
+    if (have_ref)
+        cs_eval(&cs_rec[1], c1, &rwakes, &rworst, &rover);
 
     uint32_t others = 0;
     for (int i = 1; i < MAX_CPUS; i++)
@@ -1480,6 +1614,10 @@ void cpu0_stall_wake_test(void)
             "sleeper woke %u times, worst %llu counts (clock %llu Hz), %u over %u ms, host stalls >=10 ticks %u\n",
             CS_STALL_MS, (unsigned long long)(tk1 - tk0), hb1 - hb0, adv_cpu0, others, wakes,
             (unsigned long long)worst, (unsigned long long)cs_hz, strict_over, CS_STRICT_MS, host_stalls);
+    if (have_ref)
+        kprintf("cpu0-stall: control sleeper on cpu 2 woke %u times, worst %llu counts, %u over %u ms\n",
+                rwakes, (unsigned long long)rworst, rover, CS_STRICT_MS);
+    cs_diagnose(&ctx, strict_over, rover, have_ref);
 
     if (hb1 != hb0)
         panic("cpu0-stall: control failed, cpu0 handled %lu timer interrupts with irqs off", hb1 - hb0);
@@ -1488,8 +1626,9 @@ void cpu0_stall_wake_test(void)
               (unsigned long long)(tk1 - tk0), CS_STALL_MS);
     if (others == 0)
         panic("cpu0-stall: no other cpu advanced system time");
-    if (cs_on_cpu0)
-        panic("cpu0-stall: sleeper ran on cpu0 while its irqs were off (%u)", cs_on_cpu0);
+    if (cs_rec[0].on_cpu0 || cs_rec[1].on_cpu0)
+        panic("cpu0-stall: sleeper ran on cpu0 while its irqs were off (%u, control %u)",
+              cs_rec[0].on_cpu0, cs_rec[1].on_cpu0);
     if (wakes < CS_STALL_MS / CS_HARD_MS)  /* 修正前:睡眠全部跨過結束點,這裡是 0 */
         panic("cpu0-stall: sleeper woke only %u times during the stall", wakes);
     if (worst * 1000 > cs_hz * CS_HARD_MS)
@@ -1515,15 +1654,25 @@ void cpu0_stall_wake_test(void)
 #define AFF_SAMPLES    400
 #define AFF_MIGRATE_MS 20
 static volatile int aff_stop, aff_k;
-static volatile unsigned aff_bad, aff_seen, aff_done;
+static volatile unsigned aff_bad, aff_seen, aff_done, aff_progress;   /* aff_progress:已取樣次數(I-350) */
 static volatile int aff_cur = -1;
 static volatile unsigned aff_gen, aff_bad_after;
 
+/*
+ * 吃 CPU 的同優先權執行緒:每空轉一小段就讓出(I-350)。以前一直空轉、吃滿 10 tick 的時間片,
+ * 固定的執行緒每次醒來或讓出都要等對方用完整個時間片 — 每輪 400 次取樣要約 4.3 秒(四輪約 17 秒),
+ * 主機一忙再慢 4~5 倍就碰到逾時,看起來像卡死。改成常常讓出:每顆 CPU 更頻繁地重新排程,
+ * 從固定佇列「偷」的機會反而更多(這一項要驗證的正是不會被偷),而固定的執行緒等得少。
+ */
+#define AFF_HOG_SPIN 2000
 static void aff_hog(void *arg)
 {
     (void)arg;
-    while (!aff_stop)
-        ;
+    while (!aff_stop) {
+        for (volatile int s = 0; s < AFF_HOG_SPIN && !aff_stop; s++)
+            ;
+        thread_yield();
+    }
 }
 
 static void aff_pinned(void *arg)
@@ -1531,6 +1680,7 @@ static void aff_pinned(void *arg)
     int k = (int)(uintptr_t)arg;
     KASSERT(thread_set_affinity(0, 1u << k) == 0);
     for (int i = 0; i < AFF_SAMPLES; i++) {
+        aff_progress = (unsigned)i;
         int c = sched_cpu_id();
         aff_seen |= 1u << c;
         if (c != k)
@@ -1602,22 +1752,29 @@ void affinity_test(void)
 
     /* 2. 每一顆 CPU 各固定一次;吃 CPU 的同優先權執行緒佔滿其他 CPU,製造竊取的機會 */
     for (int k = 0; k < n; k++) {
+        /* I-350:aarch64 降級模式曾在這裡逾時(中斷照常,心跳看門狗看不出來;查明是這一項太慢、
+           主機忙時再被拉長,不是死結)。每一輪設 60 秒期限,逾時印出所有執行緒的狀態與進度再 panic */
+        watchdog_stage("affinity: pinned thread round", 60, &aff_progress);
         aff_stop = 0;
-        aff_bad = aff_seen = aff_done = 0;
+        aff_bad = aff_seen = aff_done = aff_progress = 0;
         for (int i = 0; i < n; i++) {
             hogs[i] = thread_create_prio("aff-hog", aff_hog, NULL, PRIO_NORMAL);
             KASSERT(hogs[i] > 0);
         }
+        uint64_t rt0 = timer_ticks(), rc0 = timer_clock_count();
         int tid = thread_create_prio("aff-pin", aff_pinned, (void *)(uintptr_t)k, PRIO_NORMAL);
         KASSERT(tid > 0);
         thread_join(tid);
+        uint64_t rt1 = timer_ticks(), rc1 = timer_clock_count();
         aff_stop = 1;
         join_all(hogs, n);
-        kprintf("affinity: pinned to cpu %d: %u samples, off-cpu %u, seen mask %x\n",
-                k, AFF_SAMPLES, aff_bad, aff_seen);
+        /* 這一輪花了多久(系統 tick 與高精度時鐘計數;I-350 用來看正常分布) */
+        kprintf("affinity: pinned to cpu %d: %u samples, off-cpu %u, seen mask %x (%llu ticks, %llu clock counts)\n",
+                k, AFF_SAMPLES, aff_bad, aff_seen, (unsigned long long)(rt1 - rt0), (unsigned long long)(rc1 - rc0));
         if (aff_bad || aff_seen != (1u << k))
             panic("affinity: thread pinned to cpu %d ran elsewhere (%u times, seen %x)", k, aff_bad, aff_seen);
     }
+    watchdog_stage(NULL, 0, NULL);
 
     /* 3a. 設定自己:返回時就在新的 CPU 上 */
     for (int k = n - 1; k >= 0; k--) {
@@ -1879,6 +2036,8 @@ static int r0_present_ok(const struct clksync_result *r)
  * 在每顆 CPU 上(跨 CPU 呼叫,自己直接呼叫)讀 timer_ticks_real 與計數器,間隔 200 ms 讀兩次:
  * 每顆 CPU 的 tick 增量與計數器換算的增量相差不超過 3 tick。只用乘法比較,不用 64 位元除法。
  * clock=hpet32 時另外確認 32 位元延伸真的跨過了繞回(計數器值超過 2^32)。
+ * 來源是 PM timer(24 位元,約 4.69 秒繞回)時確認延伸值超過 2^24 — 延伸起點是開機時的硬體值(< 2^24),
+ * 超過就代表至少跨過一次繞回;等待期間每次讀數都必須嚴格遞增。
  */
 struct cv_snap { volatile uint64_t tk[MAX_CPUS], ck[MAX_CPUS]; };
 
@@ -1904,6 +2063,14 @@ static void clock_view_test(int n)
     uint64_t hz = timer_clock_hz();
     unsigned th = timer_hz();
 
+    /* 不變式:一個 tick 的計數 × 每秒 tick 數 >= 計數器頻率,也就是系統時間只可以比真實時間慢、
+       不可以快 — 否則「至少睡 n 毫秒」會提早。每 tick 計數捨去時會違反:PM timer 3579545 Hz / 1000
+       捨去成 3579 是快 152 ppm。sleep 多加的 1 個 tick 會遮住這個誤差(要睡 6.5 秒以上才看得出來),
+       所以直接檢查算式(I-341 第 72 步) */
+    uint64_t iv = timer_tick_counts();
+    if (hz && iv && iv * th < hz)
+        panic("clock-view: %llu counts per tick x %u Hz < counter %llu Hz: system time runs fast (counter %s)",
+              (unsigned long long)iv, th, (unsigned long long)hz, timer_clock_name());
     if (!timer_shared_enabled() || hz == 0)
         return;
     if (has_sub(timer_clock_name(), "hpet32")) {
@@ -1920,6 +2087,21 @@ static void clock_view_test(int n)
         if (timer_clock_count() <= 0xFFFFFFFFull)
             panic("clock-view: hpet32 counter never crossed 2^32 (%llu)", (unsigned long long)timer_clock_count());
         kprintf("clock-view: hpet32 extension crossed the 32-bit wrap (now %llu)\n",
+                (unsigned long long)timer_clock_count());
+    }
+    if (has_sub(timer_clock_name(), "pmtimer24")) {
+        uint64_t prev = timer_clock_count();
+        for (int i = 0; i < 600 && timer_clock_count() <= 0xFFFFFFull; i++) {
+            thread_sleep(10);                /* 最多 6 秒(> 一圈 4.69 秒) */
+            uint64_t now = timer_clock_count();
+            if (now <= prev)
+                panic("clock-view: pmtimer counter went backwards (%llu -> %llu)",
+                      (unsigned long long)prev, (unsigned long long)now);
+            prev = now;
+        }
+        if (timer_clock_count() <= 0xFFFFFFull)
+            panic("clock-view: pmtimer counter never crossed 2^24 (%llu)", (unsigned long long)timer_clock_count());
+        kprintf("clock-view: pmtimer extension crossed the 24-bit wrap (now %llu)\n",
                 (unsigned long long)timer_clock_count());
     }
     for (int c = 0; c < MAX_CPUS; c++)
@@ -1957,9 +2139,9 @@ void clksync_test(void)
     }
     const struct clksync_result *rf = clksync_last(0);
     if (clksync_state() == CLKSYNC_DEGRADED && rf && rf->reason == CLKSYNC_R_FORCED && !clksync_last(2)) {
-        /* I-341:clock=cpu0only(或沒有備援計數器的架構 / 機器上的 clock=fallback)。
-           降級行為由 cpu0_stall_wake_test 驗證;這裡確認狀態一致。i386 有 HPET 時 clock=fallback
-           不應走到這裡 — 由 regress.sh 檢查輸出裡的切換訊息 */
+        /* I-341:clock=cpu0only(或沒有備援計數器的架構 / 機器上的 clock=fallback,例如 i386 的
+           hpet=off 加 clock=nopm)。降級行為由 cpu0_stall_wake_test 驗證;這裡確認狀態一致。
+           i386 有 HPET 或 PM timer 時 clock=fallback 不應走到這裡 — 由 regress.sh 檢查輸出裡的切換訊息 */
         KASSERT(!timer_shared_enabled() && !clksync_fallback_used());
         kprintf("clksync-test: forced degrade: cpu0-only time as required (counter %s)\n", timer_clock_name());
         return;

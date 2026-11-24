@@ -95,7 +95,7 @@ static void sbi_set_timer(uint64_t when)
 
 void arch_timer_init(unsigned hz)
 {
-    interval = TIMEBASE_HZ / hz;
+    interval = (TIMEBASE_HZ + hz - 1) / hz;  /* 無條件進位:tick 只可以比真實時間慢,不可以快(見 timer.h) */
     arch_timer_init_cpu();
 }
 

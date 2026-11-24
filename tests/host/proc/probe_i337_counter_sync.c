@@ -40,6 +40,83 @@ struct offset_interval {
     int64_t high;
 };
 
+enum drift_result {
+    DRIFT_ACCEPT,
+    DRIFT_UNCERTAIN, /* interval overlaps the allowed region but is too wide */
+    DRIFT_REJECT,    /* every possible change violates the strict bound */
+};
+
+static int sub_i64(int64_t a, int64_t b, int64_t *out)
+{
+    if ((b > 0 && a < INT64_MIN + b) ||
+        (b < 0 && a > INT64_MAX + b))
+        return 0;
+    *out = a - b;
+    return 1;
+}
+
+/* For independent intervals A and B, A-B is [A.low-B.high, A.high-B.low]. */
+static int interval_subtract(struct offset_interval a, struct offset_interval b,
+                             struct offset_interval *out)
+{
+    if (a.low > a.high || b.low > b.high ||
+        !sub_i64(a.low, b.high, &out->low) ||
+        !sub_i64(a.high, b.low, &out->high))
+        return 0;
+    return out->low <= out->high;
+}
+
+/* Convert a CPU's offset interval from this round's reference to CPU 0:
+ * (CPUx - ref) - (CPU0 - ref) = CPUx - CPU0. */
+static int normalize_to_cpu0(struct offset_interval cpu_x,
+                             struct offset_interval cpu0,
+                             struct offset_interval *normalized)
+{
+    return interval_subtract(cpu_x, cpu0, normalized);
+}
+
+/* I1/I2 must already describe the same CPU relative to the same reference. */
+static enum drift_result cross_round_evaluate(struct offset_interval i1,
+                                              struct offset_interval i2,
+                                              int64_t dmax,
+                                              struct offset_interval *change)
+{
+    if (dmax <= 0 || !interval_subtract(i2, i1, change))
+        return DRIFT_REJECT;
+    if (change->low > -dmax && change->high < dmax)
+        return DRIFT_ACCEPT;
+    if (change->low >= dmax || change->high <= -dmax)
+        return DRIFT_REJECT;
+    return DRIFT_UNCERTAIN;
+}
+
+/* Retry only inconclusive second-round samples; a proven violation is final. */
+static enum drift_result retry_second_round(struct offset_interval i1,
+                                            const struct offset_interval *i2,
+                                            unsigned n2, int64_t dmax,
+                                            unsigned *attempts_out)
+{
+    unsigned attempts = 0;
+    enum drift_result result = DRIFT_UNCERTAIN;
+    struct offset_interval change;
+
+    if (!i2 || n2 == 0 || n2 > 4 || dmax <= 0) {
+        if (attempts_out)
+            *attempts_out = 0;
+        return DRIFT_REJECT;
+    }
+    for (; attempts < n2; ++attempts) {
+        result = cross_round_evaluate(i1, i2[attempts], dmax, &change);
+        if (result != DRIFT_UNCERTAIN) {
+            ++attempts;
+            break;
+        }
+    }
+    if (attempts_out)
+        *attempts_out = attempts;
+    return result;
+}
+
 static int counter_pair_intersection(const struct bracket *samples, unsigned n,
                                      int64_t tolerance,
                                      struct offset_interval *common,
@@ -284,6 +361,66 @@ static void accept_tolerance_boundary_case(void)
     assert(counter_pair_strictly_bounded(s, sizeof(s) / sizeof(s[0]), 4));
 }
 
+static void cross_round_drift_cases(void)
+{
+    const int64_t dmax = 50; /* production proposal: timer_tick_counts() >> 3 */
+    struct offset_interval change;
+
+    /* (a) Two narrow rounds with a small possible change are acceptable. */
+    assert(cross_round_evaluate((struct offset_interval){10, 12},
+                                (struct offset_interval){11, 13},
+                                dmax, &change) == DRIFT_ACCEPT);
+    assert(change.low == -1 && change.high == 3);
+
+    /* (b) Each round fits +/-100, but the cross-round change is definitely too large. */
+    const struct offset_interval bad1 = {-100, -90};
+    const struct offset_interval bad2 = {90, 100};
+    assert(interval_strictly_within_tolerance(bad1, 100));
+    assert(interval_strictly_within_tolerance(bad2, 100));
+    assert(cross_round_evaluate(bad1, bad2, dmax, &change) == DRIFT_REJECT);
+    assert(change.low == 180 && change.high == 200);
+
+    /* (c) A wide interval straddles acceptable and unacceptable changes: retry. */
+    const struct offset_interval i1 = {-40, 0};
+    const struct offset_interval second[] = {{0, 40}, {0, 1}};
+    unsigned attempts = 0;
+    assert(interval_strictly_within_tolerance(i1, 100));
+    assert(interval_strictly_within_tolerance(second[0], 100));
+    assert(interval_strictly_within_tolerance(second[1], 100));
+    assert(cross_round_evaluate(i1, second[0], dmax, &change) == DRIFT_UNCERTAIN);
+    assert(change.low == 0 && change.high == 80);
+    assert(retry_second_round(i1, second, 2, dmax, &attempts) == DRIFT_ACCEPT);
+    assert(attempts == 2); /* only the inconclusive sample was retried */
+
+    /* A proven violation is not retried, even when retry samples remain. */
+    const struct offset_interval reject_then_pass[] = {
+        {90, 100}, {0, 1},
+    };
+    assert(retry_second_round(bad1, reject_then_pass, 2, dmax, &attempts) == DRIFT_REJECT);
+    assert(attempts == 1);
+
+    /* (d) Different reference CPUs must be normalized to CPU 0 first.
+     * Raw intervals appear to change by about 80 counts; common-reference
+     * intervals show the same target offset in both rounds. */
+    struct offset_interval round1, round2;
+    assert(interval_strictly_within_tolerance((struct offset_interval){-41, -39}, 100));
+    assert(interval_strictly_within_tolerance((struct offset_interval){39, 41}, 100));
+    assert(normalize_to_cpu0((struct offset_interval){-41, -39},
+                             (struct offset_interval){-41, -39}, &round1));
+    assert(normalize_to_cpu0((struct offset_interval){39, 41},
+                             (struct offset_interval){39, 41}, &round2));
+    assert(cross_round_evaluate(round1, round2, dmax, &change) == DRIFT_ACCEPT);
+    assert(cross_round_evaluate((struct offset_interval){-41, -39},
+                                (struct offset_interval){39, 41},
+                                dmax, &change) == DRIFT_REJECT);
+
+    /* Low drift inside bracket uncertainty cannot be measured exactly; only bounded. */
+    assert(cross_round_evaluate((struct offset_interval){-4, 0},
+                                (struct offset_interval){0, 4},
+                                9, &change) == DRIFT_ACCEPT);
+    assert(change.low == 0 && change.high == 8);
+}
+
 int main(void)
 {
     synchronized_case();
@@ -298,6 +435,7 @@ int main(void)
     accept_tolerance_boundary_case();
     overlap_vs_strict_bound_case();
     drift_hidden_by_bracket_uncertainty_case();
-    puts("PASS: intersection model distinguishes overlap from strict bounds and exposes drift uncertainty");
+    cross_round_drift_cases();
+    puts("PASS: intersection and cross-round models enforce strict offset/drift bounds, normalize references, and retry uncertainty only");
     return 0;
 }

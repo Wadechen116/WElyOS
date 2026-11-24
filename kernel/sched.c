@@ -897,6 +897,40 @@ int sched_trace_dump_all(unsigned last)
     return printed;
 }
 
+/* 診斷(I-350 階段看門狗):不取鎖的快照,只在 panic 之前用。串列可能正被別顆 CPU 改,所以每個走訪都有上限 */
+static const char *const state_name[] = { "ready", "run", "sleep", "block", "zombie" };
+
+static void dump_thread(const char *tag, const struct thread *t)
+{
+    unsigned st = (unsigned)t->state;
+    kprintf("  %s id %d %s: %s prio %d (base %d, boost %d) allow %x pinq %d slice %u ready_since %llu wake %llu\n",
+            tag, t->id, t->name ? t->name : "?", st < 5 ? state_name[st] : "?", t->prio, t->base_prio,
+            t->starve_boost, t->allow, t->pin_cpu - 1, t->slice, (unsigned long long)t->ready_since,
+            (unsigned long long)t->wake_tick);
+}
+
+void sched_dump_state(void)
+{
+    struct timer_stats ts;
+    timer_get_stats(&ts);
+    kprintf("sched state: ticks %llu, shared clock %d; timer catch-ups 2:%u 3:%u 4-5:%u 6:%u 7-9:%u 10+:%u, "
+            "degraded dropped %u\n", (unsigned long long)timer_ticks(), timer_shared_enabled(), ts.burst[0], ts.burst[1],
+            ts.burst[2], ts.burst[3], ts.burst[4], ts.burst[5], ts.degraded_dropped);
+    for (int i = 0; i < cpu_count && i < MAX_CPUS; i++) {
+        struct cpu *c = &cpus[i];
+        kprintf(" cpu %d: online %d need_resched %d heartbeat %lu pinq mask %x\n", i, c->online,
+                c->need_resched, c->heartbeat, pinqs[i].mask);
+        if (c->current)
+            dump_thread("current", c->current);
+    }
+    int k = 0;
+    for (const struct thread *t = sleepers; t && k < 32; t = t->next, k++)
+        dump_thread("sleeper", t);
+    k = 0;
+    for (const struct thread *t = all_threads; t && k < 128; t = t->all_next, k++)
+        dump_thread("thread", t);
+}
+
 static void schedule(void)
 {
     struct cpu *c = this_cpu();

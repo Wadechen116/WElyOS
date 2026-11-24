@@ -224,7 +224,10 @@ for a in $ARCHS; do
         "|selftest clock=hpet32|switched shared counter tsc -> hpet32;forced 32-bit (test);hpet32 extension crossed"
         "|selftest clock=cpu0only|clksync: DEGRADED;cpu0-stall: degraded mode;clksync-test: forced degrade"
         "-cpu qemu32,-tsc|selftest|clock: shared counter hpet;clksync: check #1 (hpet)"
-        "-machine hpet=off|selftest clock=fallback|hpet: no ACPI HPET table;clksync: DEGRADED;cpu0-stall: degraded mode"
+        "-machine hpet=off|selftest clock=fallback|hpet: no ACPI HPET table;switched shared counter tsc -> pmtimer24;fallback counter pmtimer24 ok;clock-view: pmtimer extension crossed"
+        "|selftest clock=pmtimer|switched shared counter tsc -> hpet;switched shared counter hpet -> pmtimer24;fallback counter pmtimer24 ok;clock-view: pmtimer extension crossed"
+        "-cpu qemu32,-tsc -machine hpet=off|selftest|clock: shared counter pmtimer24;clksync: check #1 (pmtimer24);clock-view: pmtimer extension crossed"
+        "-machine hpet=off|selftest clock=fallback clock=nopm|pmtimer: disabled (test);clksync: DEGRADED;cpu0-stall: degraded mode"
       )
     else
       clk_cases=("|selftest clock=fallback|clksync: DEGRADED;cpu0-stall: degraded mode;clksync-test: forced degrade")
@@ -233,11 +236,14 @@ for a in $ARCHS; do
       IFS='|' read -r qx cl want_txt <<< "$cc"
       log="$OUT/$a-clk-${cl// /+}${qx:+-${qx//[ ,=]/_}}.txt"
       cpu_env=(); qargs=()
-      case "$qx" in
-        "-cpu "*) cpu_env=(QEMU_CPU="${qx#-cpu }") ;;   # qemu.sh 自己帶 -cpu:改用環境變數
-        "") ;;
-        *) read -r -a qargs <<< "$qx" ;;
-      esac
+      read -r -a qw <<< "$qx"
+      for ((j = 0; j < ${#qw[@]}; j++)); do
+        if [ "${qw[j]}" = "-cpu" ]; then       # qemu.sh 自己帶 -cpu:改用環境變數,其餘照傳
+          cpu_env=(QEMU_CPU="${qw[j+1]}"); j=$((j + 1))
+        else
+          qargs+=("${qw[j]}")
+        fi
+      done
       env "${cpu_env[@]}" timeout -k 10 90 scripts/qemu.sh "$a" "build/$a/welyos.elf" "${qargs[@]}" \
           -append "autoexit $cl" > "$log" 2>&1 < /dev/null
       crc=$?
@@ -275,6 +281,25 @@ if [ "$QUICK" -eq 0 ] && [ -f scripts/host-test-net.sh ]; then
     echo "網路堆疊主機測試:$(grep -o 'net: PASS.*' "$OUT/host-net.txt" | head -1)"
   else
     fail=1; echo "  網路堆疊主機測試失敗,輸出在 $OUT/host-net.txt"
+  fi
+fi
+
+# PM timer 的純函式(32 位元繞回計數、X_PM_TMR_BLK 檢查):QEMU 跑不到這些路徑,在主機上測(I-348)
+if [ "$QUICK" -eq 0 ]; then
+  if gcc -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined tests/host/time/pmtimer_logic_test.c \
+       -o "$OUT/pmtimer_logic" > "$OUT/host-pmtimer.txt" 2>&1 && "$OUT/pmtimer_logic" >> "$OUT/host-pmtimer.txt" 2>&1; then
+    echo "PM timer 主機測試:$(tail -1 "$OUT/host-pmtimer.txt")"
+  else
+    fail=1; echo "  PM timer 主機測試失敗,輸出在 $OUT/host-pmtimer.txt"
+  fi
+fi
+
+# I-349 診斷分類的主機模型(Codex 的 tests/host/sched/i349_diagnosis_probe.c):標籤永遠不豁免失敗
+if [ "$QUICK" -eq 0 ] && [ -f scripts/host-test-i349.sh ]; then
+  if bash scripts/host-test-i349.sh > "$OUT/host-i349.txt" 2>&1; then
+    echo "I-349 診斷模型主機測試:$(tail -1 "$OUT/host-i349.txt")"
+  else
+    fail=1; echo "  I-349 診斷模型主機測試失敗,輸出在 $OUT/host-i349.txt"
   fi
 fi
 

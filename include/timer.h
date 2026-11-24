@@ -14,6 +14,8 @@ uint32_t timer_advances(int cpu);  /* 第 cpu 顆 CPU 推進過幾次系統時�
  * 驗證失敗時呼叫 timer_shared_disable() 退回「只有第 0 顆推進」(降級,不可逆)。
  *   timer_shared_enabled()  目前是否走共用路徑(有共用計數器且未停用)
  *   timer_tick_counts()     一個 tick 相當於幾個計數(timer_init 算好、之後唯讀;0 = 沒有共用計數器)。
+ *                           各架構一律無條件進位:計數 × 每秒 tick 數 >= 計數器頻率,系統時間只會比真實時間慢、
+ *                           不會快(「至少睡 n 毫秒」才成立;clock_view_test 檢查)。
  *                           i386 沒有 64 位元除法,需要「每 tick 計數」的地方用它,不要自己除
  */
 void     timer_shared_disable(void);

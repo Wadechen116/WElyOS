@@ -332,8 +332,15 @@ void kmain(const struct boot_info *bi)
        從開中斷那一刻起,main 也會和其他執行緒一樣被搶佔 */
     /* I-341 測試:clock=hpet32 把 HPET 當 32 位元計數器用(起始值設在繞回前約 2 秒),
        要在 timer_init 探測 HPET 之前設定。只在 selftest 時有效 */
-    if (selftest && cmdline_has(bi->cmdline, "clock=hpet32"))
-        arch_clock_test_mode(ARCH_CLOCK_TEST_HPET32);
+    /* clock=nopm:不探測 PM timer,重現「沒有任何備援」(I-341 第二層備援的負對照) */
+    if (selftest) {
+        int m = ARCH_CLOCK_TEST_NONE;
+        if (cmdline_has(bi->cmdline, "clock=hpet32"))
+            m |= ARCH_CLOCK_TEST_HPET32;
+        if (cmdline_has(bi->cmdline, "clock=nopm"))
+            m |= ARCH_CLOCK_TEST_NOPM;
+        arch_clock_test_mode(m);
+    }
     timer_init(1000);
     sched_init();
     arch_irq_enable();
@@ -376,6 +383,8 @@ void kmain(const struct boot_info *bi)
             clksync_force(CLKSYNC_FORCE_FALLBACK);
         else if (cmdline_has(bi->cmdline, "clock=cpu0only"))
             clksync_force(CLKSYNC_FORCE_CPU0ONLY);
+        else if (cmdline_has(bi->cmdline, "clock=pmtimer"))
+            clksync_force(CLKSYNC_FORCE_PMTIMER);    /* 完整走 TSC → HPET → PM timer 兩次切換 */
     }
     smp_init(bi, cmdline_has(bi->cmdline, "selftest"));
 

@@ -15,8 +15,8 @@
  * 取樣不採用(無法判斷),太多時整輪重試;採用的取樣偏移區間都必須落在 ±tol 之內。
  * tol = 四分之一個 tick(timer_tick_counts() >> 2,不用 64 位元除法)。
  *
- * 不合格時(I-341):先換到備援的共用計數器(timer_clock_fallback;i386 TSC → HPET),
- * 對新來源做同樣的完整驗證;合格就繼續由任何 CPU 推進(狀態 OK、fallback = 1)。
+ * 不合格時(I-341):依序換到下一層備援的共用計數器(timer_clock_fallback;i386 TSC → HPET → PM timer),
+ * 對每個新來源做同樣的完整驗證;合格就繼續由任何 CPU 推進(狀態 OK、fallback = 1)。
  * 沒有備援、或備援也不合格時才失敗即關閉(fail closed):停用共用路徑(timer_shared_disable),
  * 退回只由第 0 顆推進時間(降級,仍是單點)。每一步都記在黑盒子與開機訊息裡。
  * riscv64 / aarch64 的計數器在架構上就是全系統共用的單一時基,沒有備援(見 arch.h)。
@@ -38,7 +38,7 @@ enum clksync_reason {
     CLKSYNC_R_WIDE,          /* 重試後可用的取樣仍太少(區間都太寬,無法判斷) */
     CLKSYNC_R_OFFSET,        /* 偏移區間超出 ±tol(固定偏移或漂移) */
     CLKSYNC_R_BUSY,          /* 另一次驗證正在進行(只會出現在測試的乾跑) */
-    CLKSYNC_R_FORCED,        /* 測試:開機參數 clock=fallback / clock=cpu0only 強制判定不合格 */
+    CLKSYNC_R_FORCED,        /* 測試:開機參數 clock=fallback / cpu0only / pmtimer 強制判定不合格 */
 };
 
 /* 測試用的強制降級(只在 selftest 時由 kmain 設定,見 clksync_force) */
@@ -46,6 +46,7 @@ enum clksync_force_mode {
     CLKSYNC_FORCE_NONE = 0,
     CLKSYNC_FORCE_FALLBACK,  /* 開機驗證強制不合格 → 走「換到備援計數器並驗證」 */
     CLKSYNC_FORCE_CPU0ONLY,  /* 開機驗證強制不合格,而且不用備援 → 走「只由第 0 顆推進」的降級 */
+    CLKSYNC_FORCE_PMTIMER,   /* 名稱不是 pmtimer 的來源一律強制不合格(含備援的驗證)→ 走完整條備援鏈 */
 };
 
 #define CLKSYNC_SAMPLES  16      /* 每顆 AP 每輪的取樣數 */

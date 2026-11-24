@@ -21,8 +21,9 @@
  * 經過了多少時間來決定。CPU 不支援 TSC 時退回每次中斷記一個 tick。
  *
  * 共用時鐘的來源(I-341):arch_clock_count() 是 kernel/timer.c 推進系統時間用的共用計數器。
- * 首選 TSC;另外在開機時探測 HPET 主計數器(hpet.c)當備援。CPU 沒有 TSC 時一開始就用 HPET;
- * TSC 不合格(clksync 驗證失敗)時由 kernel/timer.c 呼叫 arch_clock_fallback() 切到 HPET。
+ * 首選 TSC;另外在開機時探測 HPET 主計數器(hpet.c)與 ACPI PM timer(pmtimer.c)當兩層備援。
+ * 開機時選第一個可用的;不合格(clksync 驗證失敗)時由 kernel/timer.c 呼叫 arch_clock_fallback()
+ * 依序切到下一層:TSC → HPET → PM timer。
  * 切換只會 TSC → HPET 一次,只在 timer.c 的序號寫入區間內做(讀者不會把兩種單位混用)。
  */
 #include <stdint.h>
@@ -35,6 +36,7 @@
 #include "sched.h"
 #include "trap.h"
 #include "hpet.h"
+#include "pmtimer.h"
 
 #define PIC1_CMD   0x20
 #define PIC1_DATA  0x21
@@ -57,11 +59,14 @@ static uint64_t tsc_interval;  /* 一個 tick 相當於多少 TSC 計數;0 = 不
 static uint64_t tsc_deadline;  /* 下一個 tick 應該發生的 TSC 值 */
 static uint64_t tsc_hz;        /* TSC 每秒的計數(校正得到);0 = 沒有 TSC */
 
-enum { SRC_UNSET = 0, SRC_TSC, SRC_HPET, SRC_NONE };
+enum { SRC_UNSET = 0, SRC_TSC, SRC_HPET, SRC_PMTMR, SRC_NONE };
 static volatile int clk_src;   /* 目前的共用時鐘;SRC_UNSET = arch_timer_init 之前(開機最早期) */
 static uint64_t hpet_hz;       /* HPET 每秒計數;0 = 沒有或不合格 */
 static uint64_t hpet_iv;       /* 一個 tick 相當於多少 HPET 計數 */
 static int test_hpet32;        /* 測試(clock=hpet32):把 HPET 當 32 位元用,開機後約 2 秒繞回 */
+static uint32_t pm_hz;         /* PM timer 每秒計數;0 = 沒有或不合格 */
+static uint32_t pm_iv;         /* 一個 tick 相當於多少 PM timer 計數(無條件進位,見 pmtimer_probe) */
+static int test_nopm;          /* 測試(clock=nopm):不探測 PM timer */
 #define HPET32_WRAP_MS 2000u
 
 static uint64_t rdtsc(void)
@@ -121,6 +126,7 @@ uint64_t arch_clock_count(void)
     switch (__atomic_load_n(&clk_src, __ATOMIC_ACQUIRE)) {
     case SRC_TSC:   return rdtsc();
     case SRC_HPET:  return hpet_read();
+    case SRC_PMTMR: return pmtimer_read();
     case SRC_NONE:  return 0;
     default:        return early_count();
     }
@@ -138,11 +144,12 @@ static void cpuid_serialize(void)
 uint64_t arch_clock_count_ordered(void)
 {
     int src = __atomic_load_n(&clk_src, __ATOMIC_ACQUIRE);
-    if (src == SRC_HPET) {
+    if (src == SRC_HPET || src == SRC_PMTMR) {
         /* HPET 是 uncached 的記憶體讀取:x86 的讀取之間不會互相重排(和 RDTSC 不同,它本身就是讀取),
-           只要擋住編譯器 */
+           只要擋住編譯器。PM timer 的 IN 指令:x86 的 I/O 指令依程式順序執行、不會被推測或合併,
+           SDM 稱其為「近乎序列化」(確切措辭未查證);要更保守可改用 cpuid_serialize,只影響 clksync 取樣 */
         __asm__ volatile("" ::: "memory");
-        uint64_t t = hpet_read();
+        uint64_t t = src == SRC_HPET ? hpet_read() : pmtimer_read();
         __asm__ volatile("" ::: "memory");
         return t;
     }
@@ -159,6 +166,7 @@ uint64_t arch_tick_interval(void)
     switch (__atomic_load_n(&clk_src, __ATOMIC_ACQUIRE)) {
     case SRC_TSC:   return tsc_interval;
     case SRC_HPET:  return hpet_iv;
+    case SRC_PMTMR: return pm_iv;
     default:        return 0;
     }
 }
@@ -170,20 +178,26 @@ uint64_t arch_clock_hz(void)
     switch (__atomic_load_n(&clk_src, __ATOMIC_ACQUIRE)) {
     case SRC_TSC:   return tsc_hz;
     case SRC_HPET:  return hpet_hz;
+    case SRC_PMTMR: return pm_hz;
     case SRC_NONE:  return 0;
     default:        return 0;                    /* 還沒校正 */
     }
 }
 
 /*
- * 切到備援時鐘(I-341)。只能由 kernel/timer.c 在序號寫入區間、持有 time_lk 時呼叫。
- * 回傳 1 = 已切到 HPET(之後 arch_clock_* 都是 HPET 的值);0 = 沒有備援(維持原樣)。
+ * 切到下一層備援時鐘(I-341):TSC → HPET → PM timer,跳過不存在的。只能由 kernel/timer.c 在序號寫入區間、
+ * 持有 time_lk 時呼叫。回傳 1 = 已切換(之後 arch_clock_* 都是新來源的值);0 = 沒有下一層(維持原樣)。
  */
 int arch_clock_fallback(void)
 {
-    if (__atomic_load_n(&clk_src, __ATOMIC_ACQUIRE) != SRC_TSC || hpet_hz == 0)
+    int src = __atomic_load_n(&clk_src, __ATOMIC_ACQUIRE), next;
+    if (src == SRC_TSC && hpet_hz)
+        next = SRC_HPET;
+    else if ((src == SRC_TSC || src == SRC_HPET) && pm_hz)
+        next = SRC_PMTMR;
+    else
         return 0;
-    __atomic_store_n(&clk_src, SRC_HPET, __ATOMIC_RELEASE);
+    __atomic_store_n(&clk_src, next, __ATOMIC_RELEASE);
     return 1;
 }
 
@@ -192,6 +206,7 @@ const char *arch_clock_name(void)
     switch (__atomic_load_n(&clk_src, __ATOMIC_ACQUIRE)) {
     case SRC_TSC:   return "tsc";
     case SRC_HPET:  return hpet_is32() ? "hpet32" : "hpet";
+    case SRC_PMTMR: return pmtimer_is24() ? "pmtimer24" : "pmtimer";
     case SRC_NONE:  return "none";
     default:        return "early";
     }
@@ -199,7 +214,32 @@ const char *arch_clock_name(void)
 
 void arch_clock_test_mode(int mode)
 {
-    test_hpet32 = (mode == ARCH_CLOCK_TEST_HPET32);
+    test_hpet32 = (mode & ARCH_CLOCK_TEST_HPET32) != 0;
+    test_nopm = (mode & ARCH_CLOCK_TEST_NOPM) != 0;
+}
+
+/*
+ * 探測 PM timer,並以 PIT 量 10ms 交叉驗證(期望 35795 個計數,誤差 2% 以內)。
+ * 每 tick 的計數無條件進位:3579545 / 1000 = 3579.545,捨去成 3579 會讓系統時間快 152 ppm,
+ * 「至少睡 n 毫秒」就會提早(違反 I-346 的語意);進位成 3580 是慢 127 ppm,只會晚。
+ */
+static void pmtimer_probe(unsigned hz)
+{
+    if (test_nopm) {
+        kprintf("pmtimer: disabled (test)\n");
+        return;
+    }
+    uint32_t h = pmtimer_init();
+    if (h == 0)
+        return;
+    uint32_t got = per_10ms(pmtimer_read);
+    uint32_t want = h / 100u, slack = want / 50u;
+    if (got + slack < want || got > want + slack) {
+        kprintf("pmtimer: rate check failed: %u counts in 10 ms, expected %u; not used\n", got, want);
+        return;
+    }
+    pm_iv = (h + hz - 1) / hz;
+    pm_hz = h;
 }
 
 /* 探測 HPET,並以 PIT 量 10ms 交叉驗證它回報的頻率(誤差 2% 以內;PIT 輪詢的誤差約千分之一) */
@@ -215,7 +255,7 @@ static void hpet_probe(unsigned hz)
         kprintf("hpet: rate check failed: %u counts in 10 ms, expected %u; not used\n", got, want);
         return;
     }
-    hpet_iv = (uint32_t)h / hz;
+    hpet_iv = ((uint32_t)h + hz - 1) / hz;     /* 無條件進位(見 pmtimer_probe) */
     hpet_hz = h;
 }
 
@@ -251,16 +291,25 @@ void arch_timer_init(unsigned hz)
     if (cpu_has_tsc()) {
         uint32_t d = per_10ms(rdtsc);
         tsc_hz = (uint64_t)d * 100;
-        /* 換算成一個 tick 的計數:d * 100 / hz。拆成兩步避免 32 位元溢位,
-           也避開 64 位元除法(i386 上需要 libgcc 的 __udivdi3) */
-        tsc_interval = (uint64_t)(d / hz) * 100 + (d % hz) * 100 / hz;
+        /* 換算成一個 tick 的計數:d * 100 / hz,無條件進位(tick 只可以比真實時間慢,否則「至少睡 n 毫秒」
+           會提早,見 timer.h)。拆成兩步避免 32 位元溢位,也避開 64 位元除法(i386 上需要 libgcc 的 __udivdi3) */
+        tsc_interval = (uint64_t)(d / hz) * 100 + ((d % hz) * 100 + hz - 1) / hz;
         tsc_deadline = rdtsc() + tsc_interval;
     }
     hpet_probe(hz);                              /* 有 TSC 時也探測:備援要在需要之前就準備好 */
-    int src = tsc_interval ? SRC_TSC : hpet_hz ? SRC_HPET : SRC_NONE;
+    pmtimer_probe(hz);
+    int src = tsc_interval ? SRC_TSC : hpet_hz ? SRC_HPET : pm_hz ? SRC_PMTMR : SRC_NONE;
     __atomic_store_n(&clk_src, src, __ATOMIC_RELEASE);
+    /* 備援鏈:目前來源之後還有哪些(和 arch_clock_fallback 的順序相同) */
+    const char *fb = "none";
+    if (src == SRC_TSC && hpet_hz && pm_hz)
+        fb = "hpet,pmtimer";
+    else if (src == SRC_TSC && hpet_hz)
+        fb = "hpet";
+    else if ((src == SRC_TSC || src == SRC_HPET) && pm_hz)
+        fb = "pmtimer";
     kprintf("clock: shared counter %s (%llu Hz), fallback %s\n", arch_clock_name(),
-            (unsigned long long)arch_clock_hz(), src == SRC_TSC && hpet_hz ? "hpet" : "none");
+            (unsigned long long)arch_clock_hz(), fb);
 }
 
 /*

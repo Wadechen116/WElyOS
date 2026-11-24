@@ -312,6 +312,21 @@ const char *clksync_reason_name(int r)
 }
 
 static const char *const check_name[3] = { "#1", "#2", "fallback" };
+#define FALLBACK_HOPS_MAX 4      /* 備援鏈最多幾層(i386 兩層;多留餘裕,迴圈一定結束) */
+
+/* 測試:clock=pmtimer 時,名稱不是 pmtimer 開頭的來源都判不合格(真正的驗證照做、照印) */
+static int forced_reject(int ok, struct clksync_result *r)
+{
+    const char *n = timer_clock_name();
+    int is_pm = n[0] == 'p' && n[1] == 'm';
+    if (g_force == CLKSYNC_FORCE_PMTIMER && !is_pm && r->reason != CLKSYNC_R_NO_COUNTER) {
+        r->ok = 0;
+        r->reason = CLKSYNC_R_FORCED;
+        r->bad_cpu = -1;
+        return 0;
+    }
+    return ok;
+}
 
 static void print_result(int which, const struct clksync_result *r)
 {
@@ -340,26 +355,32 @@ static void degrade(const char *what, int reason, int bad_cpu)
 }
 
 /*
- * 一次驗證不合格(I-341):先換到備援計數器並完整驗證;不行才降級。
- * 換來源之後的驗證失敗不再換(arch 層只有一個備援,timer_clock_fallback 會回 0)。
+ * 一次驗證不合格(I-341):依序換到下一層備援計數器並完整驗證(i386:TSC → HPET → PM timer);
+ * 每一層都不行、或沒有下一層時才降級。g_res[2] 保存最後一個嘗試的來源的結果。
  */
 static void failed(int which, const struct clksync_result *r)
 {
-    const char *old = timer_clock_name();
-    kprintf("clksync: check %s rejected counter %s: %s (cpu %d)\n", check_name[which], old,
+    const char *first = timer_clock_name();
+    kprintf("clksync: check %s rejected counter %s: %s (cpu %d)\n", check_name[which], first,
             clksync_reason_name(r->reason), r->bad_cpu);
-    if (g_force == CLKSYNC_FORCE_CPU0ONLY || !timer_clock_fallback()) {
-        degrade(check_name[which], r->reason, r->bad_cpu);
-        return;
-    }
-    kprintf("clksync: switched shared counter %s -> %s (%llu Hz); validating it\n", old, timer_clock_name(),
-            (unsigned long long)timer_clock_hz());
+    const char *check = check_name[which];
+    int reason = r->reason, bad = r->bad_cpu, ok = 0;
     struct clksync_result *f = &g_res[2];
-    int ok = run(f);
-    __atomic_store_n(&g_have[2], 1, __ATOMIC_SEQ_CST);
-    print_result(2, f);
+    for (int hop = 0; hop < FALLBACK_HOPS_MAX && !ok; hop++) {
+        const char *old = timer_clock_name();
+        if (g_force == CLKSYNC_FORCE_CPU0ONLY || !timer_clock_fallback())
+            break;
+        kprintf("clksync: switched shared counter %s -> %s (%llu Hz); validating it\n", old, timer_clock_name(),
+                (unsigned long long)timer_clock_hz());
+        ok = forced_reject(run(f), f);
+        __atomic_store_n(&g_have[2], 1, __ATOMIC_SEQ_CST);
+        print_result(2, f);
+        check = check_name[2];
+        reason = f->reason;
+        bad = f->bad_cpu;
+    }
     if (!ok) {
-        degrade(check_name[2], f->reason, f->bad_cpu);
+        degrade(check, reason, bad);
         return;
     }
     g_ok_at = f->at;
@@ -368,14 +389,16 @@ static void failed(int which, const struct clksync_result *r)
     kprintf("clksync: fallback counter %s ok on %d cpus (tolerance %llu counts = 1/4 tick)\n",
             f->src, f->ncpu, (unsigned long long)f->tol);
     blackbox_log(BB_NOTE, "clksync: %s rejected (%s, cpu %d); shared counter now %s, validated",
-                 old, clksync_reason_name(r->reason), r->bad_cpu, f->src);
+                 first, clksync_reason_name(r->reason), r->bad_cpu, f->src);
 }
 
 static void live(int which)
 {
     struct clksync_result *r = &g_res[which];
     int ok = run(r);
-    if (which == 0 && g_force != CLKSYNC_FORCE_NONE && r->reason != CLKSYNC_R_NO_COUNTER) {
+    if (g_force == CLKSYNC_FORCE_PMTIMER) {
+        ok = forced_reject(ok, r);           /* 開機或再驗證:不是 pmtimer 就不合格 */
+    } else if (which == 0 && g_force != CLKSYNC_FORCE_NONE && r->reason != CLKSYNC_R_NO_COUNTER) {
         /* 測試:真正的驗證照做、照印,再把結果改成不合格,讓切換 / 降級路徑真的被執行 */
         ok = 0;
         r->ok = 0;
