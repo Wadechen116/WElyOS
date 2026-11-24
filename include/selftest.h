@@ -65,6 +65,11 @@ void rt_demo(void);                      /* 週期性的即時工作 */
 void affinity_test(void);                /* I-343:CPU 親和性(固定、搬移、拒絕、固定的即時工作) */
 void sleep_wall_test(void);
 void clksync_test(void);                 /* I-337:跨 CPU 計數器同步驗證(含注入偏移的負對照) */
+/* I-349 校準:0 = 不注入、1 = spike(卡住期間受測睡眠者那一顆關中斷 20 ms 一次)、2 = steady(見 timer.h) */
+#define CS_INJ_NONE 0
+#define CS_INJ_SPIKE 1
+#define CS_INJ_STEADY 2
+void cpu0_stall_set_injection(int mode);
 void cpu0_stall_wake_test(void);         /* 第 0 顆 CPU 關中斷 300 ms 時休眠者照樣醒(I-337) */              /* 睡眠以真實時間計不可提早醒(高精度時鐘量) */
 void sched_stress(void);                 /* stress:大量執行緒 */
 void sched_crash_test(const char *cmd);  /* crash=<種類>:需要排程器的那些 */

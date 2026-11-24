@@ -96,6 +96,13 @@ enum {
     SYS_failinj,            /* (op, site, n)   配置失敗注入與計量(只給自我測試):只有以 selftest 開機、
                                                而且呼叫者有 CAP_ADMIN 時有效,否則 -E_PERM。
                                                op:FI_OP_ARM / DISARM(回傳是否注入過)/ DOMAIN / RESERVED / AVAIL_KB */
+    /* ---- CPU 親和性(I-344;接在最後,既有編號不變) ---- */
+    SYS_setaffinity,        /* (tid, mask)     把執行緒限制在 mask 的 CPU 上(tid 0 = 自己)。只能設同一個行程的
+                                               執行緒,否則要 CAP_ADMIN(-E_PERM);mask 為 0、超過 32 位元、含不在線上的
+                                               CPU:-E_INVAL;即時工作放不進新遮罩的某一顆:-E_BUSY(什麼都不變;
+                                               這是接受政策,不是逐顆的完整可排程性證明)。
+                                               fork / thread_create 不繼承;exec 保留(同一條執行緒) */
+    SYS_getaffinity,        /* (tid)           回傳執行緒的遮罩(不限制 = 所有線上的 CPU);權限同上 */
 };
 
 

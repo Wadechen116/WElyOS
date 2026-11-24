@@ -39,39 +39,45 @@ void watchdog_set_timeout(unsigned ms)
  */
 static const char *stage_name;
 static const volatile unsigned *stage_progress;
-static uint64_t stage_start, stage_limit;    /* 時鐘計數;只在 stage_armed == 0 時改 */
-static volatile int stage_armed, stage_fired;   /* 32 位元旗標:i386 沒有 64 位元的 atomic */
-static volatile unsigned stage_gen;          /* 每次設定加一:讀者比較前後,換過就不算(像 seqlock) */
+static uint64_t stage_start, stage_limit;    /* 時鐘計數;只在「未啟用」時改 */
+/* 單一 32 位元狀態 = 版本 × 2 + 啟用(i386 沒有 64 位元的 atomic)。設定:先寫「新版本、未啟用」,
+   再寫內容,最後「新版本、啟用」。逾時的 CPU 以比較並交換(CAS)把「這個版本、啟用」改成「這個版本、
+   未啟用」才算搶到 — 版本不同(已被重設 / 取消)就搶不到,舊階段的逾時不會誤報到新階段(Codex 015) */
+static volatile uint32_t stage_state;
 
 void watchdog_stage(const char *name, unsigned secs, const volatile unsigned *progress)
 {
     uint64_t hz = timer_clock_hz();
-    __atomic_store_n(&stage_armed, 0, __ATOMIC_SEQ_CST);     /* 先停,再改內容(讀者只在 armed 時讀) */
-    __atomic_add_fetch(&stage_gen, 1, __ATOMIC_SEQ_CST);
+    uint32_t gen = (__atomic_load_n(&stage_state, __ATOMIC_SEQ_CST) >> 1) + 1;
+    __atomic_store_n(&stage_state, gen << 1, __ATOMIC_SEQ_CST);      /* 新版本、未啟用 */
     if (!name || hz == 0)
         return;
     stage_name = name;
     stage_progress = progress;
     stage_start = timer_clock_count();
     stage_limit = hz * secs;
-    __atomic_store_n(&stage_armed, 1, __ATOMIC_SEQ_CST);     /* 內容寫好之後才啟用 */
+    __atomic_store_n(&stage_state, (gen << 1) | 1, __ATOMIC_SEQ_CST);  /* 內容寫好之後才啟用 */
 }
 
 static void stage_check(void)
 {
-    unsigned g = __atomic_load_n(&stage_gen, __ATOMIC_SEQ_CST);
-    if (!__atomic_load_n(&stage_armed, __ATOMIC_SEQ_CST))
+    uint32_t s = __atomic_load_n(&stage_state, __ATOMIC_SEQ_CST);
+    if (!(s & 1))
         return;
+    /* 快照:之後只用快照,不再讀全域(搶到之後別人可能已經設了新階段) */
+    const char *name = stage_name;
+    const volatile unsigned *prog = stage_progress;
     uint64_t start = stage_start, lim = stage_limit;
-    if (__atomic_load_n(&stage_gen, __ATOMIC_SEQ_CST) != g)
+    if (__atomic_load_n(&stage_state, __ATOMIC_SEQ_CST) != s)
         return;                              /* 讀的期間被重設:這次不算,下一次中斷再看 */
     if (timer_clock_count() - start < lim)
         return;
-    if (__atomic_exchange_n(&stage_fired, 1, __ATOMIC_SEQ_CST))
-        return;                              /* 別顆 CPU 已經在報了 */
+    uint32_t want = s;
+    if (!__atomic_compare_exchange_n(&stage_state, &want, s & ~1u, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+        return;                              /* 別顆已經搶到,或剛被重設 */
+    int progress = prog ? (int)*prog : -1;
     sched_dump_state();
-    panic("watchdog: self-test stage \"%s\" did not finish in time (progress %d; threads above)", stage_name,
-          stage_progress ? (int)*stage_progress : -1);
+    panic("watchdog: self-test stage \"%s\" did not finish in time (progress %d; threads above)", name, progress);
 }
 
 void watchdog_tick(void)

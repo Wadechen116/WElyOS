@@ -1244,6 +1244,15 @@ struct cs_sleeper_rec {
     uint64_t t0[CS_MAX_SAMPLES], d[CS_MAX_SAMPLES];   /* 每次睡眠的起點與長度(時鐘計數) */
 };
 static struct cs_sleeper_rec cs_rec[2];
+/* I-349 校準的注入(只印診斷,不改判定):模式、spike 實際做了幾次、開始時刻與長度(時鐘計數) */
+static int cs_inj_mode;
+static volatile unsigned cs_spike_n;
+static volatile uint64_t cs_spike_at, cs_spike_len;
+
+void cpu0_stall_set_injection(int mode)
+{
+    cs_inj_mode = mode;
+}
 static void *volatile cs_sleeper_self;           /* 受測睡眠者(卡住的處理函式用來判斷被打斷的是不是它) */
 
 static void cs_sleeper(void *arg)
@@ -1257,7 +1266,23 @@ static void cs_sleeper(void *arg)
     /* 忙等:卡住期間不能靠 sleep 開始(那正是待測項目) */
     while (cs_phase == 0)
         r->cpu = sched_cpu_id();
+    uint64_t ph0 = 0;
     while (cs_phase == 1) {
+        if (!ph0)
+            ph0 = timer_clock_count();
+        /* spike:受測那一顆(第 1 顆)在卡住開始約 100 ms 後關中斷 20 ms,只一次 — 模擬「這顆虛擬 CPU 被主機
+           停住一下」。記下實際的開始時刻與長度 */
+        if (cs_inj_mode == CS_INJ_SPIKE && r == &cs_rec[0] && !cs_spike_n &&
+            (timer_clock_count() - ph0) * 10 >= cs_hz) {
+            unsigned long fl = arch_irq_save();
+            uint64_t s0 = timer_clock_count();
+            while ((timer_clock_count() - s0) * 50 < cs_hz)
+                ;
+            cs_spike_len = timer_clock_count() - s0;
+            cs_spike_at = s0;
+            cs_spike_n = 1;
+            arch_irq_restore(fl);
+        }
         uint64_t t0 = timer_clock_count();
         thread_sleep(CS_SLEEP_MS);
         uint64_t d = timer_clock_count() - t0;
@@ -1331,6 +1356,8 @@ static void cs_stall_fn(void *arg)
     x->hb0 = this_cpu()->heartbeat;
     x->tk0 = timer_ticks();
     x->c0 = timer_clock_count();
+    if (cs_inj_mode == CS_INJ_STEADY)
+        timer_test_steady_window(1);         /* I-349 校準:只在卡住期間注入 */
     cs_phase = 1;
     uint64_t wend = x->c0;
     it = 0;
@@ -1357,6 +1384,8 @@ static void cs_stall_fn(void *arg)
     /* 卡住結束:在第 0 顆恢復中斷「之前」就換階段。以前由發起者在跨 CPU 呼叫返回後才設,
        中間第 0 顆已經開中斷、睡眠者可能被排上去,階段卻還是 1 → 被誤算成「卡住時跑在第 0 顆」
        (第 68 步完整回歸 aarch64 兩次) */
+    if (cs_inj_mode == CS_INJ_STEADY)
+        timer_test_steady_window(0);
     cs_phase = 2;
 }
 
@@ -1524,6 +1553,26 @@ static void cs_diagnose(const struct cs_stall_ctx *x, unsigned over_t, unsigned 
             "over target %u control %u; progress %s%u%% of baseline; lock not-measured)\n",
             label, lag, lag_w, x->nwin, max_run, scope, over_t, over_r,
             prog_known ? "min " : "unknown, ", prog_known ? min_pct : 0u);
+    /* 逐窗原始資料(Codex 020):D = 時鐘增量 / 每 tick 計數 − tick 增量,以千分之一 tick 表示(可為負);
+       每 tick 計數是 0(沒有共用計數器)時印 invalid */
+    pc = x->c0;
+    pt = x->tk0;
+    for (unsigned w = 0; w < x->nwin; w++) {
+        uint64_t dc = x->win_c[w] - pc, dt = x->win_t[w] - pt;
+        if (!iv) {
+            kprintf("cpu0-stall: win %u dC=%llu dT=%llu iv=0 D=invalid iter=%u end=%llu\n", w,
+                    (unsigned long long)dc, (unsigned long long)dt, x->win_iter[w], (unsigned long long)x->win_c[w]);
+        } else {
+            uint64_t want = dt * iv;
+            int neg = dc < want;
+            uint32_t mt = clksync_milli_ticks(neg ? want - dc : dc - want, iv);   /* 上限 4000 */
+            kprintf("cpu0-stall: win %u dC=%llu dT=%llu iv=%llu D=%s%u/1000 tick%s iter=%u end=%llu\n", w,
+                    (unsigned long long)dc, (unsigned long long)dt, (unsigned long long)iv, neg ? "-" : "",
+                    mt, mt >= 4000 ? "(capped)" : "", x->win_iter[w], (unsigned long long)x->win_c[w]);
+        }
+        pc = x->win_c[w];
+        pt = x->win_t[w];
+    }
     kprintf("cpu0-stall: diagnosis: irqs per cpu during the stall:");
     for (int i = 0; i < cpu_count && i < MAX_CPUS; i++)
         kprintf(" %d:+%lu", i, x->hb_other1[i] - x->hb_other0[i]);
@@ -1618,6 +1667,19 @@ void cpu0_stall_wake_test(void)
         kprintf("cpu0-stall: control sleeper on cpu 2 woke %u times, worst %llu counts, %u over %u ms\n",
                 rwakes, (unsigned long long)rworst, rover, CS_STRICT_MS);
     cs_diagnose(&ctx, strict_over, rover, have_ref);
+    /* I-349 校準:注入是否真的發生、在哪、多長(Codex 018 / 020 要求記錄) */
+    if (cs_inj_mode == CS_INJ_SPIKE)
+        kprintf("cpu0-stall: injection spike: %u done on cpu 1, %llu counts (clock %llu Hz) starting %llu counts "
+                "after the stall began\n", cs_spike_n, (unsigned long long)cs_spike_len, (unsigned long long)cs_hz,
+                (unsigned long long)(cs_spike_n ? cs_spike_at - ctx.c0 : 0));
+    if (cs_inj_mode == CS_INJ_STEADY) {
+        uint32_t n, cm;
+        uint64_t tot, mx;
+        timer_test_steady_stats(&n, &cm, &tot, &mx);
+        kprintf("cpu0-stall: injection steady (kernel-side delayed progress, not host descheduling): %u delays "
+                "on cpu mask %x, total %llu counts, longest %llu counts\n", n, cm, (unsigned long long)tot,
+                (unsigned long long)mx);
+    }
 
     if (hb1 != hb0)
         panic("cpu0-stall: control failed, cpu0 handled %lu timer interrupts with irqs off", hb1 - hb0);
@@ -1736,6 +1798,8 @@ static void aff_rt_task(void *arg)
 
 static void affinity_hol_test(void);     /* 第 5 項,定義在後面 */
 static void affinity_starve_test(void);  /* 第 6 項 */
+static void affinity_rt_admit_test(void);   /* 第 7 項 */
+static void rt_capacity_test(void);         /* 第 8 項 */
 
 void affinity_test(void)
 {
@@ -1850,6 +1914,8 @@ void affinity_test(void)
     }
     affinity_hol_test();                     /* 5 */
     affinity_starve_test();                  /* 6 */
+    affinity_rt_admit_test();                /* 7 */
+    rt_capacity_test();                      /* 8:1 顆以上都跑(7 需要 3 顆以上) */
 }
 
 /*
@@ -2153,6 +2219,27 @@ void clksync_test(void)
                 rf ? rf->src : "?", rf ? clksync_reason_name(rf->reason) : "never checked");
     }
     clksync_recheck();                       /* 最近一次合格驗證後不到 1 秒時會睡到滿 1 秒 */
+    /* I-345(clock=drift):第一次再驗證注入了 3/16 tick。單輪檢查必須仍合格(證明只有跨輪比較抓得到),
+       跨輪比較必須判漂移;之後 i386 換到 HPET(並對新來源再驗證一輪),其他架構沒有備援 → 降級 */
+    if (clksync_force_mode() == CLKSYNC_FORCE_DRIFT) {
+        const struct clksync_result *rd = clksync_drift_first();
+        if (!rd || rd->reason != CLKSYNC_R_DRIFT || rd->cross != CLKSYNC_X_REJECT)
+            panic("clksync-test: injected drift not rejected by the cross-round check (%s, cross %d)",
+                  rd ? clksync_reason_name(rd->reason) : "no recheck", rd ? rd->cross : -1);
+        for (int c = 0; c < rd->ncpu; c++)
+            if (c != rd->ref && (c == 0 || cpus[c].started) && rd->cpu[c].max_abs > rd->tol)
+                panic("clksync-test: drift injection exceeded the single-round tolerance on cpu %d", c);
+        if (clksync_state() == CLKSYNC_DEGRADED) {
+            KASSERT(!timer_shared_enabled());
+            kprintf("clksync-test: forced drift rejected by the cross-round check; no fallback, degraded\n");
+            return;
+        }
+        const struct clksync_result *r1 = clksync_last(1);
+        KASSERT(clksync_state() == CLKSYNC_OK && clksync_fallback_used() && r1 && r1->ok &&
+                r1->cross == CLKSYNC_X_ACCEPT && r1->src == clksync_last(2)->src);
+        kprintf("clksync-test: forced drift rejected by the cross-round check; fallback %s rechecked: cross-round accept\n",
+                r1->src);
+    }
     if (clksync_state() != CLKSYNC_OK) {
         const struct clksync_result *bad = clksync_last(1) ? clksync_last(1) : clksync_last(0);
         panic("clksync-test: shared counter rejected: %s (cpu %d)",
@@ -2203,4 +2290,148 @@ void clksync_test(void)
     if (clksync_state() != CLKSYNC_OK || !timer_shared_enabled())
         panic("clksync-test: a dry run changed the time mode");
     clock_view_test(n);
+}
+
+/*
+ * ---- 第 7 項:每顆 CPU 的即時工作接受檢查(I-344)----
+ * 輔助執行緒各自固定 CPU 後宣告即時工作(thread_set_periodic 只能設自己),記下結果,等到結束才取消。
+ *   A 固定第 1 顆 40% → 接受;B 也固定第 1 顆 40% → 拒絕(全系統合計 80% 沒超過 70% × CPU 數,
+ *   只有「每顆」的規則會拒絕 — 這一項的重點);C 固定第 2 顆 40% → 接受;
+ *   D 遮罩 {1, 2} 20% → 接受,而且兩顆都記上 20%(保守);
+ *   把 A 改到第 2 顆(會變 100%)→ -E_BUSY,A 的遮罩與兩顆的記帳都不變;
+ *   有第 3 顆時把 A 改到第 3 顆 → 接受,第 1 顆少 40%、第 3 顆多 40%;
+ *   全部取消後每顆回到原本的值。
+ * 負對照:拿掉 thread_set_periodic 的每顆檢查(rt_cpus_fit),B 會被接受 → panic。
+ */
+struct ra_arg {
+    unsigned mask, period, budget;
+    volatile int rc, ready, err;             /* err:等週期時的非 0 回傳值(由主測試判失敗) */
+};
+static volatile int ra_stop;
+
+static void ra_task(void *arg)
+{
+    struct ra_arg *a = arg;
+    KASSERT(thread_set_affinity(0, a->mask) == 0);
+    a->rc = thread_set_periodic(a->period, a->budget);
+    __atomic_store_n(&a->ready, 1, __ATOMIC_SEQ_CST);
+    while (!ra_stop) {
+        if (a->rc == 0) {
+            /* 非 0(例如將來加了訊號、被打斷)是可以處理的錯誤:記下來、離開迴圈、照樣清理,
+               由主測試在 join 之後判失敗 — 不在這裡 panic(Codex 020) */
+            int w = thread_wait_period(NULL);
+            if (w != 0) {
+                a->err = w;
+                break;
+            }
+        } else {
+            thread_sleep(1);
+        }
+    }
+    if (a->rc == 0)
+        KASSERT(thread_set_periodic(0, 0) == 0);
+}
+
+static int ra_start(struct ra_arg *a, unsigned mask, unsigned period, unsigned budget)
+{
+    a->mask = mask;
+    a->period = period;
+    a->budget = budget;
+    a->rc = 1;
+    a->ready = a->err = 0;
+    int tid = thread_create_prio("ra-task", ra_task, a, PRIO_NORMAL);
+    KASSERT(tid > 0);
+    for (int w = 0; !__atomic_load_n(&a->ready, __ATOMIC_SEQ_CST); w++) {
+        KASSERT(w < 5000);
+        thread_sleep(1);
+    }
+    return tid;
+}
+
+static void affinity_rt_admit_test(void)
+{
+    unsigned online = sched_online_mask();
+    if (cpu_count < 3 || (online & 6u) != 6u) {
+        kprintf("affinity: per-cpu rt admission test needs cpus 1 and 2 online, skipped\n");
+        return;
+    }
+    int has3 = (online & 8u) != 0;
+    unsigned b1 = sched_rt_util_cpu(1), b2 = sched_rt_util_cpu(2), b3 = sched_rt_util_cpu(3);
+    static struct ra_arg A, B, C, D;
+    ra_stop = 0;
+    int ta = ra_start(&A, 1u << 1, 10, 4);
+    int tb = ra_start(&B, 1u << 1, 10, 4);
+    int tc = ra_start(&C, 1u << 2, 10, 4);
+    int td = ra_start(&D, (1u << 1) | (1u << 2), 10, 2);
+    unsigned u1 = sched_rt_util_cpu(1), u2 = sched_rt_util_cpu(2);
+    kprintf("affinity: rt admission: A cpu1 40%% -> %d, B cpu1 40%% -> %d, C cpu2 40%% -> %d, "
+            "D cpu1+2 20%% -> %d; cpu1 %u per mille, cpu2 %u\n", A.rc, B.rc, C.rc, D.rc, u1 - b1, u2 - b2);
+    if (A.rc != 0 || B.rc != -E_BUSY || C.rc != 0 || D.rc != 0)
+        panic("affinity: per-cpu rt admission wrong (A %d, B %d (want %d), C %d, D %d)",
+              A.rc, B.rc, -E_BUSY, C.rc, D.rc);
+    KASSERT(u1 - b1 == 600 && u2 - b2 == 600);      /* A 400 + D 200;C 400 + D 200(D 記在兩顆) */
+
+    /* 改親和性:A 到第 2 顆會讓第 2 顆變 1000 → 拒絕,什麼都不變 */
+    unsigned m = 0;
+    int rc = thread_set_affinity(ta, 1u << 2);
+    KASSERT(thread_get_affinity_checked(ta, NULL, 1, &m) == 0);
+    kprintf("affinity: rt admission: moving A to the full cpu 2 -> %d, A's mask still %x\n", rc, m);
+    if (rc != -E_BUSY || m != (1u << 1) || sched_rt_util_cpu(1) - b1 != 600 || sched_rt_util_cpu(2) - b2 != 600)
+        panic("affinity: rt affinity change to a full cpu not refused cleanly (rc %d, mask %x)", rc, m);
+    if (has3) {
+        KASSERT(thread_set_affinity(ta, 1u << 3) == 0);
+        KASSERT(sched_rt_util_cpu(1) - b1 == 200 && sched_rt_util_cpu(3) - b3 == 400);
+        kprintf("affinity: rt admission: moving A to cpu 3 accepted, load moved with it\n");
+    }
+    ra_stop = 1;
+    thread_join(ta);
+    thread_join(tb);
+    thread_join(tc);
+    thread_join(td);
+    if (A.err || B.err || C.err || D.err)
+        panic("affinity: rt admission helper failed waiting for a period (%d %d %d %d)", A.err, B.err, C.err, D.err);
+    KASSERT(sched_rt_util_cpu(1) == b1 && sched_rt_util_cpu(2) == b2 && sched_rt_util_cpu(3) == b3);
+    kprintf("affinity: rt admission: all removed, per-cpu load back to the baseline\n");
+}
+
+/*
+ * 全系統容量(I-344 選 A;Codex 020 要求保留這項限制的明確測試):不限制 CPU 的即時工作每個 70%
+ * (單一工作的上限),線上 N 顆時接受 N 個(合計 70% × N),第 N + 1 個必須 -E_BUSY。
+ * 舊規則(全系統只有 70%)下第 2 個就會被拒,所以 N >= 2 時這一項分得出新舊。
+ * 限制:即時工作的槽位只有 RT_MAX(8)個;N >= 8 時第 N + 1 個會先因「沒有槽位」被拒(-E_NOSPC),
+ * 容量上限碰不到 — 跳過並印出原因(要不要加大 RT_MAX 另議)。
+ */
+static void rt_capacity_test(void)
+{
+    unsigned online = sched_online_mask();
+    int n = 0;
+    for (unsigned m = online; m; m &= m - 1)
+        n++;
+    if (n >= 8) {
+        kprintf("affinity: rt capacity test skipped: %d cpus x 70%% needs %d tasks, more than the 8 rt slots\n",
+                n, n + 1);
+        return;
+    }
+    unsigned base = sched_rt_util_total();
+    if (base != 0)
+        panic("affinity: rt capacity test needs no other rt tasks (total %u per mille)", base);
+    static struct ra_arg R[8];
+    int tid[8];
+    ra_stop = 0;
+    for (int i = 0; i <= n; i++)
+        tid[i] = ra_start(&R[i], online, 10, 7);  /* 遮罩 = 全部線上 = 不限制 */
+    int ok = 0;
+    for (int i = 0; i < n; i++)
+        ok += R[i].rc == 0;
+    kprintf("affinity: rt capacity: %d cpus, %d unpinned 70%% tasks accepted (total %u per mille), next one -> %d\n",
+            n, ok, sched_rt_util_total(), R[n].rc);
+    if (ok != n || R[n].rc != -E_BUSY)
+        panic("affinity: rt capacity wrong: %d of %d accepted, task %d got %d (want %d)", ok, n, n + 1, R[n].rc, -E_BUSY);
+    ra_stop = 1;
+    for (int i = 0; i <= n; i++)
+        thread_join(tid[i]);
+    for (int i = 0; i <= n; i++)
+        if (R[i].err)
+            panic("affinity: rt capacity helper %d failed waiting for a period (%d)", i, R[i].err);
+    KASSERT(sched_rt_util_total() == 0);
 }

@@ -38,7 +38,8 @@ static uint32_t sx_seq;                      /* 序號:只有參考 CPU 改(sx_b
 static int sx_busy;                          /* 1 = 有一次驗證正在進行 */
 
 /* ---- 測試注入(只有 selftest 會設定;平常 sx_inj_cpu == -1) ---- */
-static volatile int      sx_inj_cpu = -1;
+static volatile int      sx_inj_cpu = -1;    /* -2 = 參考以外的每一顆(I-345 的 clock=drift) */
+static volatile int      sx_ref = -1;        /* 目前這一輪的參考 CPU(run 設定;注入 -2 時用) */
 static volatile uint64_t sx_inj_off, sx_inj_delay;
 
 /* ---- 結果 ---- */
@@ -48,6 +49,9 @@ static volatile int g_have[3];
 static volatile int g_fallback;              /* 1 = 已換到備援計數器而且合格 */
 static int g_force;                          /* enum clksync_force_mode;只在 smp_init 之前設定 */
 static uint64_t g_ok_at;                     /* 最近一次合格驗證開始時的計數(目前來源的單位) */
+static int g_recheck_again;                  /* 1 = 再驗證時換了來源:新來源 1 秒後要再做一輪(I-345) */
+static int g_drift_injected;                 /* clock=drift:只注入一次 */
+static struct clksync_result g_drift_res;    /* 被注入的那一次再驗證(測試檢查用) */
 
 /*
  * 讀計數器:讀取指令本身也要依程式順序,不可被提前或延後到交接旗標的存取之外(I-342)。
@@ -96,7 +100,8 @@ void clksync_remote(void)
         }
         last = r;
         uint64_t c = read_count();
-        if (__atomic_load_n(&sx_inj_cpu, __ATOMIC_SEQ_CST) == me) {
+        int inj = __atomic_load_n(&sx_inj_cpu, __ATOMIC_SEQ_CST);
+        if (inj == me || (inj == -2 && me != __atomic_load_n(&sx_ref, __ATOMIC_SEQ_CST))) {
             c += sx_inj_off;                     /* 測試:假裝這顆 CPU 的計數器超前 */
             uint64_t d = sx_inj_delay, t = read_count();
             while (d && read_count() - t < d)
@@ -256,6 +261,7 @@ static int run(struct clksync_result *res)
        (CPU 數 - 1) × 重試次數 × 2 × 20 tick,遠小於看門狗的 5000 tick */
     unsigned long fl = arch_irq_save();
     res->ref = this_cpu()->id;
+    __atomic_store_n(&sx_ref, res->ref, __ATOMIC_SEQ_CST);
     res->src = timer_clock_name();
     res->at = read_count();
     res->ok = 1;
@@ -307,6 +313,7 @@ const char *clksync_reason_name(int r)
     case CLKSYNC_R_OFFSET:       return "counter offset beyond a quarter tick";
     case CLKSYNC_R_BUSY:         return "another check in progress";
     case CLKSYNC_R_FORCED:       return "forced by boot parameter (test)";
+    case CLKSYNC_R_DRIFT:        return "counter offset changed between checks";
     }
     return "?";
 }
@@ -341,6 +348,91 @@ static void print_result(int which, const struct clksync_result *r)
                 (unsigned long long)o->tightest, o->used, CLKSYNC_SAMPLES, o->wide, o->attempts,
                 clksync_reason_name(o->reason));
     }
+    if (r->cross != CLKSYNC_X_NONE) {
+        static const char *const xname[] = { "none", "accept", "uncertain", "reject" };
+        for (int c = 1; c < r->ncpu; c++) {
+            const struct clksync_cpu *o = &r->cpu[c];
+            if (o->dclass == CLKSYNC_X_NONE)
+                continue;
+            kprintf("clksync: cross-round (%s) cpu %d vs cpu 0: offset change %lld..%lld counts, "
+                    "limit +-%llu: %s\n", r->src ? r->src : "?", c, (long long)o->d_lo, (long long)o->d_hi,
+                    (unsigned long long)r->dmax, xname[o->dclass]);
+        }
+        kprintf("clksync: cross-round (%s): %s after %u try(s)\n", r->src ? r->src : "?", xname[r->cross],
+                r->cross_tries);
+    }
+}
+
+/*
+ * ---- 跨輪比較(I-345;模型見 tests/host/proc/probe_i337_counter_sync.c 的 cross_round_evaluate)----
+ * 每輪記下的是「遠端 − 參考」偏移的交集區間。兩輪的參考 CPU 可能不同(再驗證在別顆上做),
+ * 所以先各自換算成「相對第 0 顆」:x 相對 0 = (x 相對 ref) − (0 相對 ref);ref 自己 = −(0 相對 ref)。
+ * 區間相減 [a, b] − [c, d] = [a − d, b − c]。變化區間 = 本輪 − 基準輪。
+ * 三態(只用加減與比較,i386 不需要 64 位元除法):
+ *   整個在 [−dmax, dmax] 內 = 接受;整個在外 = 確定漂移;橫跨邊界 = 無法判斷(呼叫端只對這種重跑第二輪)。
+ * 減法溢位(不可能出現在正常計數上)當成無法判斷 — 不確定就不接受。
+ */
+static int isub(int64_t a, int64_t b, int64_t *out)
+{
+    return !__builtin_sub_overflow(a, b, out);
+}
+
+static int interval_sub(int64_t a, int64_t b, int64_t c, int64_t d, int64_t *lo, int64_t *hi)
+{
+    return isub(a, d, lo) && isub(b, c, hi);
+}
+
+/* 第 x 顆相對第 0 顆的偏移區間;這一輪沒有它的有效資料就回傳 0 */
+static int rel_cpu0(const struct clksync_result *r, int x, int64_t *lo, int64_t *hi)
+{
+    if (x == 0 && r->ref == 0) {
+        *lo = *hi = 0;
+        return 1;
+    }
+    if (r->ref != 0 && (r->cpu[0].reason != CLKSYNC_R_NONE || r->cpu[0].used == 0))
+        return 0;                                /* 需要「第 0 顆相對 ref」才能換算 */
+    const struct clksync_cpu *z = &r->cpu[0];
+    if (x == r->ref)                             /* ref 自己:−(0 相對 ref) */
+        return isub(0, z->max_high, lo) && isub(0, z->min_low, hi);
+    const struct clksync_cpu *o = &r->cpu[x];
+    if (o->reason != CLKSYNC_R_NONE || o->used == 0)
+        return 0;
+    if (r->ref == 0) {
+        *lo = o->min_low;
+        *hi = o->max_high;
+        return 1;
+    }
+    return interval_sub(o->min_low, o->max_high, z->min_low, z->max_high, lo, hi);
+}
+
+static int cross_round(const struct clksync_result *base, struct clksync_result *cur)
+{
+    int worst = CLKSYNC_X_ACCEPT, bad = -1;
+    cur->dmax = cur->iv >> 3;
+    int64_t dmax = (int64_t)cur->dmax;
+    for (int x = 1; x < cur->ncpu && x < MAX_CPUS; x++) {
+        struct clksync_cpu *o = &cur->cpu[x];
+        o->dclass = CLKSYNC_X_NONE;
+        int64_t l1, u1, l2, u2;
+        if (!rel_cpu0(base, x, &l1, &u1) || !rel_cpu0(cur, x, &l2, &u2))
+            continue;                            /* 兩輪都有才比 */
+        int k;
+        if (!interval_sub(l2, u2, l1, u1, &o->d_lo, &o->d_hi))
+            k = CLKSYNC_X_UNCERTAIN;
+        else if (o->d_lo >= -dmax && o->d_hi <= dmax)
+            k = CLKSYNC_X_ACCEPT;
+        else if (o->d_hi < -dmax || o->d_lo > dmax)
+            k = CLKSYNC_X_REJECT;
+        else
+            k = CLKSYNC_X_UNCERTAIN;
+        o->dclass = k;
+        if (k > worst) {
+            worst = k;
+            bad = x;
+        }
+    }
+    cur->cross = worst;
+    return bad;
 }
 
 /* 失敗即關閉:停用共用路徑、記黑盒子、印出看得到的開機訊息 */
@@ -384,6 +476,8 @@ static void failed(int which, const struct clksync_result *r)
         return;
     }
     g_ok_at = f->at;
+    if (which == 1)
+        g_recheck_again = 1;                     /* 新來源只有一輪:1 秒後再驗證、做跨輪比較(Codex 018) */
     __atomic_store_n(&g_fallback, 1, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_state, CLKSYNC_OK, __ATOMIC_SEQ_CST);
     kprintf("clksync: fallback counter %s ok on %d cpus (tolerance %llu counts = 1/4 tick)\n",
@@ -395,15 +489,53 @@ static void failed(int which, const struct clksync_result *r)
 static void live(int which)
 {
     struct clksync_result *r = &g_res[which];
+    /* 測試(clock=drift):第一次再驗證時,參考以外的每顆 CPU 回報的計數加 3/16 tick。小於 tol(1/4 tick),
+       單輪檢查會通過;大於 dmax(1/8 tick),只有跨輪比較抓得到。跑完立刻清掉(在 failed() 換備援之前) */
+    int inject = which == 1 && g_force == CLKSYNC_FORCE_DRIFT && !g_drift_injected;
+    if (inject) {
+        uint64_t iv = timer_tick_counts();
+        g_drift_injected = 1;
+        clksync_test_inject(-2, (iv >> 2) - (iv >> 4), 0);
+        kprintf("clksync: drift test: adding %llu counts (3/16 tick) to every non-reference cpu for this check\n",
+                (unsigned long long)((iv >> 2) - (iv >> 4)));
+    }
     int ok = run(r);
     if (g_force == CLKSYNC_FORCE_PMTIMER) {
         ok = forced_reject(ok, r);           /* 開機或再驗證:不是 pmtimer 就不合格 */
-    } else if (which == 0 && g_force != CLKSYNC_FORCE_NONE && r->reason != CLKSYNC_R_NO_COUNTER) {
+    } else if (which == 0 && (g_force == CLKSYNC_FORCE_FALLBACK || g_force == CLKSYNC_FORCE_CPU0ONLY) &&
+               r->reason != CLKSYNC_R_NO_COUNTER) {    /* clock=drift 不動開機驗證:它測的是再驗證 */
         /* 測試:真正的驗證照做、照印,再把結果改成不合格,讓切換 / 降級路徑真的被執行 */
         ok = 0;
         r->ok = 0;
         r->reason = CLKSYNC_R_FORCED;
         r->bad_cpu = -1;
+    }
+    if (which == 1 && ok) {
+        /* I-345:和基準輪比較。基準 = 換過來源時是備援的驗證,否則是開機驗證;來源不同就不比 */
+        const struct clksync_result *base = __atomic_load_n(&g_fallback, __ATOMIC_SEQ_CST) ? &g_res[2] : &g_res[0];
+        if (base->src && r->src && base->src == r->src && base->ok) {
+            int bad = cross_round(base, r);
+            for (r->cross_tries = 1; r->cross == CLKSYNC_X_UNCERTAIN && r->cross_tries < CLKSYNC_ATTEMPTS;
+                 r->cross_tries++) {
+                ok = run(r);                     /* 只有「無法判斷」才重跑第二輪(確定漂移不重跑) */
+                if (!ok)
+                    break;
+                bad = cross_round(base, r);
+            }
+            if (ok && r->cross != CLKSYNC_X_ACCEPT) {
+                ok = 0;                          /* 確定漂移,或重試後仍無法判斷:不確定就判失敗 */
+                r->ok = 0;
+                r->reason = CLKSYNC_R_DRIFT;
+                r->bad_cpu = bad;
+            }
+        } else {
+            kprintf("clksync: cross-round skipped: baseline counter %s, now %s\n",
+                    base->src ? base->src : "none", r->src ? r->src : "none");
+        }
+    }
+    if (inject) {
+        clksync_test_inject(-1, 0, 0);           /* 跨輪比較(含重跑)之後、換備援之前清掉 */
+        g_drift_res = *r;
     }
     __atomic_store_n(&g_have[which], 1, __ATOMIC_SEQ_CST);
     print_result(which, r);
@@ -433,12 +565,20 @@ void clksync_recheck(void)
     if (__atomic_load_n(&g_state, __ATOMIC_SEQ_CST) != CLKSYNC_OK || done)
         return;                                  /* 單核、已降級、或已經再驗證過 */
     done = 1;
-    /* 距離最近一次合格驗證至少 1 秒(timer_clock_hz() 個計數):用比較,不用除法。
-       g_ok_at 是目前來源的單位(換過來源時是備援驗證的起點),不會和舊來源混用 */
-    uint64_t hz = timer_clock_hz();
-    while (read_count() - g_ok_at < hz)
-        thread_sleep(10);
-    live(1);
+    /* 再驗證時換了來源,新來源也要有自己的第二輪與跨輪比較(Codex 018)。每次換來源都往備援鏈前進一層,
+       所以最多 FALLBACK_HOPS_MAX 輪,不會在 failed() 與再驗證之間循環 */
+    for (int pass = 0; pass < FALLBACK_HOPS_MAX; pass++) {
+        g_recheck_again = 0;
+        /* 距離最近一次合格驗證至少 1 秒(timer_clock_hz() 個計數):用比較,不用除法。
+           g_ok_at 是目前來源的單位(換過來源時是備援驗證的起點),不會和舊來源混用 */
+        uint64_t hz = timer_clock_hz();
+        while (read_count() - g_ok_at < hz)
+            thread_sleep(10);
+        live(1);
+        if (!g_recheck_again || __atomic_load_n(&g_state, __ATOMIC_SEQ_CST) != CLKSYNC_OK)
+            break;
+        kprintf("clksync: counter changed during the recheck: rechecking %s in 1 s\n", timer_clock_name());
+    }
 }
 
 int clksync_state(void)
@@ -463,6 +603,16 @@ void clksync_force(int mode)
     g_force = mode;
 }
 
+int clksync_force_mode(void)
+{
+    return g_force;
+}
+
+const struct clksync_result *clksync_drift_first(void)
+{
+    return g_drift_injected ? &g_drift_res : NULL;
+}
+
 int clksync_run_dry(struct clksync_result *out)
 {
     return run(out);
@@ -473,6 +623,6 @@ void clksync_test_inject(int cpu, uint64_t offset, uint64_t delay)
     __atomic_store_n(&sx_inj_cpu, -1, __ATOMIC_SEQ_CST);    /* 先關掉,再改數值,最後才指定對象 */
     sx_inj_off = offset;
     sx_inj_delay = delay;
-    if (cpu >= 0)
+    if (cpu >= 0 || cpu == -2)                   /* -2 = 參考以外的每一顆 */
         __atomic_store_n(&sx_inj_cpu, cpu, __ATOMIC_SEQ_CST);
 }

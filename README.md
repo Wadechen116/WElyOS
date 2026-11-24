@@ -27,7 +27,7 @@
 - [x] 優先權排程:8 級固定優先權、搶佔式、同級輪流;mutex 的優先權繼承(防止優先權反轉)
 - [x] 使用者模式與行程:每個行程獨立的位址空間、系統呼叫(i386 `int 0x80`、RISC-V `ecall`、AArch64 `svc`)、行程內多執行緒、`proc_spawn` / `proc_wait` / `proc_kill`;使用者程式以 C 撰寫、獨立連結後嵌入 kernel;出錯只終止該行程
 - [x] 排程補強:防飢餓(老化)、完整的優先權繼承(多把鎖、連鎖等待)
-- [x] CPU 親和性(affinity):`thread_set_affinity` 把執行緒固定在指定的 CPU 集合;固定佇列不經過工作竊取,即時工作可綁定 CPU;防飢餓掃描用持續前進的掃描位置,固定佇列再長也有提升時間上界(I-347)
+- [x] CPU 親和性(affinity):`thread_set_affinity` 把執行緒固定在指定的 CPU 集合;固定佇列不經過工作竊取,即時工作可綁定 CPU;防飢餓掃描用持續前進的掃描位置,固定佇列再長也有提升時間上界(I-347);使用者程式可用 `SYS_setaffinity` / `SYS_getaffinity` 設定(同一個行程或 CAP_ADMIN);即時工作的接受檢查分全系統(70% × CPU 數)與每顆 CPU(70%)
 - [x] 記憶體保護補強:i386 改用 PAE(Physical Address Extension) 分頁取得 NX(No-eXecute);SMEP(Supervisor Mode Execution Prevention) / SMAP(Supervisor Mode Access Prevention,i386)與 PAN(Privileged Access Never,AArch64)禁止 kernel 存取或執行使用者的頁;ASID(Address Space Identifier) 與全域頁避免切換行程時清空 TLB(Translation Lookaside Buffer)
 - [x] futex 與使用者模式的 mutex
 - [x] 以 `-O2` 編譯(`-DWELYOS_OPT=-O0` 可改回,方便 GDB 逐行追蹤)
@@ -55,7 +55,7 @@
 - [x] 記憶體配額:承諾記帳(超過行程配額或系統上限的要求當場回報 `E_NOMEM`,不再事後終止行程)、保留給 kernel 的記憶體、`memlimit` 與 shell 的 `limit`;匿名對映 `mmap` / `munmap`
 - [x] 網路(到 UDP):網路卡驅動(RISC-V / AArch64 的 virtio-net、i386 的 NE2000)、協定堆疊(乙太網路、ARP、IPv4、ICMP、UDP;純 C、不配置記憶體、主機端以 sanitizer 測試,由 Codex 實作)、整合層與以檔案描述符表示的 UDP socket;新增 `ping`、`net`、`tftp`(可從主機下載檔案)
 - [x] DNS 查詢:`host`(訊息的組合與解析 `user/dns.h` 由 Codex 實作並以 sanitizer 測試)
-- [x] 可靠性之一:看門狗(CPU 互相監看心跳,卡死時 panic)、黑盒子(磁碟最後 8KB 的事件紀錄,每筆有 CRC-32,panic 時以不上鎖的緊急路徑寫入,重新開機後可讀)、`supervise`(程式當掉時重新啟動,退避、有上限)、`faultlog`
+- [x] 可靠性之一:看門狗(CPU 互相監看心跳,卡死時 panic;自我測試另有階段看門狗,一段工作逾時就印出所有執行緒的狀態再 panic)、黑盒子(磁碟最後 8KB 的事件紀錄,每筆有 CRC-32,panic 時以不上鎖的緊急路徑寫入,重新開機後可讀)、`supervise`(程式當掉時重新啟動,退避、有上限)、`faultlog`
 - [x] 可靠性之二:磁碟每個區塊的 CRC-32(讀取時核對,損壞的資料不會交給程式)、superblock 兩份(主要的壞了用備份並修復,而不是誤判成新磁碟而格式化)、背景巡檢與 `scrub` 命令、位元翻轉的錯誤注入;磁碟格式 WFS2(舊格式仍可掛載)
 - [x] 靜態檢查(由 Codex 實作):`scripts/static-check.sh` — 快速的規則掃描(遞迴、未檢查的錯誤回傳、禁用函式等)與按需的 GCC `-fanalyzer`;已據此修正 `printf` 寬度的溢位等缺陷
 - [x] 可靠性之三:開機失敗計數(黑盒子記錄每次開機是否順利完成)與安全模式(連續 3 次失敗後只啟動最少的功能:不掛載磁碟、不啟動網路、單一 CPU,但仍可用 `faultlog` 診斷)
@@ -94,7 +94,7 @@
 - [x] 修正訊號遺失喚醒:訊號若剛好在返回使用者模式的空檔送達,之後的睡眠也一定會被叫醒(以延遲注入穩定重現並驗證)
 - [x] 磁碟檔案系統的掛載與格式化在任何配置失敗時都不寫磁碟、不洩漏;寫入失敗造成的唯讀狀態不會延續到下一次掛載
 - [x] 記憶體壓力測試涵蓋執行緒、stack、mmap、exec:記憶體不足一律由系統呼叫回報,沒有程式在觸碰已承諾的記憶體時被終止;配額調到已用量以下時,已承諾的記憶體照樣可用
-- [x] 系統時間不再依賴 CPU0:任何一顆 CPU 都能依共用硬體計數器推進時間、叫醒睡眠者(CPU0 關中斷 300 毫秒時照常運作);開機時驗證各 CPU 的計數器同步,不合格就明確降級並記錄
+- [x] 系統時間不再依賴 CPU0:任何一顆 CPU 都能依共用硬體計數器推進時間、叫醒睡眠者(CPU0 關中斷 300 毫秒時照常運作);開機時驗證各 CPU 的計數器同步,約 1 秒後再驗證並比較兩輪的偏移變化(抓小幅漂移),不合格就換備援或明確降級並記錄
 - [x] 時間來源的備援與降級:i386 依序 TSC → HPET → ACPI PM timer 兩層共用備援計數器(支援 32 / 24 位元計數器延伸);都不可用時只由 CPU0 推進,並保證睡眠只會變長、不會提早醒(落後量有統計);每 tick 計數一律無條件進位,系統時間只會比真實時間慢;測試用開機參數 `clock=fallback` / `clock=hpet32` / `clock=cpu0only` / `clock=pmtimer` / `clock=nopm`
 - [x] VM 層只兌現已承諾的記憶體(每個位址空間一張承諾位元圖):保護頁、空洞、已歸還的部分即使有票也不會被兌現
 - [x] kernel stack 改用按需要增加的 2MB 區塊:建立、結束執行緒不再拆開大分頁或累積頁表,也沒有固定的執行緒上限

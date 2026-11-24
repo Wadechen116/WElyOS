@@ -46,6 +46,15 @@ struct timer_stats {
 };
 void timer_note_catchup(int n, int resynced);   /* 架構層:這次中斷補記了 n 個 tick */
 void timer_get_stats(struct timer_stats *st);
+/* 診斷用(panic 之前的狀態傾印):不會無限等待、不會卡在鎖上。bit 0 = *t 讀到一致的系統時間,
+   bit 1 = *st 讀到統計(統計的鎖只試一次)。讀不到的就不要印 */
+int timer_diag_peek(uint64_t *t, struct timer_stats *st);
+/* I-349 校準(只給自我測試):stallinj=steady 時,推進時間的 CPU 在持有時間鎖時每 10 tick 忙等 3 tick。
+   enable 在開機時設;window 由測試在 CPU0 卡住期間開關(打開時清統計);stats 讀注入次數、
+   執行過的 CPU 遮罩、實際延遲的合計與最大值(計數) */
+void timer_test_steady(int enable);
+void timer_test_steady_window(int active);
+void timer_test_steady_stats(uint32_t *count, uint32_t *cpus, uint64_t *total, uint64_t *max);
 /* 累計有幾次「一次補記 >= k 個 tick」。k 會往上取到分組的邊界(2、3、4、6、7、10),
    所以算出來只會少不會多 — 測試用它放寬條件時,只會更嚴格,不會更寬鬆 */
 uint32_t timer_bursts_at_least(const struct timer_stats *st, unsigned k);

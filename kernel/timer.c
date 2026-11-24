@@ -124,6 +124,59 @@ static uint64_t live_iv(void)
  */
 static uint32_t deg_dropped, deg_run, deg_max_run;   /* 只有第 0 顆在中斷中寫;讀取用 atomic */
 
+/*
+ * I-349 校準(只給自我測試,開機參數 stallinj=steady;Codex 020 / 021 同意的延遲點):推進時間的 CPU
+ * 在拿到 time_lk 之後、提交 tick 之前,每 10 個 tick 忙等 3 個 tick 的計數。拿著鎖延遲,別顆的 trylock
+ * 會失敗、交給它,所以這確實拖住時間的推進,不會被別顆繞過。量時間只讀硬體計數器(arch_clock_count),
+ * 不碰 time_lk。這模擬的是「kernel 內部的推進延遲」,不是主機不給虛擬 CPU 時間。
+ * 只有 inj_active(由測試在 CPU0 卡住期間打開)時才作用;正式路徑的成本是一次讀取。
+ */
+static volatile int inj_steady, inj_active;
+static uint64_t inj_last;                    /* 上次注入的計數值;time_lk 之內讀寫 */
+static volatile uint32_t inj_count, inj_cpus;
+static volatile uint64_t inj_total, inj_max;
+
+void timer_test_steady(int enable)
+{
+    inj_steady = enable;
+}
+
+void timer_test_steady_window(int active)
+{
+    if (active) {
+        inj_count = inj_cpus = 0;
+        inj_total = inj_max = 0;
+        inj_last = 0;
+    }
+    __atomic_store_n(&inj_active, active, __ATOMIC_SEQ_CST);
+}
+
+void timer_test_steady_stats(uint32_t *count, uint32_t *cpus, uint64_t *total, uint64_t *max)
+{
+    *count = inj_count;
+    *cpus = inj_cpus;
+    *total = inj_total;
+    *max = inj_max;
+}
+
+/* 呼叫時持有 time_lk;iv = 每 tick 計數 */
+static void inject_steady_delay(uint64_t iv)
+{
+    uint64_t now = arch_clock_count();
+    if (inj_last && now - inj_last < 10 * iv)
+        return;
+    uint64_t t0 = now;
+    while (arch_clock_count() - t0 < 3 * iv)
+        arch_cpu_relax();
+    uint64_t d = arch_clock_count() - t0;
+    inj_last = arch_clock_count();
+    inj_count++;
+    inj_cpus |= 1u << this_cpu()->id;
+    inj_total += d;
+    if (d > inj_max)
+        inj_max = d;
+}
+
 static int timer_advance(uint64_t *from, uint64_t *to, int charge)
 {
     uint64_t t, d, iv, now;
@@ -160,6 +213,8 @@ static int timer_advance(uint64_t *from, uint64_t *to, int charge)
     }
     time_read(&t, &d);
     iv = g_iv;
+    if (inj_steady && __atomic_load_n(&inj_active, __ATOMIC_ACQUIRE))
+        inject_steady_delay(iv);             /* I-349 校準(只在自我測試、參數 stallinj=steady 時) */
     now = arch_clock_count();
     unsigned n = 0;
     while (d <= now && n < REAL_CATCHUP_MAX) {
@@ -261,6 +316,29 @@ void timer_get_stats(struct timer_stats *st)
     spin_unlock_irqrestore(&tstat_lk, fl);
     st->degraded_dropped = __atomic_load_n(&deg_dropped, __ATOMIC_RELAXED);
     st->degraded_max_run = __atomic_load_n(&deg_max_run, __ATOMIC_RELAXED);
+}
+
+int timer_diag_peek(uint64_t *t, struct timer_stats *st)
+{
+    int ok = 0;
+    for (int i = 0; i < 1000; i++) {         /* 有限次:寫入端可能正停在序號為奇數的區間裡(就是卡住的那一顆) */
+        uint32_t s = __atomic_load_n(&time_seq, __ATOMIC_ACQUIRE);
+        uint64_t v = ticks;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (!(s & 1) && s == __atomic_load_n(&time_seq, __ATOMIC_RELAXED)) {
+            *t = v;
+            ok |= 1;
+            break;
+        }
+    }
+    if (spin_trylock(&tstat_lk)) {           /* 只試一次:鎖可能正被卡住的 CPU 持有 */
+        *st = tstats;
+        spin_unlock(&tstat_lk);
+        st->degraded_dropped = __atomic_load_n(&deg_dropped, __ATOMIC_RELAXED);
+        st->degraded_max_run = __atomic_load_n(&deg_max_run, __ATOMIC_RELAXED);
+        ok |= 2;
+    }
+    return ok;
 }
 
 uint32_t timer_bursts_at_least(const struct timer_stats *st, unsigned k)

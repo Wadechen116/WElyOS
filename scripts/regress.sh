@@ -118,7 +118,9 @@ for a in $ARCHS; do
     # 「模擬器以結束碼 5 結束」至今只出現在這類情境,而且約七百次才一次,專門去重現(500 次)沒有遇到。
     # 讓它下次出現時自己留下證據(見下方與 docs/ISSUES.md 的 N-002)
     wx=0; case "$c" in crash=*) wx=1 ;; esac
-    QEMU_WINEXIT=$wx timeout -k 10 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" -append "autoexit $c" > "$log" 2>&1 < /dev/null
+    rm -f "$log.winexit"
+    QEMU_WINEXIT=$wx QEMU_WINEXIT_FILE="$log.winexit" timeout -k 10 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
+        -append "autoexit $c" > "$log" 2>&1 < /dev/null
     rc=$?
     t=$(echo "$(date +%s.%N) - $t0" | bc)
     # 結束碼 5(docs/ISSUES.md N-002(a))。第 51 步的追查(1400 次當機情境)抓到兩次,都在 aarch64:
@@ -128,12 +130,15 @@ for a in $ARCHS; do
     # 才認定是模擬器的問題:保留證據、重試一次,重試符合預期就算通過並在最後列出次數。
     # 其他任何結束碼 5(例如 i386 的 kernel 寫了 2,或沒有記到完整結束碼)一律算失敗。
     if [ "$rc" -eq 5 ] && [ "$want" -ne 5 ]; then
-      win=$(grep -ao 'WIN_EXIT=[-0-9]* (0x[0-9A-F]*)' "$log" | tail -1 || true)
+      win=$(winexit_read "$log" "$log.winexit" || true)
       cp "$log" "$log.exit5"
+      [ -f "$log.winexit" ] && cp "$log.winexit" "$log.exit5.winexit"
       mkdir -p build/exit5-hunt && cp "$log" "build/exit5-hunt/regress-$(date +%Y%m%d-%H%M%S)-$a-${c// /+}.txt"
-      if exit5_is_host_crash "$log"; then
+      if exit5_is_host_crash "$log" "$log.winexit"; then
         echo "  注意:$a ${c:-(只開機)}:kernel 給了正確的值,模擬器結束時當掉($win),重試一次(輸出保留在 $log.exit5)"
-        QEMU_WINEXIT=1 timeout -k 10 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" -append "autoexit $c" > "$log" 2>&1 < /dev/null
+        rm -f "$log.winexit"
+        QEMU_WINEXIT=1 QEMU_WINEXIT_FILE="$log.winexit" timeout -k 10 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
+            -append "autoexit $c" > "$log" 2>&1 < /dev/null
         rc=$?
         [ "$rc" -eq "$want" ] && hostcrash=$((hostcrash + 1))
       else
@@ -228,9 +233,11 @@ for a in $ARCHS; do
         "|selftest clock=pmtimer|switched shared counter tsc -> hpet;switched shared counter hpet -> pmtimer24;fallback counter pmtimer24 ok;clock-view: pmtimer extension crossed"
         "-cpu qemu32,-tsc -machine hpet=off|selftest|clock: shared counter pmtimer24;clksync: check #1 (pmtimer24);clock-view: pmtimer extension crossed"
         "-machine hpet=off|selftest clock=fallback clock=nopm|pmtimer: disabled (test);clksync: DEGRADED;cpu0-stall: degraded mode"
+        "|selftest clock=drift|cross-round (tsc): reject;switched shared counter tsc -> hpet;cross-round (hpet): accept;clksync-test: forced drift rejected"
       )
     else
-      clk_cases=("|selftest clock=fallback|clksync: DEGRADED;cpu0-stall: degraded mode;clksync-test: forced degrade")
+      clk_cases=("|selftest clock=fallback|clksync: DEGRADED;cpu0-stall: degraded mode;clksync-test: forced degrade"
+                 "|selftest clock=drift|counter offset changed between checks;clksync-test: forced drift rejected")
     fi
     for cc in "${clk_cases[@]}"; do
       IFS='|' read -r qx cl want_txt <<< "$cc"

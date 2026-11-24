@@ -332,6 +332,13 @@ void kmain(const struct boot_info *bi)
        從開中斷那一刻起,main 也會和其他執行緒一樣被搶佔 */
     /* I-341 測試:clock=hpet32 把 HPET 當 32 位元計數器用(起始值設在繞回前約 2 秒),
        要在 timer_init 探測 HPET 之前設定。只在 selftest 時有效 */
+    /* I-349 校準:stallinj=spike / steady(只在 selftest;只印診斷,不改任何判定) */
+    if (selftest && cmdline_has(bi->cmdline, "stallinj=spike"))
+        cpu0_stall_set_injection(CS_INJ_SPIKE);
+    if (selftest && cmdline_has(bi->cmdline, "stallinj=steady")) {
+        cpu0_stall_set_injection(CS_INJ_STEADY);
+        timer_test_steady(1);
+    }
     /* clock=nopm:不探測 PM timer,重現「沒有任何備援」(I-341 第二層備援的負對照) */
     if (selftest) {
         int m = ARCH_CLOCK_TEST_NONE;
@@ -385,6 +392,8 @@ void kmain(const struct boot_info *bi)
             clksync_force(CLKSYNC_FORCE_CPU0ONLY);
         else if (cmdline_has(bi->cmdline, "clock=pmtimer"))
             clksync_force(CLKSYNC_FORCE_PMTIMER);    /* 完整走 TSC → HPET → PM timer 兩次切換 */
+        else if (cmdline_has(bi->cmdline, "clock=drift"))
+            clksync_force(CLKSYNC_FORCE_DRIFT);      /* I-345:第一次再驗證注入 3/16 tick,只有跨輪比較抓得到 */
     }
     smp_init(bi, cmdline_has(bi->cmdline, "selftest"));
 

@@ -23,6 +23,7 @@
 #include "timer.h"
 #include "proc_calls.h"
 #include "failinj.h"
+#include "affinity_check.h"
 
 /* rename / link:兩個路徑 */
 static long sys_two_paths(struct proc *p, long num, uintptr_t uold, uintptr_t unew)
@@ -384,6 +385,23 @@ long syscall_dispatch(long num, long a0, long a1, long a2, void *tf)
         if (!cred_current() || !(cred_current()->caps & CAP_ADMIN))
             return -E_PERM;
         return failinj_syscall((long)a0, (long)a1, (long)a2);
+    case SYS_setaffinity: {          /* I-344:參數規則在 affinity_check.h(純函式,主機端可測) */
+        unsigned m;
+        if (a0 < 0 || a0 > 0x7fffffffL)
+            return -E_INVAL;
+        int rc = affinity_mask_check((unsigned long)a1, sched_online_mask(), &m);
+        if (rc != 0)
+            return rc;
+        /* 線上遮罩在鎖內會再檢查一次:這裡只是先擋掉明顯不合法的輸入 */
+        return thread_set_affinity_checked((int)a0, m, thread_domain(), proc_has_cap(p, CAP_ADMIN));
+    }
+    case SYS_getaffinity: {
+        unsigned m = 0;
+        if (a0 < 0 || a0 > 0x7fffffffL)
+            return -E_INVAL;
+        int rc = thread_get_affinity_checked((int)a0, thread_domain(), proc_has_cap(p, CAP_ADMIN), &m);
+        return rc != 0 ? rc : (long)m;
+    }
     case SYS_lseek:
         return sys_lseek(p, a0, a1, a2);
     case SYS_sbrk:

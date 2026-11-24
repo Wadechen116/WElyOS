@@ -1621,16 +1621,33 @@ static int mode_rt(void)
         return 1;
     if (sys_rt_set(10, 10) != -E_INVAL || sys_rt_set(0, 5) != -E_INVAL)
         return 2;
-    if (sys_rt_set(10, 8) != -E_BUSY)                    /* 80%:超過系統願意承諾的量 */
+    if (sys_rt_set(10, 8) != -E_BUSY)                    /* 80%:一條執行緒同時只能用一顆 CPU,超過 70% 不承諾 */
         return 3;
+    /* I-344:SYS_setaffinity / SYS_getaffinity 的參數規則,以及固定在同一顆 CPU 時的每顆上限。
+       全系統上限是 70% × CPU 數(多核心的容量);「超過一顆能承諾的量」要固定在同一顆才測得到。
+       只有一顆 CPU 時固定在第 0 顆等於不限制,走全系統 70% 的上限,結果相同 */
+    long me = sys_gettid();
+    if (sys_setaffinity(0, 0) != -E_INVAL || sys_setaffinity(0, 1ul << 20) != -E_INVAL ||
+        sys_getaffinity(0x7fffffff) != -E_SRCH)
+        return 12;
+    if (sys_setaffinity(0, 1) != 0 || sys_getaffinity(0) != 1 || sys_getaffinity(me) != 1)
+        return 13;
     if (sys_rt_set(10, 2) != 0)
         return 4;
-    /* 另一個行程再要 60%:加上我們的 20% 超過上限,被拒絕;沒有特權的行程則根本不能要求 */
+    /* 另一個行程也固定在第 0 顆、再要 60%:加上我們的 20% 超過那一顆的上限,被拒絕;40% 可以。
+       fork 不繼承親和性(子行程要自己設)。沒有特權的行程不能要求即時工作,也不能改別的行程的親和性 */
     pid = sys_fork();
     if (pid == 0) {
+        struct sysinfo si;
+        if (sys_sysinfo(&si) != 0 || (si.ncpu > 1 && sys_getaffinity(0) == 1))
+            sys_exit(3);                                 /* fork 不繼承親和性:多顆 CPU 時不可以只剩第 0 顆 */
+        if (sys_setaffinity(0, 1) != 0)
+            sys_exit(4);
         if (sys_rt_set(10, 6) != -E_BUSY || sys_rt_set(10, 4) != 0)
             sys_exit(1);
         sys_capdrop(CAP_ADMIN);
+        if (sys_setaffinity(me, 1) != -E_PERM || sys_getaffinity(me) != -E_PERM)
+            sys_exit(5);                                 /* 別的行程的執行緒:沒有 CAP_ADMIN 不可以碰 */
         sys_exit(sys_rt_set(20, 1) == -E_PERM ? 0 : 2);
     }
     struct sysinfo t0, t1;

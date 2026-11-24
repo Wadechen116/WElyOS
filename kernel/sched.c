@@ -148,6 +148,19 @@ static unsigned long nstarve_boosts;         /* 累計的防飢餓提升次數 *
 #define RT_UTIL_MAX  700u                    /* 即時工作合計最多佔 CPU 的千分比(見 thread_set_periodic) */
 static struct thread *rt_tasks[RT_MAX];
 static unsigned rt_util_total;
+/*
+ * 每顆 CPU 的即時工作負載(I-344,千分比)。接受一個即時工作的三條規則(使用者決定,
+ * decision:welyos-i344-rt-admission,選 A):
+ *   1. 單一工作 <= RT_UTIL_MAX:一條執行緒同一時間只能在一顆 CPU 上跑
+ *   2. 全系統合計 <= RT_UTIL_MAX × 線上 CPU 數(多核心的容量)。以前是 RT_UTIL_MAX 一個總量,
+ *      那樣任何一顆的負載都不可能超過它,第 3 條永遠不會先觸發(等於沒有作用)
+ *   3. 有限制 CPU 的(單一或多顆)把同一份使用率記在遮罩內的每一顆(保守),每顆 <= RT_UTIL_MAX;
+ *      不限制的(allow == 0)只計入全系統
+ * 保證範圍(明訂):第 2 條保證總量;第 3 條保證「固定在某一顆的」即時工作合計不超過。不固定的即時工作
+ * 可以被排到某一顆而和那顆的固定工作合計超過 RT_UTIL_MAX — 這不是逐顆的完整可排程性證明(Codex 018)。
+ * 前提:沒有 CPU 熱插拔(online 遮罩開機後不變),記帳不需要隨 CPU 上下線重算。
+ */
+static unsigned rt_util_cpu[MAX_CPUS];
 
 /*
  * ---- CPU 親和性(affinity,I-343)----
@@ -201,6 +214,9 @@ static void rt_begin_period(struct thread *t);
 static void rt_check_deadlines(uint64_t now);
 static void rt_remove(struct thread *t);
 static void rt_assign_levels(void);
+static void rt_charge_cpus(unsigned allow, unsigned util, int add);
+static int rt_cpus_fit(unsigned allow, unsigned util);
+static void rt_check_accounting(void);
 
 /* ---- 排程器的鎖 ---- */
 
@@ -903,19 +919,28 @@ static const char *const state_name[] = { "ready", "run", "sleep", "block", "zom
 static void dump_thread(const char *tag, const struct thread *t)
 {
     unsigned st = (unsigned)t->state;
+    int pinned = t->pin_cpu ? (int)t->pin_cpu - 1 : -1;   /* 不在固定佇列上 = -1(Codex 015) */
     kprintf("  %s id %d %s: %s prio %d (base %d, boost %d) allow %x pinq %d slice %u ready_since %llu wake %llu\n",
             tag, t->id, t->name ? t->name : "?", st < 5 ? state_name[st] : "?", t->prio, t->base_prio,
-            t->starve_boost, t->allow, t->pin_cpu - 1, t->slice, (unsigned long long)t->ready_since,
+            t->starve_boost, t->allow, pinned, t->slice, (unsigned long long)t->ready_since,
             (unsigned long long)t->wake_tick);
 }
 
 void sched_dump_state(void)
 {
+    /* 不可以呼叫 timer_ticks / timer_get_stats:前者在序號為奇數時無限重試、後者要取鎖 — 卡住的
+       正可能是時間的寫入端,傾印就會跟著卡住、永遠 panic 不了(Codex 015)。用有限次的讀取 */
     struct timer_stats ts;
-    timer_get_stats(&ts);
-    kprintf("sched state: ticks %llu, shared clock %d; timer catch-ups 2:%u 3:%u 4-5:%u 6:%u 7-9:%u 10+:%u, "
-            "degraded dropped %u\n", (unsigned long long)timer_ticks(), timer_shared_enabled(), ts.burst[0], ts.burst[1],
-            ts.burst[2], ts.burst[3], ts.burst[4], ts.burst[5], ts.degraded_dropped);
+    uint64_t now = 0;
+    int ok = timer_diag_peek(&now, &ts);
+    kprintf("sched state: ticks %s%llu, shared clock %d", (ok & 1) ? "" : "(unreadable) ",
+            (unsigned long long)now, timer_shared_enabled());
+    if (ok & 2)
+        kprintf("; timer catch-ups 2:%u 3:%u 4-5:%u 6:%u 7-9:%u 10+:%u, degraded dropped %u", ts.burst[0],
+                ts.burst[1], ts.burst[2], ts.burst[3], ts.burst[4], ts.burst[5], ts.degraded_dropped);
+    else
+        kprintf("; timer stats lock busy");
+    kprintf("\n");
     for (int i = 0; i < cpu_count && i < MAX_CPUS; i++) {
         struct cpu *c = &cpus[i];
         kprintf(" cpu %d: online %d need_resched %d heartbeat %lu pinq mask %x\n", i, c->online,
@@ -1511,28 +1536,35 @@ static void starve_scan(uint64_t now)
  * 目前所在的 CPU 不在新的 mask 裡:要求那顆 CPU 重新排程;它在 schedule() 裡被排到允許的 CPU。
  * 設定自己時,返回前就已經在允許的 CPU 上(搶佔點在這裡;在中斷處理中呼叫則延到中斷返回)。
  */
-int thread_set_affinity(int tid, unsigned mask)
+/* tid 0 = 自己;找不到(或已結束)回傳 NULL。呼叫時持有 sched_lk */
+static struct thread *find_thread_locked(int tid)
 {
-    unsigned long flags = sched_lock();
-    unsigned online = online_mask_locked();
-    struct thread *t = NULL;
-    int rc = 0;
+    if (tid == 0)
+        return cur();
+    for (struct thread *x = all_threads; x; x = x->all_next)
+        if (x->id == tid)
+            return x;                        /* all_threads 只含存活的:結束的(zombie)找不到 */
+    return NULL;
+}
 
-    if (mask == 0 || (mask & ~online))
-        rc = -E_INVAL;
-    else if (tid == 0)
-        t = cur();
-    else {
-        for (struct thread *x = all_threads; x; x = x->all_next)
-            if (x->id == tid) {
-                t = x;
-                break;
-            }
-        if (!t)
-            rc = -E_SRCH;                    /* all_threads 只含存活的:結束的(zombie)找不到 */
+/*
+ * 設定 t 的親和性。呼叫時持有 sched_lk,mask 已確認非 0、只含線上的 CPU。
+ * t 是即時工作時(I-344):先扣掉舊遮罩上的記帳,新遮罩放不下就還原、回 -E_BUSY,
+ * 遮罩、佇列、記帳都不變;放得下才提交。
+ */
+static int affinity_set_locked(struct thread *t, unsigned mask, unsigned online)
+{
+    unsigned allow = mask == online ? 0 : mask;
+    if (t->rt_period) {
+        rt_charge_cpus(t->allow, t->rt_util, 0);
+        if (!rt_cpus_fit(allow, t->rt_util)) {
+            rt_charge_cpus(t->allow, t->rt_util, 1);
+            return -E_BUSY;
+        }
+        rt_charge_cpus(allow, t->rt_util, 1);
     }
-    if (rc == 0) {
-        t->allow = mask == online ? 0 : mask;
+    {
+        t->allow = allow;
         if (t->state == T_READY && t->pin_cpu) {
             if (!t->allow || !allowed_on(t, t->pin_cpu - 1)) {
                 pin_unlink(t);
@@ -1544,10 +1576,92 @@ int thread_set_affinity(int tid, unsigned mask)
         /* T_READY 且在 runq 中:無法從無鎖的環中間移除,由 pick_next 取到時改排(P3)。
            T_SLEEPING / T_BLOCKED:醒來時 make_ready 依新的 mask 排 */
     }
-    if (t == cur())
+    rt_check_accounting();
+    return 0;
+}
+
+int thread_set_affinity(int tid, unsigned mask)
+{
+    unsigned long flags = sched_lock();
+    unsigned online = online_mask_locked();
+    struct thread *t = NULL;
+    int rc = 0;
+
+    if (mask == 0 || (mask & ~online))
+        rc = -E_INVAL;
+    else if (!(t = find_thread_locked(tid)))
+        rc = -E_SRCH;
+    if (rc == 0)
+        rc = affinity_set_locked(t, mask, online);
+    if (rc == 0 && t == cur())
         sched_preempt_point();
     sched_unlock(flags);
     return rc;
+}
+
+/*
+ * 使用者層(SYS_setaffinity / SYS_getaffinity,I-344):查 tid、檢查權限、檢查遮罩、檢查即時工作記帳、
+ * 提交,全部在同一段 sched_lk 裡 — 不會「先對一條執行緒查權限,實際改到的卻是另一條」(Codex 013)。
+ * 權限:同一個行程的執行緒(記帳 domain 相同;fork 會建新的 domain,exec 沿用,所以 domain 對應行程),
+ * 或 admin(CAP_ADMIN)。kernel 執行緒(domain 為 NULL)只有 admin 可以設。
+ */
+static int may_touch(const struct thread *t, const struct mb_domain *dom, int admin)
+{
+    return admin || (t->dom && t->dom == dom);
+}
+
+int thread_set_affinity_checked(int tid, unsigned mask, const struct mb_domain *dom, int admin)
+{
+    unsigned long flags = sched_lock();
+    unsigned online = online_mask_locked();
+    struct thread *t = NULL;
+    int rc = 0;
+
+    if (mask == 0 || (mask & ~online))
+        rc = -E_INVAL;
+    else if (!(t = find_thread_locked(tid)))
+        rc = -E_SRCH;
+    else if (t != cur() && !may_touch(t, dom, admin))
+        rc = -E_PERM;
+    if (rc == 0)
+        rc = affinity_set_locked(t, mask, online);
+    if (rc == 0 && t == cur())
+        sched_preempt_point();
+    sched_unlock(flags);
+    return rc;
+}
+
+int thread_get_affinity_checked(int tid, const struct mb_domain *dom, int admin, unsigned *out)
+{
+    unsigned long flags = sched_lock();
+    struct thread *t = find_thread_locked(tid);
+    int rc = 0;
+    if (!t)
+        rc = -E_SRCH;
+    else if (t != cur() && !may_touch(t, dom, admin))
+        rc = -E_PERM;
+    else
+        *out = t->allow ? t->allow : online_mask_locked();   /* 不限制 = 所有線上的 CPU */
+    sched_unlock(flags);
+    return rc;
+}
+
+/* 自我測試(I-344):全系統目前的即時工作負載(千分比) */
+unsigned sched_rt_util_total(void)
+{
+    unsigned long flags = sched_lock();
+    unsigned u = rt_util_total;
+    sched_unlock(flags);
+    return u;
+}
+
+/* 自我測試(I-344):某一顆 CPU 目前的即時工作負載(千分比) */
+unsigned sched_rt_util_cpu(int cpu)
+{
+    unsigned long flags = sched_lock();
+    unsigned u = (cpu >= 0 && cpu < MAX_CPUS) ? rt_util_cpu[cpu] : 0;
+    sched_unlock(flags);
+    return u;
 }
 
 unsigned sched_online_mask(void)
@@ -1694,6 +1808,51 @@ static void rt_assign_levels(void)
     }
 }
 
+/* 線上的 CPU 數。不用 __builtin_popcount:它會呼叫 libgcc 的 __popcountsi2,這裡沒有連結 libgcc */
+static unsigned online_count_locked(void)
+{
+    unsigned n = 0;
+    for (unsigned m = online_mask_locked(); m; m &= m - 1)
+        n++;
+    return n;
+}
+
+/* 每顆 CPU 的記帳加減(只有有限制的才記;見 rt_util_cpu)。呼叫時持有 sched_lk */
+static void rt_charge_cpus(unsigned allow, unsigned util, int add)
+{
+    for (int c = 0; allow && c < MAX_CPUS; c++)
+        if (allow & (1u << c))
+            rt_util_cpu[c] = add ? rt_util_cpu[c] + util : rt_util_cpu[c] - util;
+}
+
+/* 遮罩內每一顆再加 util 都不超過上限?(呼叫端先扣掉自己舊的那一份) */
+static int rt_cpus_fit(unsigned allow, unsigned util)
+{
+    for (int c = 0; allow && c < MAX_CPUS; c++)
+        if ((allow & (1u << c)) && rt_util_cpu[c] + util > RT_UTIL_MAX)
+            return 0;
+    return 1;
+}
+
+/* 不變式:記帳等於從 rt_tasks 重算的值。三個改動點(設定、取消、改親和性)之後都檢查:加減不一致
+   (例如某條路徑忘了扣)會在發生的當下 panic,而不是很久以後「莫名其妙被拒絕」 */
+static void rt_check_accounting(void)
+{
+    unsigned total = 0, cpu[MAX_CPUS] = { 0 };
+    for (unsigned i = 0; i < RT_MAX; i++) {
+        struct thread *t = rt_tasks[i];
+        if (!t)
+            continue;
+        total += t->rt_util;
+        for (int c = 0; t->allow && c < MAX_CPUS; c++)
+            if (t->allow & (1u << c))
+                cpu[c] += t->rt_util;
+    }
+    KASSERT(total == rt_util_total);
+    for (int c = 0; c < MAX_CPUS; c++)
+        KASSERT(cpu[c] == rt_util_cpu[c]);
+}
+
 /* 取消 t 的即時工作身分(本來就不是的話不做任何事)。呼叫時持有 sched_lk */
 static void rt_remove(struct thread *t)
 {
@@ -1703,10 +1862,12 @@ static void rt_remove(struct thread *t)
         if (rt_tasks[i] == t)
             rt_tasks[i] = NULL;
     rt_util_total -= t->rt_util;
+    rt_charge_cpus(t->allow, t->rt_util, 0);
     t->rt_period = 0;
     t->rt_level = 0;
     t->rt_throttled = t->rt_waiting = 0;
     rt_assign_levels();                      /* 其他工作的相對順序可能因此改變 */
+    rt_check_accounting();
 }
 
 int thread_set_periodic(unsigned period_ms, unsigned budget_ms)
@@ -1739,15 +1900,22 @@ int thread_set_periodic(unsigned period_ms, unsigned budget_ms)
         if (!rt_tasks[i] && slot < 0)
             slot = (int)i;
     }
+    /* 每顆 CPU(I-344):先扣掉自己舊的那一份(重新宣告時),檢查新的放不放得下;放不下就還原 */
+    if (self->rt_period)
+        rt_charge_cpus(self->allow, self->rt_util, 0);
     if (period < 2 || budget >= period)
         rc = -E_INVAL;                       /* 至少要留一個 tick 給別人,也給「睡到下個週期」 */
     else if (slot < 0)
         rc = -E_NOSPC;
-    else if (others + util > RT_UTIL_MAX)
-        rc = -E_BUSY;
+    else if (util > RT_UTIL_MAX || others + util > RT_UTIL_MAX * online_count_locked() ||
+             !rt_cpus_fit(self->allow, util))
+        rc = -E_BUSY;                        /* 見 rt_util_cpu 上方的三條規則(I-344) */
+    if (rc != 0 && self->rt_period)
+        rt_charge_cpus(self->allow, self->rt_util, 1);   /* 拒絕:舊的設定完整保留 */
     if (rc == 0) {
         rt_tasks[slot] = self;
         rt_util_total = others + util;
+        rt_charge_cpus(self->allow, util, 1);
         self->rt_util = util;
         self->rt_period = period;
         self->rt_budget = budget;
@@ -1760,6 +1928,7 @@ int thread_set_periodic(unsigned period_ms, unsigned budget_ms)
         rt_assign_levels();
         update_prio(self);
     }
+    rt_check_accounting();
     sched_unlock(flags);
     return rc;
 }

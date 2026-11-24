@@ -211,6 +211,18 @@ int  sched_cpu_id(void);                 /* 目前執行在哪一顆 CPU 上(只
    mask 等於全部在線上的 CPU = 不限制 */
 int  thread_set_affinity(int tid, unsigned mask);
 unsigned sched_online_mask(void);        /* 目前在線上的 CPU 遮罩 */
+/* 使用者層的親和性(I-344,SYS_setaffinity / SYS_getaffinity):查 tid、權限(同一個行程 = 記帳 domain
+   相同,或 admin)、遮罩、即時工作的每顆 CPU 記帳都在同一段鎖裡。tid 0 = 自己。
+   回傳 0、-E_INVAL、-E_SRCH、-E_PERM 或 -E_BUSY(即時工作放不進新遮罩的某一顆;什麼都不變)。
+   get:不限制時回報所有線上的 CPU。
+   即時工作的接受(thread_set_periodic 與這裡的 -E_BUSY)是「接受政策」:單一工作 <= 70%、全系統 <= 70% ×
+   線上 CPU 數、有限制 CPU 的工作在遮罩內每一顆 <= 70%。它不是多個不固定工作在每顆 CPU 上的完整可排程性
+   證明 — 不固定的工作被排到某一顆時,那一顆仍可能超過 70%(見 sched.c 的 rt_util_cpu) */
+struct mb_domain;
+int  thread_set_affinity_checked(int tid, unsigned mask, const struct mb_domain *dom, int admin);
+int  thread_get_affinity_checked(int tid, const struct mb_domain *dom, int admin, unsigned *out);
+unsigned sched_rt_util_cpu(int cpu);       /* 自我測試:第 cpu 顆目前的即時工作負載(千分比) */
+unsigned sched_rt_util_total(void);        /* 自我測試:全系統目前的即時工作負載(千分比) */
 void sched_space_dropped(struct vm_space *vs);   /* 位址空間即將釋放:這顆 CPU 若還載入著就換掉 */
 void sched_space_flush(struct vm_space *vs);     /* 位址空間的對映大量更改:這顆 CPU 若載入著就清空 TLB */
 

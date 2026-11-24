@@ -111,8 +111,15 @@ fi
 LAUNCH=("$QEMU")
 case "$QEMU" in *.exe)
   if [ "${QEMU_WINEXIT:-0}" = 1 ]; then
+    # QEMU_WINEXIT_FILE:結束碼寫到這個獨立檔,不寫 stderr(第 73 步:和序列埠輸出寫同一個檔會交錯)。
+    # 先建立空檔:wslpath 需要檔案所在的目錄存在;讀取端把空檔當成「沒有記到」,不會誤判成功
+    WX=()
+    if [ -n "${QEMU_WINEXIT_FILE:-}" ]; then
+      : > "$QEMU_WINEXIT_FILE"
+      WX=(-WinExitFile "$(wslpath -w "$QEMU_WINEXIT_FILE")")
+    fi
     LAUNCH=(powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w "$(dirname "$0")/win-exit.ps1")"
-            "$(wslpath -w "$QEMU")")
+            "${WX[@]}" "$(wslpath -w "$QEMU")")
   fi ;;
 esac
 

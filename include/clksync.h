@@ -39,6 +39,7 @@ enum clksync_reason {
     CLKSYNC_R_OFFSET,        /* 偏移區間超出 ±tol(固定偏移或漂移) */
     CLKSYNC_R_BUSY,          /* 另一次驗證正在進行(只會出現在測試的乾跑) */
     CLKSYNC_R_FORCED,        /* 測試:開機參數 clock=fallback / cpu0only / pmtimer 強制判定不合格 */
+    CLKSYNC_R_DRIFT,         /* 兩輪之間偏移變化超過 dmax,或重試後仍無法判斷(I-345) */
 };
 
 /* 測試用的強制降級(只在 selftest 時由 kmain 設定,見 clksync_force) */
@@ -47,6 +48,7 @@ enum clksync_force_mode {
     CLKSYNC_FORCE_FALLBACK,  /* 開機驗證強制不合格 → 走「換到備援計數器並驗證」 */
     CLKSYNC_FORCE_CPU0ONLY,  /* 開機驗證強制不合格,而且不用備援 → 走「只由第 0 顆推進」的降級 */
     CLKSYNC_FORCE_PMTIMER,   /* 名稱不是 pmtimer 的來源一律強制不合格(含備援的驗證)→ 走完整條備援鏈 */
+    CLKSYNC_FORCE_DRIFT,     /* 第一次再驗證時,讓參考以外的每顆 CPU 回報的計數加 3/16 tick(單輪仍合格) */
 };
 
 #define CLKSYNC_SAMPLES  16      /* 每顆 AP 每輪的取樣數 */
@@ -58,6 +60,17 @@ struct clksync_cpu {
     uint64_t max_abs;            /* max(-min_low, max_high, 0):最大可能偏移(計數) */
     uint64_t tightest;           /* 最窄的一次括號寬度 ref_after - ref_before(計數) */
     unsigned used, wide, attempts;
+    /* 跨輪比較(I-345;只有再驗證的結果有):相對第 0 顆的偏移,本輪減基準輪的變化區間與分類 */
+    int64_t  d_lo, d_hi;
+    int      dclass;             /* enum clksync_cross */
+};
+
+/* 跨輪比較的分類(I-345,Codex 006 的三態模型) */
+enum clksync_cross {
+    CLKSYNC_X_NONE = 0,      /* 沒有比較(不是再驗證、或基準輪來源不同) */
+    CLKSYNC_X_ACCEPT,        /* 變化區間整個落在 [−dmax, dmax] */
+    CLKSYNC_X_UNCERTAIN,     /* 橫跨邊界:無法證明(只有這種會重跑第二輪) */
+    CLKSYNC_X_REJECT,        /* 整個落在外面:確定漂移 */
 };
 
 struct clksync_result {
@@ -70,12 +83,17 @@ struct clksync_result {
     uint64_t at;                 /* 驗證開始時的計數值 */
     int      ref;                /* 參考 CPU(執行驗證的那一顆;開機驗證時是第 0 顆) */
     const char *src;             /* 驗證的是哪一個計數器(timer_clock_name) */
+    int      cross;              /* 跨輪比較的整體分類(enum clksync_cross) */
+    unsigned cross_tries;        /* 第二輪跑了幾次(無法判斷才重跑) */
+    uint64_t dmax;               /* 允許的偏移變化(計數)= 每 tick 計數 >> 3 */
     struct clksync_cpu cpu[MAX_CPUS];   /* 以 CPU 編號索引;參考 CPU 那一格不填 */
 };
 
 /* smp_init 在所有 AP 回報後、smp_sched_start 之前呼叫(第 0 顆、開著中斷)。失敗時降級 */
 void clksync_boot_check(int ncpu);
-/* 第一次驗證之後至少 1 秒再驗證一次,抓漂移。只做一次;之後呼叫不做事。可能睡到滿 1 秒 */
+/* 第一次驗證之後至少 1 秒再驗證一次,抓漂移:本輪必須合格,而且和基準輪(同一個來源)比較,每顆 CPU
+   相對第 0 顆的偏移變化不超過 dmax(I-345)。再驗證時換了來源的話,新來源 1 秒後再做一輪(每個來源
+   最多一次,整條備援鏈有上限)。之後呼叫不做事。可能睡到滿 1 秒 */
 void clksync_recheck(void);
 /* 由 smp_poll 在收到 IPI_CLKSYNC 時呼叫(中斷關閉中) */
 void clksync_remote(void);
@@ -88,6 +106,9 @@ const struct clksync_result *clksync_last(int which);
 int         clksync_fallback_used(void);          /* 1 = 已換到備援計數器(而且驗證合格) */
 /* 測試:kmain 在 smp_init 之前呼叫(只在 selftest 時),影響開機驗證;enum clksync_force_mode */
 void        clksync_force(int mode);
+int         clksync_force_mode(void);
+/* 測試(clock=drift):被注入的那一次再驗證的結果(之後的再驗證會覆蓋 clksync_last(1));沒有為 NULL */
+const struct clksync_result *clksync_drift_first(void);
 uint32_t    clksync_milli_ticks(uint64_t counts, uint64_t iv);  /* 計數換成千分之一 tick(上限 4000) */
 
 /*

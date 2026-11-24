@@ -284,6 +284,9 @@ static inline long sys_setpgid(long pid, long pgid) { return syscall3(SYS_setpgi
 static inline long sys_tcsetfg(long pgid)         { return syscall3(SYS_tcsetfg, pgid, 0, 0); }
 /* 建立管線:fds[0] 是讀端,fds[1] 是寫端 */
 static inline long sys_failinj(long op, long site, long n) { return syscall3(SYS_failinj, op, site, n); }
+/* CPU 親和性(I-344):tid 0 = 自己 */
+static inline long sys_setaffinity(long tid, unsigned long mask) { return syscall3(SYS_setaffinity, tid, (long)mask, 0); }
+static inline long sys_getaffinity(long tid)                     { return syscall3(SYS_getaffinity, tid, 0, 0); }
 static inline long sys_pipe(int fds[2])           { return syscall3(SYS_pipe, (long)fds, 0, 0); }
 /* 複製目前的行程。回傳值:在原本的行程裡是新行程的 pid,在新行程裡是 0 */
 static inline long sys_fork(void)                 { return syscall3(SYS_fork, 0, 0, 0); }
