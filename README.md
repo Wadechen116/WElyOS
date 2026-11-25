@@ -127,6 +127,7 @@ cmake --build build/riscv64 --target debug     # 啟動 QEMU 並暫停,等待 GD
 cmake --build build/riscv64 --target gdb       # (另一個終端機)連上 gdb,輸入 welyos-start 開始
 bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit"              # 只開機,不跑測試(最快)
 bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit selftest"     # 開機並執行各子系統的自我測試與示範
+bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit selftest nosafe stallinj=spike"   # 測試用的停頓注入(steady / spike);nosafe 停用「連續 3 次開機失敗就進安全模式」,否則依約定 panic 的情境會被跳過
 bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit crash=fault"  # 故意觸發錯誤(crash=panic|fault|illegal|break|dfree|stack|mainstack|thread|relock|null|wtext|exec|uaccess|uexec|spin|spinsleep|smp|wdog)
 bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit memtest"      # 完整記憶體測試:寫入並驗證每一個空閒頁
 bash scripts/qemu.sh riscv64 build/riscv64/welyos.elf -append "autoexit stress"       # 排程器壓力測試:建立 1000 條執行緒

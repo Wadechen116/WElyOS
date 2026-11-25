@@ -1,266 +1,430 @@
-/*
- * Host-side model of the I-349 cpu0-stall diagnostics.
- *
- * This model checks diagnostic classification only.  A target timeout always
- * remains a failure, including ENVIRONMENT_SUSPECT; no evidence here waives a
- * kernel correctness assertion.  The 2-tick lag margin, three-window run,
- * 50-ms windows, and 80% progress threshold are provisional policy inputs,
- * not calibrated production limits.
- */
+/* Host tests for the shared I-349 pure classifier. */
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
 
-#define MAX_WINDOWS 8
-#define WINDOW_MS 50 /* matches the current 300-ms kernel probe: six full windows */
+#include "i349_classify.h"
 
-enum diagnostic {
-    DIAG_OK,
-    DIAG_ENVIRONMENT_SUSPECT,
-    DIAG_KERNEL_CANDIDATE,
-    DIAG_INCONCLUSIVE,
-};
+static void fill_sleeper(struct i349_sleeper *s, uint32_t total,
+                         uint32_t over, uint64_t base, uint64_t late);
 
-enum scope {
-    SCOPE_UNKNOWN,
-    SCOPE_NONE,
-    SCOPE_SYSTEM_WIDE,
-    SCOPE_TARGET_LOCAL,
-    SCOPE_CONTROL_ONLY,
-    SCOPE_NO_CONTROL,
-};
-
-enum lag_class {
-    LAG_UNKNOWN,
-    LAG_NONE,
-    LAG_SPIKE,
-    LAG_SUSTAINED,
-};
-
-enum host_elapsed_class {
-    HOST_ELAPSED_UNKNOWN,
-    HOST_ELAPSED_NORMAL,
-    HOST_ELAPSED_SLOW,
-};
-
-struct window {
-    uint64_t counter_delta;
-    uint64_t committed_tick_delta;
-    uint32_t iterations;
-};
-
-struct evidence {
-    const struct window *windows;
-    unsigned window_count;
-    uint64_t counts_per_tick;
-    uint32_t baseline_iterations;
-    int target_over_limit;
-    int control_over_limit;
-    int have_control;
-    enum host_elapsed_class host_elapsed;
-};
-
-struct diagnosis {
-    enum diagnostic label;
-    enum scope affected_scope;
-    enum lag_class lag;
-    int test_failed;
-    unsigned lag_windows;
-    unsigned longest_lag_run;
-    unsigned min_progress_percent;
-    int progress_known;
-};
-
-/* Match the proposed clock-relative rule without overflowing a multiply. */
-static int window_lags(const struct window *w, uint64_t iv)
+static void init_obs(struct i349_obs *o)
 {
-    uint64_t expected_with_margin;
-
-    if (!iv)
-        return 0;
-    if (w->committed_tick_delta > UINT64_MAX - 2)
-        return 0; /* malformed/unrepresentable evidence is not positive proof */
-    expected_with_margin = w->committed_tick_delta + 2;
-    if (expected_with_margin > UINT64_MAX / iv)
-        return 0;
-    return w->counter_delta > expected_with_margin * iv;
+    *o = (struct i349_obs){0};
+    o->iv = 100;
+    o->nwin = 3;
+    o->have_control = 1;
+    o->base_iter.known = 1;
+    o->base_iter.v = 100;
+    o->inj = I349_INJ_NONE;
+    assert(i349_params_default(&o->p, o->iv) == 0);
+    for (unsigned i = 0; i < o->nwin; i++) {
+        o->win[i] = (struct i349_win){
+            .dc = 500,
+            .dt = 5,
+            .iter = 100,
+            .valid = 1,
+        };
+    }
+    fill_sleeper(&o->target, 12, 0, 1000, 1500);
+    fill_sleeper(&o->control, 12, 0, 1000, 1500);
 }
 
-static struct diagnosis diagnose(const struct evidence *e)
+/* Populate a coherent retained sample set. over is the kernel's exact count
+ * using d*1000 > cs_hz*CS_STRICT_MS, not a separately inferred threshold. */
+static void fill_sleeper(struct i349_sleeper *s, uint32_t total,
+                         uint32_t over, uint64_t base, uint64_t late)
 {
-    struct diagnosis d = {
-        .label = DIAG_INCONCLUSIVE,
-        .affected_scope = SCOPE_UNKNOWN,
-        .lag = LAG_UNKNOWN,
-        .test_failed = !!e->target_over_limit,
-        .min_progress_percent = 0,
-        .progress_known = 0,
-    };
-    unsigned run = 0;
+    assert(total <= I349_MAX_SAMPLES);
+    assert(over <= total);
+    *s = (struct i349_sleeper){0};
+    s->total = total;
+    s->kept = total;
+    s->over = over;
+    for (uint32_t i = 0; i < total; i++)
+        s->d[i] = i < over ? late : base;
+}
 
-    if (e->window_count == 0 || e->window_count > MAX_WINDOWS || !e->windows)
-        return d;
-    if (!e->counts_per_tick)
-        return d;
-
-    d.affected_scope = !e->have_control ? SCOPE_NO_CONTROL :
-        e->target_over_limit && e->control_over_limit ? SCOPE_SYSTEM_WIDE :
-        e->target_over_limit ? SCOPE_TARGET_LOCAL :
-        e->control_over_limit ? SCOPE_CONTROL_ONLY : SCOPE_NONE;
-
-    d.progress_known = e->baseline_iterations != 0;
-    d.min_progress_percent = 100;
-    for (unsigned i = 0; i < e->window_count; i++) {
-        const struct window *w = &e->windows[i];
-        if (window_lags(w, e->counts_per_tick)) {
-            d.lag_windows++;
-            run++;
-            if (run > d.longest_lag_run)
-                d.longest_lag_run = run;
-        } else {
-            run = 0;
-        }
-        if (d.progress_known) {
-            uint64_t pct = (uint64_t)w->iterations * 100 / e->baseline_iterations;
-            if (pct > 100)
-                pct = 100;
-            if (pct < d.min_progress_percent)
-                d.min_progress_percent = (unsigned)pct;
-        }
-    }
-
-    d.lag = d.longest_lag_run >= 3 ? LAG_SUSTAINED :
-            d.lag_windows ? LAG_SPIKE : LAG_NONE;
-    if (!e->target_over_limit) {
-        d.label = DIAG_OK;
-    } else if (d.longest_lag_run >= 3 && e->have_control &&
-               e->control_over_limit && d.progress_known &&
-               d.min_progress_percent < 80 &&
-               e->host_elapsed == HOST_ELAPSED_SLOW) {
-        d.label = DIAG_ENVIRONMENT_SUSPECT;
-    } else if ((e->have_control && !e->control_over_limit) ||
-               (d.lag_windows == 0 && d.progress_known &&
-                d.min_progress_percent >= 80)) {
-        d.label = DIAG_KERNEL_CANDIDATE;
-    }
+static struct i349_diag classify(const struct i349_obs *o)
+{
+    struct i349_diag d;
+    assert(i349_classify(o, &d) == 0);
     return d;
 }
 
-static struct window steady_lag[] = {
-    { .counter_delta = 1000, .committed_tick_delta = 5, .iterations = 70 },
-    { .counter_delta = 1000, .committed_tick_delta = 5, .iterations = 75 },
-    { .counter_delta = 1000, .committed_tick_delta = 5, .iterations = 72 },
+static void progress_ratio_boundaries(void)
+{
+    struct i349_obs o;
+    struct i349_diag d;
+    uint32_t eighty = (uint32_t)(((uint64_t)UINT32_MAX * 80u) / 100u);
+
+    /* Near UINT32_MAX the old common-right-shift method rounded this ratio
+     * up to 100%; the exact integer percentage is 99%. */
+    assert(i349_progress_pct(UINT32_MAX - 1u, UINT32_MAX) == 99u);
+    assert(i349_progress_pct(eighty, UINT32_MAX) == 80u);
+    assert(i349_progress_pct(eighty - 1u, UINT32_MAX) == 79u);
+    assert(i349_progress_pct(0u, UINT32_MAX) == 0u);
+    assert(i349_progress_pct(UINT32_MAX, UINT32_MAX) == 100u);
+
+    /* The classifier's environment threshold must distinguish exactly 80%
+     * from the immediately lower count, even at a UINT32_MAX baseline. */
+    init_obs(&o);
+    o.base_iter.v = UINT32_MAX;
+    fill_sleeper(&o.target, 20, 1, 1000, 1500);
+    fill_sleeper(&o.control, 20, 1, 1000, 1500);
+    for (unsigned i = 0; i < o.nwin; i++) {
+        o.win[i].dc = 701; /* (dt + lag_tick) * iv + 1 */
+        o.win[i].iter = eighty;
+    }
+    d = classify(&o);
+    assert(d.progress_known && d.progress_min_pct == 80u);
+    assert(d.lag == I349_LAG_SUSTAINED);
+    assert(d.label == I349_LABEL_INCONCLUSIVE);
+
+    for (unsigned i = 0; i < o.nwin; i++)
+        o.win[i].iter = eighty - 1u;
+    d = classify(&o);
+    assert(d.progress_known && d.progress_min_pct == 79u);
+    assert(d.label == I349_LABEL_ENVIRONMENT_SUSPECT);
+}
+
+/* Reproduce only the old faulty fallback predicate as a negative-control
+ * witness. The fixture must satisfy it, proving that the old precedence
+ * would have produced KERNEL-CANDIDATE for this SYSTEM-WIDE evidence. */
+static int legacy_precedence_would_mislabel(const struct i349_obs *o,
+                                             const struct i349_diag *d)
+{
+    return o->target.over && d->lag_windows == 0 && d->progress_known &&
+           d->progress_min_pct >= 80u;
+}
+
+struct historical_case {
+    const char *name;
+    uint64_t iv;
+    uint32_t wakes;
+    uint32_t target_over;
+    uint32_t control_over;
+    uint32_t progress_pct;
+    uint64_t dc[5];
+    uint64_t dt[5];
+    uint32_t iter[5];
 };
 
-static struct evidence sample(struct window *w, unsigned n, uint32_t baseline,
-                              int target, int control, int have_control)
+/* These five rows preserve the logged calibration values. Individual sleep
+ * durations were not logged; fill_sleeper creates internally coherent
+ * synthetic durations solely to exercise the p50/p95 output. The historical
+ * assertions rely on the recorded wake/over counts and SYSTEM_WIDE scope. */
+static const struct historical_case historical[] = {
+    {"riscv64 steady run 1", 10000, 22, 7, 7, 100,
+     {500001,500001,500000,500000,500000}, {50,50,50,50,49},
+     {212831,215012,212962,212975,211710}},
+    {"riscv64 steady run 4", 10000, 21, 10, 10, 100,
+     {500001,500000,500001,500001,500001}, {51,49,49,51,51},
+     {206302,209098,201358,218009,200743}},
+    {"riscv64 steady run 9", 10000, 22, 5, 7, 99,
+     {500002,500000,500001,500002,500001}, {50,48,51,51,50},
+     {185297,188894,187979,192100,203148}},
+    {"aarch64 steady run 4", 62500, 22, 9, 9, 86,
+     {3125012,3125025,3125013,3125000,3125012}, {50,49,51,51,49},
+     {124629,136000,142900,134517,139163}},
+    {"aarch64 steady run 7", 62500, 22, 8, 9, 88,
+     {3125006,3125000,3125012,3125007,3125000}, {49,49,52,49,51},
+     {134780,136942,137085,138961,137602}},
+};
+
+static void historical_system_wide_regressions(void)
 {
-    return (struct evidence){
-        .windows = w, .window_count = n, .counts_per_tick = 100,
-        .baseline_iterations = baseline,
-        .target_over_limit = target,
-        .control_over_limit = control,
-        .have_control = have_control,
-        .host_elapsed = HOST_ELAPSED_UNKNOWN,
-    };
+    for (unsigned c = 0; c < sizeof(historical) / sizeof(historical[0]); c++) {
+        const struct historical_case *h = &historical[c];
+        struct i349_obs o;
+        struct i349_diag d;
+        init_obs(&o);
+        o.iv = h->iv;
+        o.nwin = 5;
+        assert(i349_params_default(&o.p, o.iv) == 0);
+        o.base_iter.v = (h->iter[0] / h->progress_pct) * 100u;
+        for (unsigned i = 0; i < o.nwin; i++) {
+            o.win[i] = (struct i349_win){
+                .dc = h->dc[i], .dt = h->dt[i], .iter = h->iter[i], .valid = 1,
+            };
+        }
+        fill_sleeper(&o.target, h->wakes, h->target_over,
+                     10 * h->iv, 15 * h->iv);
+        fill_sleeper(&o.control, h->wakes, h->control_over,
+                     10 * h->iv, 15 * h->iv);
+
+        d = classify(&o);
+        assert(d.scope == I349_SCOPE_SYSTEM_WIDE);
+        assert(d.label != I349_LABEL_TARGET_PATH_CANDIDATE);
+        assert(d.label == I349_LABEL_INCONCLUSIVE);
+        assert(legacy_precedence_would_mislabel(&o, &d));
+        assert(o.target.over == h->target_over);
+        assert(o.control.over == h->control_over);
+        assert(d.reason & I349_R_SYSTEM_WIDE_DELAY);
+        assert(d.lag == I349_LAG_NONE);
+    }
 }
 
-static void assert_diag(struct evidence e, enum diagnostic expected,
-                        int remains_failure)
+static void scope_and_label_cases(void)
 {
-    struct diagnosis d = diagnose(&e);
-    assert(d.label == expected);
-    assert(d.test_failed == remains_failure);
+    struct i349_obs o;
+    struct i349_diag d;
+
+    init_obs(&o);
+    fill_sleeper(&o.target, 12, 0, 1000, 1500);
+    fill_sleeper(&o.control, 12, 0, 1000, 1500);
+    d = classify(&o);
+    assert(d.scope == I349_SCOPE_NONE && d.label == I349_LABEL_OK);
+
+    o.have_control = 0;
+    d = classify(&o);
+    assert(d.scope == I349_SCOPE_NO_CONTROL && d.label == I349_LABEL_OK);
+
+    o.have_control = 1;
+    o.control.over = 1;
+    d = classify(&o);
+    assert(d.scope == I349_SCOPE_CONTROL_ONLY);
+    assert(d.label == I349_LABEL_OK); /* target did not exceed its limit */
+
+    /* Three consecutive windows over the provisional two-tick margin. */
+    for (unsigned i = 0; i < 3; i++) {
+        o.win[i].dc = 900;
+        o.win[i].iter = 70;
+    }
+    fill_sleeper(&o.target, 12, 1, 1000, 1500);
+    fill_sleeper(&o.control, 12, 1, 1000, 1500);
+    d = classify(&o);
+    assert(d.lag == I349_LAG_SUSTAINED);
+    assert(d.scope == I349_SCOPE_SYSTEM_WIDE);
+    assert(d.label == I349_LABEL_ENVIRONMENT_SUSPECT);
+
+    /* Unknown progress is not treated as normal and blocks environment blame. */
+    o.base_iter.known = 0;
+    d = classify(&o);
+    assert(!d.progress_known);
+    assert(d.reason & I349_R_PROGRESS_UNKNOWN);
+    assert(d.label == I349_LABEL_INCONCLUSIVE);
+
+    /* Target-local evidence remains a candidate even if optional progress is
+     * unknown; the reason states that evidence is timeout-distribution only. */
+    init_obs(&o);
+    o.base_iter.known = 0;
+    fill_sleeper(&o.target, 20, 2, 1100, 1501);
+    fill_sleeper(&o.control, 20, 0, 1100, 1501);
+    d = classify(&o);
+    assert(d.scope == I349_SCOPE_TARGET_LOCAL);
+    assert(d.label == I349_LABEL_TARGET_PATH_CANDIDATE);
+    assert(d.reason & I349_R_TIMEOUT_DIST_ONLY);
+    assert(d.reason & I349_R_PROGRESS_UNKNOWN);
 }
 
-static void scenario_cases(void)
+static void percentile_and_gap_boundaries(void)
 {
-    struct evidence e;
-    struct diagnosis d;
+    struct i349_obs o;
+    struct i349_diag d;
+    uint64_t original[I349_MAX_SAMPLES];
 
-    /* (a) One isolated lag window followed by recovery is a spike. */
-    struct window spike[] = {
-        { .counter_delta = 1000, .committed_tick_delta = 5, .iterations = 70 },
-        { .counter_delta = 500, .committed_tick_delta = 5, .iterations = 100 },
-        { .counter_delta = 500, .committed_tick_delta = 5, .iterations = 100 },
-    };
-    e = sample(spike, 3, 100, 1, 1, 1);
-    e.host_elapsed = HOST_ELAPSED_SLOW;
-    d = diagnose(&e);
-    assert(d.label == DIAG_INCONCLUSIVE && d.lag == LAG_SPIKE);
-    assert(d.longest_lag_run == 1);
-    assert(d.test_failed);
+    init_obs(&o);
+    /* n=20 nearest rank: p50 is item 10 (index 9), p95 item 19 (index 18).
+     * Two late samples make p95 cross the 4-tick gap by one count. */
+    fill_sleeper(&o.target, 20, 2, 1100, 1501);
+    fill_sleeper(&o.control, 20, 0, 1100, 1501);
+    for (unsigned i = 0; i < 20; i++)
+        original[i] = o.target.d[i];
+    d = classify(&o);
+    assert(d.target_percentiles_known && d.control_percentiles_known);
+    assert(d.target_p50 == 1100 && d.control_p50 == 1100);
+    assert(d.target_p95 == 1501 && d.control_p95 == 1100);
+    assert(d.scope == I349_SCOPE_TARGET_LOCAL);
+    assert(d.label == I349_LABEL_TARGET_PATH_CANDIDATE);
+    for (unsigned i = 0; i < 20; i++)
+        assert(o.target.d[i] == original[i]); /* classifier sorts a local copy */
 
-    /* (b) Multiple small deficits form SUSTAINED_LAG; no timeout means no
-     * test failure and no environment attribution. */
-    e = sample(steady_lag, 3, 100, 0, 0, 1);
-    d = diagnose(&e);
-    assert(d.lag == LAG_SUSTAINED && d.label == DIAG_OK && !d.test_failed);
+    /* Equal-to-gap is not strictly greater and cannot establish TARGET_LOCAL. */
+    fill_sleeper(&o.target, 20, 2, 1100, 1500);
+    fill_sleeper(&o.control, 20, 0, 1100, 1500);
+    d = classify(&o);
+    assert(d.target_p95 == d.control_p95 + o.p.gap_counts);
+    assert(d.scope == I349_SCOPE_INCONCLUSIVE);
+    assert(d.label == I349_LABEL_INCONCLUSIVE);
 
-    /* (c) Target-only lateness is a kernel-candidate diagnostic. */
-    e = sample(steady_lag, 3, 100, 1, 0, 1);
-    e.host_elapsed = HOST_ELAPSED_NORMAL;
-    d = diagnose(&e);
-    assert(d.label == DIAG_KERNEL_CANDIDATE);
-    assert(d.affected_scope == SCOPE_TARGET_LOCAL && d.test_failed);
+    /* Only one high sample leaves the nearest-rank p95 at the lower value. */
+    fill_sleeper(&o.target, 20, 1, 1100, 1600);
+    fill_sleeper(&o.control, 20, 0, 1100, 1600);
+    d = classify(&o);
+    assert(d.target_p95 == 1100);
+    assert(d.scope == I349_SCOPE_INCONCLUSIVE);
 
-    /* (d) Both sleepers and clock-relative lag are slow, but host elapsed is
-     * normal: retain a failure without blaming the host. */
-    e = sample(steady_lag, 3, 100, 1, 1, 1);
-    e.host_elapsed = HOST_ELAPSED_NORMAL;
-    assert_diag(e, DIAG_INCONCLUSIVE, 1);
-    assert(diagnose(&e).affected_scope == SCOPE_SYSTEM_WIDE);
+    /* Fewer than the configured 10 control samples is inconclusive. */
+    fill_sleeper(&o.target, 20, 2, 1100, 1501);
+    fill_sleeper(&o.control, 9, 0, 1100, 1501);
+    d = classify(&o);
+    assert(d.scope == I349_SCOPE_INCONCLUSIVE);
+    assert(d.reason & I349_R_FEW_CONTROL);
+}
 
-    /* (e) Independent host elapsed evidence adds ENVIRONMENT_SUSPECT, but it
-     * never converts the original timeout into a pass. */
-    e.host_elapsed = HOST_ELAPSED_SLOW;
-    d = diagnose(&e);
-    assert(d.label == DIAG_ENVIRONMENT_SUSPECT && d.test_failed);
+static void bounded_and_invalid_inputs(void)
+{
+    struct i349_obs o;
+    struct i349_diag d;
 
-    /* Lower progress by itself is not an environment classification. */
-    for (unsigned i = 0; i < 3; i++)
-        steady_lag[i].iterations = 76;
-    e = sample(steady_lag, 3, 100, 1, 1, 1);
-    e.host_elapsed = HOST_ELAPSED_NORMAL;
-    assert_diag(e, DIAG_INCONCLUSIVE, 1);
-    for (unsigned i = 0; i < 3; i++)
-        steady_lag[i].iterations = 70;
+    init_obs(&o);
+    fill_sleeper(&o.target, 0, 0, 1000, 1500);
+    fill_sleeper(&o.control, 12, 0, 1000, 1500);
+    d = classify(&o);
+    assert(d.scope == I349_SCOPE_INVALID);
+    assert(d.label == I349_LABEL_INCONCLUSIVE);
+    assert(d.reason & I349_R_MISSING_TARGET_SAMPLES);
 
-    /* (f) Missing reference, clock, host elapsed, or progress data is
-     * inconclusive; it cannot be used to waive a failure. */
-    e = sample(steady_lag, 3, 0, 1, 1, 0);
-    e.host_elapsed = HOST_ELAPSED_SLOW;
-    assert_diag(e, DIAG_INCONCLUSIVE, 1);
-    e = sample(steady_lag, 3, 100, 1, 1, 0);
-    e.host_elapsed = HOST_ELAPSED_SLOW;
-    assert_diag(e, DIAG_INCONCLUSIVE, 1);
-    e.counts_per_tick = 0;
-    assert_diag(e, DIAG_INCONCLUSIVE, 1);
-    e = sample(steady_lag, 3, 100, 1, 1, 1);
-    assert_diag(e, DIAG_INCONCLUSIVE, 1); /* host elapsed unknown */
+    init_obs(&o);
+    /* For n=64, nearest-rank p95 is item 61; four late values place it at
+     * 1501, above the 400-count gap from the control p95 of 1000. */
+    fill_sleeper(&o.target, 64, 4, 1000, 1501);
+    fill_sleeper(&o.control, 64, 0, 1000, 1500);
+    d = classify(&o);
+    assert(d.target_p95 == 1501 && d.control_p95 == 1000);
+    assert(d.scope == I349_SCOPE_TARGET_LOCAL);
 
-    /* A healthy probe can run below the provisional progress threshold and
-     * still pass; this mirrors the i386 no-injection 76% observation. */
-    struct window healthy[] = {
-        { .counter_delta = 700, .committed_tick_delta = 5, .iterations = 76 },
-        { .counter_delta = 700, .committed_tick_delta = 5, .iterations = 76 },
-        { .counter_delta = 700, .committed_tick_delta = 5, .iterations = 76 },
-    };
-    e = sample(healthy, 3, 100, 0, 0, 1);
-    assert_diag(e, DIAG_OK, 0);
-    /* Claude's i386 no-injection sample reached 76% progress while another
-     * architecture was under load. A sub-80% progress value alone must not
-     * create an environment label or change a passing result. */
-    assert(diagnose(&e).min_progress_percent == 76);
+    /* Truncated observations preserve total/over counts but cannot establish
+     * target-local scope. The retained arrays remain bounded at 64 entries. */
+    init_obs(&o);
+    fill_sleeper(&o.target, 64, 2, 1100, 1501);
+    fill_sleeper(&o.control, 64, 0, 1100, 1501);
+    o.target.total = 65;
+    o.target.truncated = 1;
+    d = classify(&o);
+    assert(d.scope == I349_SCOPE_INCONCLUSIVE);
+    assert(d.reason & I349_R_TRUNCATED);
+    assert(d.label != I349_LABEL_TARGET_PATH_CANDIDATE);
 
-    /* An unavailable or oversized sample set is inconclusive, never a waiver. */
-    e = sample(healthy, 0, 100, 1, 1, 1);
-    assert_diag(e, DIAG_INCONCLUSIVE, 1);
+    /* The retained prefix must be full at the bound: silent under-retention
+     * is malformed, even if the producer set truncated correctly. */
+    init_obs(&o);
+    fill_sleeper(&o.target, 64, 2, 1100, 1501);
+    fill_sleeper(&o.control, 20, 0, 1100, 1501);
+    o.target.total = 65;
+    o.target.kept = 63;
+    o.target.truncated = 1;
+    d = classify(&o);
+    assert(d.scope == I349_SCOPE_INVALID);
+    assert(d.label == I349_LABEL_INCONCLUSIVE);
+    assert(d.reason & I349_R_BAD_OBSERVATION);
+
+    init_obs(&o);
+    fill_sleeper(&o.target, 20, 2, 1100, 1501);
+    fill_sleeper(&o.control, 64, 0, 1100, 1501);
+    o.control.total = 65;
+    o.control.truncated = 1;
+    d = classify(&o);
+    assert(d.scope == I349_SCOPE_INCONCLUSIVE);
+    assert(d.reason & I349_R_TRUNCATED);
+
+    init_obs(&o);
+    o.win[1].valid = 0;
+    d = classify(&o);
+    assert(d.scope == I349_SCOPE_INVALID);
+    assert(d.reason & I349_R_INVALID_WINDOW);
+
+    init_obs(&o);
+    o.iv = 0;
+    d = classify(&o);
+    assert(d.scope == I349_SCOPE_INVALID);
+
+    init_obs(&o);
+    o.nwin = 0;
+    d = classify(&o);
+    assert(d.scope == I349_SCOPE_INVALID);
+
+    init_obs(&o);
+    o.target.over = o.target.total + 1;
+    d = classify(&o);
+    assert(d.scope == I349_SCOPE_INVALID);
+
+    init_obs(&o);
+    o.win[0].dt = UINT64_MAX;
+    d = classify(&o);
+    assert(d.scope == I349_SCOPE_INVALID);
+    assert(d.reason & I349_R_OVERFLOW);
+
+    init_obs(&o);
+    o.p.gap_counts = 4;
+    fill_sleeper(&o.target, 20, 2, UINT64_MAX, UINT64_MAX);
+    fill_sleeper(&o.control, 20, 0, UINT64_MAX - 1, UINT64_MAX);
+    d = classify(&o);
+    assert(d.scope == I349_SCOPE_INVALID);
+    assert(d.reason & I349_R_OVERFLOW);
+
+    assert(i349_params_default(&o.p, 0) != 0);
+    assert(i349_params_default(&o.p, UINT64_MAX / 4 + 1) != 0);
+}
+
+static void injection_and_precedence_negative_control(void)
+{
+    struct i349_obs o;
+    struct i349_diag d;
+
+    /* Without a control, a target timeout is not enough to attribute the
+     * scope or produce a target-path candidate. */
+    init_obs(&o);
+    o.have_control = 0;
+    fill_sleeper(&o.target, 20, 2, 1100, 1501);
+    d = classify(&o);
+    assert(o.target.over == 2);
+    assert(d.scope == I349_SCOPE_NO_CONTROL);
+    assert(d.label == I349_LABEL_INCONCLUSIVE);
+    assert(d.label != I349_LABEL_OK);
+    assert(d.label != I349_LABEL_TARGET_PATH_CANDIDATE);
+    assert(d.reason & I349_R_NO_CONTROL);
+
+    init_obs(&o);
+    o.inj = I349_INJ_SPIKE_VALID;
+    fill_sleeper(&o.target, 22, 7, 1000, 1500);
+    fill_sleeper(&o.control, 22, 7, 1000, 1500);
+    d = classify(&o);
+    assert(d.reason & I349_R_INJECTED);
+
+    /* Negative control for the old precedence: the fixture has a timeout in
+     * both sleepers and high progress, which made the legacy fallback choose
+     * KERNEL-CANDIDATE merely because the lag count was zero. The new rule
+     * must choose SYSTEM_WIDE/INCONCLUSIVE before considering that fallback. */
+    assert(d.scope == I349_SCOPE_SYSTEM_WIDE);
+    assert(d.label == I349_LABEL_INCONCLUSIVE);
+    assert(d.label != I349_LABEL_TARGET_PATH_CANDIDATE);
+    assert(d.reason & I349_R_SYSTEM_WIDE_DELAY);
+    assert(legacy_precedence_would_mislabel(&o, &d));
+
+    /* Invalid, missed, and steady injections are diagnostic annotations;
+     * none may erase the target timeout or turn a failing observation into
+     * an OK result. */
+    {
+        static const enum i349_inj injections[] = {
+            I349_INJ_SPIKE_INVALID,
+            I349_INJ_SPIKE_MISS,
+            I349_INJ_STEADY,
+        };
+        for (unsigned i = 0; i < sizeof(injections) / sizeof(injections[0]); i++) {
+            init_obs(&o);
+            o.inj = injections[i];
+            fill_sleeper(&o.target, 20, 2, 1100, 1501);
+            fill_sleeper(&o.control, 20, 0, 1100, 1501);
+            d = classify(&o);
+            assert(o.target.over == 2);
+            assert(d.reason & I349_R_INJECTED);
+            assert(d.scope == I349_SCOPE_TARGET_LOCAL);
+            assert(d.label == I349_LABEL_TARGET_PATH_CANDIDATE);
+            assert(d.label != I349_LABEL_OK);
+        }
+    }
 }
 
 int main(void)
 {
-    scenario_cases();
-    puts("I-349: classification model cases passed (diagnostic labels never waive failure)");
+    progress_ratio_boundaries();
+    historical_system_wide_regressions();
+    scope_and_label_cases();
+    percentile_and_gap_boundaries();
+    bounded_and_invalid_inputs();
+    injection_and_precedence_negative_control();
+    puts("I-349: shared classifier host cases passed; labels never waive timeout failures");
     return 0;
 }

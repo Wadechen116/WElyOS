@@ -28,6 +28,7 @@
 #include "watchdog.h"
 #include "mmu.h"
 #include "netdev.h"
+#include "i349_classify.h"
 #include "netif.h"
 #include "selftest.h"
 #include "uapi/selftest.h"
@@ -1229,25 +1230,45 @@ void sleep_wall_test(void)
                                             插入競賽 1 個 tick、喚醒通知 1 個 tick(1 tick = 1 ms) */
 #define CS_HARD_MS    100                /* 絕對上限:遠小於修正前的 ~300 ms,也容得下模擬器的主機停頓 */
 #define CS_MAX_SAMPLES 64
+/* 存樣本的陣列和分類器的樣本上限必須一樣大:分類器檢查「保留數 = min(總數, I349_MAX_SAMPLES)」,
+   只改一邊會把每一次都判成資料不一致(第 73 步之後的 P0 實測過) */
+_Static_assert(CS_MAX_SAMPLES == I349_MAX_SAMPLES, "CS_MAX_SAMPLES must equal I349_MAX_SAMPLES");
 static volatile int cs_phase;            /* 0 = 準備、1 = 第 0 顆關中斷中、2 = 結束 */
 static uint64_t cs_hz;
 
 /*
  * 睡眠者:[0] = 受測(固定在第 1 顆;只有 2 顆 CPU 時固定在第 1 顆),[1] = 對照(I-349,固定在第 2 顆,
  * 做一模一樣的事;只有 2 顆 CPU 時不建立)。對照只用來分類失敗的原因(兩邊一起慢 = 全系統,
- * 只有受測慢 = 受測路徑),不影響通過 / 失敗 — 見 cs_diagnose。
+ * 只有受測慢 = 受測路徑),不影響通過 / 失敗 — 見 cs_classify_print 與 include/i349_classify.h。
  */
 struct cs_sleeper_rec {
     int pin;                                 /* 固定在哪一顆 */
     volatile int cpu;                        /* 忙等時所在的 CPU(-1 = 還沒開始) */
     volatile unsigned n, on_cpu0;
+    volatile unsigned total;                 /* 完成的睡眠總數(陣列滿了也照加;n 只算存下的) */
+    /* 陣列滿了之後丟掉的睡眠(Codex 042:凍結介面要求 over 統計全部有效樣本):長度當場判斷、
+       只計數不存。睡眠一次接一次,所以只有最後一筆可能跨過卡住的結束點 — 另外記住最後一筆 */
+    volatile unsigned drop_over;             /* 丟掉的睡眠中超過設計上限的次數 */
+    uint64_t drop_last_t0, drop_last_d;      /* 最後一筆丟掉的睡眠 */
+    volatile int drop_last_over;
     uint64_t t0[CS_MAX_SAMPLES], d[CS_MAX_SAMPLES];   /* 每次睡眠的起點與長度(時鐘計數) */
 };
 static struct cs_sleeper_rec cs_rec[2];
-/* I-349 校準的注入(只印診斷,不改判定):模式、spike 實際做了幾次、開始時刻與長度(時鐘計數) */
+/* I-349 校準的注入(只印診斷,不改判定):模式 */
 static int cs_inj_mode;
-static volatile unsigned cs_spike_n;
+/*
+ * spike(I-349 重做):受測睡眠者在 thread_sleep 期間才把這個旗標設成 1(只在 cs_phase == 1)。
+ * 注入由固定在第 1 顆、優先度低於受測者的輔助執行緒做:它只能在受測者讓出第 1 顆(睡著)時跑,
+ * 看到旗標 = 1 才關中斷 20 ms,模擬「睡眠者等待喚醒時這顆虛擬 CPU 被主機停住」。
+ * 32 位元原子操作(i386 不可用 64 位元 __atomic)。
+ */
+static volatile uint32_t cs_target_sleeping;
+static volatile uint64_t cs_stall_c0;        /* 卡住開始的時刻(ctx.c0 的共享複本,在 cs_phase = 1 前寫入) */
+enum { CS_SPIKE_MISS = 0, CS_SPIKE_VALID, CS_SPIKE_INVALID };
+/* 注入結果:只有輔助執行緒寫,寫完(且已恢復中斷)才設 done;測試端在 join 之後才讀 */
+static volatile uint32_t cs_spike_done, cs_spike_valid, cs_spike_sl0, cs_spike_sl1;
 static volatile uint64_t cs_spike_at, cs_spike_len;
+static volatile int cs_spike_ready;          /* 輔助執行緒已固定到第 1 顆 */
 
 void cpu0_stall_set_injection(int mode)
 {
@@ -1266,25 +1287,15 @@ static void cs_sleeper(void *arg)
     /* 忙等:卡住期間不能靠 sleep 開始(那正是待測項目) */
     while (cs_phase == 0)
         r->cpu = sched_cpu_id();
-    uint64_t ph0 = 0;
+    int target = r == &cs_rec[0];
     while (cs_phase == 1) {
-        if (!ph0)
-            ph0 = timer_clock_count();
-        /* spike:受測那一顆(第 1 顆)在卡住開始約 100 ms 後關中斷 20 ms,只一次 — 模擬「這顆虛擬 CPU 被主機
-           停住一下」。記下實際的開始時刻與長度 */
-        if (cs_inj_mode == CS_INJ_SPIKE && r == &cs_rec[0] && !cs_spike_n &&
-            (timer_clock_count() - ph0) * 10 >= cs_hz) {
-            unsigned long fl = arch_irq_save();
-            uint64_t s0 = timer_clock_count();
-            while ((timer_clock_count() - s0) * 50 < cs_hz)
-                ;
-            cs_spike_len = timer_clock_count() - s0;
-            cs_spike_at = s0;
-            cs_spike_n = 1;
-            arch_irq_restore(fl);
-        }
         uint64_t t0 = timer_clock_count();
+        int mark = target && cs_phase == 1;
+        if (mark)
+            __atomic_store_n(&cs_target_sleeping, 1u, __ATOMIC_SEQ_CST);   /* 緊接在 sleep 之前 */
         thread_sleep(CS_SLEEP_MS);
+        if (mark)
+            __atomic_store_n(&cs_target_sleeping, 0u, __ATOMIC_SEQ_CST);   /* 醒來第一件事 */
         uint64_t d = timer_clock_count() - t0;
         if (cs_phase == 1 && sched_cpu_id() == 0)
             r->on_cpu0++;                    /* 不可能:第 0 顆關著中斷 */
@@ -1292,8 +1303,69 @@ static void cs_sleeper(void *arg)
             r->t0[r->n] = t0;
             r->d[r->n] = d;
             r->n++;
+        } else {
+            int ov = d * 1000 > cs_hz * CS_STRICT_MS;   /* 和 cs_eval 一字不差的條件 */
+            r->drop_over += (unsigned)ov;
+            r->drop_last_t0 = t0;
+            r->drop_last_d = d;
+            r->drop_last_over = ov;
         }
+        r->total++;
     }
+}
+
+/*
+ * spike 輔助執行緒:固定在第 1 顆、PRIO_LOW。等到卡住開始滿約 100 ms,第一次看到受測者睡著
+ * (cs_target_sleeping == 1 且 cs_phase == 1)就關中斷忙等 20 ms,只做一次。共享紀錄在恢復中斷後才寫。
+ * 啟動順序:測試端先建立本執行緒,等它固定到第 1 顆、停在 phase 0 的迴圈(cs_spike_ready = 1)之後,
+ * 才建立受測者與對照者。之後受測者(PRIO_HIGH)忙等時會把本執行緒搶占掉,這是預期的:本執行緒只需要
+ * 在受測者睡著時才有機會執行。
+ * 定義 CS_SPIKE_NEGCTL(負對照)時:本執行緒以 PRIO_HIGH(與受測者同級)建立,而且略過「睡著」條件,
+ * 卡住開始約 100 ms 後不論受測者狀態都注入一次,讓有效性檢查有機會回報 invalid(受測者醒著時重疊)。
+ * 若在某個架構上排程仍然無法產生「受測者醒著時注入」的重疊,負對照的結果必須回報為 unsupported,
+ * 不可默默算成通過或計入統計。
+ */
+static void cs_spike_fn(void *arg)
+{
+    (void)arg;
+    KASSERT(thread_set_affinity(0, 1u << 1) == 0);
+    KASSERT(sched_cpu_id() == 1);
+    cs_spike_ready = 1;
+    while (cs_phase == 0)
+        thread_yield();
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);  /* cs_stall_c0 在 cs_phase = 1 之前寫入 */
+    uint64_t c0 = cs_stall_c0;
+    while (cs_phase == 1) {
+        if ((timer_clock_count() - c0) * 10 < cs_hz) {
+            thread_yield();
+            continue;
+        }
+#ifndef CS_SPIKE_NEGCTL
+        if (__atomic_load_n(&cs_target_sleeping, __ATOMIC_SEQ_CST) != 1u) {
+            thread_yield();
+            continue;
+        }
+#endif
+        uint32_t sl0 = __atomic_load_n(&cs_target_sleeping, __ATOMIC_SEQ_CST);
+        int ph = cs_phase;
+        unsigned long fl = arch_irq_save();
+        uint64_t s0 = timer_clock_count();
+        while ((timer_clock_count() - s0) * 50 < cs_hz)
+            ;
+        uint64_t s1 = timer_clock_count();
+        uint32_t sl1 = __atomic_load_n(&cs_target_sleeping, __ATOMIC_SEQ_CST);
+        arch_irq_restore(fl);
+        cs_spike_at = s0;
+        cs_spike_len = s1 - s0;
+        cs_spike_sl0 = sl0;
+        cs_spike_sl1 = sl1;
+        cs_spike_valid = (sl0 == 1u && ph == 1) ? CS_SPIKE_VALID : CS_SPIKE_INVALID;
+        __atomic_store_n(&cs_spike_done, 1u, __ATOMIC_SEQ_CST);   /* 單一寫入者:紀錄寫完才設 */
+        break;
+    }
+    /* 沒注入就結束(cs_phase 變成 2)= miss:cs_spike_done 維持 0 */
+    while (cs_phase != 2)
+        thread_yield();
 }
 
 /* 只評估「整段都落在卡住期間」的睡眠(最後一次跨過結束點的不算):醒來次數、最壞、超過設計上限的次數 */
@@ -1356,6 +1428,8 @@ static void cs_stall_fn(void *arg)
     x->hb0 = this_cpu()->heartbeat;
     x->tk0 = timer_ticks();
     x->c0 = timer_clock_count();
+    cs_stall_c0 = x->c0;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);  /* 輔助執行緒看到 cs_phase == 1 時必須已看到 cs_stall_c0 */
     if (cs_inj_mode == CS_INJ_STEADY)
         timer_test_steady_window(1);         /* I-349 校準:只在卡住期間注入 */
     cs_phase = 1;
@@ -1495,64 +1569,96 @@ static void cpu0_stall_degraded_test(void)
 }
 
 /*
- * I-349 第一階段(與 Codex 011/012 討論的結論):只分類、不豁免。每一次都印一行診斷(收集校準資料),
- * 原本會失敗的照樣失敗。各訊號(候選門檻,待校準):
- *   lag   = 窗內落後量:時鐘增量 − tick 增量 × 每 tick 計數 > 2 個 tick 的計數 → 該窗落後;
- *           連續 >= 3 窗 = SUSTAINED,只有零星 = SPIKE,沒有 = NONE
- *   scope = 對照睡眠者也有超過設計上限的 = SYSTEM-WIDE;只有受測 = TARGET-LOCAL;沒有對照(2 顆 CPU)= NO-CONTROL
- *   prog  = 進度計最慢一窗相對基準的百分比(主機給這顆虛擬 CPU 的時間變少時下降)
- *   irq   = 其他每顆 CPU 的本地計時器中斷次數(和 lag 共用計時器路徑,只當一致性檢查)
- *   lock  = time_lk / sched_lk 的持有時間:第一階段沒有量(印 not-measured)
- * 標籤:SUSTAINED 且 SYSTEM-WIDE 且進度計明顯下降(< 80%,候選)= ENVIRONMENT-SUSPECT;
- *       TARGET-LOCAL,或沒有落後也沒有進度下降卻超過上限 = KERNEL-CANDIDATE;其他 = INCONCLUSIVE。
- * 標籤只是診斷:不改變任何 panic 條件。門檻要用無注入 / 單次停頓 / 持續落後三種資料校準後再討論。
+ * I-349 診斷(只分類、不豁免;不改變任何 panic 條件):規則的唯一來源是 include/i349_classify.h
+ * (純函式 i349_classify,核心與主機測試共用)。這裡只把量到的資料填進 struct i349_obs、呼叫分類器、
+ * 印出一行診斷,再印逐窗原始資料與每顆 CPU 的中斷次數。lock(time_lk / sched_lk 持有時間)沒有量。
  */
-static void cs_diagnose(const struct cs_stall_ctx *x, unsigned over_t, unsigned over_r, int have_ref)
+static struct i349_obs cs_obs;               /* 約 1 KB 以上:放靜態區,不放在小小的核心堆疊上 */
+
+/*
+ * 把睡眠紀錄轉成分類器的 sleeper。total / over 和 cs_eval 用同一個過濾條件(t0 + d <= c1)。
+ * 陣列滿了之後被丟掉的樣本不知道 d,也不知道是否落在卡住期間:把它們算進 total(保守地視為已完成)、
+ * over 只算存下的樣本(= cs_eval 的 strict 次數),並設 truncated — 分類器看到 truncated 就不會判
+ * TARGET-LOCAL。若此時過濾後保留的樣本不到 I349_MAX_SAMPLES,kept 會不等於 min(total, 64),
+ * 分類器會報 BAD_OBSERVATION / INVALID(誠實地表示資料不完整,而不是猜)。
+ */
+static void cs_fill_sleeper(struct i349_sleeper *o, const struct cs_sleeper_rec *r, uint64_t c1)
 {
+    unsigned kept = 0, over = 0;
+    for (unsigned i = 0; i < r->n; i++) {
+        if (r->t0[i] + r->d[i] > c1)
+            continue;
+        if (kept < I349_MAX_SAMPLES)
+            o->d[kept] = r->d[i];
+        kept++;
+        if (r->d[i] * 1000 > cs_hz * CS_STRICT_MS)
+            over++;
+    }
+    /* 丟掉的睡眠:全部是存下的那些之後才發生的;只有最後一筆可能跨過 c1,要排除 */
+    unsigned dropped = r->total > r->n ? r->total - r->n : 0;
+    unsigned dover = r->drop_over;
+    if (dropped && r->drop_last_t0 + r->drop_last_d > c1) {
+        dropped--;
+        dover -= (unsigned)r->drop_last_over;
+    }
+    o->total = kept + dropped;
+    o->kept = kept < I349_MAX_SAMPLES ? kept : I349_MAX_SAMPLES;
+    o->truncated = o->total > o->kept;
+    o->over = over + dover;                  /* 統計全部有效樣本(凍結介面 034) */
+}
+
+static void cs_classify_print(const struct cs_stall_ctx *x, uint64_t c1, int have_ref, int stid)
+{
+    struct i349_obs *o = &cs_obs;
+    struct i349_diag dg;
     uint64_t iv = timer_tick_counts();
-    unsigned lag_w = 0, run = 0, max_run = 0;
+    for (unsigned i = 0; i < sizeof(*o); i++)
+        ((char *)o)[i] = 0;
+    o->iv = iv;
+    o->nwin = x->nwin;
     uint64_t pc = x->c0, pt = x->tk0;
-    uint32_t min_pct = 100;
-    for (unsigned w = 0; w < x->nwin; w++) {
-        uint64_t dc = x->win_c[w] - pc, dt = x->win_t[w] - pt;
-        int lag = iv && dc > dt * iv + 2 * iv;
-        lag_w += (unsigned)lag;
-        run = lag ? run + 1 : 0;
-        if (run > max_run)
-            max_run = run;
-        /* 進度百分比 = 本窗迴圈次數 × 100 / 基準:用 32 位元除法(i386 沒有 64 位元除法);
-           次數大到乘 100 會溢位時先一起右移。窗只在滿一個窗長時才記,所以每窗都完整 */
-        if (x->base_iter) {
-            uint32_t a = x->win_iter[w], b = x->base_iter;
-            while (a > 0xFFFFFFFFu / 100u) {
-                a >>= 1;
-                b >>= 1;
-            }
-            uint32_t pct = b ? a * 100u / b : 100;
-            if (pct < min_pct)
-                min_pct = pct;
-        }
+    for (unsigned w = 0; w < x->nwin && w < I349_MAX_WIN; w++) {
+        o->win[w].dc = x->win_c[w] - pc;
+        o->win[w].dt = x->win_t[w] - pt;
+        o->win[w].iter = x->win_iter[w];
+        o->win[w].valid = iv != 0;
         pc = x->win_c[w];
         pt = x->win_t[w];
     }
-    const char *lag = max_run >= 3 ? "SUSTAINED" : lag_w ? "SPIKE" : "NONE";
-    const char *scope = !have_ref ? "NO-CONTROL" : over_t && over_r ? "SYSTEM-WIDE" :
-                        over_t ? "TARGET-LOCAL" : over_r ? "CONTROL-ONLY" : "NONE";
-    /* 基準是 0(量不到)時進度未知:不可以當成 100% 而誤標 KERNEL-CANDIDATE(Codex 013) */
-    int prog_known = x->base_iter != 0 && x->nwin != 0;
-    const char *label = "OK";
-    if (over_t) {
-        if (max_run >= 3 && have_ref && over_r && prog_known && min_pct < 80)
-            label = "ENVIRONMENT-SUSPECT";
-        else if ((have_ref && !over_r) || (!lag_w && prog_known && min_pct >= 80))
-            label = "KERNEL-CANDIDATE";
-        else
-            label = "INCONCLUSIVE";
+    o->have_control = have_ref != 0;
+    cs_fill_sleeper(&o->target, &cs_rec[0], c1);
+    if (have_ref)
+        cs_fill_sleeper(&o->control, &cs_rec[1], c1);
+    o->base_iter.known = x->base_iter != 0;
+    o->base_iter.v = x->base_iter;
+    o->inj = I349_INJ_NONE;
+    if (cs_inj_mode == CS_INJ_STEADY) {
+        o->inj = I349_INJ_STEADY;
+    } else if (cs_inj_mode == CS_INJ_SPIKE && stid > 0) {   /* 輔助執行緒沒建立(CPU 不足)= 沒注入 */
+        int done = __atomic_load_n(&cs_spike_done, __ATOMIC_SEQ_CST) != 0;
+        o->inj = !done ? I349_INJ_SPIKE_MISS :
+                 cs_spike_valid == CS_SPIKE_VALID ? I349_INJ_SPIKE_VALID : I349_INJ_SPIKE_INVALID;
     }
+    (void)i349_params_default(&o->p, iv);   /* 失敗(iv = 0)時參數全 0,分類器會報 INVALID */
+    (void)i349_classify(o, &dg);            /* o、&dg 都非空:只會回 0;診斷不得新增 panic 條件 */
     kprintf("cpu0-stall: diagnosis: %s (lag %s, %u of %u windows lagging, longest run %u; scope %s, "
-            "over target %u control %u; progress %s%u%% of baseline; lock not-measured)\n",
-            label, lag, lag_w, x->nwin, max_run, scope, over_t, over_r,
-            prog_known ? "min " : "unknown, ", prog_known ? min_pct : 0u);
+            "over target %u/%u control %u/%u; target p50/p95 ",
+            i349_label_name(dg.label), i349_lag_name(dg.lag), dg.lag_windows, o->nwin, dg.longest_run,
+            i349_scope_name(dg.scope), o->target.over, o->target.total, o->control.over, o->control.total);
+    if (dg.target_percentiles_known)
+        kprintf("%llu/%llu counts", (unsigned long long)dg.target_p50, (unsigned long long)dg.target_p95);
+    else
+        kprintf("unknown");
+    kprintf(" control p50/p95 ");
+    if (dg.control_percentiles_known)
+        kprintf("%llu/%llu counts", (unsigned long long)dg.control_p50, (unsigned long long)dg.control_p95);
+    else
+        kprintf("unknown");
+    if (dg.progress_known)
+        kprintf("; progress min %u%%", dg.progress_min_pct);
+    else
+        kprintf("; progress unknown");
+    kprintf("; reason 0x%x; lock not-measured)\n", dg.reason);
     /* 逐窗原始資料(Codex 020):D = 時鐘增量 / 每 tick 計數 − tick 增量,以千分之一 tick 表示(可為負);
        每 tick 計數是 0(沒有共用計數器)時印 invalid */
     pc = x->c0;
@@ -1599,8 +1705,15 @@ void cpu0_stall_wake_test(void)
     for (int k = 0; k < 2; k++) {
         cs_rec[k].pin = k + 1;
         cs_rec[k].cpu = -1;
-        cs_rec[k].n = cs_rec[k].on_cpu0 = 0;
+        cs_rec[k].n = cs_rec[k].on_cpu0 = cs_rec[k].total = cs_rec[k].drop_over = 0;
+        cs_rec[k].drop_last_t0 = cs_rec[k].drop_last_d = 0;
+        cs_rec[k].drop_last_over = 0;
     }
+    cs_target_sleeping = 0;
+    cs_stall_c0 = 0;
+    cs_spike_done = cs_spike_valid = cs_spike_sl0 = cs_spike_sl1 = 0;
+    cs_spike_at = cs_spike_len = 0;
+    cs_spike_ready = 0;
     uint32_t adv0[MAX_CPUS];
     for (int i = 0; i < MAX_CPUS; i++)
         adv0[i] = timer_advances(i);
@@ -1611,6 +1724,29 @@ void cpu0_stall_wake_test(void)
        (24 次有 3 次逾時),後來改成跨 CPU 呼叫加上讓睡眠者自己離開第 0 顆的重試;現在兩者都是確定的 */
     KASSERT(thread_set_affinity(0, 1u << 0) == 0);
     KASSERT(sched_cpu_id() == 0);            /* 設定自己:返回前已經搬好 */
+    /* spike 輔助執行緒(I-349):要第 1、2、3 顆都在線上(至少 4 顆)。
+       必須先於受測者建立並等它就緒:受測者(PRIO_HIGH)在第 1 顆忙等時,PRIO_LOW 的輔助執行緒
+       只能靠飢餓提升(約 100 ms)才輪得到,握手會又慢又脆弱 */
+    int stid = 0;
+    if (cs_inj_mode == CS_INJ_SPIKE) {
+        if (cpu_count >= 4 && (online & 0xeu) == 0xeu) {
+#ifdef CS_SPIKE_NEGCTL
+            int sprio = PRIO_HIGH;           /* 負對照:與受測者同級,受測者醒著時也能執行 */
+#else
+            int sprio = PRIO_LOW;
+#endif
+            stid = thread_create_prio("cs-spike", cs_spike_fn, NULL, sprio);
+            if (stid <= 0)
+                panic("cpu0-stall: cannot create spike helper (%d)", stid);
+            for (int w = 0; !cs_spike_ready; w++) {   /* 等輔助執行緒固定到第 1 顆並停在 phase 0 */
+                if (w > 5000)
+                    panic("cpu0-stall: the spike helper never started on cpu 1");
+                thread_sleep(1);
+            }
+        } else {
+            kprintf("cpu0-stall: injection spike skipped: needs >= 4 cpus\n");
+        }
+    }
     int tid = thread_create_prio("cs-sleeper", cs_sleeper, &cs_rec[0], PRIO_HIGH);
     if (tid <= 0)
         panic("cpu0-stall: cannot create sleeper (%d)", tid);
@@ -1641,6 +1777,8 @@ void cpu0_stall_wake_test(void)
     thread_join(tid);
     if (rtid > 0)
         thread_join(rtid);
+    if (stid > 0)
+        thread_join(stid);
     KASSERT(thread_set_affinity(0, online) == 0);     /* 恢復不限制 */
 
     unsigned wakes, strict_over, rwakes = 0, rover = 0;
@@ -1666,12 +1804,17 @@ void cpu0_stall_wake_test(void)
     if (have_ref)
         kprintf("cpu0-stall: control sleeper on cpu 2 woke %u times, worst %llu counts, %u over %u ms\n",
                 rwakes, (unsigned long long)rworst, rover, CS_STRICT_MS);
-    cs_diagnose(&ctx, strict_over, rover, have_ref);
+    cs_classify_print(&ctx, c1, have_ref, stid);
     /* I-349 校準:注入是否真的發生、在哪、多長(Codex 018 / 020 要求記錄) */
-    if (cs_inj_mode == CS_INJ_SPIKE)
-        kprintf("cpu0-stall: injection spike: %u done on cpu 1, %llu counts (clock %llu Hz) starting %llu counts "
-                "after the stall began\n", cs_spike_n, (unsigned long long)cs_spike_len, (unsigned long long)cs_hz,
-                (unsigned long long)(cs_spike_n ? cs_spike_at - ctx.c0 : 0));
+    if (cs_inj_mode == CS_INJ_SPIKE && stid > 0) {
+        int done = __atomic_load_n(&cs_spike_done, __ATOMIC_SEQ_CST) != 0;
+        const char *res = !done ? "miss" : cs_spike_valid == CS_SPIKE_VALID ? "valid" : "invalid";
+        kprintf("cpu0-stall: injection spike: %s on cpu 1, %llu counts (clock %llu Hz), starting %llu counts "
+                "after the stall began, target sleeping before %u after %u\n", res,
+                (unsigned long long)(done ? cs_spike_len : 0), (unsigned long long)cs_hz,
+                (unsigned long long)(done ? cs_spike_at - ctx.c0 : 0), (unsigned)cs_spike_sl0,
+                (unsigned)cs_spike_sl1);
+    }
     if (cs_inj_mode == CS_INJ_STEADY) {
         uint32_t n, cm;
         uint64_t tot, mx;

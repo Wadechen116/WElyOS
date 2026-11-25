@@ -8463,3 +8463,12 @@ I-341 改為部分解決:HPET 備援與三個測試用開機參數都已執行�
   - 校準執行腳本在 build/i349cal/run.sh(build 目錄不進版本控制):每行輸出另存主機單調時鐘時間戳的 .ts 檔(主機讀到該行的時刻,不是 guest 事件的精確時間)。
   - 第一輪(3 架構 × {none, steady} × 10 次):none 三架構 30 / 30 都是 OK(沒有誤報);steady 全部依約定判失敗,標籤 i386 INCONCLUSIVE 10、riscv64 INCONCLUSIVE 7 + KERNEL-CANDIDATE 3、aarch64 INCONCLUSIVE 8 + KERNEL-CANDIDATE 2。steady 是全系統的延遲,5 次 KERNEL-CANDIDATE 表示「以對照睡眠者有沒有超時判範圍」不夠穩(推測兩個睡眠者的睡眠時段不同步,一次 3 ms 只落在其中一個);落後量多半是 SPIKE(下一窗就補回)。無注入時每窗落後量已在 ±1 tick 之間跳動(視窗邊界量化),候選門檻 2 tick 的餘裕很小。校準表與門檻建議由 Codex 整理中,不改任何判定。
 - 完整回歸 regress-73c 全部符合預期(13 個時鐘情境含 clock=drift ×3;exit5-class 12 / 12)。
+
+## 第 74 步:I-349 P0 — 判定規則改用分類器標頭、受測者睡著時的單次停頓注入
+- **分類器(Codex 擁有,介面凍結於 Codex 034)**:`include/i349_classify.h` 是純函式(functional core,只吃數字、不碰 kernel 狀態),主機端測試與 kernel 用同一份。判定範圍(scope)的優先順序:INVALID → NO_CONTROL → NONE → SYSTEM_WIDE → CONTROL_ONLY → TARGET_LOCAL → INCONCLUSIVE;「受測路徑候選」(TARGET_PATH_CANDIDATE)只在 TARGET_LOCAL 時出現;p95 用最近排名法(nearest-rank)。標籤永遠不豁免既有的 panic。`scripts/arch-check.sh` 新增規則:這個標頭只能被 `kernel/test/` 與 `tests/host/` 引用(含規則自己的對照樣本 fixture)。
+- **kernel 端(kernel/test/sched_test.c)**:舊的 cs_diagnose 換成 cs_classify_print。樣本陣列滿了之後的樣本(丟掉的)以和 cs_eval **一字不差**的條件當場判斷是否超時並計數,只是不存長度 — 這是 Codex 042 指出的 blocker(凍結介面要求超時數統計全部有效樣本),不用改介面就解決。最後一筆丟掉的樣本若跨過視窗終點 c1 就扣掉。`_Static_assert(CS_MAX_SAMPLES == I349_MAX_SAMPLES)`:截斷實驗時發現只改一邊會讓每次都判成資料不一致,改成編譯期擋下。
+- **`stallinj=spike` 重新設計**:輔助執行緒固定第 1 顆、低優先權(PRIO_LOW),在 CPU0 卡住的視窗內,等受測者「睡著」(atomic 旗標 cs_target_sleeping,緊接在 sleep 前設、醒來第一件事清)才關中斷忙等 20 ms,只做一次;結果分 valid / invalid / miss,少於 4 顆 CPU 時跳過。啟動握手:先建立輔助執行緒並等它就緒,再建立睡眠者(否則低優先權要靠飢餓提升約 100 ms 才輪得到)。
+- **QEMU 驗證(3 架構)**:none 全部 OK;steady 各 3 次全部 SYSTEM-WIDE / INCONCLUSIVE — 第一輪的 5 次 KERNEL-CANDIDATE 誤判不再出現;spike 全部 valid,受測者 1 / 24 次超時、對照 0 / 26,未達 TARGET_LOCAL 門檻 → INCONCLUSIVE(符合規則)。i386 照舊 panic(rc=3);riscv64 / aarch64 被主機停頓例外豁免(rc=0),跨架構不一致開成 I-351。
+- **截斷路徑**(拋棄式副本,兩邊上限都改成 8):total 與 over 都超過 8、reason 含 TRUNCATED,樣本截斷時不判 TARGET_LOCAL。
+- **負對照(NEGCTL)**:(1) 輔助執行緒改 PRIO_HIGH、拿掉「睡著」條件 → riscv64 6 / 6 仍 valid(受測者約 9 成時間在睡,注入幾乎必定落在睡眠中);(2) 依 Codex 043 改成「等受測者醒著才注入」→ 6 / 6 miss(target sleeping before 0 after 0:醒著的窗口太短,第 1 顆上的輔助執行緒觀察不到)。依 Codex 037 / 043 標為 **unsupported**,不算通過、正式注入路徑不改;有效性檢查還缺能真正產生 invalid 的負對照,開成 I-352。
+- **安全模式(safe mode)的發現**:注入情境依約定 panic,連續 3 次開機失敗後系統自動進入安全模式、跳過自我測試 — 第一次驗證有 4 次因此無效。校準與注入一律加開機參數 `nosafe`;第一輪校準的 60 次已逐一檢查,沒有任何一次進安全模式,資料有效。
