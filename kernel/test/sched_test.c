@@ -1269,6 +1269,11 @@ enum { CS_SPIKE_MISS = 0, CS_SPIKE_VALID, CS_SPIKE_INVALID };
 static volatile uint32_t cs_spike_done, cs_spike_valid, cs_spike_sl0, cs_spike_sl1;
 static volatile uint64_t cs_spike_at, cs_spike_len;
 static volatile int cs_spike_ready;          /* 輔助執行緒已固定到第 1 顆 */
+#ifdef CS_SPIKE_NEGCTL
+/* 負對照的會合點(I-352,Codex 045):armed = 輔助執行緒已過 100 ms、準備注入;parked = 受測者醒著、
+   停在會合點等注入。兩個都是 32 位元原子旗標。這是人工合成的「醒著時注入」,不代表重現了自然的排程競賽。 */
+static volatile uint32_t cs_negctl_armed, cs_negctl_parked;
+#endif
 
 void cpu0_stall_set_injection(int mode)
 {
@@ -1311,6 +1316,19 @@ static void cs_sleeper(void *arg)
             r->drop_last_over = ov;
         }
         r->total++;
+#ifdef CS_SPIKE_NEGCTL
+        /* 會合點:樣本已記完、下一次 t0 還沒取,停在這裡不污染任何樣本。開著中斷讓出(同級的輔助執行緒
+           在同一顆才排得到),最多 50 ms;逾時或 phase 結束就清 parked 照常繼續,結果留在 MISS */
+        if (target && cs_phase == 1 && __atomic_load_n(&cs_negctl_armed, __ATOMIC_SEQ_CST) &&
+            !__atomic_load_n(&cs_spike_done, __ATOMIC_SEQ_CST)) {
+            uint64_t p0 = timer_clock_count();
+            __atomic_store_n(&cs_negctl_parked, 1u, __ATOMIC_SEQ_CST);
+            while (cs_phase == 1 && !__atomic_load_n(&cs_spike_done, __ATOMIC_SEQ_CST) &&
+                   (timer_clock_count() - p0) * 20 < cs_hz)
+                thread_yield();
+            __atomic_store_n(&cs_negctl_parked, 0u, __ATOMIC_SEQ_CST);
+        }
+#endif
     }
 }
 
@@ -1320,10 +1338,10 @@ static void cs_sleeper(void *arg)
  * 啟動順序:測試端先建立本執行緒,等它固定到第 1 顆、停在 phase 0 的迴圈(cs_spike_ready = 1)之後,
  * 才建立受測者與對照者。之後受測者(PRIO_HIGH)忙等時會把本執行緒搶占掉,這是預期的:本執行緒只需要
  * 在受測者睡著時才有機會執行。
- * 定義 CS_SPIKE_NEGCTL(負對照)時:本執行緒以 PRIO_HIGH(與受測者同級)建立,而且略過「睡著」條件,
- * 卡住開始約 100 ms 後不論受測者狀態都注入一次,讓有效性檢查有機會回報 invalid(受測者醒著時重疊)。
- * 若在某個架構上排程仍然無法產生「受測者醒著時注入」的重疊,負對照的結果必須回報為 unsupported,
- * 不可默默算成通過或計入統計。
+ * 定義 CS_SPIKE_NEGCTL(負對照,I-352)時:本執行緒以 PRIO_HIGH(與受測者同級)建立;過了約 100 ms 設
+ * armed,改等受測者醒著停在會合點(cs_negctl_parked)才注入 — sl0 必為 0,結果必須是 SPIKE_INVALID。
+ * 前兩版(無條件注入、等受測者醒著)排程上做不出重疊,所以改用人工會合點。注入狀態只加 reason,
+ * 不豁免逾時、也不讓有效的觀測變成 INVALID(Codex 034 / 045)。
  */
 static void cs_spike_fn(void *arg)
 {
@@ -1340,12 +1358,15 @@ static void cs_spike_fn(void *arg)
             thread_yield();
             continue;
         }
-#ifndef CS_SPIKE_NEGCTL
+#ifdef CS_SPIKE_NEGCTL
+        __atomic_store_n(&cs_negctl_armed, 1u, __ATOMIC_SEQ_CST);
+        if (__atomic_load_n(&cs_negctl_parked, __ATOMIC_SEQ_CST) != 1u) {   /* 等受測者停在會合點(醒著) */
+#else
         if (__atomic_load_n(&cs_target_sleeping, __ATOMIC_SEQ_CST) != 1u) {
+#endif
             thread_yield();
             continue;
         }
-#endif
         uint32_t sl0 = __atomic_load_n(&cs_target_sleeping, __ATOMIC_SEQ_CST);
         int ph = cs_phase;
         unsigned long fl = arch_irq_save();
@@ -1710,6 +1731,10 @@ void cpu0_stall_wake_test(void)
         cs_rec[k].drop_last_over = 0;
     }
     cs_target_sleeping = 0;
+#ifdef CS_SPIKE_NEGCTL
+    cs_negctl_armed = 0;
+    cs_negctl_parked = 0;
+#endif
     cs_stall_c0 = 0;
     cs_spike_done = cs_spike_valid = cs_spike_sl0 = cs_spike_sl1 = 0;
     cs_spike_at = cs_spike_len = 0;
