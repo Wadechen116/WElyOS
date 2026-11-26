@@ -8511,3 +8511,11 @@ I-341 改為部分解決:HPET 備援與三個測試用開機參數都已執行�
 - **驗證**:三架構建置無警告;backend 主機測試 build/lockhold/lh_host_test.c 通過,突變(拿掉 held 檢查)失敗 2 項。QEMU 9 次(三架構 × 1/4/8 CPU,build/lockhold/q1/,含 SHA256)全部 rc=0;4 / 8 CPU 都是 coverage complete、invalid 0;1 CPU 依規則跳過此測試。最長持有都在 time 鎖:i386 約 0.97 ms、aarch64 約 1.0 ms、riscv64 約 0.64 ms(只記錄數字,原因未查)。
 - **QEMU 負對照**:副本 build/lockhold/negtree 拿掉 spin_unlock 的釋放 hook(grep 確認 0 筆),riscv64 / i386 4 CPU:安全點看到仍持有,START ack inconsistent、coverage incomplete。
 - **待辦**:rdtsc 不序列化的量測邊界待 Codex 裁定;backend 契約疑問 5 點(285)待裁定;max 約 1 ms 的成因;056 校準 capture。
+
+### 未解決事項總盤點(第 77 步,使用者要求)
+
+- 唯讀稽核了 DEVLOG、README 未勾選項、兩份路線圖(docs/OS-ROADMAP-CODEX.md / OS-ROADMAP-CLAUDE.md)與程式碼中的 TODO / FIXME(沒有任何一筆),逐條和 docs/ISSUES.md 比對。
+- 新增 I-353~I-360(本次量測與整合留下的問題)、I-361~I-362(稽核找到、原本只寫在別條後續欄的問題),以及 I-363~I-373(路線圖 P1~P8 尚未實作、ISSUES 原本沒有條目的功能)。
+- 狀態可能過時、行數過時、內容重複的條目(I-091、I-331、I-310、I-299、I-300、I-309、I-327、I-170/116、I-155/147、I-177/166)在後續欄加註,逐條核對後再改狀態,不直接結案。
+- 不穩定 / 偶發失敗:稽核沒找到未收錄的;已知的都在 I-331、I-334、I-349、I-350、I-351、I-352、I-361、I-362。
+- 統計:總數 373,待處理 247、部分解決 13、已解決 113。
