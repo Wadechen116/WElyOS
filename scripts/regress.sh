@@ -119,7 +119,7 @@ for a in $ARCHS; do
     # 讓它下次出現時自己留下證據(見下方與 docs/ISSUES.md 的 N-002)
     wx=0; case "$c" in crash=*) wx=1 ;; esac
     rm -f "$log.winexit"
-    QEMU_WINEXIT=$wx QEMU_WINEXIT_FILE="$log.winexit" timeout -k 10 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
+    QEMU_WINEXIT=$wx QEMU_WINEXIT_FILE="$log.winexit" QEMU_TS_FILE="$log.ts" timeout -k 10 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
         -append "autoexit $c" > "$log" 2>&1 < /dev/null
     rc=$?
     t=$(echo "$(date +%s.%N) - $t0" | bc)
@@ -137,7 +137,7 @@ for a in $ARCHS; do
       if exit5_is_host_crash "$log" "$log.winexit"; then
         echo "  注意:$a ${c:-(只開機)}:kernel 給了正確的值,模擬器結束時當掉($win),重試一次(輸出保留在 $log.exit5)"
         rm -f "$log.winexit"
-        QEMU_WINEXIT=1 QEMU_WINEXIT_FILE="$log.winexit" timeout -k 10 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
+        QEMU_WINEXIT=1 QEMU_WINEXIT_FILE="$log.winexit" QEMU_TS_FILE="$log.ts" timeout -k 10 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
             -append "autoexit $c" > "$log" 2>&1 < /dev/null
         rc=$?
         [ "$rc" -eq "$want" ] && hostcrash=$((hostcrash + 1))
@@ -170,7 +170,7 @@ for a in $ARCHS; do
       log="$OUT/$a-disktest$s.txt"
       # 第 6 階段故意 panic(測試黑盒子):預期的結束碼和其他當機情境相同
       dwant=0; [ "$s" -eq 6 ] && { [ "$a" = i386 ] && dwant=3 || dwant=1; }
-      QEMU_DISK="$img" timeout -k 10 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
+      QEMU_DISK="$img" QEMU_TS_FILE="$log.ts" timeout -k 10 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
            -append "autoexit disktest=$s" > "$log" 2>&1 < /dev/null
       if [ "$?" -eq "$dwant" ]; then
         dok=$((dok + 1))
@@ -185,7 +185,7 @@ for a in $ARCHS; do
     # 在安全模式裡正常結束之後,第五次回到一般的開機
     rm -f "$img"; sok=0; pwant=1; [ "$a" = i386 ] && pwant=3
     for step in "crash=boot:$pwant" "crash=boot:$pwant" "crash=boot:$pwant" "expect=safe:0" "expect=normal:0"; do
-      QEMU_DISK="$img" timeout -k 10 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
+      QEMU_DISK="$img" QEMU_TS_FILE="$OUT/$a-safemode-$sok-${step%%:*}.txt.ts" timeout -k 10 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
            -append "autoexit ${step%%:*}" > "$OUT/$a-safemode.txt" 2>&1 < /dev/null
       if [ "$?" -eq "${step##*:}" ]; then
         sok=$((sok + 1))
@@ -200,7 +200,7 @@ for a in $ARCHS; do
     # 不掛載、不格式化,黑盒子也不可以把紀錄寫在它最後的 8KB(Codex 找到的問題:第 113 號留言)
     python3 -c "import sys; open(sys.argv[1],'wb').write(b'\\xa5' * (16 << 20))" "$img"
     before=$(md5sum < "$img")
-    QEMU_DISK="$img" timeout -k 10 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
+    QEMU_DISK="$img" QEMU_TS_FILE="$OUT/$a-foreign.txt.ts" timeout -k 10 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
          -append "autoexit" > "$OUT/$a-foreign.txt" 2>&1 < /dev/null
     frc=$?
     if [ "$frc" -eq 0 ] && [ "$(md5sum < "$img")" = "$before" ] && grep -q "blackbox: disabled" "$OUT/$a-foreign.txt"; then
@@ -212,7 +212,7 @@ for a in $ARCHS; do
 
     # 沒有磁碟、也沒有網路卡:每個驅動程式都必須正確回報「沒有」,自我測試照樣通過。
     # (第 48 步以前只在 RISC-V 上跑過這個組合,i386 的 NE2000 偵測因此把空的匯流排當成一張卡)
-    QEMU_DISK=none QEMU_NET=none timeout -k 10 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
+    QEMU_DISK=none QEMU_NET=none QEMU_TS_FILE="$OUT/$a-bare.txt.ts" timeout -k 10 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
          -append "autoexit selftest" > "$OUT/$a-bare.txt" 2>&1 < /dev/null
     brc=$?
     if [ "$brc" -eq 0 ] && grep -q "^net: none" "$OUT/$a-bare.txt" && grep -q "^disk: none" "$OUT/$a-bare.txt"; then
@@ -251,7 +251,7 @@ for a in $ARCHS; do
           qargs+=("${qw[j]}")
         fi
       done
-      env "${cpu_env[@]}" timeout -k 10 90 scripts/qemu.sh "$a" "build/$a/welyos.elf" "${qargs[@]}" \
+      env "${cpu_env[@]}" QEMU_TS_FILE="$log.ts" timeout -k 10 90 scripts/qemu.sh "$a" "build/$a/welyos.elf" "${qargs[@]}" \
           -append "autoexit $cl" > "$log" 2>&1 < /dev/null
       crc=$?
       miss=""
@@ -270,7 +270,7 @@ for a in $ARCHS; do
       good=0
       for i in $(seq "$REPEAT"); do
         log="$OUT/$a-repeat-smp$n-$i.txt"
-        if QEMU_SMP=$n timeout -k 10 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
+        if QEMU_SMP=$n QEMU_TS_FILE="$log.ts" timeout -k 10 60 scripts/qemu.sh "$a" "build/$a/welyos.elf" \
              -append "autoexit selftest stress memtest" > "$log" 2>&1 < /dev/null && guest_exit_ok "$log" 0; then
           good=$((good + 1))               # 成功的紀錄也保留:偶發失敗時可以和成功的那幾次比對
         else
@@ -307,6 +307,15 @@ if [ "$QUICK" -eq 0 ] && [ -f scripts/host-test-i349.sh ]; then
     echo "I-349 診斷模型主機測試:$(tail -1 "$OUT/host-i349.txt")"
   else
     fail=1; echo "  I-349 診斷模型主機測試失敗,輸出在 $OUT/host-i349.txt"
+  fi
+fi
+
+# I-351 計時器中斷晚到觀測的純函式分析器(include/irq_late.h)
+if [ "$QUICK" -eq 0 ] && [ -f scripts/host-test-irq-late.sh ]; then
+  if bash scripts/host-test-irq-late.sh > "$OUT/host-irq-late.txt" 2>&1; then
+    echo "irq_late 主機測試:$(tail -1 "$OUT/host-irq-late.txt")"
+  else
+    fail=1; echo "  irq_late 主機測試失敗,輸出在 $OUT/host-irq-late.txt"
   fi
 fi
 

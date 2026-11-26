@@ -12,10 +12,13 @@
  */
 #include <stdint.h>
 #include "arch.h"
+#include "irq_late.h"
+#include "lockhold.h"
 #include "cpu.h"
 #include "timer.h"
 #include "sched.h"
 #include "trap.h"
+#include "lockhold_model.h"
 
 /*
  * time CSR 每秒增加的次數。正確做法是從裝置樹 /cpus 的 timebase-frequency 讀取;
@@ -74,6 +77,16 @@ int arch_clock_fallback(void)
     return 0;
 }
 
+/* I-349 鎖持有量測的戳記:time CSR 一開機就可讀(S 模式由韌體開放),來源固定、不會切換。
+   source 1 = time CSR(本架構唯一的來源),generation 固定 0 */
+void arch_lh_stamp(struct lh_stamp *out)
+{
+    out->count = read_time();
+    out->source = 1;
+    out->generation = 0;
+    out->valid = 1;
+}
+
 const char *arch_clock_name(void)
 {
     return "time";
@@ -104,7 +117,14 @@ void arch_timer_init_cpu(void)
 {
     deadline = read_time() + interval;
     sbi_set_timer(deadline);
+    arch_irq_late_config_cpu(this_cpu()->id, interval);   /* I-351:deadline 與 time CSR 同單位 */
     __asm__ volatile("csrs sie, %0" : : "r"(SIE_STIE));
+}
+
+/* I-351:time CSR 是唯一的共用計數器(src_id 0),每顆 hart 都有預定 deadline */
+void arch_irq_late_config_cpu(int cpu, uint64_t iv)
+{
+    irq_late_config(cpu, 0, IRQL_KIND_DEADLINE, iv);
 }
 
 /*
@@ -119,9 +139,11 @@ void arch_timer_init_cpu(void)
  */
 void timer_interrupt(void)
 {
+    lockhold_safepoint();                    /* 鎖持有量測的安全點:尚未取 time_lk / sched_lk */
     sched_irq_enter();                       /* 中斷中喚醒別人時,切換要留到返回前 */
 
-    uint64_t now = read_time();
+    uint64_t now = read_time();          /* = arch_clock_count() = timer_clock_count() 的讀值 */
+    uint64_t ref = deadline;             /* I-351:補記之前的預定 deadline */
     int n = 0;
 
     while (deadline <= now && n < MAX_CATCHUP) {
@@ -136,6 +158,8 @@ void timer_interrupt(void)
     if (resynced)                     /* 落後太多(例如被除錯器暫停):放棄補記,重新對時 */
         deadline = now + interval;
     timer_note_catchup(n, resynced);   /* 晚到的紀錄(見 timer.h) */
+    struct irq_late_in li = { IRQL_KIND_DEADLINE, resynced ? IRQL_F_RESYNC : 0, (uint16_t)n, ref, now, 0 };   /* src_id 0:唯一的共用計數器 */
+    irq_late_note(&li);                /* I-351:獨立的晚到觀測,不影響上面的補記 */
 
     sbi_set_timer(deadline);                 /* 設定下一次,並清除本次的待處理狀態 */
     sched_irq_exit();                        /* 時間片用完就在這裡換人(下一次鬧鐘已設好) */

@@ -1,6 +1,8 @@
 #ifndef WELYOS_SPINLOCK_H
 #define WELYOS_SPINLOCK_H
 
+#include <stdint.h>
+
 /*
  * 自旋鎖(spinlock):多核心之下保護共用資料的最基本工具。
  *
@@ -57,8 +59,11 @@ struct spinlock {
     int cpu;                     /* 持有者的 CPU 編號;-1 = 無 */
     const char *name;            /* 診斷訊息用 */
     unsigned rank;               /* 層級(enum lock_rank) */
+    uint8_t probe_id;            /* 鎖持有量測(I-349)的編號;0 = 不量測 */
 };
-#define SPINLOCK_INIT(nm, rk) { 0, -1, nm, rk }
+#define SPINLOCK_INIT(nm, rk) { 0, -1, nm, rk, 0 }
+/* 要量測持有時間的鎖:id 由 lockhold 後端定義(見 kernel/lockhold.c) */
+#define SPINLOCK_INIT_PROBED(nm, rk, id) { 0, -1, nm, rk, id }
 #define LOCK_DEPTH_MAX 8         /* 一顆 CPU 同時最多持有幾把 spinlock */
 
 /* 量測模式(只在找出巢狀關係時暫時打開):違反層級時不 panic,而是記下並由

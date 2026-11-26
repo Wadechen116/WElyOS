@@ -8477,3 +8477,37 @@ I-341 改為部分解決:HPET 備援與三個測試用開機參數都已執行�
 - 依 Codex 045:前兩版負對照(同級無條件注入 6 / 6 valid、等受測者醒著 6 / 6 miss)排程上都做不出「受測者醒著時注入」。改成只在 `CS_SPIKE_NEGCTL` 建置存在的會合點(rendezvous):輔助執行緒過了約 100 ms 設 armed(雙方用同一個時段握手,受測者不會在第一次醒來就白等);受測者每次記完樣本、取下一個 t0 之前,若已 armed 就設 parked,開著中斷讓出等注入,最多 50 ms(1/20 秒),逾時或 phase 結束清 parked、結果留在 MISS;輔助執行緒看到 parked == 1 才關中斷 20 ms。旗標都是 32 位元原子操作;重設區塊一起清。正式建置沒有任何差異(全在 #ifdef 內),三架構正式建置成功。
 - 結果(副本):riscv64 6 / 6、i386 1 / 1、aarch64 1 / 1 全部 invalid,實際約 20 ms,target sleeping before 0 after 0;分類器 inj = SPIKE_INVALID,reason 0x880(INJECTED | NO_TIMEOUT),分類依實際觀測判 OK — 注入狀態只加 reason,不把有效觀測變成 INVALID(Codex 034 / 045 的契約)。
 - 限制照實寫:這是人工合成的負對照,證明「有效性檢查能回報 invalid」,不代表重現了自然排程下的競賽;這幾次都沒有逾時,所以「不豁免逾時」這點由主機端分類器測試涵蓋;結案範圍只限「人工合成的有效性負對照」— 自然排程下的競賽、以及 QEMU 中 invalid 與逾時同時出現,都還沒驗證(Codex 046),不是這次 QEMU 的證據。
+
+## 第 76 步(進行中):I-351 第一階段 — 每顆 CPU 計時器中斷晚到的獨立觀測
+- 設計依 Claude 264 / 265、Codex 046 / 047 / 049:只觀測、只印,不改 timer_note_catchup 的補記統計、時間推進、排程與任何測試的通過條件;不做因果歸因,只描述「時間區間重疊關係」與「證據是否完整」。
+- 以多個 agent 平行實作(各自的 worktree,主 session 合併):
+  - `include/irq_late.h`:型別、kernel API、純函式分析器(irq_late_ticks / irq_late_check / irq_late_classify,主機端可直接 include)。兩種紀錄不可直接比較:DEADLINE(有硬體預定到期時刻:riscv64、aarch64、i386 第 0 顆且共用來源是 TSC)與 GAP(i386 其他 CPU 的 LAPIC 週期模式,只記兩次入口間距,不是晚到量的下界)。
+  - `kernel/irq_late.c`:每顆 CPU 只有自己的計時器中斷寫自己的狀態(單一寫入者);所有共享欄位都是 32 位元 atomic(64 位元拆 hi/lo),以序號鎖(seqlock)發布,讀者最多重試 1000 次,失敗就標「不完整」。設定(來源切換、降級)由任一 CPU 寫「請求」,該 CPU 在自己的中斷內套用。中斷路徑不配置、不印、不除法、不取鎖。
+  - 三架構的計時器中斷在補記之後呼叫 irq_late_note;來源切換(arch_clock_fallback)與降級(timer_shared_disable)時重新設定。
+  - cpu0_stall_wake_test:停頓開始前取快照 A,結束並 join 後有界重試取 B(直到最後一次中斷晚於 c1),印每顆 CPU 一行、CPU1 的每筆原始紀錄,以及每個受測者超時樣本的重疊關係統計;既有 panic 條件一字不改。
+  - 主機測試 tests/host/time/irq_late_test.c 60 項(ASan / UBSan),負對照:拿掉遺失紀錄檢查、把區間重疊改成不含端點,都會失敗。
+- **第一輪 QEMU(build/i351/)**:三架構 × none / spike / steady,原判定完全不變;但 9 / 9 都是「紀錄被覆寫」— 300 ms 內 CPU1 寫了 48~126 筆,而每顆只有 8 筆。QEMU 上晚到 1~2 tick 是常態。
+- **分布量測(副本,容量改 256,build/i351/r256/)**:none 時 riscv64 / aarch64 全部晚 1 tick、i386 間距全部 2 tick;spike 三架構都有一筆 20 tick(就是第 1 顆關中斷 20 ms 的注入);steady 為 2~5 tick。**i386 其他 CPU 的間距觀測也看得到這次注入**(約 20 tick)。依 Codex 072 限縮結論:已查明的是「補記統計的記錄路徑不同」;這些觀測不能證明三架構的 kernel 行為完全相同,GAP(間距)與 DEADLINE(晚到)也不可直接等同。
+- **門檻與容量(Codex 072 同意,為「容量 / 觀測篩選候選」,不是逾時可靠度門檻的校準)**:DEADLINE 只記晚 ≥ 2 tick(catchup_n ≥ 3)、GAP 只記間距 ≥ 3 tick,RESYNC / EARLY / BACKWARD 等異常不受門檻一律記;低於門檻的只計 below_min、不當證據;容量 32。「沒有重疊」改名 NO_RECORDED_EVENT_OVERLAP,complete 印成 complete(above-min):只表示門檻以上的紀錄完整,門檻以下的小事件仍可能影響逾時。每顆 CPU 的輸出印種類、iv、門檻、below-min;飽和的紀錄標 (saturated)。這次的新資料不拿來反過來調門檻。
+- 審查修正(Codex 051 / 052 / 053 / 057):每筆輸入帶讀計數器當下的來源 ID,和已套用設定不同(切換中)就不記;快照帶「有尚未套用的設定請求」(pending),一律判不完整;設定請求的 gen 改在仍持有寫者互斥時發布(避免兩個寫者交錯時版本倒退),取得互斥改 ACQUIRE。分析器端(從未寫過的格、倒退、iv 改變、筆數超過容量、區間顛倒、飽和核對、容量必須是 2 的冪)由 Codex 修。
+- **QEMU 驗證(build/i351/v3/,三架構 × none / spike / steady × 3 = 27 次)**:原判定全部不變(i386 spike / steady rc=3;riscv64 / aarch64 spike rc=0、steady rc=1;none 全 0)。26 / 27 為 complete(above-min);aarch64 none 第 2 次有 33 筆(超過容量)如實判 incomplete 0x10。spike 9 次:INJECTION_OVERLAP 8、AMBIGUOUS 1;steady 為 NO_RECORDED_EVENT_OVERLAP 與 OUTSIDE_INJECTION 混合;none 無逾時。
+- **負對照(副本,build/i351/neg/)**:(1) 照樣 total++ 但不寫紀錄 → incomplete 0x80(未寫過的格被紀錄有效性檢查擋下);(2) 不呼叫 config → incomplete 0xc2(未啟用);(3) 容量改 1、i386 steady 產生 10 筆 → incomplete 0x10。三者都沒有被判成 NO_RECORDED_EVENT_OVERLAP。
+- **I-349 R6:回歸輸出的主機時間標記(Codex 045 同意)**:`scripts/qemu.sh` 新增選用的 `QEMU_TS_FILE` — 設定時序列埠輸出照原樣逐行送到標準輸出(逐行 flush),另外寫一份每行前面加主機單調時鐘(CLOCK_MONOTONIC)秒數的副本;結束碼取 QEMU 本身(`PIPESTATUS[0]`)。沒設定時完全照舊。`scripts/regress.sh` 的每個 QEMU 呼叫都設成「輸出檔.ts」(安全模式的五次開機各自一個檔)。時間是「主機讀到那一行的時刻」,不是客體內事件的精確時間。
+  - 驗證:riscv64 / i386 的正常開機與 crash=panic,結束碼和不加時間標記時相同(0 / 1 / 0 / 3),標準輸出與 .ts 去掉時間後逐位元組相同。負對照(副本把 `PIPESTATUS[0]` 改成 `$?`):i386 crash=panic 變成 0 — 證明取錯結束碼會被看出來。
+
+### 完整性補強(Codex 075)
+
+- **pending 也涵蓋「請求寫入中」**:snapshot 讀請求的 seq 兩次(前後各一次)和已發布的 gen;seq 為奇數(寫者已取得互斥、還沒發布 gen)、前後 seq 不同、或 gen 與已套用的不同,都算 pending,分析器判 GEN 不完整。修正前只比 gen,寫者剛改內容、還沒發布時會回 pending=0。
+- **丟棄的輸入要留證據**:來源或種類和已套用設定不符時,除了 heartbeat,還累計 rejected;A/B 之間 rejected 有變,分析器就判 REJECTED(0x100)不完整。sched_test 的每顆 CPU 行改印 `rejected +N pending a/b`。
+- **驗證**:主機 irq_late 60/60;三架構建置無警告;三架構 4 CPU selftest rc=0,每顆 CPU 都是 rejected +0、pending 0/0、complete(above-min)(build/i351/v4/)。
+- **負對照(寫入端)**:Codex 的 probe 只測分析器,所以另寫主機驅動 build/i351/neg075/drv.c,直接編譯真正的 kernel/irq_late.c 副本。原版:來源不符後 rejected 0→1、判 0x100;seq 奇數時 pending=1。突變一(拿掉 rejected 累加,grep 確認副本已無此行)→ 判 0x0,抓到;突變二(拿掉 seq 奇數條件)→ pending=0,抓到。
+
+## 第 77 步(進行中):I-349 鎖持有時間量測(055)
+
+- **設計**(Codex 079 定版,使用者核准以多個 agent 平行實作):只量排程器鎖(sched_lk)與系統時間鎖(time_lk)從「成功取得」到「釋放前」的內部區間。struct spinlock 新增 probe_id(SPINLOCK_INIT_PROBED),kernel/spinlock.c 只在 probe_id 非 0 時呼叫 lockhold_acquired / lockhold_releasing,不知道是哪把鎖。純模型 include/lockhold_model.h 由 Codex 擁有(主機測試 69 項,ASan / UBSan(AddressSanitizer / UndefinedBehaviorSanitizer))。
+- **backend** kernel/lockhold.c:每顆 CPU 一份模型,只由自己寫;控制端以請求 seqlock 發布 START / STOP,各 CPU 只在計時器中斷入口的安全點(safepoint,尚未取 time_lk / sched_lk)套用並回 ack。安全點另以 held 計數確認本 CPU 沒持有目標鎖,否則判 INCONSISTENT、不清 token。
+- **時鐘**:arch_lh_stamp 只接受 i386 TSC(Time Stamp Counter)、riscv64 time CSR(Control and Status Register)、aarch64 cntpct;HPET(High Precision Event Timer)/ PM timer 一律 valid=0、不讀計數器(讀取昂貴)。i386 新增 clk_gen 世代計數(切換前後各 +1,奇數 = 切換中),讀前讀後比對來源與世代,A→B→A 也抓得到。
+- **輸出**:每 CPU × 鎖一行(count / invalid / sum / max / ack / 開始戳記 / aggregate / raw),raw 逐筆一行;彙總分開列 coverage(涵蓋是否完整)與 raw(原始紀錄是否完整,環形容量 16)。只印,不改判定。
+- **驗證**:三架構建置無警告;backend 主機測試 build/lockhold/lh_host_test.c 通過,突變(拿掉 held 檢查)失敗 2 項。QEMU 9 次(三架構 × 1/4/8 CPU,build/lockhold/q1/,含 SHA256)全部 rc=0;4 / 8 CPU 都是 coverage complete、invalid 0;1 CPU 依規則跳過此測試。最長持有都在 time 鎖:i386 約 0.97 ms、aarch64 約 1.0 ms、riscv64 約 0.64 ms(只記錄數字,原因未查)。
+- **QEMU 負對照**:副本 build/lockhold/negtree 拿掉 spin_unlock 的釋放 hook(grep 確認 0 筆),riscv64 / i386 4 CPU:安全點看到仍持有,START ack inconsistent、coverage incomplete。
+- **待辦**:rdtsc 不序列化的量測邊界待 Codex 裁定;backend 契約疑問 5 點(285)待裁定;max 約 1 ms 的成因;056 校準 capture。

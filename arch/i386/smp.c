@@ -38,6 +38,7 @@
 #include "trap.h"
 #include "vm.h"
 #include "acpi.h"
+#include "lockhold.h"
 
 #define TRAMP_ADDR   0x8000u                 /* 跳板放置的位址;SIPI 的頁號 = 0x08 */
 
@@ -341,6 +342,7 @@ void arch_timer_init_cpu(void)
     lapic[LAPIC_TMR_DIV / 4] = TMR_DIV_16;
     lapic[LAPIC_LVT_TMR / 4] = VEC_LAPIC_TIMER | TMR_PERIODIC;
     lapic[LAPIC_TMR_INIT / 4] = lapic_tick_count;
+    arch_irq_late_config_cpu(this_cpu()->id, arch_tick_interval());   /* I-351:LAPIC 週期模式 → GAP */
 }
 
 /* 發出處理器間中斷:固定向量 49,目標以 LAPIC ID 指定 */
@@ -354,9 +356,11 @@ void arch_ipi_send(struct cpu *c)
 void lapic_interrupt(uint32_t vector)
 {
     sched_irq_enter();
-    if (vector == VEC_LAPIC_TIMER)
+    if (vector == VEC_LAPIC_TIMER) {
+        lockhold_safepoint();                /* 鎖持有量測的安全點:尚未取 time_lk / sched_lk */
         timer_tick();                        /* 扣時間片;TSC 已過下一個 tick 時也推進系統時間 */
-    else
+        arch_irq_late_note_gap();            /* I-351:不讀 LAPIC CUR,只記入口間距 */
+    } else
         smp_ipi_handler();
     lapic[LAPIC_EOI / 4] = 0;                /* 回應之後 LAPIC 才會再送下一個 */
     sched_irq_exit();                        /* 必須在 EOI 之後:這裡可能切換到別的執行緒 */

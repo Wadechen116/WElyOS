@@ -16,6 +16,7 @@
 #include "kmalloc.h"
 #include "kprintf.h"
 #include "kstring.h"
+#include "lockhold.h"
 #include "panic.h"
 #include "pmm.h"
 #include "proc.h"
@@ -29,6 +30,7 @@
 #include "mmu.h"
 #include "netdev.h"
 #include "i349_classify.h"
+#include "irq_late.h"
 #include "netif.h"
 #include "selftest.h"
 #include "uapi/selftest.h"
@@ -1706,6 +1708,185 @@ static void cs_classify_print(const struct cs_stall_ctx *x, uint64_t c1, int hav
     kprintf("\n");
 }
 
+/*
+ * ---- I-351 第一階段:第 1 顆計時器中斷晚到的觀測(只印,不影響通過 / 失敗)----
+ * A:卡住開始(cs_stall_fn 取 c0、設 cs_phase = 1)之前取;B:join 之後取,要求 B.last_entry > c1。
+ * 快照每份數百位元組 × MAX_CPUS:放靜態區,不放在核心堆疊上。
+ */
+#define CS_IRQL_WAIT_MS 50                   /* 取 B 的有界重試上限 */
+static struct irq_late_snap cs_irql_a[MAX_CPUS], cs_irql_b[MAX_CPUS];
+
+/* 卡住之前:對每顆線上 CPU 取 A(第 1 顆一定在線上,呼叫端已確認) */
+static void cs_irq_late_begin(unsigned online)
+{
+    for (int i = 0; i < cpu_count && i < MAX_CPUS; i++) {
+        if (online & (1u << i))
+            irq_late_snapshot(i, &cs_irql_a[i]);
+        else
+            cs_irql_a[i].ok = 0;
+    }
+}
+
+/* join 之後:第 1 顆有界重試(最多 CS_IRQL_WAIT_MS,期間讓出),其他顆各取一次 */
+static void cs_irq_late_end(unsigned online, uint64_t c1)
+{
+    uint64_t w0 = timer_clock_count();
+    for (;;) {
+        irq_late_snapshot(1, &cs_irql_b[1]);
+        if (cs_irql_b[1].ok && cs_irql_b[1].last_entry > c1)
+            break;
+        if ((timer_clock_count() - w0) * 1000 >= cs_hz * CS_IRQL_WAIT_MS)
+            break;                           /* 逾時:用最後一份,irq_late_check 會標 NOT_PAST_C1 */
+        thread_yield();
+    }
+    for (int i = 0; i < cpu_count && i < MAX_CPUS; i++) {
+        if (i == 1)
+            continue;
+        if (online & (1u << i))
+            irq_late_snapshot(i, &cs_irql_b[i]);
+        else
+            cs_irql_b[i].ok = 0;
+    }
+}
+
+/* 每顆線上 CPU 一行:狀態、heartbeat / 紀錄增量與完整性(c1 與第 1 顆相同) */
+static void cs_irq_late_cpu_lines(unsigned online, uint64_t c1)
+{
+    for (int i = 0; i < cpu_count && i < MAX_CPUS; i++) {
+        if (!(online & (1u << i)))
+            continue;
+        const struct irq_late_snap *a = &cs_irql_a[i], *b = &cs_irql_b[i];
+        uint32_t first, count;
+        uint32_t inc = irq_late_check(a, b, c1, &first, &count);
+        /* Codex 072:印出種類、iv、實際的記錄門檻與低於門檻的次數;complete 只表示門檻以上的紀錄完整 */
+        kprintf("irq-late: cpu %d gen %u src %u kind %u enabled %u iv %llu min %u hb +%u records +%u "
+                "below-min +%u rejected +%u pending %u/%u %s 0x%x\n", i,
+                (unsigned)b->gen, (unsigned)b->src_id, (unsigned)b->kind, (unsigned)b->enabled,
+                (unsigned long long)b->iv,
+                b->kind == IRQL_KIND_GAP ? IRQL_MIN_GAP_TICKS : IRQL_MIN_LATE_DEADLINE,
+                (unsigned)(b->heartbeat - a->heartbeat), (unsigned)(b->total - a->total),
+                (unsigned)(b->below_min - a->below_min),
+                (unsigned)(b->rejected - a->rejected), (unsigned)a->pending, (unsigned)b->pending,
+                inc ? "incomplete" : "complete(above-min)", (unsigned)inc);
+    }
+}
+
+/* 第 1 顆觀測期間的每筆原始紀錄(全部取自同一份 B);deadline 與 gap 分開計數 */
+static void cs_irq_late_rec_lines(const struct irq_late_snap *b, uint32_t first, uint32_t count,
+                                  unsigned *ndl, unsigned *ngap)
+{
+    *ndl = *ngap = 0;
+    for (uint32_t i = 0; i < count && i < IRQL_RING; i++) {
+        const struct irq_late_rec *r = &b->ring[(first + i) & (IRQL_RING - 1)];
+        int gap = r->kind == IRQL_KIND_GAP;
+        if (gap)
+            (*ngap)++;
+        else
+            (*ndl)++;
+        unsigned lt = irq_late_ticks(r->ref, r->entry, b->iv);
+        kprintf("irq-late: cpu 1 rec %u kind %s flags 0x%x catchup_n %u ref %llu entry %llu %s %u%s\n",
+                (unsigned)r->rec_no, gap ? "gap (gap)" : "deadline", (unsigned)r->flags,
+                (unsigned)r->catchup_n, (unsigned long long)r->ref, (unsigned long long)r->entry,
+                gap ? "gap_ticks" : "late_ticks", lt, lt == IRQL_LATE_SAT ? " (saturated)" : "");
+    }
+}
+
+/* 受測者超時樣本的重疊關係彙總(只印;通過 / 失敗仍由 cpu0_stall_wake_test 末尾的判定決定) */
+static void cs_irq_late_print(unsigned online, uint64_t c1, int stid)
+{
+    cs_irq_late_end(online, c1);
+    cs_irq_late_cpu_lines(online, c1);
+    const struct irq_late_snap *b = &cs_irql_b[1];
+    uint32_t first, count;
+    uint32_t inc = irq_late_check(&cs_irql_a[1], b, c1, &first, &count);
+    unsigned ndl, ngap;
+    cs_irq_late_rec_lines(b, first, count, &ndl, &ngap);
+    int has_inj = cs_inj_mode == CS_INJ_SPIKE && stid > 0 &&
+                  __atomic_load_n(&cs_spike_done, __ATOMIC_SEQ_CST) != 0;
+    uint64_t s0 = has_inj ? cs_spike_at : 0, s1 = has_inj ? cs_spike_at + cs_spike_len : 0;
+    unsigned rel[IRQL_REL_SAMPLES_INCOMPLETE + 1] = {0};
+    const struct cs_sleeper_rec *r = &cs_rec[0];
+    for (unsigned i = 0; i < r->n && i < CS_MAX_SAMPLES; i++) {
+        if (r->t0[i] + r->d[i] > c1)        /* 和 cs_eval 相同的有效樣本過濾 */
+            continue;
+        if (!(r->d[i] * 1000 > cs_hz * CS_STRICT_MS))   /* 和 cs_eval 一字不差的超時條件 */
+            continue;
+        rel[irq_late_classify(b, inc, first, count, r->t0[i], r->t0[i] + r->d[i], has_inj, s0, s1)]++;
+    }
+    rel[IRQL_REL_SAMPLES_INCOMPLETE] += r->drop_over;    /* 被截斷、沒有保存區間的超時樣本 */
+    unsigned tot = 0;
+    for (int k = 0; k <= IRQL_REL_SAMPLES_INCOMPLETE; k++)
+        tot += rel[k];
+    kprintf("irq-late: cpu 1 records in window: deadline %u gap %u\n", ndl, ngap);
+    kprintf("irq-late: target timeouts %u: NO_RECORDED_EVENT_OVERLAP %u INJECTION_OVERLAP %u OUTSIDE_INJECTION %u "
+            "AMBIGUOUS %u EVIDENCE_INCOMPLETE %u SAMPLES_INCOMPLETE %u; scope: cpu1 local timer interrupts only, "
+            "records above min only (smaller late events not recorded); "
+            "does not rule out other-cpu or kernel delay; observation only, verdict unchanged\n",
+            tot, rel[IRQL_REL_NO_RECORDED_EVENT_OVERLAP], rel[IRQL_REL_INJECTION_OVERLAP],
+            rel[IRQL_REL_OUTSIDE_INJECTION], rel[IRQL_REL_AMBIGUOUS], rel[IRQL_REL_EVIDENCE_INCOMPLETE],
+            rel[IRQL_REL_SAMPLES_INCOMPLETE]);
+}
+
+/*
+ * 鎖持有量測(I-349 lock-hold,055):只在 cpu0_stall_wake_test 的觀測視窗內 start / stop 一個 session,
+ * 視窗結束後在鎖外印出。只印,不改任何通過 / 失敗判定;單位是 arch_lh_stamp 的原始計數。
+ */
+static uint32_t cs_lh_session;
+static uint8_t cs_lh_ack_start[MAX_CPUS], cs_lh_ack_stop[MAX_CPUS];
+static struct lockhold_snap cs_lh_snap;    /* 約 2 KB,不放 stack */
+
+static void cs_lh_print(unsigned mask, int started, int stopped)
+{
+    static const char *const lname[LH_LOCKS] = { "sched", "time" };
+    /* Codex 082 / 087:涵蓋是否完整(session 層級旗標)與原始紀錄是否完整(RAW_OVERWRITTEN)分開判;
+       COUNT_SAT 使該鎖的 count/sum/max 都不是全期間值,SUM_SAT 只使 sum 成為下界 */
+    const uint32_t cover_bad = LH_INCONSISTENT | LH_UNSUPPORTED_SOURCE | LH_SOURCE_CHANGED | LH_BACKWARD | LH_PANIC;
+    unsigned coverage = started && stopped, raw_all = 1;
+    uint32_t tcount = 0, tinvalid = 0;
+    uint64_t tmax = 0;
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        if (!(mask >> cpu & 1u))
+            continue;
+        uint8_t a = cs_lh_ack_start[cpu] != LH_ACK_OK ? cs_lh_ack_start[cpu] : cs_lh_ack_stop[cpu];
+        lockhold_snapshot(cpu, &cs_lh_snap);
+        const struct lh_model *m = &cs_lh_snap.m;
+        if (!cs_lh_snap.ok || m->session != cs_lh_session || m->phase != LH_FROZEN || (m->flags & cover_bad) ||
+            a != LH_ACK_OK)
+            coverage = 0;
+        if (!cs_lh_snap.ok) {
+            kprintf("lockhold: cpu %d snapshot busy ack %s\n", cpu, lockhold_ack_name(a));
+            continue;
+        }
+        for (unsigned l = 0; l < LH_LOCKS; l++) {
+            const struct lh_stat *st = &m->stat[l];
+            uint32_t f = m->flags | st->flags;
+            if (f & LH_RAW_OVERWRITTEN)
+                raw_all = 0;
+            kprintf("lockhold: cpu %d lock %s session %u phase %u flags 0x%x count %u invalid %u sum %llu max %llu "
+                    "ack %s begin %llu src %u gen %u aggregate %s raw %s\n", cpu, lname[l], m->session, m->phase, f,
+                    st->count, st->invalid, (unsigned long long)st->sum, (unsigned long long)st->max,
+                    lockhold_ack_name(a), (unsigned long long)m->source.count, m->source.source, m->source.generation,
+                    (st->flags & LH_COUNT_SAT) ? "count-saturated" : (st->flags & LH_SUM_SAT) ? "sum-lower-bound" : "ok",
+                    (st->flags & LH_RAW_OVERWRITTEN) ? "last-16-only" : "complete");
+            tcount += st->count;
+            tinvalid += st->invalid;
+            if (st->max > tmax)
+                tmax = st->max;
+            uint32_t n = st->count, first = n > LH_RING ? n - LH_RING : 0;
+            for (uint32_t no = first; no < n; no++) {
+                const struct lh_raw *r = &st->ring[no & (LH_RING - 1)];
+                kprintf("lockhold: raw cpu %d lock %s no %u start %llu end %llu src %u gen %u\n", cpu, lname[l],
+                        r->no, (unsigned long long)r->start.count, (unsigned long long)r->end.count,
+                        r->start.source, r->start.generation);
+            }
+        }
+    }
+    kprintf("lockhold: session %u cpus 0x%x started %d stopped %d coverage %s raw %s count %u invalid %u max %llu\n",
+            cs_lh_session, mask, started, stopped, coverage ? "complete" : "incomplete",
+            raw_all ? "complete" : "overwritten", tcount, tinvalid,
+            (unsigned long long)tmax);
+}
+
 void cpu0_stall_wake_test(void)
 {
     if (clksync_state() == CLKSYNC_DEGRADED) {
@@ -1788,9 +1969,15 @@ void cpu0_stall_wake_test(void)
     struct cs_stall_ctx ctx;
     for (unsigned i = 0; i < sizeof(ctx); i++)
         ((char *)&ctx)[i] = 0;
+    /* 鎖持有量測視窗(I-349 lock-hold):停頓前 start、停頓後 stop;逾時約 200 ms(只影響證據是否完整) */
+    uint32_t lh_to = timer_hz() / 5 + 2;
+    unsigned lh_mask = sched_online_mask();
+    int lh_started = lockhold_start(++cs_lh_session, lh_mask, lh_to, cs_lh_ack_start);
+    cs_irq_late_begin(online);               /* I-351:A 在 cs_stall_fn 取 c0、設 cs_phase = 1 之前 */
     unsigned long fl = arch_irq_save();
     cs_stall_fn(&ctx);
     arch_irq_restore(fl);
+    int lh_stopped = lockhold_stop(lh_mask, lh_to, cs_lh_ack_stop);
     if (ctx.aborted)
         panic("cpu0-stall: the pinned sleeper was running on cpu 0");
     if (!ctx.ran_on_cpu0)
@@ -1830,6 +2017,8 @@ void cpu0_stall_wake_test(void)
         kprintf("cpu0-stall: control sleeper on cpu 2 woke %u times, worst %llu counts, %u over %u ms\n",
                 rwakes, (unsigned long long)rworst, rover, CS_STRICT_MS);
     cs_classify_print(&ctx, c1, have_ref, stid);
+    cs_lh_print(lh_mask, lh_started, lh_stopped);
+    cs_irq_late_print(online, c1, stid);     /* I-351:只觀測、只印,不影響下面的判定 */
     /* I-349 校準:注入是否真的發生、在哪、多長(Codex 018 / 020 要求記錄) */
     if (cs_inj_mode == CS_INJ_SPIKE && stid > 0) {
         int done = __atomic_load_n(&cs_spike_done, __ATOMIC_SEQ_CST) != 0;

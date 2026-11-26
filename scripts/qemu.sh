@@ -128,9 +128,22 @@ NAME_ARGS=()
 [ -n "${QEMU_RUN_TAG:-}" ] && NAME_ARGS=(-name "$QEMU_RUN_TAG")
 
 set +e
-"${LAUNCH[@]}" "${MACHINE[@]}" "${DISK_ARGS[@]}" "${NET_ARGS[@]}" "${NAME_ARGS[@]}" -kernel "$ELF" -serial stdio \
-        -display "${QEMU_DISPLAY:-none}" -no-reboot "$@"
-rc=$?
+# QEMU_TS_FILE(I-349 R6):設定時,序列埠輸出照原樣逐行送到標準輸出,另外寫一份「每行前面加主機單調時鐘
+# 秒數」的副本到這個檔(主機讀到那一行的時刻,不是客體內事件的精確時間)。結束碼仍是 QEMU 自己的。
+# 沒設定時完全照舊。
+if [ -n "${QEMU_TS_FILE:-}" ]; then
+  "${LAUNCH[@]}" "${MACHINE[@]}" "${DISK_ARGS[@]}" "${NET_ARGS[@]}" "${NAME_ARGS[@]}" -kernel "$ELF" -serial stdio \
+          -display "${QEMU_DISPLAY:-none}" -no-reboot "$@" |
+    perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e '
+      open(my $t, ">", $ARGV[0]) or die "cannot open $ARGV[0]\n"; shift @ARGV;
+      $| = 1; my $o = select($t); $| = 1; select($o);
+      while (<STDIN>) { print $_; printf $t "%.6f %s", clock_gettime(CLOCK_MONOTONIC), $_; }' "$QEMU_TS_FILE"
+  rc=${PIPESTATUS[0]}
+else
+  "${LAUNCH[@]}" "${MACHINE[@]}" "${DISK_ARGS[@]}" "${NET_ARGS[@]}" "${NAME_ARGS[@]}" -kernel "$ELF" -serial stdio \
+          -display "${QEMU_DISPLAY:-none}" -no-reboot "$@"
+  rc=$?
+fi
 # i386 的 isa-debug-exit 寫入 0 時,QEMU 回傳 1,視為成功
 [ "$ARCH" = i386 ] && [ "$rc" -eq 1 ] && exit 0
 exit $rc

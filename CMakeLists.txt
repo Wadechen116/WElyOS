@@ -96,6 +96,8 @@ add_executable(welyos.elf
     kernel/fdt.c
     kernel/panic.c
     kernel/timer.c
+    kernel/irq_late.c
+    kernel/lockhold.c
     kernel/pmm.c
     kernel/membudget.c
     kernel/kmalloc.c

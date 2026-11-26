@@ -7,6 +7,7 @@
 #include "smp.h"
 #include "spinlock.h"
 #include "kprintf.h"
+#include "lockhold.h"
 
 struct cpu cpus[MAX_CPUS];
 int cpu_count = 1;
@@ -120,6 +121,8 @@ void spin_lock(struct spinlock *l)
     }
     l->cpu = c->id;
     held_push(c, l);
+    if (l->probe_id && !panic_mode)          /* I-349:取得之後才開始計時 */
+        lockhold_acquired(l->probe_id);
 }
 
 int spin_trylock(struct spinlock *l)
@@ -132,6 +135,8 @@ int spin_trylock(struct spinlock *l)
         return 0;
     l->cpu = c->id;
     held_push(c, l);
+    if (l->probe_id && !panic_mode)          /* I-349:與 spin_lock 相同 */
+        lockhold_acquired(l->probe_id);
     return 1;
 }
 
@@ -143,6 +148,8 @@ void spin_unlock(struct spinlock *l)
         return;
     if (!l->locked || l->cpu != c->id)
         panic("spinlock \"%s\": released on cpu %d but not held by it", l->name, c->id);
+    if (l->probe_id && !panic_mode)          /* I-349:釋放之前結束計時(仍持有鎖,資料不會被別人改) */
+        lockhold_releasing(l->probe_id);
     l->cpu = -1;
     held_remove(c, l);
     __atomic_store_n(&l->locked, 0u, __ATOMIC_RELEASE);

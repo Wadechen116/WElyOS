@@ -192,8 +192,21 @@ uint64_t arch_tick_interval(void);
 #define ARCH_CLOCK_TEST_HPET32 1
 #define ARCH_CLOCK_TEST_NOPM   2
 int         arch_clock_fallback(void);
+/*
+ * I-351 晚到觀測:依目前的共用計數器來源,為第 cpu 顆設定 irq_late(src_id 與 kind 由架構決定)。
+ * iv = 每 tick 的 arch_clock_count 計數;0 = 停用。只寫請求(irq_late_config),可從任何 CPU 呼叫。
+ */
+void        arch_irq_late_config_cpu(int cpu, uint64_t iv);
 const char *arch_clock_name(void);
 void        arch_clock_test_mode(int mode);
+
+/*
+ * 鎖持有量測(I-349)用的時鐘戳記:有界、不取鎖、不印訊息、不配置。
+ * 只有 i386 TSC、riscv64 time CSR、aarch64 cntpct 會給 valid=1;其他來源 valid=0、count=0,且不讀取它們。
+ * source = 來源編號,generation = 來源世代(i386 每次切換來源都會改變;其他架構固定 0)。
+ */
+struct lh_stamp;
+void arch_lh_stamp(struct lh_stamp *out);
 
 /* 測試用:執行一個非法指令,觸發「非法指令」例外 */
 void arch_test_illegal(void);

@@ -22,11 +22,14 @@
 #include "cpu.h"
 #include "smp.h"
 #include "arch.h"
+#include "irq_late.h"
+#include "lockhold.h"
 #include "kprintf.h"
 #include "panic.h"
 #include "sched.h"
 #include "timer.h"
 #include "trap.h"
+#include "lockhold_model.h"
 
 #define GICD_BASE 0x08000000UL
 #define GICC_BASE 0x08010000UL
@@ -103,6 +106,18 @@ int arch_clock_fallback(void)
     return 0;
 }
 
+/* I-349 鎖持有量測的戳記:cntpct_el0 來源固定、不會切換。counter_hz 在 arch_timer_init 設定之前
+   視為計數器尚未就緒,valid=0 且不讀。source 1 = cntpct(本架構唯一的來源),generation 固定 0 */
+void arch_lh_stamp(struct lh_stamp *out)
+{
+    int ready = __atomic_load_n(&counter_hz, __ATOMIC_ACQUIRE) != 0;
+
+    out->count = ready ? read_counter() : 0;
+    out->source = 1;
+    out->generation = 0;
+    out->valid = (uint32_t)ready;
+}
+
 const char *arch_clock_name(void)
 {
     return "cntpct";
@@ -147,7 +162,14 @@ void arch_timer_init_cpu(void)
 {
     deadline = read_counter() + interval;
     __asm__ volatile("msr cntp_cval_el0, %0" : : "r"(deadline));
+    arch_irq_late_config_cpu(this_cpu()->id, interval);   /* I-351:deadline 與 cntpct_el0 同單位 */
     __asm__ volatile("msr cntp_ctl_el0, %0" : : "r"(1UL));
+}
+
+/* I-351:cntpct_el0 是唯一的共用計數器(src_id 0),每顆 CPU 都有預定 deadline(cntp_cval_el0) */
+void arch_irq_late_config_cpu(int cpu, uint64_t iv)
+{
+    irq_late_config(cpu, 0, IRQL_KIND_DEADLINE, iv);
 }
 
 /* AP 啟動後呼叫:讓這顆 CPU 可以接收中斷(含處理器間中斷) */
@@ -196,12 +218,14 @@ void irq_handler(void)
     if (id == IRQ_IPI) {
         smp_ipi_handler();                   /* 別顆 CPU 的要求(見 kernel/smp.c) */
     } else if (id == IRQ_TIMER) {
+        lockhold_safepoint();                    /* 鎖持有量測的安全點:尚未取 time_lk / sched_lk */
         /*
          * 下一次的時間以「上一次的預定時間 + 間隔」計算,不以「現在」為基準,
          * 中斷送達的延遲才不會累積成時鐘變慢。若晚了不只一個間隔,
          * 把錯過的 tick 補記回來(說明見 arch/riscv64/timer.c)。
          */
-        uint64_t now = read_counter();
+        uint64_t now = read_counter();   /* = arch_clock_count() = timer_clock_count() 的讀值 */
+        uint64_t ref = deadline;         /* I-351:補記之前的預定 deadline */
         int n = 0;
         while (deadline <= now && n < MAX_CATCHUP) {
             if (n == 0)
@@ -215,6 +239,8 @@ void irq_handler(void)
         if (resynced)                 /* 落後太多:放棄補記,重新對時 */
             deadline = now + interval;
         timer_note_catchup(n, resynced);   /* 晚到的紀錄(見 timer.h) */
+        struct irq_late_in li = { IRQL_KIND_DEADLINE, resynced ? IRQL_F_RESYNC : 0, (uint16_t)n, ref, now, 0 };   /* src_id 0:唯一的共用計數器 */
+        irq_late_note(&li);            /* I-351:獨立的晚到觀測,不影響上面的補記 */
         /* 寫入新的比較值:同時讓計時器的中斷訊號消失 */
         __asm__ volatile("msr cntp_cval_el0, %0" : : "r"(deadline));
     } else if (id == IRQ_UART) {

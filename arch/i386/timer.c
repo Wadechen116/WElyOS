@@ -28,15 +28,19 @@
  */
 #include <stdint.h>
 #include "arch.h"
+#include "cpu.h"
 #include "console.h"
 #include "serial.h"
 #include "io.h"
+#include "irq_late.h"
+#include "lockhold.h"
 #include "kprintf.h"
 #include "timer.h"
 #include "sched.h"
 #include "trap.h"
 #include "hpet.h"
 #include "pmtimer.h"
+#include "lockhold_model.h"
 
 #define PIC1_CMD   0x20
 #define PIC1_DATA  0x21
@@ -61,6 +65,9 @@ static uint64_t tsc_hz;        /* TSC 每秒的計數(校正得到);0 = 沒有 T
 
 enum { SRC_UNSET = 0, SRC_TSC, SRC_HPET, SRC_PMTMR, SRC_NONE };
 static volatile int clk_src;   /* 目前的共用時鐘;SRC_UNSET = arch_timer_init 之前(開機最早期) */
+/* clk_src 的世代(seqcount):arch_clock_fallback 切換前後各加 1,奇數 = 正在切換。
+   只有 arch_clock_fallback 寫(持有 time_lk,單一寫者),讀者是 arch_lh_stamp */
+static volatile uint32_t clk_gen;
 static uint64_t hpet_hz;       /* HPET 每秒計數;0 = 沒有或不合格 */
 static uint64_t hpet_iv;       /* 一個 tick 相當於多少 HPET 計數 */
 static int test_hpet32;        /* 測試(clock=hpet32):把 HPET 當 32 位元用,開機後約 2 秒繞回 */
@@ -197,8 +204,74 @@ int arch_clock_fallback(void)
         next = SRC_PMTMR;
     else
         return 0;
+    /*
+     * 世代前後各加 1(seqcount):讀者(arch_lh_stamp)依序讀 gen → src → 計數 → src → gen。
+     * 先加(變奇數)再寫 src:src 的 release 保證看到新 src 的讀者,之後讀 gen 一定看到已加過的值;
+     * 寫完 src 再加(變偶數):讀者看到偶數 gen 時,之後讀到的 src 一定是切換完成的值。
+     * 只比對 src 抓不到 A->B->A(值又變回來),但每次切換 gen 都 +2,前後 gen 不同就一定抓到。
+     * 32 位元的 store 在 i386 上是單一指令,不需要 64 位元 atomic
+     */
+    __atomic_store_n(&clk_gen, clk_gen + 1, __ATOMIC_RELEASE);
     __atomic_store_n(&clk_src, next, __ATOMIC_RELEASE);
+    __atomic_store_n(&clk_gen, clk_gen + 1, __ATOMIC_RELEASE);
+    /* I-351:來源換了,計數單位也換了;所有線上 CPU 以新來源重新設定(第 0 顆離開 TSC 後改成 GAP) */
+    uint64_t iv = arch_tick_interval();
+    for (int i = 0; i < MAX_CPUS; i++)
+        if (cpus[i].online)
+            arch_irq_late_config_cpu(i, iv);
     return 1;
+}
+
+/*
+ * I-351:src_id = clk_src。只有第 0 顆的 PIT 路徑、且共用來源是 TSC 時,才有和共用計數器同單位的預定
+ * deadline(tsc_deadline),用 DEADLINE;其他情形(第 0 顆在 HPET / PM timer 上、其他 CPU 的 LAPIC 週期模式)
+ * 都只能記入口間距:GAP。
+ */
+static uint8_t irq_late_kind(int cpu, int src)
+{
+    return (cpu == 0 && src == SRC_TSC && tsc_interval) ? IRQL_KIND_DEADLINE : IRQL_KIND_GAP;
+}
+
+void arch_irq_late_config_cpu(int cpu, uint64_t iv)
+{
+    int src = __atomic_load_n(&clk_src, __ATOMIC_ACQUIRE);
+    irq_late_config(cpu, (uint8_t)src, irq_late_kind(cpu, src), iv);
+}
+
+/* I-351:GAP 紀錄(第 0 顆非 TSC、其他 CPU 的 LAPIC 計時器)。entry 用 arch_clock_count(),
+   與 timer_clock_count() 是同一個函式,單位一致 */
+void arch_irq_late_note_gap(void)
+{
+    int s0 = __atomic_load_n(&clk_src, __ATOMIC_ACQUIRE);
+    uint64_t e = arch_clock_count();
+    int s1 = __atomic_load_n(&clk_src, __ATOMIC_ACQUIRE);
+    struct irq_late_in li = { IRQL_KIND_GAP, 0, 0, 0, e, s0 == s1 ? (uint8_t)s0 : (uint8_t)IRQL_SRC_UNKNOWN };
+    irq_late_note(&li);
+}
+
+/*
+ * 鎖持有量測(I-349)的戳記:只接受 TSC。不先判斷再呼叫 arch_clock_count(判斷後若切到 HPET
+ * 就會走昂貴的讀取,TOCTOU),而是自己直接 rdtsc,讀前讀後比對 gen 與 src。
+ * 不取鎖、不印訊息、沒有重試迴圈、沒有 64 位元除法或 atomic
+ */
+void arch_lh_stamp(struct lh_stamp *out)
+{
+    uint32_t g1 = __atomic_load_n(&clk_gen, __ATOMIC_ACQUIRE);
+    int s1 = __atomic_load_n(&clk_src, __ATOMIC_ACQUIRE);
+
+    out->count = 0;
+    out->source = (uint32_t)s1;
+    out->generation = g1;
+    out->valid = 0;
+    if (s1 != SRC_TSC || (g1 & 1u))              /* 不是 TSC,或正在切換:不讀任何計數器 */
+        return;
+    uint64_t t = rdtsc();
+    int s2 = __atomic_load_n(&clk_src, __ATOMIC_ACQUIRE);
+    uint32_t g2 = __atomic_load_n(&clk_gen, __ATOMIC_ACQUIRE);
+    if (s2 != s1 || g2 != g1)                    /* 讀數期間來源變過 */
+        return;
+    out->count = t;
+    out->valid = 1;
 }
 
 const char *arch_clock_name(void)
@@ -308,6 +381,7 @@ void arch_timer_init(unsigned hz)
         fb = "hpet";
     else if ((src == SRC_TSC || src == SRC_HPET) && pm_hz)
         fb = "pmtimer";
+    arch_irq_late_config_cpu(0, arch_tick_interval());   /* I-351:第 0 顆(PIT 路徑) */
     kprintf("clock: shared counter %s (%llu Hz), fallback %s\n", arch_clock_name(),
             (unsigned long long)arch_clock_hz(), fb);
 }
@@ -329,10 +403,12 @@ void irq_handler(uint32_t irq)
     sched_irq_enter();                       /* 中斷中喚醒別人時,切換要留到返回前 */
 
     if (irq == 0) {
+        lockhold_safepoint();                /* 鎖持有量測的安全點:尚未取 time_lk / sched_lk */
         if (tsc_interval) {
             /* 依 TSC 實際經過的時間決定要記幾個 tick(通常是 1 個;
                中斷被合併時會是多個,把漏掉的補回來) */
             uint64_t now = rdtsc();
+            uint64_t ref = tsc_deadline;     /* I-351:補記之前的預定 deadline */
             int n = 0;
             while (tsc_deadline <= now && n < MAX_CATCHUP) {
                 if (n == 0)
@@ -346,8 +422,18 @@ void irq_handler(uint32_t irq)
             if (resynced)                /* 落後太多:放棄補記,重新對時 */
                 tsc_deadline = now + tsc_interval;
             timer_note_catchup(n, resynced);   /* 晚到的紀錄(見 timer.h) */
+            /* I-351:共用來源是 TSC 時 now(rdtsc)就是 arch_clock_count() 的讀值,可和 deadline 比;
+               已切到 HPET / PM timer 時 TSC 和測試端的計數器不同單位,改記 GAP */
+            if (__atomic_load_n(&clk_src, __ATOMIC_ACQUIRE) == SRC_TSC) {
+                struct irq_late_in li = { IRQL_KIND_DEADLINE, resynced ? IRQL_F_RESYNC : 0,
+                                          (uint16_t)n, ref, now, (uint8_t)SRC_TSC };
+                irq_late_note(&li);
+            } else {
+                arch_irq_late_note_gap();
+            }
         } else {
             timer_tick();
+            arch_irq_late_note_gap();        /* I-351:沒有 TSC,沒有預定 deadline */
         }
     } else if (irq == IRQ_COM1) {
         console_rx();                        /* 序列埠收到字元(見 kernel/console.c) */

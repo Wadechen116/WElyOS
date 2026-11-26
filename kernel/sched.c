@@ -117,7 +117,7 @@ extern char stack_guard[], stack_bottom[], stack_top[];
 static struct thread main_thread;            /* 開機流程本身 */
 
 /* 排程器的鎖:保護本檔所有的共用資料(見檔案開頭的上鎖規則) */
-static struct spinlock sched_lk = SPINLOCK_INIT("sched", LK_SCHED);
+static struct spinlock sched_lk = SPINLOCK_INIT_PROBED("sched", LK_SCHED, 1);   /* probe 1 = lockhold_model.h 的 LH_SCHED */
 
 /* 目前這顆 CPU 正在執行的執行緒。只能在中斷關閉時使用(見 cpu.h) */
 static inline struct thread *cur(void) { return this_cpu()->current; }

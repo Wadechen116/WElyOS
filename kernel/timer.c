@@ -5,6 +5,7 @@
  * tick 計數是 kernel 的時間基準,之後的排程器也靠它切換工作。
  */
 #include "arch.h"
+#include "irq_late.h"
 #include "cpu.h"
 #include "sched.h"
 #include "spinlock.h"
@@ -44,7 +45,7 @@ static volatile uint64_t g_iv;
    timer_shared_disable() 清成 0,之後退回「只有第 0 顆推進」的舊路徑(降級狀態)。只會由 1 變 0 */
 static volatile int g_shared = 1;
 static volatile uint32_t time_seq;     /* 奇數 = 寫入中 */
-static struct spinlock time_lk = SPINLOCK_INIT("timer-time", LK_TIME);
+static struct spinlock time_lk = SPINLOCK_INIT_PROBED("timer-time", LK_TIME, 2);   /* probe 2 = lockhold_model.h 的 LH_TIME */
 static uint32_t adv_count[MAX_CPUS];   /* 每顆 CPU 推進過幾次系統時間(量測與測試用;time_lk 之內寫) */
 static unsigned tick_hz;
 
@@ -270,6 +271,10 @@ uint64_t timer_ticks(void)
 void timer_shared_disable(void)
 {
     __atomic_store_n(&g_shared, 0, __ATOMIC_RELEASE);
+    /* I-351:降級後共用計數器不再可信,所有線上 CPU 的晚到觀測一併停用(iv = 0) */
+    for (int i = 0; i < MAX_CPUS; i++)
+        if (cpus[i].online)
+            arch_irq_late_config_cpu(i, 0);
 }
 
 int timer_shared_enabled(void)

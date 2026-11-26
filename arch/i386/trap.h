@@ -16,6 +16,7 @@ void trap_init_ap(int id);                  /* 其他 CPU 啟動時:載入 GDT�
 void trap_set_page_table(uint32_t cr3);     /* 分頁開啟時通知:TSS 需要記錄頁表位址 */
 void trap_handler(struct trap_frame *tf);   /* 由 trap.S 呼叫 */
 void irq_handler(uint32_t irq);             /* timer.c:處理硬體中斷 IRQ 0~15 */
+void arch_irq_late_note_gap(void);         /* timer.c:I-351 GAP 晚到觀測(第 0 顆非 TSC、各 CPU 的 LAPIC 計時器) */
 
 /* LAPIC 使用的中斷向量(多核心) */
 #define VEC_LAPIC_TIMER 48                  /* 每顆 CPU 自己的計時器 */
