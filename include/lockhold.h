@@ -30,6 +30,7 @@ enum lh_ack {
     LH_ACK_TIMEOUT,          /* 逾時內沒有 ACK(不強制釋鎖) */
     LH_ACK_OFFLINE,          /* 目標 CPU 不在線上 */
     LH_ACK_BUSY,             /* 另一個控制端正在進行,本次未發布 */
+    LH_ACK_QUIESCENT,        /* STOP:已靜止但本 session 無完整量測資料;不是 LH_ACK_OK */
 };
 #define LH_SNAP_TRIES 1000
 
@@ -40,12 +41,16 @@ enum lh_ack {
  * 不發布。回傳 1 = mask 內全部 LH_ACK_OK。逾時的 CPU 之後仍可能套用,但它的結果不會被當成完整。
  */
 int lockhold_start(uint32_t session, unsigned mask, uint32_t timeout_ticks, uint8_t ack[MAX_CPUS]);
-/* 對最近一次 START 的 session 發布 STOP,等目標 ACK FROZEN。語義同上。 */
+/* 對最近一次 START 的原始 mask 發布 STOP。全部 ACK_OK 才回 1。
+   若全為 ACK_OK/ACK_QUIESCENT，可關閉控制 session，但含 QUIESCENT 時仍回 0(資料不完整)。
+   TIMEOUT/OFFLINE 等結果不算安全清理，不解除新 START 的阻擋。 */
 int lockhold_stop(unsigned mask, uint32_t timeout_ticks, uint8_t ack[MAX_CPUS]);
 
 /* panic 時呼叫(任一 CPU、任何情境):只設全域旗標,不碰遠端模型。各 CPU 下一次 hook / 安全點自己
    lh_fail(LH_PANIC);snapshot 另把 panic 狀態帶出,讀者不必等目標 CPU 再執行。 */
 void lockhold_panic(void);
+/* 有 session 開著時為 1(控制端寫);spinlock 只在為 1 時呼叫 hook(I-375) */
+extern uint32_t lockhold_gate;
 
 /* 一顆 CPU 已發布副本的一致快照 */
 struct lockhold_snap {
@@ -53,6 +58,7 @@ struct lockhold_snap {
     uint32_t pub_no;         /* 發布次數(0 = 從未發布) */
     uint32_t panic;          /* 讀取時全域 panic 旗標 */
     struct lh_model m;       /* 已發布的模型;panic 時 m.flags 另 OR LH_PANIC */
+    struct lh_stamp end;     /* STOP 套用時的實際結束戳記(START 後、STOP 前為 0) */
 };
 /* 只供單一控制端(測試執行緒)呼叫:內部有每顆 CPU 一份的靜態暫存,避免 2 KB 放 stack。 */
 void lockhold_snapshot(int cpu, struct lockhold_snap *out);
@@ -67,6 +73,7 @@ static inline const char *lockhold_ack_name(uint8_t a)
     case LH_ACK_TIMEOUT: return "timeout";
     case LH_ACK_OFFLINE: return "offline";
     case LH_ACK_BUSY: return "busy";
+    case LH_ACK_QUIESCENT: return "quiescent-no-data";
     }
     return "?";
 }

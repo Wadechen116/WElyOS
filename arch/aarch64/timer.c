@@ -112,7 +112,10 @@ void arch_lh_stamp(struct lh_stamp *out)
 {
     int ready = __atomic_load_n(&counter_hz, __ATOMIC_ACQUIRE) != 0;
 
+    /* 編譯器記憶體屏障(Codex 092):讀數不被編譯器搬到 hook 前後的記憶體存取之外;硬體層面仍未序列化(STAMP_UNSERIALIZED) */
+    __asm__ volatile("" ::: "memory");
     out->count = ready ? read_counter() : 0;
+    __asm__ volatile("" ::: "memory");
     out->source = 1;
     out->generation = 0;
     out->valid = (uint32_t)ready;

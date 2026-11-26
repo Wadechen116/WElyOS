@@ -81,7 +81,10 @@ int arch_clock_fallback(void)
    source 1 = time CSR(本架構唯一的來源),generation 固定 0 */
 void arch_lh_stamp(struct lh_stamp *out)
 {
+    /* 編譯器記憶體屏障(Codex 092):讀數不被編譯器搬到 hook 前後的記憶體存取之外;硬體層面仍未序列化(STAMP_UNSERIALIZED) */
+    __asm__ volatile("" ::: "memory");
     out->count = read_time();
+    __asm__ volatile("" ::: "memory");
     out->source = 1;
     out->generation = 0;
     out->valid = 1;

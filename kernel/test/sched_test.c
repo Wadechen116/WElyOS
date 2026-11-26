@@ -1863,9 +1863,9 @@ static void cs_lh_print(unsigned mask, int started, int stopped)
             if (f & LH_RAW_OVERWRITTEN)
                 raw_all = 0;
             kprintf("lockhold: cpu %d lock %s session %u phase %u flags 0x%x count %u invalid %u sum %llu max %llu "
-                    "ack %s begin %llu src %u gen %u aggregate %s raw %s\n", cpu, lname[l], m->session, m->phase, f,
+                    "ack %s begin %llu end %llu src %u gen %u stamp approximate-unserialized aggregate %s raw %s\n", cpu, lname[l], m->session, m->phase, f,
                     st->count, st->invalid, (unsigned long long)st->sum, (unsigned long long)st->max,
-                    lockhold_ack_name(a), (unsigned long long)m->source.count, m->source.source, m->source.generation,
+                    lockhold_ack_name(a), (unsigned long long)m->source.count, (unsigned long long)cs_lh_snap.end.count, m->source.source, m->source.generation,
                     (st->flags & LH_COUNT_SAT) ? "count-saturated" : (st->flags & LH_SUM_SAT) ? "sum-lower-bound" : "ok",
                     (st->flags & LH_RAW_OVERWRITTEN) ? "last-16-only" : "complete");
             tcount += st->count;
@@ -1885,6 +1885,50 @@ static void cs_lh_print(unsigned mask, int started, int stopped)
             cs_lh_session, mask, started, stopped, coverage ? "complete" : "incomplete",
             raw_all ? "complete" : "overwritten", tcount, tinvalid,
             (unsigned long long)tmax);
+}
+
+/*
+ * I-375:鎖持有量測 hook 的成本,在同一次開機內直接量(不受主機負載漂移影響)。
+ * 兩把測試鎖:一把 probe_id = 0(spin_lock 不呼叫 hook),一把 probe_id = LH_SCHED(會呼叫 hook)。
+ * 在沒有收集 session 的狀態(OFF / FROZEN)下各做 LH_COST_N 次上鎖 + 解鎖,交錯 LH_COST_ROUNDS 輪,
+ * 印每輪的總計數;每對操作的平均在主機端算(i386 不可用 64 位元除法)。只印,不判定。
+ */
+#define LH_COST_N      200000u
+#define LH_COST_ROUNDS 5
+static struct spinlock lh_cost_plain = SPINLOCK_INIT("lh-cost-plain", LK_TEST_OUTER);
+static struct spinlock lh_cost_probed = SPINLOCK_INIT_PROBED("lh-cost-probed", LK_TEST_OUTER, LH_SCHED);
+
+static uint64_t lh_cost_run(struct spinlock *l)
+{
+    unsigned long fl = arch_irq_save();      /* 規則 1:持鎖時中斷關閉;也排除中斷干擾量測 */
+    uint64_t t0 = arch_clock_count();
+    for (uint32_t i = 0; i < LH_COST_N; i++) {
+        spin_lock(l);
+        spin_unlock(l);
+    }
+    uint64_t t1 = arch_clock_count();
+    arch_irq_restore(fl);
+    return t1 - t0;
+}
+
+void lockhold_cost_test(void)
+{
+    if (!arch_clock_hz()) {
+        kprintf("lockhold-cost: no shared counter, skipped\n");
+        return;
+    }
+    uint64_t sp = 0, sq = 0;
+    for (int r = 0; r < LH_COST_ROUNDS; r++) {
+        uint64_t p = lh_cost_run(&lh_cost_plain);
+        uint64_t q = lh_cost_run(&lh_cost_probed);
+        sp += p;
+        sq += q;
+        kprintf("lockhold-cost: round %d pairs %u plain %llu probed %llu counts\n", r, LH_COST_N,
+                (unsigned long long)p, (unsigned long long)q);
+    }
+    kprintf("lockhold-cost: total pairs %u plain %llu probed %llu counts (clock %llu Hz, gate %u; per-pair = total / pairs)\n",
+            LH_COST_N * LH_COST_ROUNDS, (unsigned long long)sp, (unsigned long long)sq,
+            (unsigned long long)arch_clock_hz(), (unsigned)__atomic_load_n(&lockhold_gate, __ATOMIC_RELAXED));
 }
 
 void cpu0_stall_wake_test(void)

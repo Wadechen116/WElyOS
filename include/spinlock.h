@@ -85,6 +85,9 @@ int spin_trylock(struct spinlock *l);
 /* 這把鎖是否正由「目前這顆 CPU」持有(斷言用;呼叫時中斷須已關閉) */
 int spin_held(struct spinlock *l);
 
+/* 目前這顆 CPU 是否持有任何設了 probe_id 的鎖(鎖持有量測的安全點用;呼叫時中斷須已關閉) */
+int spin_held_probed(void);
+
 /* panic 開始時呼叫:之後所有 spinlock 操作都直接放行。
    panic 要印訊息,而出事的當下可能正持有主控台或其他的鎖,不放行就印不出來 */
 void spin_panic_mode(void);

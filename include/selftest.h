@@ -70,6 +70,7 @@ void clksync_test(void);                 /* I-337:跨 CPU 計數器同步驗證(
 #define CS_INJ_SPIKE 1
 #define CS_INJ_STEADY 2
 void cpu0_stall_set_injection(int mode);
+void lockhold_cost_test(void);           /* I-375:同一次開機內量鎖持有量測 hook 的成本(只印) */
 void cpu0_stall_wake_test(void);         /* 第 0 顆 CPU 關中斷 300 ms 時休眠者照樣醒(I-337) */              /* 睡眠以真實時間計不可提早醒(高精度時鐘量) */
 void sched_stress(void);                 /* stress:大量執行緒 */
 void sched_crash_test(const char *cmd);  /* crash=<種類>:需要排程器的那些 */

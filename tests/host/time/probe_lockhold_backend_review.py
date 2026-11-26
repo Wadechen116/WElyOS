@@ -30,9 +30,16 @@ HARNESS = r'''
 #include <stdio.h>
 #include <string.h>
 #include "backend.c"
+#if REVIEW_MODEL_NESTED
+#define REVIEW_MODEL (lc[0].u.r.m)
+#else
+#define REVIEW_MODEL (lc[0].u.m)
+#endif
 struct cpu cpus[MAX_CPUS] = {{.id=0, .online=1}};
 static uint64_t host_ticks, counter;
 static int deliver_safepoint=1;
+static int force_ack_on_relax;
+static unsigned relax_calls;
 static uint32_t source=1, generation=1, stamp_valid=1;
 static unsigned failures, checks;
 #define CHECK(condition, name) do { int passed_ = !!(condition); checks++; \
@@ -45,7 +52,17 @@ static void pump(void) {
     if (deliver_safepoint && cpus[0].online) lockhold_safepoint();
 }
 uint64_t timer_ticks(void) { pump(); return host_ticks++; }
-void arch_cpu_relax(void) { pump(); }
+void arch_cpu_relax(void) {
+    relax_calls++;
+    if (force_ack_on_relax && cpus[0].online) lockhold_safepoint();
+    else pump();
+}
+/* 新 backend 以 bounded counter 等待；每 tick 100 counts，單次讀取 +10。
+   保留至少一次 relax/pump 機會；不得在 stamp 內 pump，否則安全點會遞迴。 */
+uint64_t arch_tick_interval(void) { return 100; }
+/* I-375 之後安全點改查 spinlock 的持有清單:由探針模擬 */
+static int review_held;
+int spin_held_probed(void) { return review_held; }
 void arch_lh_stamp(struct lh_stamp *out)
 {
     counter += 10;
@@ -134,6 +151,29 @@ static void timeout_stop(void)
     CHECK(lockhold_stop(1, 1, ack), "STOP retry observes full acknowledgement");
     CHECK(lockhold_start(2, 1, 1, ack), "session2 accepted after STOP retry");
 }
+static void timeout_zero(void)
+{
+    uint8_t ack[MAX_CPUS];
+    /* 正確 zero 是 poll-only，不可進 relax；錯誤版本在第一次 relax 收到
+       真安全點 ACK 後就返回，因此可快速抓到錯誤，不必跑完整 spin cap。 */
+    deliver_safepoint=0;
+    force_ack_on_relax=1;
+    int result=lockhold_start(1, 1, 0, ack);
+    printf("timeout0 observed: result=%d ack=%s relax_calls=%u\n",
+           result, lockhold_ack_name(ack[0]), relax_calls);
+    CHECK(!result && ack[0] == LH_ACK_TIMEOUT, "timeout0 polls missing ACK then returns TIMEOUT");
+    CHECK(relax_calls == 0, "timeout0 never waits or calls relax");
+    force_ack_on_relax=0;
+    deliver_safepoint=1;
+    int stopped=lockhold_stop(1, 100, ack);
+#if REVIEW_HAS_QUIESCENT
+    CHECK((stopped && ack[0] == LH_ACK_OK) || (!stopped && ack[0] == LH_ACK_QUIESCENT),
+          "timed-out START can be explicitly STOPped or cleaned without fabricating data success");
+#else
+    CHECK(stopped && ack[0] == LH_ACK_OK, "late START can be explicitly STOPped");
+#endif
+    CHECK(lockhold_start(2, 1, 100, ack), "new START remains available after timeout0 cleanup");
+}
 #if REVIEW_HAS_QUIESCENT
 static void unsupported_cleanup(void)
 {
@@ -173,17 +213,17 @@ static void no_fake_quiescence(void)
     uint8_t ack[MAX_CPUS];
     CHECK(lockhold_start(1, 1, 1, ack), "START1 accepted");
     /* 故意破壞本地狀態，驗證防禦分支；不複製 backend 的判定。 */
-    lc[0].u.m.session=0;
+    REVIEW_MODEL.session=0;
     CHECK(!lockhold_stop(1, 1, ack) && ack[0] == LH_ACK_INCONSISTENT,
           "ON mismatch is not quiescent");
     CHECK(!lockhold_start(2, 1, 1, ack), "ON mismatch keeps controller open");
-    lc[0].u.m.phase=LH_OFF;
-    lc[0].u.m.token[0].active=1;
+    REVIEW_MODEL.phase=LH_OFF;
+    REVIEW_MODEL.token[0].active=1;
     CHECK(!lockhold_stop(1, 1, ack) && ack[0] == LH_ACK_INCONSISTENT,
           "OFF with active token is not quiescent");
-    CHECK(lc[0].u.m.token[0].active, "failed cleanup does not erase token");
-    lc[0].u.m.token[0].active=0;
-    lc[0].held=1;
+    CHECK(REVIEW_MODEL.token[0].active, "failed cleanup does not erase token");
+    REVIEW_MODEL.token[0].active=0;
+    review_held=1;
     CHECK(!lockhold_stop(1, 1, ack) && ack[0] == LH_ACK_INCONSISTENT,
           "OFF while physically held is not quiescent");
 }
@@ -199,6 +239,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "mask_out_of_range")) masks(1);
     else if (!strcmp(argv[1], "timeout_start")) timeout_start();
     else if (!strcmp(argv[1], "timeout_stop")) timeout_stop();
+    else if (!strcmp(argv[1], "timeout_zero")) timeout_zero();
 #if REVIEW_HAS_QUIESCENT
     else if (!strcmp(argv[1], "unsupported_cleanup")) unsupported_cleanup();
     else if (!strcmp(argv[1], "offline_cleanup")) offline_cleanup();
@@ -230,6 +271,19 @@ def main():
     print(f"repo: {repo}", flush=True)
     has_quiescent = bool(re.search(rb"\bLH_ACK_QUIESCENT\b", data["include/lockhold.h"]))
     print(f"REVIEW_HAS_QUIESCENT={int(has_quiescent)}", flush=True)
+    # 唯一需要碰 backend 私有狀態的是 no_fake_quiescence 的故障注入。
+    # 只接受兩個已審查布局，未知布局不可默默跳過安全性 gate。
+    union = re.search(rb"union\s+lh_words\s*\{([^}]+)\}", data["kernel/lockhold.c"], re.S)
+    if union is None:
+        raise ValueError("NOT_APPLICABLE: unknown backend lh_words layout")
+    body = union.group(1)
+    if re.search(rb"\bstruct\s+lh_rec\s+r\s*;", body):
+        nested = True
+    elif re.search(rb"\bstruct\s+lh_model\s+m\s*;", body):
+        nested = False
+    else:
+        raise ValueError("NOT_APPLICABLE: unknown backend model layout")
+    print("REVIEW_MODEL=" + ("lc[0].u.r.m" if nested else "lc[0].u.m"), flush=True)
     with tempfile.TemporaryDirectory(prefix="welyos-lockhold-backend-") as directory:
         tmp = Path(directory)
         (tmp / "backend.c").write_bytes(data["kernel/lockhold.c"])
@@ -238,10 +292,13 @@ def main():
             (tmp / Path(name).name).write_bytes(data[name])
         (tmp / "cpu.h").write_text(CPU, encoding="utf-8")
         (tmp / "timer.h").write_text("#include <stdint.h>\nuint64_t timer_ticks(void);\n", encoding="utf-8")
+        # I-375:backend 只需要 spinlock.h 的 spin_held_probed 宣告(實作由探針模擬)
+        (tmp / "spinlock.h").write_text("int spin_held_probed(void);\n", encoding="utf-8")
         (tmp / "test.c").write_text(HARNESS, encoding="utf-8")
         build = subprocess.run(
             ["gcc", "-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
              "-DREVIEW_HAS_QUIESCENT=" + str(int(has_quiescent)),
+             "-DREVIEW_MODEL_NESTED=" + str(int(nested)),
              "-I", str(tmp), str(tmp / "test.c"), "-o", str(tmp / "probe")],
             capture_output=True, text=True, timeout=30)
         if build.returncode:
@@ -250,7 +307,7 @@ def main():
         failed = skipped = 0
         cases = ("reentry", "normal", "source_changed", "invalid_stamp", "masks", "mask_out_of_range",
                  "timeout_start", "timeout_stop", "unsupported_cleanup", "offline_cleanup",
-                 "no_fake_quiescence")
+                 "no_fake_quiescence", "timeout_zero")
         for case in cases:
             run = subprocess.run([str(tmp / "probe"), case], cwd=tmp,
                                  capture_output=True, text=True, timeout=10)

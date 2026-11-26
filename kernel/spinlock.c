@@ -85,9 +85,21 @@ static void held_remove(struct cpu *c, struct spinlock *l)
     panic("spinlock \"%s\": released on cpu %d but missing from its held list", l->name, c->id);
 }
 
+/* 本 CPU 是否持有任何設了 probe_id 的鎖(鎖持有量測的安全點用;呼叫時中斷須已關閉)。
+   spinlock 只看自己的持有清單,不知道是哪些鎖 */
+int spin_held_probed(void)
+{
+    struct cpu *c = this_cpu();
+    for (int i = 0; i < c->nlocks; i++)
+        if (c->held[i]->probe_id)
+            return 1;
+    return 0;
+}
+
 void spin_panic_mode(void)
 {
     panic_mode = 1;
+    lockhold_panic();                /* 之後 hook 不再被呼叫:量測必須標 PANIC、不可當完整(Codex 091 / 092) */
 }
 
 void spin_lock(struct spinlock *l)
@@ -121,7 +133,7 @@ void spin_lock(struct spinlock *l)
     }
     l->cpu = c->id;
     held_push(c, l);
-    if (l->probe_id && !panic_mode)          /* I-349:取得之後才開始計時 */
+    if (l->probe_id && __atomic_load_n(&lockhold_gate, __ATOMIC_RELAXED) && !panic_mode)          /* I-349:取得之後才開始計時 */
         lockhold_acquired(l->probe_id);
 }
 
@@ -135,7 +147,7 @@ int spin_trylock(struct spinlock *l)
         return 0;
     l->cpu = c->id;
     held_push(c, l);
-    if (l->probe_id && !panic_mode)          /* I-349:與 spin_lock 相同 */
+    if (l->probe_id && __atomic_load_n(&lockhold_gate, __ATOMIC_RELAXED) && !panic_mode)          /* I-349:與 spin_lock 相同 */
         lockhold_acquired(l->probe_id);
     return 1;
 }
@@ -148,7 +160,7 @@ void spin_unlock(struct spinlock *l)
         return;
     if (!l->locked || l->cpu != c->id)
         panic("spinlock \"%s\": released on cpu %d but not held by it", l->name, c->id);
-    if (l->probe_id && !panic_mode)          /* I-349:釋放之前結束計時(仍持有鎖,資料不會被別人改) */
+    if (l->probe_id && __atomic_load_n(&lockhold_gate, __ATOMIC_RELAXED) && !panic_mode)          /* I-349:釋放之前結束計時(仍持有鎖,資料不會被別人改) */
         lockhold_releasing(l->probe_id);
     l->cpu = -1;
     held_remove(c, l);

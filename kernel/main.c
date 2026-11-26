@@ -434,6 +434,7 @@ void kmain(const struct boot_info *bi)
         affinity_test();                     /* I-343 */
         sleep_wall_test();
         cpu0_stall_wake_test();
+        lockhold_cost_test();                /* I-375 */
         clksync_test();
         kstack_pool_test();                  /* I-339:要能建立執行緒,所以在排程器啟動之後 */
         pte_tear_test();

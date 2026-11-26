@@ -8519,3 +8519,20 @@ I-341 改為部分解決:HPET 備援與三個測試用開機參數都已執行�
 - 狀態可能過時、行數過時、內容重複的條目(I-091、I-331、I-310、I-299、I-300、I-309、I-327、I-170/116、I-155/147、I-177/166)在後續欄加註,逐條核對後再改狀態,不直接結案。
 - 不穩定 / 偶發失敗:稽核沒找到未收錄的;已知的都在 I-331、I-334、I-349、I-350、I-351、I-352、I-361、I-362。
 - 統計:總數 373,待處理 247、部分解決 13、已解決 113。
+
+### 控制流程修正(Codex 090~099)
+
+- **缺陷**:Codex 的正式 backend 測試重現「前一個 session 還沒收尾時新的 START 進來,讓前一個 STOP 失敗、session 收不了尾」。套用 Codex 的修補 v2:session 未收尾前拒絕新 START;STOP 的 CPU 集合必須等於 START 的集合;沒開始收集但已靜止的 CPU 回 QUIESCENT(可收尾,但回傳值仍是資料不完整);逾時 / 離線不算安全收尾。
+- **一併修正**:等待改成真正有上限(不再呼叫 timer_ticks(),它內部的 seqlock 重試沒有上限;改用時間戳記 + 每 tick 計數逐次加出的期限,加上固定迴圈上限);請求世代不繞回重用;panic 時通知量測模組;時間戳記讀取前後加編譯器屏障、輸出標 approximate-unserialized(沒有誤差上界,不能當硬體持有時間上界);每顆 CPU 記錄實際結束戳記。
+- **驗證**:三架構建置無警告;主機測試 build/lockhold/lh_host_test.c 依新規則改寫後通過;負對照 build/lockhold/neg2(拿掉「未收尾拒絕新 START」→ 12 項失敗;拿掉結束戳記 → 1 項失敗)。QEMU build/lockhold/q2 三架構 4/8 CPU 6 次 rc=0、涵蓋完整。Codex 的正式測試需要配合新的內部結構更新後重驗(待 Codex)。
+
+### 第 77 步回歸、效能與接手 Codex 的工作
+
+- **Codex 無法繼續**(使用者 2026-11-26:「codex沒有token，你必須全力承擔所有工作項目」):之後 Codex 的角色(純模型、主機測試、交叉審查、機器排程)由我承擔;交叉審查改由不看我結論的獨立 agent 做。
+- **Codex 正式 backend 測試抓到的缺陷**:逾時設 0 時應只檢查一次就返回,舊版會等到迴圈上限。修正後 tests/host/time/probe_lockhold_backend_review.py 12/12;負對照 build/lockhold/neg3(拿掉修正)→ 11/12。
+- **靜態檢查**:arch_backtrace 的三條已接受遞迴因 kernel/spinlock.c 內容變更而換了編號(呼叫鏈與函式雜湊不變)。重新審查前提並重新登記 tests/static/baseline.txt;獨立 agent 複核:hook 下游只有純 inline 模型與單次計數器讀取、不呼叫 panic / kprintf / 鎖,panic CPU 在 spin_panic_mode 後不會呼叫 hook。複核者誤稱「沒有鎖設 probe_id」(漏看巨集),已查證 sched_lk / time_lk 都設了;另查證兩把鎖的 6 個取得點都在關中斷下。
+- **完整回歸** run-20261126-111524-28856:三架構 30/30、磁碟跨開機、安全模式、外來磁碟、無裝置、時鐘降級、主機測試(網路、PM timer、I-349、irq_late)、exit5 12/12 全部通過;唯一失敗是 aarch64 8 CPU 重複第 2 次 cpu0-stall(I-374)。A/B 12 次未重現。
+- **效能基準**:bench 與 hook 關閉的副本(build/lockhold/abtree,probe_id 設 0)各跑一輪;單輪雜訊 ±15~25%,無法判定 hook 成本(I-375)。
+- **hook 成本追查(I-375)**:交錯 3 輪曾得到「開著平均慢約 9%」,但再加「空 hook」對照重跑 3 輪後,開 / 關沒有一致差異,且整體數字高了約 30%(主機負載漂移)。兩次互相矛盾,不下結論;下一步改用不受主機漂移影響的量法(同一次開機內比較、或在 kernel 內直接量 hook 的週期數)。
+- **I-375 解決:hook 成本**。在 kernel 內直接量(lockhold_cost_test,同一次開機、交錯 5 輪、各 20 萬對):沒有 session 時,hook 原本讓每對上鎖 / 解鎖多花 87~129 ns,約為鎖本身成本的兩倍。改成全域開關 lockhold_gate(START 發布前開、安全收尾後才關),spinlock 只在開關為 1 時呼叫 hook;安全點改查 spinlock 自己的持有清單(spin_held_probed),hook 不再計數。修正後 +2~7 ns。負對照(收尾後不關開關)→ +117 ns。設計理由:開關為 0 時取得、開關為 1 後才放開的鎖,模型沒有 token(START 只在本 CPU 未持有目標鎖的安全點套用),所以不會誤記。主機測試(build/lockhold/lh_host_test.c、tests/host/time/probe_lockhold_backend_review.py 12/12)已改成模擬 spinlock 的持有清單。靜態檢查的 3 條遞迴提示因 spinlock.c 變更再次換編號,重新登記。
+- **I-375 修正後完整回歸** run-20261126-115401-51632:三架構 30/30、1/4/8 CPU 重複各 3/3(含先前失敗過的 aarch64 8 CPU)、主機測試、exit5 12/12,全部符合預期。

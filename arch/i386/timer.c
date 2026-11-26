@@ -265,7 +265,10 @@ void arch_lh_stamp(struct lh_stamp *out)
     out->valid = 0;
     if (s1 != SRC_TSC || (g1 & 1u))              /* 不是 TSC,或正在切換:不讀任何計數器 */
         return;
+    /* 編譯器記憶體屏障(Codex 092):讀數不被編譯器搬到 hook 前後的記憶體存取之外;硬體層面仍未序列化(STAMP_UNSERIALIZED) */
+    __asm__ volatile("" ::: "memory");
     uint64_t t = rdtsc();
+    __asm__ volatile("" ::: "memory");
     int s2 = __atomic_load_n(&clk_src, __ATOMIC_ACQUIRE);
     uint32_t g2 = __atomic_load_n(&clk_gen, __ATOMIC_ACQUIRE);
     if (s2 != s1 || g2 != g1)                    /* 讀數期間來源變過 */
